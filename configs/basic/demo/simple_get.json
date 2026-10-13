@@ -1,0 +1,26 @@
+{
+  "scenario": "basic",
+  "operation": "get",
+  "protocol": "ub",
+  "client_node": "node4",
+  "store_node": "node4",
+  "key_prefix": "mc_bench",
+  "key_count": 1000,
+  "data_size": "8MB",
+  "params": [
+    {
+      "num_clients": 1,
+      "num_threads": 1
+   
+        }
+ 
+    ],
+  "warmup": {
+    "key_count": 100,
+    "data_size": "1MB",
+    "num_clients": 1,
+    "num_threads": 1
+ 
+    },
+  "mode": "get"
+}

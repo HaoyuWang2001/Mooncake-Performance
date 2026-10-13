@@ -1,0 +1,50 @@
+{
+  "scenario": "pipeline",
+  "mode": "rank",
+  "operation": "put_batch/getBuffer",
+  "protocol": "ub",
+  "traffic_mode": "pulse",
+  "target_qps": 105,
+  "data_size": "8MB",
+  "ttl": 0,
+  "notify_pipeline": [
+    "getBuffer"
+ 
+    ],
+  "client_node": "node4",
+  "store_node": "node4",
+  "peers": [
+    {
+      "host": "192.168.84.151",
+      "port": 9200,
+      "role": "writer",
+      "node": "node4"
+   
+        },
+    {
+      "host": "192.168.84.151",
+      "port": 9201,
+      "role": "reader",
+      "node": "node4"
+   
+        }
+ 
+    ],
+  "params": [
+    {
+      "num_clients": 1,
+      "num_threads": 1
+   
+        }
+ 
+    ],
+  "warmup": {
+    "key_count": 100,
+    "data_size": "1MB",
+    "num_clients": 1,
+    "num_threads": 1
+ 
+    },
+  "duration": 10,
+  "batch_size": 1
+}

@@ -286,14 +286,16 @@ python benchmark.py --scenario basic --config basic/get_local.json --clean-up
 ## 9. 结果目录结构
 
 ```
-results/<时间戳，如 20261010-1308>/
-├── logs/
-│   ├── <scenario>.prepare-data.log
-│   ├── <scenario>.prepare-store.log
-│   ├── <scenario>.clean.log
-│   └── <scenario>.benchmark_c{clients}_t{threads}.log
-├── <scenario>.csv                  # 该场景所有组合的性能明细
-└── benchmark_overview.csv          # 全部场景最优吞吐汇总
+outputs/<时间戳，如 20261010-1308>/
+├── <配置名>.csv                # 各用例性能明细（按配置文件名）
+├── benchmark_detail.csv        # 全部用例汇总
+└── logs/
+    └── <配置名>/               # 每个配置一个子目录
+        ├── <配置名>.prepare-data.log
+        ├── <配置名>.prepare-store.log
+        ├── <配置名>.clean.log
+        ├── <配置名>.benchmark_c{clients}_t{threads}.log
+        └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port} / .writer_port{port} ...
 ```
 
 ## 10. 注意事项与待验证项

@@ -1,0 +1,101 @@
+{
+  "scenario": "pipeline",
+  "mode": "rank",
+  "operation": "put_batch/getBuffer",
+  "protocol": "ub",
+  "traffic_mode": "balanced",
+  "target_qps": 105,
+  "data_size": "8MB",
+  "ttl": 0,
+  "notify_pipeline": [
+    "getBuffer"
+  ],
+  "notify_count": 10,
+  "writer_count": 1,
+  "reader_count": 10,
+  "client_node": "node4",
+  "store_node": "node4",
+  "key_prefix": "mc_bench",
+  "peers": [
+    {
+      "host": "192.168.84.151",
+      "port": 9200,
+      "role": "writer",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9201,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9202,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9203,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9204,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9205,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9206,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9207,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9208,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9209,
+      "role": "reader",
+      "node": "node4"
+    },
+    {
+      "host": "192.168.84.151",
+      "port": 9210,
+      "role": "reader",
+      "node": "node4"
+    }
+  ],
+  "params": [
+    {
+      "num_clients": 1,
+      "num_threads": 1
+    }
+  ],
+  "warmup": {
+    "key_count": 100,
+    "data_size": "1MB",
+    "num_clients": 1,
+    "num_threads": 1
+  },
+  "duration": 30,
+  "batch_size": 1
+}

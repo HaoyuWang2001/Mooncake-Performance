@@ -1,0 +1,13 @@
+{
+  "_note": "复制本文件为 cluster.json 并按实际环境修改后使用",
+  "venv": "~/venvs/mooncake-benchmark/bin/python",
+  "nodes": {
+    "node4": {
+      "ip": "xxx.xxx.xxx.xxx",
+      "fabric_ip": "192.168.xxx.xxx",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    }
+  }
+}
