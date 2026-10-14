@@ -23,7 +23,6 @@
     ]
   },
   "data_size": "8MB",
-  "store_node": "node4",
   "key_prefix": "mc_bench",
   "notify_pipeline": [
     "get"

@@ -3,7 +3,6 @@
   "operation": "put_batch",
   "protocol": "ub",
   "client_node": "node4",
-  "store_node": "node4",
   "key_prefix": "mc_bench",
   "key_count": 20,
   "data_size": "1MB",

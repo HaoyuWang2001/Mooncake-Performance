@@ -262,8 +262,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     involved_nodes = [primary_node_name]
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
-    # topology: dynamic from client node vs store_node
-    topology = "local_node" if primary_node_name == cfg.get("store_node", primary_node_name) else "remote_node"
+    # topology: local iff the primary client node is one of the store nodes
+    # (mooncake_store_nodes from global.json)
+    store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
+    topology = "local_node" if primary_node_name in store_nodes else "remote_node"
     if cfg.get("duration") and op not in ("get", "get_batch"):
         raise RuntimeError(
             "duration configured but operation={} does not support duration "
@@ -337,8 +339,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
-    # topology: dynamic from primary client node vs store_node
-    topology = "local_node" if primary_node_name == cfg.get("store_node", primary_node_name) else "remote_node"
+    # topology: local iff the primary client node is one of the store nodes
+    # (mooncake_store_nodes from global.json)
+    store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
+    topology = "local_node" if primary_node_name in store_nodes else "remote_node"
     remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
     if not dry:
@@ -569,14 +573,14 @@ def parse_benchmark_log(paths, op_filter=None):
     }
 
 
-def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
+def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
+    store_nodes = store_nodes or []
     name = os.path.splitext(os.path.basename(cfg_path))[0]
     out_csv = os.path.join(RESULTS_DIR, ts, "{}.csv".format(name))
     rows = []
     is_pipeline = cfg.get("scenario") == "pipeline"
     if is_pipeline:
         plan = pipeline_plan(cfg)
-        store_node = cfg.get("store_node", "")
         data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
         batch_size = int(cfg.get("batch_size", 1))
         duration = float(cfg.get("duration", 0) or 0)
@@ -614,7 +618,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
                 "role": role,
                 "node": nodename,
                 "instance": instance,
-                "topology": ("local_node" if nodename == store_node else "remote_node") if nodename else "",
+                "topology": ("local_node" if nodename in store_nodes else "remote_node") if nodename else "",
                 "protocol": cfg["protocol"],
                 "num_threads": plan["reader_threads"] if role == "reader" else "",
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
@@ -693,7 +697,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
             except (IndexError, ValueError):
                 continue
             agg = parse_benchmark_log(path)
-            topo = "local_node" if cfg["client_node"] == cfg.get("store_node", cfg["client_node"]) else "remote_node"
+            topo = "local_node" if cfg["client_node"] in store_nodes else "remote_node"
             row = {
                 "scenario": cfg["scenario"],
                 "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
@@ -856,7 +860,8 @@ def main(args, cfg_paths):
             else:
                 run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
-                rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path)
+                rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
+                                          globals_cfg.get("mooncake_store_nodes", []))
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows
