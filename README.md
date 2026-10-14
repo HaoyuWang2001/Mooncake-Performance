@@ -68,27 +68,39 @@ client 均先访问 `mooncake_master` 获取元数据，再向目标 store 发�
 
 ### 3.6 pipeline（精排/召排）模式
 
-精排/召排是**生产-消费（pipeline）**测试模式，与单接口 benchmark 并列。通过 `mode: "pipeline"` 识别。
+精排/召排是**生产-消费（pipeline）**测试模式，与单接口 benchmark 并列。通过 `scenario: "pipeline"` 识别。
 
-| 参数 | 说明 | recall 值 | refine 值 |
+**配置命名**：`{work_mode}_{traffic_mode}_{W}w{notify}r_{倍数}x_n{节点数}.json`
+（W = writer 真实数量 = count_per_node × 节点数；`10r` = notify_count 扇出数，非 reader 池大小）
+
+| 参数 | 说明 | rank 值 | recall 值 |
 | --- | --- | --- | --- |
-| `work_mode` | recall(召排) / refine(精排) | `recall` | `refine` |
+| `work_mode` | rank(精排) / recall(召排) | `rank` | `recall` |
+| `traffic_mode` | `balanced`=均衡（按 QPS 均匀节流）/ `pulse`=脉冲（每秒窗口集中突发） | 两者皆测 | 两者皆测 |
+| `base_qps` | 基准写入 QPS | 105 | 35 |
+| `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
+| `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读） | 10 | 1 |
+| `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 操作（put_batch）/ notify 发送线程池 / 部署节点 | cpn=1 | cpn=1 |
+| `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 操作（get，mooncake 单 key 接口）/ 拉取线程池 / 部署节点 | n1:10, n2:5, n4:3 | 恒 1 |
 | `data_size` | 单个 value 大小 | 8MB | 3.5MB |
-| `ttl` | key 自动过期秒数（0=不过期） | 3s | 0 |
-| `notify_count` | 每次写入通知的 reader 数（扇出比） | 10 | 1 |
-| `notify_pipeline` | reader 操作链 | `["getBuffer"]` | `["exist","getBuffer"]` |
-| `writer_count` | 生产者线程数（配置值，非扫描维度） | 1 | 1 |
-| `reader_count` | 消费者线程数（配置值，非扫描维度） | 1 | 1 |
-| `target_qps` | 写入目标 QPS（pacing） | 200 | 200 |
-| `enable_jitter` | false=均衡模式（均匀节流）; true=pulse 脉冲模式（突发） | false | false |
-| `batch_keys_count` | 每次写入的 key 数 | 1 | 1 |
-| `stage_duration_seconds` | 持续运行秒数 | 30 | 30 |
-| **工作流**：prepare-data（生成 value.bin）→ clean(full) → pipeline benchmark（writer 按 target_qps 写入；读取完成后扇出通知；reader 执行 notify_pipeline 链读取并校验） |  |  |  |
-| **扇出语义**：每次 writer 写入成功后，该 BatchItem 被 `notify_count` 个 reader 各读一遍（1 写 → N 读）。recall notify_count=10 即每写一次 10 个 reader 扇出读；refine notify_count=1 即每写一次 1 个 reader 消费。 |  |  |  |
-| **pacing 模式**：`enable_jitter=false` 写线程按 target_qps 均匀节流（balanced 均衡模式）；`true` 写线程无节流以最大速率写入（模拟推理批到达的 pulse 突刺）。 |  |  |  |
-| **输出指标**：与单接口一致，另增加 `work_mode/writer_count/reader_count/target_qps/ttl/notify_count/notify_pipeline/enable_jitter/stage_duration_seconds/batch_keys_count`。 |  |  |  |
-| **运行**： |  |  |  |
+| `store_node` | 仅用于指标行的 local/remote 拓扑标注（实际通信经 master 发现 store） | node4 | node4 |
+| `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
+| `duration` | 压测时长（秒） | 30 | 30 |
+| `batch_size` | writer 每批写入的 key 数（reader 逐 key 读取） | 1 | 1 |
 
+- **部署语义**：writer/reader 各自在 client_nodes 的**每个节点**启动 count_per_node 个进程（节点列表正序）；writer 全局编号按节点正序，reader 端口 9201..9200+池大小；n{N} = 参与 pipeline 的节点总数（n1=node4、n2=node3+node4、n4=node1~node4）；
+- **负载语义**：总写入 QPS = base_qps × qps_multiple，由全部 writer（cpn × 节点数）均分（n2 双 writer 各半即原系统 "105/2" 语义，总量守恒；小数速率由窗口预算累积保证长期精确）；
+- **扇出语义**：每批写入后从 reader 池随机选 notify_count 个 reader，单次 HTTP 请求携带整批 key（读总量 = 写入批数 × notify_count）；
+- **warmup 语义**：正式测量前以相同部署形态运行 warmup.duration 秒（notify 带 warmup=1 标记，writer 不输出 RESULT、reader 照常读取但不记录，SUMMARY 计入 warmup_total）；
+- **operation 角色化**：writer.operation（CSV writer 行显示）与 reader.operation（reader 行显示）分别配置，对齐原系统测试表的 operation（SET/GET）列；reader 的 `get` 即 mooncake 单 key `get()` 接口（原 getBuffer 步骤名的落地），零拷贝 `get_buffer()` 留作后续优化；
+- **指标输出**：每个 writer 一行、每个 reader 一行、全 reader 聚合一行（instance=TOTAL），`role/node/instance/topology` 列区分；
+- 1写7读（notify=7）用例范围暂不实现；
+- **运行**：
+
+```
+python benchmark.py --scenario pipeline --config pipeline/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --all                     # 跑全部 pipeline 场景
+python benchmark.py --scenario pipeline --demo                    # 冒烟（demo 目录）
 ```
 python benchmark.py --scenario pipeline --config pipeline/recall_pipeline.json
 python benchmark.py --scenario pipeline --config pipeline/refine_pipeline.json
@@ -163,8 +175,12 @@ python benchmark.py --scenario pipeline --all                     # �
 - 时延基于全部 client 上报的单次操作样本精确统计；
 - 吞吐量 = 全部 client 传输总字节数 / 全局墙钟时间；
 - 每条结果（CSV 行）同时打印本次运行配置的核心参数：`data_size`、`key_count`、
-  `batch_size`（put_batch / get_batch 场景）、`put_ratio`（mixed 场景）、
-  `duration`（仅配置时）。
+  `batch_size`（put_batch / get_batch 场景）、`put_ratio`（mixed 场景）、
+  `duration`（仅配置时）；
+- **pipeline 场景多行输出**：每个 writer 一行（`role=writer`，指标取 pipeline_write
+  时延）、每个 reader 一行（`role=reader`，指标取 pipeline_read 时延，含 node/instance/
+  topology 列以区分不同节点与 store 的通信路径差异）、全 reader 聚合一行
+  （`instance=TOTAL`，对齐原系统每组测试单条 GET 指标）。
 
 ## 7. 配置文件
 
@@ -295,7 +311,8 @@ outputs/<时间戳，如 20261010-1308>/
         ├── <配置名>.prepare-store.log
         ├── <配置名>.clean.log
         ├── <配置名>.benchmark_c{clients}_t{threads}.log
-        └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port} / .writer_port{port} ...
+        └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port}.log / .writer{gid}.log ...
+            （脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
 ```
 
 ## 10. 注意事项与待验证项
