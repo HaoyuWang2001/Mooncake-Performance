@@ -190,22 +190,30 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 
 | 指标 | 含义 | 单位 |
 | --- | --- | --- |
-| throughput_mb_s / throughput_gb_s | 吞吐量 | MB/s、GB/s |
+| throughput_mb_s / throughput_gb_s | 吞吐量（1024 进制，1 MB/s = 1024² B/s） | MB/s、GB/s |
 | qps | 每秒操作数（total / wall_s） | ops/s |
-| total | 总操作数（duration 模式下为截止前实际执行的次数） | ops |
+| total | 总操作数；pipeline 场景按 key 数计（writer 为写入 key 数，reader 为读取 key 数） | ops |
 | success / ok、fail、fail_rate | 成功数 / 失败数 / 失败率（fail / total） | ops、% |
-| avg_ms / min_ms / max_ms / p99_ms / p999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9） | ms |
+| avg_ms / min_ms / max_ms / p99_ms / p999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9），仅统计成功样本 | ms |
+| queue_wait_avg_ms / queue_wait_max_ms / max_depth | reader 队列积压诊断：notify 到达→出队等待（平均/最大）与最大队列深度 | ms、ops |
 
-- 时延基于全部 client 上报的单次操作样本精确统计；
-- 吞吐量 = 全部 client 传输总字节数 / 全局墙钟时间；
+- 时延基于全部 client 上报的成功操作样本精确统计（失败样本计入 fail/fail_rate，不计入时延百分位）；
+- 吞吐量 = 全部 client 传输总字节数 / 全局墙钟时间，按 1024 进制换算；
 - 每条结果（CSV 行）同时打印本次运行配置的核心参数：`data_size`、`key_count`、
   `batch_size`（put_batch / get_batch 场景）、`put_ratio`（mixed 场景）、`duration`（仅配置时）；
 - **basic 与 pipeline 使用不同 CSV Schema**：basic 保留 `num_clients/key_count/put_ratio/ok` 等列；
-  pipeline 采用 `config_name/success/num_threads/notify_threads/writer_count(N*{cpn})` 等 37 列，
+  pipeline 采用 `config_name/success/num_threads/notify_threads/writer_count(N*{cpn})` 等 40 列，
   每个 writer 与 reader 各一行 + 各聚合（TOTAL）一行；
 - **pipeline 多行输出**：每个 writer 一行（指标取 pipeline_write 时延）、全 writer 聚合一行、
   每个 reader 一行（指标取 pipeline_read 时延，含 node/instance/topology 列以区分不同节点与 store
   的通信路径差异）、全 reader 聚合一行；
+  reader 的 pipeline_read 时延为 reader 节点本地对 `store.get` 接口调用的耗时（`time.perf_counter()`
+  计时，不依赖跨节点时钟同步；exist 预检与数据校验不计入时延）。writer 时延样本为每次 `put_batch`
+  接口调用的耗时，total/success/fail/qps 均按 key 数计（qps = key 数 / duration），TOTAL 行将
+  全部 writer 写入的 key 数或全部 reader 读取的 key 数叠加后除以 duration。reader 行附
+  queue_wait/max_depth 列用于观察积压是否发生及严重程度（writer 行为空）；
+- **basic mixed（put/get）拆分输出**：put 与 get 分别统计、各输出一行（operation 列取
+  `put` / `get`，`put_ratio` 列标识混合来源）；
 - **benchmark_detail.csv**：pipeline 场景仅保留 writer/reader 的 TOTAL 行（先 writer 后 reader），
   `config_name` 列组首填充便于横向对比。
 
@@ -346,7 +354,7 @@ python benchmark.py --scenario basic --config basic/get_local.json --clean-up
 
 ```
 outputs/<时间戳，如 20261010-1308>/
-├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 为双 Schema 37 列）
+├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 为双 Schema 40 列）
 ├── benchmark_detail.csv        # 全部用例汇总（pipeline 仅 writer/reader TOTAL 行）
 └── logs/
     └── <配置名>/               # 每个配置一个子目录

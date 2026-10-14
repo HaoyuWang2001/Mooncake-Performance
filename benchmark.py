@@ -49,6 +49,7 @@ PIPELINE_CSV_HEADER = [
     "total_bytes", "wall_s", "qps",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+    "queue_wait_avg_ms", "queue_wait_max_ms", "max_depth",
 ]
 
 
@@ -351,6 +352,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     if plan["notify_count"] > len(plan["readers"]):
         raise RuntimeError("notify_count={} exceeds reader count {}".format(
             plan["notify_count"], len(plan["readers"])))
+    # duration is mandatory for pipeline: it is the measurement window for
+    # qps/throughput on both writer and reader rows
+    cfg_duration = cfg.get("duration", None)
+    if not cfg_duration or float(cfg_duration) <= 0:
+        raise RuntimeError("pipeline config requires duration > 0 (missing or invalid)")
     involved_nodes = []
     seen_nodes = set()
     for p in plan["writers"] + plan["readers"]:
@@ -531,6 +537,8 @@ def parse_benchmark_log(paths, op_filter=None):
     total_bytes = 0
     starts = []
     walls = []
+    queue_waits = []
+    max_depth = 0
     for path in paths:
         for line in open(path, "r", encoding="utf-8", errors="replace"):
             line = line.rstrip("\n")
@@ -540,11 +548,17 @@ def parse_benchmark_log(paths, op_filter=None):
                     continue
                 if op_filter is not None and parts[1] != op_filter:
                     continue
-                latencies.append(float(parts[3]))
+                # latency statistics count successful samples only
                 if parts[4] == "OK":
                     ok += 1
+                    latencies.append(float(parts[3]))
                 else:
                     fail += 1
+                if len(parts) > 5 and parts[1] == "pipeline_read":
+                    try:
+                        queue_waits.append(float(parts[5]))
+                    except ValueError:
+                        pass
             elif line.startswith("META\t"):
                 try:
                     meta = json.loads(line.split("\t", 1)[1])
@@ -559,6 +573,7 @@ def parse_benchmark_log(paths, op_filter=None):
                     continue
                 total_bytes += int(s.get("bytes", 0))
                 walls.append(float(s.get("wall_s", 0.0)))
+                max_depth = max(max_depth, int(s.get("max_depth", 0)))
     latencies.sort()
     if starts and len(walls) == len(starts):
         ends = [s + w for s, w in zip(starts, walls)]
@@ -566,13 +581,13 @@ def parse_benchmark_log(paths, op_filter=None):
     else:
         wall = 0.0
     n = len(latencies)
-    total = n
+    total = ok + fail
     return {
         "total": total,
         "total_bytes": total_bytes,
         "wall_s": wall,
-        "throughput_mb_s": (total_bytes / wall / 1e6) if wall > 0 else 0.0,
-        "throughput_gb_s": (total_bytes / wall / 1e9) if wall > 0 else 0.0,
+        "throughput_mb_s": (total_bytes / wall / 1024.0 ** 2) if wall > 0 else 0.0,
+        "throughput_gb_s": (total_bytes / wall / 1024.0 ** 3) if wall > 0 else 0.0,
         "avg_ms": (sum(latencies) / n) if n else 0.0,
         "min_ms": percentile(latencies, 0.0),
         "max_ms": percentile(latencies, 1.0),
@@ -582,6 +597,9 @@ def parse_benchmark_log(paths, op_filter=None):
         "fail": fail,
         "qps": (total / wall) if wall > 0 else 0.0,
         "fail_rate": (fail / total) if total else 0.0,
+        "queue_wait_avg_ms": (sum(queue_waits) / len(queue_waits)) if queue_waits else 0.0,
+        "queue_wait_max_ms": max(queue_waits) if queue_waits else 0.0,
+        "max_depth": max_depth,
     }
 
 
@@ -648,22 +666,34 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "traffic_mode": cfg.get("traffic_mode", ""),
             }
 
-        def metrics_into(row, agg, bytes_per_op):
-            total = agg["total"]
+        def metrics_into(row, agg, bytes_per_op, count_mult=1, with_queue=False):
+            # pipeline counts are key-based: writer ops are put_batch calls,
+            # each moving batch_size keys, so totals scale by batch_size
+            total = agg["total"] * count_mult
+            ok = agg["ok"] * count_mult
+            fail = agg["fail"] * count_mult
             wall = duration if duration > 0 else agg["wall_s"]
             row["total"] = total
-            row["success"] = agg["ok"]
-            row["fail"] = agg["fail"]
+            row["success"] = ok
+            row["fail"] = fail
             row["fail_rate"] = agg["fail_rate"]
             row["total_bytes"] = int(total * bytes_per_op)
             row["wall_s"] = wall
             row["qps"] = (total / wall) if wall > 0 else 0.0
-            row["throughput_mb_s"] = (row["total_bytes"] / wall / 1e6) if wall > 0 else 0.0
-            row["throughput_gb_s"] = (row["total_bytes"] / wall / 1e9) if wall > 0 else 0.0
+            row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2) if wall > 0 else 0.0
+            row["throughput_gb_s"] = (row["total_bytes"] / wall / 1024.0 ** 3) if wall > 0 else 0.0
             for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms"):
                 row[k] = agg[k]
-            for k in ("wall_s", "throughput_mb_s", "throughput_gb_s",
-                      "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+            if with_queue:
+                row["queue_wait_avg_ms"] = agg["queue_wait_avg_ms"]
+                row["queue_wait_max_ms"] = agg["queue_wait_max_ms"]
+                row["max_depth"] = agg["max_depth"]
+            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+                      "queue_wait_avg_ms", "queue_wait_max_ms", "wall_s"):
+                v = row.get(k)
+                if isinstance(v, float):
+                    row[k] = round(v, 4)
+            for k in ("throughput_mb_s", "throughput_gb_s",
                       "qps", "fail_rate"):
                 v = row.get(k)
                 if isinstance(v, float):
@@ -675,13 +705,13 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 continue
             agg = parse_benchmark_log(f, op_filter="pipeline_write")
             row = base_row("writer", "w{}".format(w["gid"]), w["node"])
-            metrics_into(row, agg, batch_size * data_size_bytes)
+            metrics_into(row, agg, data_size_bytes, count_mult=batch_size)
             rows.append(row)
         # writer TOTAL row: all writers aggregated
         if writer_files:
             agg = parse_benchmark_log(list(writer_files.values()), op_filter="pipeline_write")
             row = base_row("writer", "TOTAL", "")
-            metrics_into(row, agg, batch_size * data_size_bytes)
+            metrics_into(row, agg, data_size_bytes, count_mult=batch_size)
             rows.append(row)
         for r in plan["readers"]:
             f = reader_files.get(r["port"])
@@ -689,17 +719,36 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 continue
             agg = parse_benchmark_log(f, op_filter="pipeline_read")
             row = base_row("reader", "r{}".format(r["index"]), r["node"])
-            metrics_into(row, agg, data_size_bytes)
+            metrics_into(row, agg, data_size_bytes, with_queue=True)
             rows.append(row)
         # TOTAL row: all readers aggregated (aligns with the datasystem
         # single GET row per test group)
         if reader_files:
             agg = parse_benchmark_log(list(reader_files.values()), op_filter="pipeline_read")
             row = base_row("reader", "TOTAL", "")
-            metrics_into(row, agg, data_size_bytes)
+            metrics_into(row, agg, data_size_bytes, with_queue=True)
             rows.append(row)
     else:
         pattern = os.path.join(local_log_dir, "{}.*.log".format(name))
+        def fill_basic_row(row, agg, op_label):
+            row["operation"] = op_label
+            row.update({k: agg[k] for k in (
+                "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
+                "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "ok", "fail",
+                "qps", "fail_rate")})
+            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "wall_s"):
+                v = row.get(k)
+                if v is not None and isinstance(v, float):
+                    row[k] = round(v, 4)
+            for k in ("throughput_mb_s", "throughput_gb_s",
+                      "qps", "fail_rate", "total_bytes"):
+                v = row.get(k)
+                if v is not None and isinstance(v, float):
+                    row[k] = round(v, 2)
+
+        op_label = cfg.get("operation", "")
+        is_mixed = op_label == "mixed" or ("/" in op_label and "put" in op_label and "get" in op_label)
+        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
         for path in sorted(glob.glob(pattern)):
             base = os.path.basename(path)
             try:
@@ -708,12 +757,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 c, t = int(c_part), int(t_part)
             except (IndexError, ValueError):
                 continue
-            agg = parse_benchmark_log(path)
             topo = "local_node" if cfg["client_node"] in store_nodes else "remote_node"
-            row = {
+            base_row_vals = {
                 "scenario": cfg["scenario"],
                 "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
-                "operation": cfg.get("operation", ""),
+                "operation": op_label,
                 "role": "",
                 "node": "",
                 "instance": "",
@@ -721,8 +769,6 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "protocol": cfg["protocol"],
                 "num_clients": c,
                 "num_threads": t,
-            }
-            row.update({
                 "data_size": cfg.get("data_size", ""),
                 "key_count": cfg.get("key_count", ""),
                 "batch_size": cfg.get("batch_size", "") if cfg.get("operation") in ("put_batch", "get_batch") else "",
@@ -739,18 +785,23 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "target_qps": "",
                 "notify_pipeline": "",
                 "traffic_mode": "",
-            })
-            row.update({k: agg[k] for k in (
-                "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
-                "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "ok", "fail",
-                "qps", "fail_rate")})
-            for k in ("wall_s", "throughput_mb_s", "throughput_gb_s",
-                       "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
-                       "qps", "fail_rate", "total_bytes"):
-                v = row.get(k)
-                if v is not None and isinstance(v, float):
-                    row[k] = round(v, 2)
-            rows.append(row)
+            }
+            if is_mixed:
+                # mixed must be split: put and get latencies are statistically
+                # independent and are aggregated/输出 as separate rows
+                for sub in ("put", "get"):
+                    agg = parse_benchmark_log(path, op_filter=sub)
+                    row = dict(base_row_vals)
+                    # parse bytes come from the combined SUMMARY; recompute per
+                    # sub-op (single put/get both move data_size bytes)
+                    agg = dict(agg, total_bytes=int(agg["total"] * data_size_bytes))
+                    fill_basic_row(row, agg, sub)
+                    rows.append(row)
+            else:
+                agg = parse_benchmark_log(path)
+                row = dict(base_row_vals)
+                fill_basic_row(row, agg, op_label)
+                rows.append(row)
     if is_pipeline:
         write_rows = collapse_config_name(rows)
         with open(out_csv, "w", newline="", encoding="utf-8") as f:

@@ -313,7 +313,10 @@ def cmd_benchmark(args, store):
     ok_count = sum(1 for r in results if r[3] == "OK")
     fail_count = len(results) - ok_count
     total = len(results)
-    latencies = sorted(r[2] for r in results)
+    # latency statistics count successful samples only; failed ops still
+    # contribute to total/ok/fail counts but not to the latency percentiles
+    lat_ok = [r[2] for r in results if r[3] == "OK"]
+    latencies = sorted(lat_ok)
     summary = {
         "mode": "benchmark", "scenario": args.scenario, "operation": op,
         "protocol": args.protocol, "client_id": args.client_id,
@@ -325,7 +328,7 @@ def cmd_benchmark(args, store):
         "fail_rate": (fail_count / total) if total else 0.0,
         "min_ms": _percentile(latencies, 0.0),
         "max_ms": _percentile(latencies, 1.0),
-        "avg_ms": (sum(r[2] for r in results) / total) if total else 0.0,
+        "avg_ms": (sum(lat_ok) / len(lat_ok)) if lat_ok else 0.0,
         "p99_ms": _percentile(latencies, 0.99),
         "p999_ms": _percentile(latencies, 0.999),
         "data_size": data_size,
@@ -335,6 +338,8 @@ def cmd_benchmark(args, store):
         summary["batch_size"] = batch_size
     if op == "mixed" or ("/" in op and "put" in op and "get" in op):
         summary["put_ratio"] = args.put_ratio
+        summary["put_total"] = sum(1 for r in results if r[0] == "put")
+        summary["get_total"] = sum(1 for r in results if r[0] == "get")
     if duration:
         summary["duration"] = duration
     emit("SUMMARY", summary)
@@ -421,6 +426,9 @@ def _pipeline_writer(args, store, do_warmup=True):
     from concurrent.futures import ThreadPoolExecutor
     notify_pool = ThreadPoolExecutor(max_workers=notify_threads)
     seq = [0]
+    # measured-phase stats (warmup writes stay out of the metrics)
+    stats = {"keys_ok": 0, "keys_fail": 0, "batches_ok": 0, "batches_fail": 0, "lats": []}
+    last_flush = [time.time()]
 
     def _run_phase(phase_deadline, is_warmup):
         next_t = time.time() + interval
@@ -444,14 +452,20 @@ def _pipeline_writer(args, store, do_warmup=True):
             lat_ms = (time.perf_counter() - t0) * 1000.0
             if ret < 0:
                 if not is_warmup:
+                    stats["keys_fail"] += batch_keys
+                    stats["batches_fail"] += 1
                     sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tERR:{}\n".format(keys[0], lat_ms, ret))
             else:
                 if not is_warmup:
+                    stats["keys_ok"] += batch_keys
+                    stats["batches_ok"] += 1
+                    stats["lats"].append(lat_ms)
                     sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tOK\n".format(keys[0], lat_ms))
                 # Randomly select notify_count readers and deliver the whole
                 # batch in a single multi-key request per reader (bypass proxy;
-                # write_ts is wall-clock so reader latency is comparable across
-                # nodes; warmup flag lets readers warm up without recording).
+                # write_ts is retained for diagnostics only — reader latency is
+                # measured locally on the reader node with time.perf_counter();
+                # warmup flag lets readers warm up without recording).
                 n_sel = min(notify_count, len(readers)) if notify_count > 0 else len(readers)
                 selected = random.sample(readers, n_sel) if readers else []
                 write_ts = time.time()
@@ -470,6 +484,11 @@ def _pipeline_writer(args, store, do_warmup=True):
                 futures = [notify_pool.submit(_notify, r) for r in selected]
                 for f in futures:
                     f.result()
+            if not is_warmup:
+                now = time.time()
+                if now - last_flush[0] >= 1.0:
+                    sys.stdout.flush()
+                    last_flush[0] = now
             if balanced and target_qps > 0:
                 next_t += interval
                 time.sleep(max(0.0, next_t - time.time()))
@@ -488,12 +507,39 @@ def _pipeline_writer(args, store, do_warmup=True):
                       "ts": time.time()})
     _run_phase(time.time() + duration, False)
     sys.stdout.flush()
+    # Writer performance summary (measured phase only; keys/duration based).
+    # Keeps the writer log self-contained: META + SUMMARY pair like the
+    # reader/basic clients, so the orchestrator aggregation is uniform.
+    keys_total = stats["keys_ok"] + stats["keys_fail"]
+    lats = stats["lats"]
+    emit("SUMMARY", {
+        "mode": "pipeline_writer_summary", "scenario": scenario,
+        "work_mode": args.work_mode or "recall", "protocol": args.protocol,
+        "writer_id": writer_id, "target_qps": target_qps,
+        "traffic_mode": traffic_mode, "batch_size": batch_keys,
+        "duration": duration, "warmup_duration": warmup_duration,
+        "total": keys_total, "bytes": keys_total * len(value),
+        "wall_s": duration, "ok": stats["keys_ok"], "fail": stats["keys_fail"],
+        "qps": (keys_total / duration) if duration > 0 else 0.0,
+        "fail_rate": (stats["keys_fail"] / keys_total) if keys_total else 0.0,
+        "min_ms": _percentile(sorted(lats), 0.0),
+        "max_ms": _percentile(sorted(lats), 1.0),
+        "avg_ms": (sum(lats) / len(lats)) if lats else 0.0,
+        "p99_ms": _percentile(sorted(lats), 0.99),
+        "p999_ms": _percentile(sorted(lats), 0.999),
+        "data_size": len(value),
+    })
+    sys.stdout.flush()
 class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     """HTTP handler for reader: receives write notifications from writers."""
     # Class-level shared state set by _pipeline_reader
     queue = None
     deadline = 0.0
     exit_grace = 5.0
+    # backlog diagnostics: exact queue depth (lock-protected) + observed max
+    qdepth = 0
+    qmax = 0
+    qlock = None
     def do_GET(self):
         self._handle()
     def do_POST(self):
@@ -508,7 +554,14 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             is_warmup = params.get("warmup", ["0"])[0] == "1"
             for k in keys:
                 if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
-                    _PipelineNotifyHandler.queue.put((k, int(writer_id), write_ts, is_warmup))
+                    # arrival stamp uses the reader-local monotonic clock so
+                    # queue_wait stays comparable to the worker's dequeue time
+                    _PipelineNotifyHandler.queue.put(
+                        (k, int(writer_id), write_ts, is_warmup, time.perf_counter()))
+                    with _PipelineNotifyHandler.qlock:
+                        _PipelineNotifyHandler.qdepth += 1
+                        if _PipelineNotifyHandler.qdepth > _PipelineNotifyHandler.qmax:
+                            _PipelineNotifyHandler.qmax = _PipelineNotifyHandler.qdepth
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
@@ -529,7 +582,14 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
         pass  # suppress HTTP server logs
     do_GET = do_POST
 def _reader_worker(args, store, queue, deadline, results):
-    """Reader worker thread: dequeue keys, execute notify_pipeline, record latency.
+    """Reader worker thread: dequeue keys, execute notify_pipeline, record the
+    local store interface latency.
+
+    Latency only wraps the store.get interface call (time.perf_counter(),
+    reader-local monotonic clock); the optional exist pre-check and the
+    value validation are not part of the timed region. The metric therefore
+    never depends on cross-node wall clocks. queue_wait (notify arrival ->
+    worker dequeue) and queue depth are tracked as backlog diagnostics.
 
     Warmup items (warmup=1 flag from the notify) are still processed — the
     actual store reads warm up the reader->store path — but are tagged so
@@ -545,33 +605,38 @@ def _reader_worker(args, store, queue, deadline, results):
             continue
         if item is None:
             break
-        key, writer_id, write_ts, is_warmup = item
-        ok = True
-        for step in pipeline:
-            step = step.strip()
-            if step == "exist":
-                ex = store.is_exist(key)
-                if ex <= 0:
-                    ok = False
-                    break
-            elif step == "get" or step == "getBuffer":
-                data = store.get(key)
-                if not data:
-                    ok = False
-                    break
-                if len(data) != len(value) or data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
-                    ok = False
-                    break
-            else:
-                pass
+        key, writer_id, write_ts, is_warmup, arrival_mono = item
+        with _PipelineNotifyHandler.qlock:
+            _PipelineNotifyHandler.qdepth -= 1
+        status = "OK"
+        lat_ms = 0.0
+        queue_wait_ms = (time.perf_counter() - arrival_mono) * 1000.0
+        try:
+            for step in pipeline:
+                step = step.strip()
+                if step == "exist":
+                    ex = store.is_exist(key)
+                    if ex <= 0:
+                        status = "MISS/MISMATCH"
+                        break
+                elif step == "get" or step == "getBuffer":
+                    t0 = time.perf_counter()
+                    data = store.get(key)
+                    lat_ms += (time.perf_counter() - t0) * 1000.0
+                    if not data:
+                        status = "MISS/MISMATCH"
+                        break
+                    if len(data) != len(value) or data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+                        status = "MISS/MISMATCH"
+                        break
+                else:
+                    pass
+        except Exception as exc:
+            status = "ERR:{}".format(type(exc).__name__)
         if is_warmup:
-            local.append(("pipeline_warmup_read", key, 0.0, "SKIP"))
+            local.append(("pipeline_warmup_read", key, lat_ms, "SKIP", queue_wait_ms))
             continue
-        lat_ms = (time.time() - write_ts) * 1000.0
-        if ok:
-            local.append(("pipeline_read", key, lat_ms, "OK"))
-        else:
-            local.append(("pipeline_read", key, lat_ms, "MISS/MISMATCH"))
+        local.append(("pipeline_read", key, lat_ms, status, queue_wait_ms))
     results.extend(local)
 def cmd_pipeline(args, store):
     """Run pipeline (精排/召排) — dispatches to writer or reader based on --role."""
@@ -600,24 +665,30 @@ def cmd_pipeline(args, store):
 
 def _pipeline_reader(args, store):
     """Reader process: HTTP server to receive notify, worker threads to read store."""
-    duration = float(args.timeout)
+    lifetime = float(args.timeout)
+    # measurement window = configured duration (MC_DURATION); fall back to
+    # lifetime only if duration was not provided
+    meas_duration = float(args.duration or 0) or lifetime
     exit_grace = 5.0
     num_threads = max(1, args.num_threads)
-    my_port = args.listen_port
     my_port = args.listen_port
     emit("META", {"mode": "pipeline_reader", "scenario": args.scenario,
                   "work_mode": args.work_mode or "recall", "protocol": args.protocol,
                   "client_id": args.client_id, "reader_count": args.reader_count,
                   "listen_port": my_port, "num_threads": num_threads,
                   "notify_pipeline": args.notify_pipeline,
-                  "duration": duration, "start_ts": time.time()})
+                  "duration": lifetime, "measure_window": meas_duration,
+                  "start_ts": time.time()})
     queue = Queue(maxsize=max(8192, num_threads * 1024))
-    deadline = time.time() + duration
+    deadline = time.time() + lifetime
     results = []
     # Set class-level shared state for the HTTP handler
     _PipelineNotifyHandler.queue = queue
     _PipelineNotifyHandler.deadline = deadline
     _PipelineNotifyHandler.exit_grace = exit_grace
+    _PipelineNotifyHandler.qdepth = 0
+    _PipelineNotifyHandler.qmax = 0
+    _PipelineNotifyHandler.qlock = threading.Lock()
     # Start worker threads
     with ThreadPoolExecutor(max_workers=num_threads) as pool:
         worker_futures = [pool.submit(_reader_worker, args, store, queue, deadline + exit_grace, results)
@@ -641,7 +712,6 @@ def _pipeline_reader(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
-    wall_s = duration
     data_size = parse_size(args.data_size)
     # split off warmup items: processed (store reads warmed up) but not
     # part of the measured metrics
@@ -651,27 +721,32 @@ def _pipeline_reader(args, store):
     ok_count = sum(1 for r in measured if r[3] == "OK")
     fail_count = len(measured) - ok_count
     total = len(measured)
-    latencies = sorted(r[2] for r in measured)
+    lat_ok = [r[2] for r in measured if r[3] == "OK"]
+    latencies = sorted(lat_ok)
+    queue_waits = [r[4] for r in results]
     summary = {
         "mode": "pipeline_reader", "scenario": args.scenario,
         "work_mode": args.work_mode or "recall", "protocol": args.protocol,
         "client_id": args.client_id, "reader_count": args.reader_count,
         "num_threads": num_threads,
-        "total": total, "bytes": total_bytes, "wall_s": wall_s,
+        "total": total, "bytes": total_bytes, "wall_s": meas_duration,
         "warmup_total": warmup_total,
         "ok": ok_count, "fail": fail_count,
-        "qps": (total / wall_s) if wall_s > 0 else 0.0,
+        "qps": (total / meas_duration) if meas_duration > 0 else 0.0,
         "fail_rate": (fail_count / total) if total else 0.0,
         "min_ms": _percentile(latencies, 0.0),
         "max_ms": _percentile(latencies, 1.0),
-        "avg_ms": (sum(r[2] for r in measured) / total) if total else 0.0,
+        "avg_ms": (sum(lat_ok) / len(lat_ok)) if lat_ok else 0.0,
         "p99_ms": _percentile(latencies, 0.99),
         "p999_ms": _percentile(latencies, 0.999),
+        "queue_wait_avg_ms": (sum(queue_waits) / len(queue_waits)) if queue_waits else 0.0,
+        "queue_wait_max_ms": max(queue_waits) if queue_waits else 0.0,
+        "max_depth": _PipelineNotifyHandler.qmax,
         "data_size": data_size,
     }
     emit("SUMMARY", summary)
-    for opname, k, lat, status in measured:
-        sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\n".format(opname, k, lat, status))
+    for opname, k, lat, status, qw in measured:
+        sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\t{:.6f}\n".format(opname, k, lat, status, qw))
     sys.stdout.flush()
 
 # --------------------------------------------------------------------------
