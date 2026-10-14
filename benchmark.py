@@ -1,154 +1,153 @@
 #!/usr/bin/env python3
+"""Mooncake benchmark orchestrator (runs locally).
+
+Reads cluster/global/scenario configs, generates env.sh, drives the remote
+test stages over ssh/scp, pulls logs back and aggregates CSV metrics.
+
+Structure:
+  - parse_arguments(): CLI parsing + validation + config path collection
+  - main(args, cfg_paths): orchestration loop, dispatches per config to
+    run_basic_scenario() or run_pipeline_scenario() based on cfg["scenario"]
+  - utils.py: generic helpers (ssh/scp execution, json/size parsing)
+"""
 import argparse
 import csv
 import glob
 import json
 import os
-import subprocess
 import sys
 import time
+
+from utils import (get_node, load_json, log, parse_data_size, percentile,
+                   run_ssh, scp_pull, scp_push, ssh_check_output)
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
+DEFAULT_LD_PATH = ("/home/w00921547/stress-cluster-bench/lib/:/usr/local/cuda-12.9/lib64:"
+                   "/usr/local/lib64:${LD_LIBRARY_PATH:-}")
 CSV_HEADER = [
-    "scenario", "mode", "operation", "topology", "protocol",
+    "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_clients", "num_threads",
-    "data_size", "key_count", "batch_size", "put_ratio", "duration",
-    "writer_count", "reader_count", "target_qps",
-    "ttl", "notify_count", "notify_pipeline", "traffic_mode",
+    "data_size", "key_count", "batch_size", "put_ratio", "duration", "warmup_duration",
+    "writer_count", "reader_count", "notify_count", "notify_threads", "reader_threads",
+    "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
     "total", "total_bytes", "wall_s",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
     "ok", "fail", "qps", "fail_rate",
 ]
-OVERVIEW_HEADER = CSV_HEADER
-def log(msg):
-    print("[benchmark] {}".format(msg), flush=True)
-def _node(cluster, name):
-    node = cluster.get("nodes", {}).get(name)
-    if node is None:
-        raise RuntimeError("unknown node in cluster.json: {}".format(name))
-    return node
-def _ssh_args(node):
-    args = ["ssh", "-q", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=15"]
-    port = int(node.get("ssh_port", 22))
-    if port != 22:
-        args += ["-p", str(port)]
-    key = node.get("ssh_key") or ""
-    if key:
-        args += ["-i", key]
-    args.append("{}@{}".format(node.get("ssh_user", "root"), node["ip"]))
-    return args
-def _scp_args(node):
-    args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "LogLevel=QUIET"]
-    port = int(node.get("ssh_port", 22))
-    if port != 22:
-        args += ["-P", str(port)]
-    key = node.get("ssh_key") or ""
-    if key:
-        args += ["-i", key]
-    return args
-def run_ssh(cluster, host, node, command, dry_run=False):
-    cmd = _ssh_args(node) + [command]
-    log("[ssh] {} : {}".format(host, command))
-    if dry_run:
-        log("      (dry-run, skipped)")
-        return
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
-            result.returncode, host, command))
-def ssh_check_output(cluster, host, node, command, dry_run=False):
-    cmd = _ssh_args(node) + [command]
-    log("[ssh] {} : {}".format(host, command))
-    if dry_run:
-        log("      (dry-run, skipped)")
-        return ""
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
-            result.returncode, host, command))
-    return result.stdout.strip()
-def scp_push(cluster, host, node, local_files, remote_path, dry_run=False):
-    cmd = _scp_args(node) + list(local_files) + \
-        ["{}@{}:{}".format(node.get("ssh_user", "root"), host, remote_path)]
-    log("[scp] -> {} : {}".format(host, remote_path))
-    if dry_run:
-        log("      (dry-run, skipped)")
-        return
-    subprocess.run(cmd, check=True)
-def scp_pull(cluster, host, node, remote_glob, local_dir, dry_run=False):
-    cmd = _scp_args(node) + ["-r"] + \
-        ["{}@{}:{}".format(node.get("ssh_user", "root"), host, remote_glob),
-         local_dir.rstrip("\\/") + os.sep]
-    log("[scp] <- {} : {}".format(host, remote_glob))
-    if dry_run:
-        log("      (dry-run, skipped)")
-        return
-    subprocess.run(cmd, check=True)
+
+
+# --------------------------------------------------------------------------
+# domain planning
+# --------------------------------------------------------------------------
+
+def remote_log_path(remote_log_dir, scenario, name):
+    return "{}/{}.{}.log".format(remote_log_dir, scenario, name)
+
+
 def build_runs(cfg):
     params = cfg["params"]
     return [(int(p["num_clients"]), int(p["num_threads"])) for p in params]
-def remote_log_path(remote_log_dir, scenario, name):
-    return "{}/{}.{}.log".format(remote_log_dir, scenario, name)
-def parse_data_size(data_size_str):
-    data_size_str = data_size_str.strip().upper()
-    if data_size_str.endswith("KB"):
-        return int(float(data_size_str[:-2]) * 1024)
-    elif data_size_str.endswith("MB"):
-        return int(float(data_size_str[:-2]) * 1024 * 1024)
-    elif data_size_str.endswith("GB"):
-        return int(float(data_size_str[:-2]) * 1024 * 1024 * 1024)
-    elif data_size_str.endswith("B"):
-        return int(float(data_size_str[:-1]))
-    else:
-        return int(float(data_size_str))
-def run_stage(cluster, globals_cfg, host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
-    remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
-    command = "bash {} {} 1 1 {}".format(runner, mode, remote_log)
-    if extra:
-        command += " " + extra
-    run_ssh(cluster, host, node, command, dry_run=dry_run)
-def run_scenario(cluster, globals_cfg, cfg, ts, args):
+
+
+def pipeline_plan(cfg):
+    """Derive the writer/reader process plan from a pipeline config.
+
+    Shared by run_pipeline_scenario (orchestration) and write_scenario_csv
+    (metrics attribution) so the assignment stays deterministic and
+    consistent. Both roles start count_per_node processes on EVERY node of
+    their client_nodes (ascending node order), so:
+      writer total = writer.count_per_node * len(writer.client_nodes)
+      reader pool = reader.count_per_node * len(reader.client_nodes)
+    Total write QPS = base_qps * qps_multiple, split evenly across all
+    writers (n2 dual-writer reproduces the datasystem "105/2" semantics
+    with the total held constant). Writers get global ids 1..W in node
+    order; readers get ports 9201..9200+R. The reader pool must cover
+    notify_count (each batch notifies a random subset of notify_count
+    readers). The business model "1写10读" maps to writer count_per_node=1
+    and notify_count=10 — the reader pool is a deployment parameter.
+    """
+    writer_cfg = cfg.get("writer", {}) or {}
+    reader_cfg = cfg.get("reader", {}) or {}
+    w_cpn = int(writer_cfg.get("count_per_node", 1))
+    r_cpn = int(reader_cfg.get("count_per_node", 1))
+    w_nodes = writer_cfg.get("client_nodes") or [cfg.get("store_node", "")]
+    r_nodes = reader_cfg.get("client_nodes") or [cfg.get("store_node", "")]
+    writers = []
+    for node in w_nodes:
+        for _ in range(w_cpn):
+            writers.append({"gid": len(writers) + 1, "node": node})
+    readers = []
+    for node in r_nodes:
+        for _ in range(r_cpn):
+            readers.append({"index": len(readers) + 1, "port": 9201 + len(readers), "node": node})
+    base_qps = float(cfg.get("base_qps", 0))
+    qps_multiple = float(cfg.get("qps_multiple", 1))
+    total_qps = base_qps * qps_multiple
+    per_writer_qps = (total_qps / len(writers)) if writers else total_qps
+    return {
+        "writers": writers,
+        "readers": readers,
+        "total_qps": total_qps,
+        "per_writer_qps": per_writer_qps,
+        "notify_count": int(cfg.get("notify_count", 1)),
+        "notify_threads": int(writer_cfg.get("notify_threads", 1)),
+        "reader_threads": int(reader_cfg.get("num_threads", 1)),
+        "writer_nodes": w_nodes,
+        "reader_nodes": r_nodes,
+    }
+
+
+# --------------------------------------------------------------------------
+# shared orchestration infrastructure (both scenario families)
+# --------------------------------------------------------------------------
+
+def apply_cli_overrides(cfg, args):
     if getattr(args, "protocol", None):
         cfg["protocol"] = args.protocol
     if getattr(args, "key_count", None):
         cfg["key_count"] = args.key_count
     if getattr(args, "data_size", None):
         cfg["data_size"] = args.data_size
-    scenario = cfg["scenario"]
-    cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
-    node = _node(cluster, cfg["client_node"])
-    host = node["ip"]
-    dry = args.dry_run
-    op = cfg["operation"]
-    mode = cfg.get("mode", "standard")
-    is_pipeline = cfg.get("scenario") == "pipeline"
-    # topology: dynamic from client_node vs store_node
-    topology = "local_node" if cfg["client_node"] == cfg.get("store_node", cfg["client_node"]) else "remote_node"
-    if cfg.get("duration") and not is_pipeline and op not in ("get", "get_batch"):
-        raise RuntimeError(
-            "duration configured but operation={} does not support duration "
-            "stress (only get/get_batch)".format(op))
+
+
+def scenario_paths(globals_cfg, ts, cfg_name):
     remote_dir = globals_cfg["remote_dir"]
     remote_scripts = remote_dir + "/scripts"
     remote_log_dir = "{}/{}/logs".format(globals_cfg["remote_results_dir"], ts)
     remote_runner = remote_scripts + "/run_benchmark.sh"
     local_log_dir = os.path.join(RESULTS_DIR, ts, "logs", cfg_name)
-    if not dry:
-        os.makedirs(local_log_dir, exist_ok=True)
-    log("=== scenario {} (op={}, topo={}, protocol={}) client_node={} ===".format(
-        cfg_name, op, topology, cfg["protocol"], host))
-    scenario_params = {
-        "MC_SCENARIO": scenario,
-        "MC_SCENARIO_MODE": cfg.get("mode", ""),
-        "MC_MODE": cfg.get("mode", ""),
+    return remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir
+
+
+def build_cluster_session(cluster, globals_cfg, remote_dir):
+    return {
+        "MC_MASTER_ADDR": globals_cfg.get("master_addr", ""),
+        "MC_METADATA_SERVER": globals_cfg.get("metadata_server", ""),
+        "MC_PROTOCOL_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
+        "MC_VENV": cluster.get("venv", ""),
+        "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
+        "MC_GLOBAL_SEGMENT_SIZE": str(globals_cfg.get("global_segment_size", 0)),
+        "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
+        "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
+        "MC_REMOTE_DIR": remote_dir,
+        "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
+        "MC_REMOTE_RESULTS_DIR": globals_cfg.get("remote_results_dir", remote_dir + "/results"),
+    }
+
+
+def base_scenario_params(cfg, work_mode, topology, primary_node_name):
+    return {
+        "MC_SCENARIO": cfg["scenario"],
+        "MC_SCENARIO_MODE": work_mode,
+        "MC_MODE": work_mode,
         "MC_OPERATION": cfg.get("operation", ""),
         "MC_TOPOLOGY": topology,
         "MC_PROTOCOL": cfg["protocol"],
-        "MC_CLIENT_NODE": cfg["client_node"],
+        "MC_CLIENT_NODE": primary_node_name,
         "MC_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
         "MC_KEY_COUNT": str(cfg.get("key_count", 1000)),
         "MC_DATA_SIZE": cfg.get("data_size", "8MB"),
@@ -159,231 +158,346 @@ def run_scenario(cluster, globals_cfg, cfg, ts, args):
         "MC_WARMUP_DATA_SIZE": cfg.get("warmup", {}).get("data_size", cfg.get("warmup_data_size", "1MB")),
         "MC_PARAMS": json.dumps(cfg.get("params", [])),
     }
-    if is_pipeline:
-        scenario_params.update({
-            "MC_WORK_MODE": cfg.get("mode", ""),
-            "MC_WRITER_COUNT": str(cfg.get("writer_count", 1)),
-            "MC_READER_COUNT": str(cfg.get("reader_count", 1)),
-            "MC_TARGET_QPS": str(cfg.get("target_qps", 200)),
-            "MC_TTL": str(cfg.get("ttl", 0)),
-            "MC_NOTIFY_COUNT": str(cfg.get("notify_count", 1)),
-            "MC_NOTIFY_PIPELINE": ",".join(cfg.get("notify_pipeline", [])),
-            "MC_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
-            "MC_DURATION": str(cfg.get("duration", 30)),
-            "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)),
-        })
-    client_node_name = cfg["client_node"]
-    client_node_cfg = cluster["nodes"][client_node_name]
-    fabric_ip = client_node_cfg.get("fabric_ip", client_node_cfg.get("ip", ""))
-    cluster_session = {
-        "MC_MASTER_ADDR": globals_cfg.get("master_addr", ""),
-        "MC_METADATA_SERVER": globals_cfg.get("metadata_server", ""),
-        "MC_PROTOCOL_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
-        "MC_VENV": cluster.get("venv", ""),
-        "MC_FABRIC_IP": fabric_ip,
-        "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
-        "MC_GLOBAL_SEGMENT_SIZE": str(globals_cfg.get("global_segment_size", 0)),
-        "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
-        "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
-        "MC_REMOTE_DIR": remote_dir,
-        "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
-        "MC_REMOTE_RESULTS_DIR": globals_cfg.get("remote_results_dir", remote_dir + "/results"),
-    }
-    runtime = {
-        "MC_TIMESTAMP": ts,
-        "MC_LOG_DIR": remote_log_dir,
-    }
-    env_lines = ["#!/usr/bin/env bash"]
-    env_lines.append("")
-    env_lines.append("# scenario params")
+
+
+def build_env_content(scenario_params, cluster_session, runtime, ld_path, fabric_ip):
+    session = dict(cluster_session)
+    session["MC_FABRIC_IP"] = fabric_ip
+    lines = ["#!/usr/bin/env bash", ""]
+    lines.append("# scenario params")
     for k, v in sorted(scenario_params.items()):
         if v:
-            env_lines.append('export {}="{}"'.format(k, v))
-    env_lines.append("")
-    env_lines.append("# cluster / session")
-    for k, v in sorted(cluster_session.items()):
+            lines.append('export {}="{}"'.format(k, v))
+    lines.append("")
+    lines.append("# cluster / session")
+    for k, v in sorted(session.items()):
         if k in ("MC_PARAMS", "MC_PEERS") and isinstance(v, str) and v.startswith("{"):
-            env_lines.append("export {}='{}'".format(k, v))
+            lines.append("export {}='{}'".format(k, v))
         else:
-            env_lines.append('export {}="{}"'.format(k, v))
-    env_lines.append("")
-    env_lines.append("# runtime")
+            lines.append('export {}="{}"'.format(k, v))
+    lines.append("")
+    lines.append("# runtime")
     for k, v in sorted(runtime.items()):
-        env_lines.append('export {}="{}"'.format(k, v))
-    env_lines.append("")
-    ld_path = cluster.get("ld_library_path",
-                          "/home/w00921547/stress-cluster-bench/lib/:/usr/local/cuda-12.9/lib64:/usr/local/lib64:${LD_LIBRARY_PATH:-}")
-    env_lines.append('export LD_LIBRARY_PATH={}'.format(ld_path))
-    env_lines.append("")
-    env_content = "\n".join(env_lines) + "\n"
+        lines.append('export {}="{}"'.format(k, v))
+    lines.append("")
+    lines.append('export LD_LIBRARY_PATH={}'.format(ld_path))
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, runtime,
+                   ld_path, remote_scripts, remote_log_dir, remote_runner, dry_run):
+    """Generate a per-node env.sh (node-specific fabric_ip) and push the
+    three orchestrator scripts to every involved node."""
     env_sh_path = os.path.join(SCRIPTS_DIR, "env.sh")
-    with open(env_sh_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(env_content)
-    log("env.sh written -> {}".format(env_sh_path))
-    run_ssh(cluster, host, node, "mkdir -p {} {}".format(
-        remote_scripts, remote_log_dir), dry_run=dry)
-    scp_push(cluster, host, node,
-             [os.path.join(SCRIPTS_DIR, "env.sh"),
-              os.path.join(SCRIPTS_DIR, "run_benchmark.sh"),
-              os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")],
-             remote_scripts, dry_run=dry)
-    run_ssh(cluster, host, node, "chmod +x {} {}".format(
-        remote_scripts + "/env.sh", remote_runner), dry_run=dry)
-    data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
-    remote_data_dir = cluster_session["MC_REMOTE_DATA_DIR"]
-    check_cmd = (
+    for node_name in involved_nodes:
+        n = get_node(cluster, node_name)
+        fab = n.get("fabric_ip", n.get("ip", ""))
+        with open(env_sh_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(build_env_content(scenario_params, cluster_session, runtime, ld_path, fab))
+        log("env.sh written (node={}, fabric_ip={})".format(node_name, fab))
+        run_ssh(n["ip"], n, "mkdir -p {} {}".format(
+            remote_scripts, remote_log_dir), dry_run=dry_run)
+        scp_push(n["ip"], n,
+                 [env_sh_path,
+                  os.path.join(SCRIPTS_DIR, "run_benchmark.sh"),
+                  os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")],
+                 remote_scripts, dry_run=dry_run)
+        run_ssh(n["ip"], n, "chmod +x {} {}".format(
+            remote_scripts + "/env.sh", remote_runner), dry_run=dry_run)
+
+
+def value_check_cmd(remote_data_dir, scenario, data_size_bytes):
+    return (
         'python3 -c "import os,sys; p=os.path.expanduser(sys.argv[1]); '
         "print('EXISTS' if os.path.isfile(p) and os.path.getsize(p)==int(sys.argv[2]) "
         "else 'MISSING')\" "
         "{}/{}/value.bin {}".format(remote_data_dir, scenario, data_size_bytes)
     )
-    data_status = ssh_check_output(cluster, host, node, check_cmd, dry_run=dry)
-    if is_pipeline:
-        if data_status != "EXISTS":
-            run_stage(cluster, globals_cfg, host, node, remote_runner,
-                      "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
-        run_stage(cluster, globals_cfg, host, node, remote_runner,
-                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-        peers = cfg.get("peers", [])
-        for p in peers:
-            pnode = _node(cluster, p.get("node", cfg["client_node"]))
-            p["host"] = pnode.get("fabric_ip", pnode.get("ip", p.get("host", "")))
-        reader_peers = [p for p in peers if p.get("role") == "reader"]
-        writer_peers = [p for p in peers if p.get("role") == "writer"]
-        all_peer_nodes = []
-        seen_ips = set()
-        for p in peers:
-            pn = _node(cluster, p.get("node", cfg["client_node"]))
-            if pn["ip"] not in seen_ips:
-                seen_ips.add(pn["ip"])
-                all_peer_nodes.append(pn)
-        warmup = "false" if args.no_warmup else "true"
-        runs = build_runs(cfg)
-        log("scenario {} (pipeline, {}): {} run combos, warmup={}, readers={}, writers={}".format(
-            cfg_name, cfg.get("mode", "recall"), len(runs), warmup,
-            len(reader_peers), len(writer_peers)))
-        for c, t in runs:
-            name = "benchmark_c{}_t{}".format(c, t)
-            remote_log_base = remote_log_path(remote_log_dir, cfg_name, name)
-            # Step 0: ensure scripts exist on reader nodes (may differ from host)
-            reader_nodes_seen = set()
-            for rp in reader_peers:
-                rn = _node(cluster, rp["node"])
-                rn_ip = rn["ip"]
-                if rn_ip != host and rn_ip not in reader_nodes_seen:
-                    reader_nodes_seen.add(rn_ip)
-                    rn_scripts = remote_dir + "/scripts"
-                    run_ssh(cluster, rn_ip, rn, "mkdir -p {}".format(rn_scripts), dry_run=dry)
-                    scp_push(cluster, rn_ip, rn,
-                             [os.path.join(SCRIPTS_DIR, "env.sh"),
-                              os.path.join(SCRIPTS_DIR, "run_benchmark.sh"),
-                              os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")],
-                             rn_scripts, dry_run=dry)
-                    run_ssh(cluster, rn_ip, rn,
-                            "chmod +x {}/env.sh {}/run_benchmark.sh".format(rn_scripts, rn_scripts),
-                            dry_run=dry)
-            # Step 1: start all readers
-            reader_pids = []
-            for rp in reader_peers:
-                rnode = _node(cluster, rp["node"])
-                rlog = "{}.reader_port{}".format(remote_log_base, rp["port"])
-                rcmd = "nohup bash {} pipeline {} {} {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 > {} 2>&1 & echo $!".format(
-                    remote_runner, c, t, rlog.replace(".log", ""),
-                    rp["port"], json.dumps(peers), rlog)
-                pid = ssh_check_output(cluster, rnode["ip"], rnode, rcmd, dry_run=dry)
-                reader_pids.append((rp, pid))
-            # Step 2: wait for all readers to be healthy
-            for rp in reader_peers:
-                rnode = _node(cluster, rp["node"])
-                rlog = "{}.reader_port{}".format(remote_log_base, rp["port"])
-                health_url = "http://{}:{}/health".format(rp["host"], rp["port"])
-                HEALTHY = False
-                for attempt in range(10):
-                    health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
-                    result = ssh_check_output(cluster, rnode["ip"], rnode, health_cmd, dry_run=dry) if not dry else "HEALTHY"
-                    if "HEALTHY" in result:
-                        HEALTHY = True
-                        break
-                    time.sleep(1)
-                if not dry:
-                    if not HEALTHY:
-                        err_msg = "reader at {}:{} not ready after 30s".format(rp["host"], rp["port"])
-                        log("[ERROR] " + err_msg)
-                        raise RuntimeError(err_msg)
-                    else:
-                        log("reader at {}:{}=READY".format(rp["host"], rp["port"]))
-            # Step 3: start all writers
-            for wp in writer_peers:
-                wnode = _node(cluster, wp["node"])
-                wlog = "{}.writer_port{}".format(remote_log_base, wp["port"])
-                wcmd = "bash {} pipeline {} {} {} --role writer --listen-port {} --peers '{}' --warmup {}".format(
-                    remote_runner, c, t, wlog, wp["port"], json.dumps(peers), warmup)
-                run_ssh(cluster, wnode["ip"], wnode, wcmd, dry_run=dry)
-            # Step 4: shutdown readers and wait for their final logs
-            for rp in reader_peers:
-                rnode = _node(cluster, rp["node"])
-                shutdown_url = "http://{}:{}/shutdown".format(rp["host"], rp["port"])
-                curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
-                if not dry:
-                    ssh_check_output(cluster, rnode["ip"], rnode, curl_cmd, dry_run=dry)
-            # Wait for all reader processes to exit (flush final SUMMARY/RESULT)
-            for rp, pid in reader_pids:
-                rnode = _node(cluster, rp["node"])
-                if not dry and pid:
-                    for _ in range(60):
-                        alive = ssh_check_output(
-                            cluster, rnode["ip"], rnode,
-                            "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
-                            dry_run=dry)
-                        if alive != "ALIVE":
-                            break
-                        time.sleep(1)
-    else:
-        if data_status != "EXISTS":
-            run_stage(cluster, globals_cfg, host, node, remote_runner,
-                      "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
-        run_stage(cluster, globals_cfg, host, node, remote_runner,
-                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-        if op in ("get", "get_batch"):
-            run_stage(cluster, globals_cfg, host, node, remote_runner,
-                      "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
-        warmup = "false" if args.no_warmup else "true"
-        runs = build_runs(cfg)
-        need_clean_before_run = op in ("put", "put_batch") or "/" in op
-        log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}".format(
-            cfg_name, len(runs), warmup, need_clean_before_run))
-        for c, t in runs:
-            if need_clean_before_run:
-                run_stage(cluster, globals_cfg, host, node, remote_runner,
-                          "clean", remote_log_dir, cfg_name,
-                          extra="--scope full", dry_run=dry)
-            name = "benchmark_c{}_t{}".format(c, t)
-            remote_log = remote_log_path(remote_log_dir, cfg_name, name)
-            command = "bash {} benchmark {} {} {} --warmup {}".format(
-                remote_runner, c, t, remote_log, warmup)
-            run_ssh(cluster, host, node, command, dry_run=dry)
-        # Final cleanup after all params complete
-        run_stage(cluster, globals_cfg, host, node, remote_runner,
-                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-    if is_pipeline:
-        pulled_ips = set()
-        for pnode in all_peer_nodes:
-            if pnode["ip"] in pulled_ips:
-                continue
-            pulled_ips.add(pnode["ip"])
-            scp_pull(cluster, pnode["ip"], pnode, "{}/{}.*".format(remote_log_dir, cfg_name),
-                     local_log_dir, dry_run=dry)
-    else:
-        scp_pull(cluster, host, node, "{}/{}.*".format(remote_log_dir, cfg_name),
-                 local_log_dir, dry_run=dry)
+
+
+def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
+    pulled_ips = set()
+    for node_name in involved_nodes:
+        n = get_node(cluster, node_name)
+        if n["ip"] in pulled_ips:
+            continue
+        pulled_ips.add(n["ip"])
+        scp_pull(n["ip"], n, "{}/{}.*".format(remote_log_dir, cfg_name),
+                 local_log_dir, dry_run=dry_run)
+
+
+def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
+    remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
+    command = "bash {} {} 1 1 {}".format(runner, mode, remote_log)
+    if extra:
+        command += " " + extra
+    run_ssh(host, node, command, dry_run=dry_run)
+
+
+# --------------------------------------------------------------------------
+# basic scenario (interface-level benchmark: put/get/batch/mixed sweeps)
+# --------------------------------------------------------------------------
+
+def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
+    apply_cli_overrides(cfg, args)
+    scenario = cfg["scenario"]
+    cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
+    dry = args.dry_run
+    op = cfg.get("operation", "")
+    work_mode = cfg.get("work_mode", cfg.get("mode", ""))
+    primary_node_name = cfg["client_node"]
+    involved_nodes = [primary_node_name]
+    node = get_node(cluster, primary_node_name)
+    host = node["ip"]
+    # topology: dynamic from client node vs store_node
+    topology = "local_node" if primary_node_name == cfg.get("store_node", primary_node_name) else "remote_node"
+    if cfg.get("duration") and op not in ("get", "get_batch"):
+        raise RuntimeError(
+            "duration configured but operation={} does not support duration "
+            "stress (only get/get_batch)".format(op))
+    remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir = \
+        scenario_paths(globals_cfg, ts, cfg_name)
+    if not dry:
+        os.makedirs(local_log_dir, exist_ok=True)
+    log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
+        cfg_name, op, topology, cfg["protocol"], host))
+    scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
+    cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
+    runtime = {
+        "MC_TIMESTAMP": ts,
+        "MC_LOG_DIR": remote_log_dir,
+    }
+    ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
+    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, runtime,
+                   ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
+    data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
+    check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
+    data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
+    if data_status != "EXISTS":
+        run_stage(host, node, remote_runner,
+                  "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
+    run_stage(host, node, remote_runner,
+              "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+    if op in ("get", "get_batch"):
+        run_stage(host, node, remote_runner,
+                  "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
+    warmup = "false" if args.no_warmup else "true"
+    runs = build_runs(cfg)
+    need_clean_before_run = op in ("put", "put_batch") or "/" in op
+    log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}".format(
+        cfg_name, len(runs), warmup, need_clean_before_run))
+    for c, t in runs:
+        if need_clean_before_run:
+            run_stage(host, node, remote_runner,
+                      "clean", remote_log_dir, cfg_name,
+                      extra="--scope full", dry_run=dry)
+        name = "benchmark_c{}_t{}".format(c, t)
+        remote_log = remote_log_path(remote_log_dir, cfg_name, name)
+        command = "bash {} benchmark {} {} {} --warmup {}".format(
+            remote_runner, c, t, remote_log, warmup)
+        run_ssh(host, node, command, dry_run=dry)
+    # Final cleanup after all params complete
+    run_stage(host, node, remote_runner,
+              "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+    pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
     if args.clean_up:
-        run_ssh(cluster, host, node, "rm -rf {}".format(remote_dir), dry_run=dry)
-def percentile(sorted_vals, p):
-    if not sorted_vals:
-        return 0.0
-    idx = int(round(p * (len(sorted_vals) - 1)))
-    return sorted_vals[idx]
-def parse_benchmark_log(paths):
+        run_ssh(host, node, "rm -rf {}".format(remote_dir), dry_run=dry)
+
+
+# --------------------------------------------------------------------------
+# pipeline scenario (producer/consumer: writers notify random reader subsets)
+# --------------------------------------------------------------------------
+
+def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
+    apply_cli_overrides(cfg, args)
+    scenario = cfg["scenario"]
+    cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
+    dry = args.dry_run
+    op = cfg.get("operation", "")
+    work_mode = cfg.get("work_mode", cfg.get("mode", ""))
+    plan = pipeline_plan(cfg)
+    if plan["notify_count"] < 1:
+        raise RuntimeError("pipeline config requires notify_count >= 1")
+    if plan["notify_count"] > len(plan["readers"]):
+        raise RuntimeError("notify_count={} exceeds reader count {}".format(
+            plan["notify_count"], len(plan["readers"])))
+    involved_nodes = []
+    seen_nodes = set()
+    for p in plan["writers"] + plan["readers"]:
+        if p["node"] not in seen_nodes:
+            seen_nodes.add(p["node"])
+            involved_nodes.append(p["node"])
+    primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
+    node = get_node(cluster, primary_node_name)
+    host = node["ip"]
+    # topology: dynamic from primary client node vs store_node
+    topology = "local_node" if primary_node_name == cfg.get("store_node", primary_node_name) else "remote_node"
+    remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir = \
+        scenario_paths(globals_cfg, ts, cfg_name)
+    if not dry:
+        os.makedirs(local_log_dir, exist_ok=True)
+    log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
+        cfg_name, op, topology, cfg["protocol"], host))
+    scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
+    scenario_params.update({
+        "MC_WORK_MODE": work_mode,
+        "MC_WRITER_COUNT": str(len(plan["writers"])),
+        "MC_READER_COUNT": str(len(plan["readers"])),
+        "MC_TARGET_QPS": str(plan["per_writer_qps"]),
+        "MC_NOTIFY_COUNT": str(plan["notify_count"]),
+        "MC_NOTIFY_THREADS": str(plan["notify_threads"]),
+        "MC_NOTIFY_PIPELINE": ",".join(cfg.get("notify_pipeline", [])),
+        "MC_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
+        "MC_DURATION": str(cfg.get("duration", 30)),
+        "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)),
+        "MC_OPERATION": "",
+        "MC_WARMUP_KEY_COUNT": "",
+        "MC_WARMUP_DATA_SIZE": "",
+        "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
+    })
+    cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
+    runtime = {
+        "MC_TIMESTAMP": ts,
+        "MC_LOG_DIR": remote_log_dir,
+    }
+    ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
+    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, runtime,
+                   ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
+    data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
+    check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
+    # value.bin must exist on EVERY node that runs a writer or reader
+    for node_name in involved_nodes:
+        n = get_node(cluster, node_name)
+        data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
+        if data_status != "EXISTS":
+            run_stage(n["ip"], n, remote_runner,
+                      "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
+    run_stage(host, node, remote_runner,
+              "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+    warmup = "false" if args.no_warmup else "true"
+    reader_threads = plan["reader_threads"]
+    log("scenario {} (pipeline, {}): writers={}, readers={}, notify_count={}, "
+        "total_qps={}, per_writer_qps={}, traffic={}".format(
+            cfg_name, work_mode, len(plan["writers"]), len(plan["readers"]),
+            plan["notify_count"], plan["total_qps"], plan["per_writer_qps"],
+            cfg.get("traffic_mode", "pulse")))
+    # Reader peers: host resolved from each reader node's fabric_ip so the
+    # same config works unchanged on any deployment.
+    reader_peers = []
+    for r in plan["readers"]:
+        rn = get_node(cluster, r["node"])
+        reader_peers.append({
+            "role": "reader",
+            "host": rn.get("fabric_ip", rn.get("ip", "")),
+            "port": r["port"],
+            "node": r["node"],
+        })
+    peers_json = json.dumps(reader_peers)
+    run_name = "benchmark_c1_t{}".format(reader_threads)
+    base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
+    # Step 1: start all readers (one process per reader, unique port)
+    reader_pids = []
+    for r in plan["readers"]:
+        rn = get_node(cluster, r["node"])
+        merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
+        nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
+        rcmd = "nohup bash {} pipeline 1 {} {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 > {} 2>&1 & echo $!".format(
+            remote_runner, reader_threads, merged_log,
+            r["port"], peers_json, nohup_log)
+        pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
+        reader_pids.append((r, pid))
+    # Step 2: wait for all readers to be healthy
+    for r, peer in zip(plan["readers"], reader_peers):
+        rn = get_node(cluster, r["node"])
+        health_url = "http://{}:{}/health".format(peer["host"], r["port"])
+        HEALTHY = False
+        for attempt in range(10):
+            health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
+            result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry) if not dry else "HEALTHY"
+            if "HEALTHY" in result:
+                HEALTHY = True
+                break
+            time.sleep(1)
+        if not dry:
+            if not HEALTHY:
+                err_msg = "reader at {}:{} not ready after 30s".format(peer["host"], r["port"])
+                log("[ERROR] " + err_msg)
+                raise RuntimeError(err_msg)
+            else:
+                log("reader at {}:{}=READY".format(peer["host"], r["port"]))
+    # Step 3: start all writers in parallel (one invocation per writer; the
+    # explicit --client-id in EXTRA overrides the per-invocation default
+    # and gives each writer a globally unique id). ALL writers run the
+    # warmup phase so every writer's store/notify connections are warmed.
+    writer_pids = []
+    for w in plan["writers"]:
+        wn = get_node(cluster, w["node"])
+        merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
+        nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
+        wcmd = "nohup bash {} pipeline 1 1 {} --role writer --client-id {} --peers '{}' --warmup {} > {} 2>&1 & echo $!".format(
+            remote_runner, merged_log, w["gid"], peers_json, warmup, nohup_log)
+        pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
+        writer_pids.append((w, pid))
+    # Step 4: wait for all writers to finish (warmup + measured run)
+    warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
+    duration = float(cfg.get("duration", 30))
+    for w, pid in writer_pids:
+        wn = get_node(cluster, w["node"])
+        if not dry and pid:
+            for _ in range(int(warmup_duration + duration) + 300):
+                alive = ssh_check_output(
+                    wn["ip"], wn,
+                    "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
+                    dry_run=dry)
+                if alive != "ALIVE":
+                    break
+                time.sleep(1)
+    # Step 5: shutdown readers and wait for their final logs
+    for r, peer in zip(plan["readers"], reader_peers):
+        rn = get_node(cluster, r["node"])
+        shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
+        curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
+        if not dry:
+            ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
+    for r, pid in reader_pids:
+        rn = get_node(cluster, r["node"])
+        if not dry and pid:
+            for _ in range(60):
+                alive = ssh_check_output(
+                    rn["ip"], rn,
+                    "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
+                    dry_run=dry)
+                if alive != "ALIVE":
+                    break
+                time.sleep(1)
+    # Step 6: remove empty .nohup redirect files (they capture script-level
+    # errors only — empty on success). Non-empty ones are kept for diagnostics
+    # and pulled back with the rest of the logs.
+    if not dry:
+        for node_name in involved_nodes:
+            n = get_node(cluster, node_name)
+            nohup_files = []
+            for r in plan["readers"]:
+                if r["node"] == node_name:
+                    nohup_files.append("{}.reader_port{}.nohup".format(base_noext, r["port"]))
+            for w in plan["writers"]:
+                if w["node"] == node_name:
+                    nohup_files.append("{}.writer{}.nohup".format(base_noext, w["gid"]))
+            if nohup_files:
+                cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
+                    " ".join(nohup_files))
+                ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+    pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+    if args.clean_up:
+        run_ssh(host, node, "rm -rf {}".format(remote_dir), dry_run=dry)
+
+
+# --------------------------------------------------------------------------
+# metrics aggregation
+# --------------------------------------------------------------------------
+
+def parse_benchmark_log(paths, op_filter=None):
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
     latencies = []
@@ -397,6 +511,8 @@ def parse_benchmark_log(paths):
             if line.startswith("RESULT\t"):
                 parts = line.split("\t")
                 if len(parts) < 5:
+                    continue
+                if op_filter is not None and parts[1] != op_filter:
                     continue
                 latencies.append(float(parts[3]))
                 if parts[4] == "OK":
@@ -441,65 +557,113 @@ def parse_benchmark_log(paths):
         "qps": (total / wall) if wall > 0 else 0.0,
         "fail_rate": (fail / total) if total else 0.0,
     }
+
+
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
     name = os.path.splitext(os.path.basename(cfg_path))[0]
     out_csv = os.path.join(RESULTS_DIR, ts, "{}.csv".format(name))
     rows = []
     is_pipeline = cfg.get("scenario") == "pipeline"
     if is_pipeline:
-        # Pipeline: aggregate all merged reader logs (one per reader port)
-        reader_paths = []
-        for p in sorted(glob.glob(os.path.join(local_log_dir, "{}*reader*".format(name)))):
-            # Skip .d directories and files ending with .log.reader (nohup redirect)
-            if os.path.isdir(p) or ".log.reader" in p:
+        plan = pipeline_plan(cfg)
+        store_node = cfg.get("store_node", "")
+        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
+        batch_size = int(cfg.get("batch_size", 1))
+        duration = float(cfg.get("duration", 0) or 0)
+        writer_files = {}
+        for p in sorted(glob.glob(os.path.join(local_log_dir, "{}*writer*".format(name)))):
+            if os.path.isdir(p) or p.endswith(".nohup"):
                 continue
-            reader_paths.append(p)
-        if reader_paths:
-            agg = parse_benchmark_log(reader_paths)
-            c, t = 1, cfg.get("num_threads", 1)
-            topo = "local_node" if cfg["client_node"] == cfg.get("store_node", cfg["client_node"]) else "remote_node"
-            row = {
+            try:
+                gid = int(os.path.basename(p).replace(".log", "").split(".writer")[-1])
+            except ValueError:
+                continue
+            writer_files[gid] = p
+        reader_files = {}
+        for p in sorted(glob.glob(os.path.join(local_log_dir, "{}*reader_port*".format(name)))):
+            if os.path.isdir(p) or p.endswith(".nohup"):
+                continue
+            try:
+                port = int(os.path.basename(p).replace(".log", "").split(".reader_port")[-1])
+            except ValueError:
+                continue
+            reader_files[port] = p
+
+        def base_row(role, instance, nodename):
+            if role == "writer":
+                op = (cfg.get("writer", {}) or {}).get("operation", "")
+            else:
+                op = (cfg.get("reader", {}) or {}).get("operation", "")
+            return {
                 "scenario": cfg["scenario"],
-                "mode": cfg.get("mode", ""),
-                "operation": cfg.get("operation", ""),
-                "topology": topo,
+                "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
+                "operation": op,
+                "role": role,
+                "node": nodename,
+                "instance": instance,
+                "topology": ("local_node" if nodename == store_node else "remote_node") if nodename else "",
                 "protocol": cfg["protocol"],
-                "num_clients": c,
-                "num_threads": t,
-            }
-            row.update({
+                "num_clients": "",
+                "num_threads": "",
                 "data_size": cfg.get("data_size", ""),
                 "key_count": cfg.get("key_count", ""),
-                "batch_size": "",
+                "batch_size": cfg.get("batch_size", ""),
                 "put_ratio": "",
                 "duration": cfg.get("duration", ""),
-                "writer_count": cfg.get("writer_count", ""),
-                "reader_count": cfg.get("reader_count", ""),
-                "target_qps": cfg.get("target_qps", ""),
-                "ttl": cfg.get("ttl", ""),
-                "notify_count": cfg.get("notify_count", ""),
+                "warmup_duration": cfg.get("warmup", {}).get("duration", ""),
+                "writer_count": len(plan["writers"]),
+                "reader_count": len(plan["readers"]),
+                "notify_count": plan["notify_count"],
+                "notify_threads": plan["notify_threads"],
+                "reader_threads": plan["reader_threads"],
+                "base_qps": cfg.get("base_qps", ""),
+                "qps_multiple": cfg.get("qps_multiple", ""),
+                "target_qps": plan["total_qps"],
                 "notify_pipeline": ",".join(cfg.get("notify_pipeline", [])),
                 "traffic_mode": cfg.get("traffic_mode", ""),
-            })
-            row.update({k: agg[k] for k in (
-                "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
-                "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "ok", "fail",
-                "qps", "fail_rate")})
-            # Use configured duration for wall_s instead of reader's timeout
-            if is_pipeline and cfg.get("duration"):
-                row["wall_s"] = float(cfg["duration"])
-                total = row["total"]
-                total_bytes = row["total_bytes"]
-                wall_s = row["wall_s"]
-                row["throughput_mb_s"] = round(total_bytes / wall_s / 1e6, 2) if wall_s > 0 else 0.0
-                row["throughput_gb_s"] = round(total_bytes / wall_s / 1e9, 2) if wall_s > 0 else 0.0
-                row["qps"] = round(total / wall_s, 2) if wall_s > 0 else 0.0
+            }
+
+        def metrics_into(row, agg, bytes_per_op):
+            total = agg["total"]
+            wall = duration if duration > 0 else agg["wall_s"]
+            row["total"] = total
+            row["total_bytes"] = int(total * bytes_per_op)
+            row["wall_s"] = wall
+            row["throughput_mb_s"] = (row["total_bytes"] / wall / 1e6) if wall > 0 else 0.0
+            row["throughput_gb_s"] = (row["total_bytes"] / wall / 1e9) if wall > 0 else 0.0
+            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+                      "ok", "fail", "fail_rate"):
+                row[k] = agg[k]
+            row["qps"] = (total / wall) if wall > 0 else 0.0
             for k in ("wall_s", "throughput_mb_s", "throughput_gb_s",
-                       "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
-                       "qps", "fail_rate", "total_bytes"):
+                      "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+                      "qps", "fail_rate"):
                 v = row.get(k)
-                if v is not None and isinstance(v, float):
+                if isinstance(v, float):
                     row[k] = round(v, 2)
+
+        for w in plan["writers"]:
+            f = writer_files.get(w["gid"])
+            if not f:
+                continue
+            agg = parse_benchmark_log(f, op_filter="pipeline_write")
+            row = base_row("writer", "w{}".format(w["gid"]), w["node"])
+            metrics_into(row, agg, batch_size * data_size_bytes)
+            rows.append(row)
+        for r in plan["readers"]:
+            f = reader_files.get(r["port"])
+            if not f:
+                continue
+            agg = parse_benchmark_log(f, op_filter="pipeline_read")
+            row = base_row("reader", "r{}".format(r["index"]), r["node"])
+            metrics_into(row, agg, data_size_bytes)
+            rows.append(row)
+        # TOTAL row: all readers aggregated (aligns with the datasystem
+        # single GET row per test group)
+        if reader_files:
+            agg = parse_benchmark_log(list(reader_files.values()), op_filter="pipeline_read")
+            row = base_row("reader", "TOTAL", "")
+            metrics_into(row, agg, data_size_bytes)
             rows.append(row)
     else:
         pattern = os.path.join(local_log_dir, "{}.*.log".format(name))
@@ -515,8 +679,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
             topo = "local_node" if cfg["client_node"] == cfg.get("store_node", cfg["client_node"]) else "remote_node"
             row = {
                 "scenario": cfg["scenario"],
-                "mode": cfg.get("mode", ""),
+                "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
                 "operation": cfg.get("operation", ""),
+                "role": "",
+                "node": "",
+                "instance": "",
                 "topology": topo,
                 "protocol": cfg["protocol"],
                 "num_clients": c,
@@ -525,16 +692,20 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
             row.update({
                 "data_size": cfg.get("data_size", ""),
                 "key_count": cfg.get("key_count", ""),
-                "batch_size": cfg.get("batch_size", "") if not is_pipeline and cfg.get("operation") in ("put_batch", "get_batch") else "",
-                "put_ratio": cfg.get("put_ratio", "") if not is_pipeline and cfg.get("operation") in ("mixed", "put/get") else "",
+                "batch_size": cfg.get("batch_size", "") if cfg.get("operation") in ("put_batch", "get_batch") else "",
+                "put_ratio": cfg.get("put_ratio", "") if cfg.get("operation") in ("mixed", "put/get") else "",
                 "duration": cfg.get("duration", ""),
-                "writer_count": cfg.get("writer_count", ""),
-                "reader_count": cfg.get("reader_count", ""),
-                "target_qps": cfg.get("target_qps", ""),
-                "ttl": cfg.get("ttl", ""),
-                "notify_count": cfg.get("notify_count", ""),
-                "notify_pipeline": ",".join(cfg.get("notify_pipeline", [])),
-                "traffic_mode": cfg.get("traffic_mode", ""),
+                "warmup_duration": "",
+                "writer_count": "",
+                "reader_count": "",
+                "notify_count": "",
+                "notify_threads": "",
+                "reader_threads": "",
+                "base_qps": "",
+                "qps_multiple": "",
+                "target_qps": "",
+                "notify_pipeline": "",
+                "traffic_mode": "",
             })
             row.update({k: agg[k] for k in (
                 "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
@@ -554,10 +725,16 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
             writer.writerow(row)
     return rows
 
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-def main():
+
+# --------------------------------------------------------------------------
+# CLI entry
+# --------------------------------------------------------------------------
+
+def parse_arguments(argv=None):
+    """Parse CLI args, validate combinations, and collect config paths.
+
+    Returns (args, cfg_paths).
+    """
     parser = argparse.ArgumentParser(description="Mooncake benchmark orchestrator (runs locally)")
     parser.add_argument("--cluster", default=os.path.join(CONFIGS_DIR, "cluster.json"),
                         help="path to cluster json")
@@ -583,7 +760,7 @@ def main():
                         help="override data_size (e.g. 1MB) for local scaled-down testing")
     parser.add_argument("--clean-up", action="store_true",
                         help="after run, ssh delete all remote files (scripts, data, results)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not os.path.exists(args.cluster):
         example = os.path.join(CONFIGS_DIR, "cluster.example.json")
         sys.exit("[ERROR] cluster config not found: {}\n"
@@ -592,11 +769,11 @@ def main():
     if not os.path.exists(args.global_cfg):
         sys.exit("[ERROR] global config not found: {}".format(args.global_cfg))
     scenario_category = args.scenario
+    cfg_path = None
     if args.config:
         cfg_path = os.path.join(CONFIGS_DIR, args.config)
         if scenario_category is None:
-            parts = args.config.replace("\\", "/").split("/")
-            scenario_category = parts[0]
+            scenario_category = args.config.replace("\\", "/").split("/")[0]
     elif args.all or args.demo:
         if scenario_category is None:
             sys.exit("[ERROR] --all/--demo requires --scenario")
@@ -604,21 +781,8 @@ def main():
         sys.exit("[ERROR] provide --scenario with --all or --demo or --config")
     if args.scenario and not args.all and not args.config and not args.demo:
         sys.exit("[ERROR] --scenario provided but none of --all/--demo/--config is given")
-    cluster = load_json(args.cluster)
-    globals_cfg = load_json(args.global_cfg)
-    ts = time.strftime("%Y%m%d-%H%M")
-    ts_dir = os.path.join(RESULTS_DIR, ts)
-    n = 1
-    while os.path.exists(ts_dir):
-        ts = "{}-{}".format(time.strftime("%Y%m%d-%H%M"), n)
-        ts_dir = os.path.join(RESULTS_DIR, ts)
-        n += 1
-    if not args.dry_run:
-        os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
-        log("results root: {}".format(ts_dir))
     cfg_paths = []
     if args.config:
-        cfg_path = os.path.join(CONFIGS_DIR, args.config)
         if not os.path.exists(cfg_path):
             sys.exit("[ERROR] config not found: {}".format(cfg_path))
         cfg_paths = [cfg_path]
@@ -634,13 +798,32 @@ def main():
         for f in sorted(os.listdir(scenario_dir)):
             if f.endswith(".json"):
                 cfg_paths.append(os.path.join(scenario_dir, f))
+    return args, cfg_paths
+
+
+def main(args, cfg_paths):
+    cluster = load_json(args.cluster)
+    globals_cfg = load_json(args.global_cfg)
+    ts = time.strftime("%Y%m%d-%H%M")
+    ts_dir = os.path.join(RESULTS_DIR, ts)
+    n = 1
+    while os.path.exists(ts_dir):
+        ts = "{}-{}".format(time.strftime("%Y%m%d-%H%M"), n)
+        ts_dir = os.path.join(RESULTS_DIR, ts)
+        n += 1
+    if not args.dry_run:
+        os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
+        log("results root: {}".format(ts_dir))
     all_rows = []
     for cfg_path in cfg_paths:
         cfg = load_json(cfg_path)
         cfg["__cfg_path__"] = cfg_path
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         try:
-            run_scenario(cluster, globals_cfg, cfg, ts, args)
+            if cfg.get("scenario") == "pipeline":
+                run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
+            else:
+                run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
                 rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path)
                 all_rows.extend(rows)
@@ -657,5 +840,8 @@ def main():
             writer.writerow(row)
     log("detail -> {}".format(detail_csv))
     log("done. results in {}".format(ts_dir))
+
+
 if __name__ == "__main__":
-    main()
+    args, cfg_paths = parse_arguments()
+    main(args, cfg_paths)

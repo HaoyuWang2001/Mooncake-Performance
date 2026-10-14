@@ -1,0 +1,38 @@
+{
+  "scenario": "pipeline",
+  "work_mode": "rank",
+  "protocol": "ub",
+  "traffic_mode": "balanced",
+  "base_qps": 105,
+  "qps_multiple": 1,
+  "notify_count": 10,
+  "writer": {
+    "count_per_node": 1,
+    "operation": "put_batch",
+    "notify_threads": 1,
+    "client_nodes": [
+      "node3",
+      "node4"
+    ]
+  },
+  "reader": {
+    "count_per_node": 5,
+    "operation": "get",
+    "num_threads": 1,
+    "client_nodes": [
+      "node3",
+      "node4"
+    ]
+  },
+  "data_size": "8MB",
+  "store_node": "node4",
+  "key_prefix": "mc_bench",
+  "notify_pipeline": [
+    "get"
+  ],
+  "warmup": {
+    "duration": 5
+  },
+  "duration": 30,
+  "batch_size": 1
+}

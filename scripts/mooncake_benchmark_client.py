@@ -353,14 +353,21 @@ import socketserver
 import urllib.parse
 import threading
 from queue import Queue
-def _pipeline_writer(args, store):
-    """Writer process: write keys at target_qps, HTTP notify all readers."""
+def _pipeline_writer(args, store, do_warmup=True):
+    """Writer process: write keys at target_qps, notify a random subset of readers.
+
+    Optionally runs a warmup phase first: the SAME deployment shape (same
+    pacing, same notify path) for warmup_duration seconds to activate the
+    writer->store, writer->reader and reader->store connections. Warmup
+    writes carry a warmup=1 flag so readers process them without recording.
+    """
     value = load_value(args.remote_data_dir, args.scenario)
     batch_keys = max(1, args.batch_size)
     prefix = args.key_prefix
     scenario = args.scenario
     writer_id = args.client_id
     duration = float(args.duration)
+    warmup_duration = float(getattr(args, "warmup_duration", 0) or 0)
     target_qps = float(args.target_qps) if args.target_qps > 0 else 0
     traffic_mode = args.traffic_mode
     peers = json.loads(args.peers) if isinstance(args.peers, str) else args.peers
@@ -392,6 +399,8 @@ def _pipeline_writer(args, store):
             r["host"] = "127.0.0.1"
         _norm_readers.append(r)
     readers = _norm_readers
+    notify_count = int(getattr(args, "notify_count", 0) or 0)
+    notify_threads = max(1, int(getattr(args, "notify_threads", 1) or 1))
     # Original datasystem semantics:
     #   balanced = even pacing at target_qps (interval = 1/qps between batches)
     #   pulse    = per 1s window, fire target_qps batches back-to-back (burst),
@@ -402,49 +411,81 @@ def _pipeline_writer(args, store):
                   "pipeline_mode": args.scenario_mode or "recall", "protocol": args.protocol,
                   "writer_id": writer_id, "target_qps": target_qps,
                   "traffic_mode": traffic_mode, "batch_size": batch_keys,
-                  "duration": duration, "start_ts": time.time(),
-                  "num_readers": len(readers)})
-    deadline = time.time() + duration
-    seq = 0
+                  "duration": duration, "warmup_duration": warmup_duration,
+                  "start_ts": time.time(),
+                  "num_readers": len(readers), "notify_count": notify_count,
+                  "notify_threads": notify_threads})
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    next_t = time.time() + interval
-    burst_remaining = 0
-    window_start = 0.0
-    while time.time() < deadline:
-        if not balanced and target_qps > 0:
-            if burst_remaining <= 0:
-                burst_remaining = int(target_qps)
-                window_start = time.time()
-        keys = ["{}*{}*w{}*{:08d}".format(prefix, scenario, writer_id, seq + i)
-                for i in range(batch_keys)]
-        seq += batch_keys
-        t0 = time.perf_counter()
-        ret = store.put_batch(keys, [value] * len(keys))
-        lat_ms = (time.perf_counter() - t0) * 1000.0
-        if ret < 0:
-            sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tERR:{}\n".format(keys[0], lat_ms, ret))
-        else:
-            sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tOK\n".format(keys[0], lat_ms))
-            # HTTP notify all readers (bypass proxy; write_ts is wall-clock so
-            # reader latency is comparable across nodes)
-            for k in keys:
-                for r in readers:
-                    url = "http://{}:{}/notify?key={}&writer_id={}&write_ts={}".format(
-                        r["host"], r["port"], k, writer_id, time.time())
+    from concurrent.futures import ThreadPoolExecutor
+    notify_pool = ThreadPoolExecutor(max_workers=notify_threads)
+    seq = [0]
+
+    def _run_phase(phase_deadline, is_warmup):
+        next_t = time.time() + interval
+        burst_remaining = 0
+        burst_budget = 0.0
+        window_start = 0.0
+        while time.time() < phase_deadline:
+            if not balanced and target_qps > 0:
+                if burst_remaining <= 0:
+                    # fractional per-writer rates (e.g. 52.5) are accumulated
+                    # across windows so the long-run average stays exact
+                    burst_budget += target_qps
+                    burst_remaining = int(burst_budget)
+                    burst_budget -= burst_remaining
+                    window_start = time.time()
+            keys = ["{}*{}*w{}*{:08d}".format(prefix, scenario, writer_id, seq[0] + i)
+                    for i in range(batch_keys)]
+            seq[0] += batch_keys
+            t0 = time.perf_counter()
+            ret = store.put_batch(keys, [value] * len(keys))
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            if ret < 0:
+                if not is_warmup:
+                    sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tERR:{}\n".format(keys[0], lat_ms, ret))
+            else:
+                if not is_warmup:
+                    sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tOK\n".format(keys[0], lat_ms))
+                # Randomly select notify_count readers and deliver the whole
+                # batch in a single multi-key request per reader (bypass proxy;
+                # write_ts is wall-clock so reader latency is comparable across
+                # nodes; warmup flag lets readers warm up without recording).
+                n_sel = min(notify_count, len(readers)) if notify_count > 0 else len(readers)
+                selected = random.sample(readers, n_sel) if readers else []
+                write_ts = time.time()
+                wflag = "1" if is_warmup else "0"
+                def _notify(r, ks=keys, ts=write_ts, wf=wflag):
+                    query = "&".join("key=" + k for k in ks)
+                    url = "http://{}:{}/notify?{}&writer_id={}&write_ts={}&warmup={}".format(
+                        r["host"], r["port"], query, writer_id, ts, wf)
                     try:
                         opener.open(url, timeout=0.5)
                     except Exception as exc:
-                        sys.stdout.write("RESULT\tpipeline_notify\t{}\t0\tERR:{} target={}:{}\n".format(k, exc, r["host"], r["port"]))
-        if balanced and target_qps > 0:
-            next_t += interval
-            time.sleep(max(0.0, next_t - time.time()))
-        elif target_qps > 0:
-            burst_remaining -= 1
-            if burst_remaining <= 0:
-                sleep_t = window_start + 1.0 - time.time()
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
+                        sys.stdout.write("RESULT\tpipeline_notify\t{}\t0\tERR:{} target={}:{}\n".format(
+                            ks[0], exc, r["host"], r["port"]))
+                # blocking submit = natural backpressure; pacing accounts for
+                # the slowest in-flight notify instead of the sequential sum
+                futures = [notify_pool.submit(_notify, r) for r in selected]
+                for f in futures:
+                    f.result()
+            if balanced and target_qps > 0:
+                next_t += interval
+                time.sleep(max(0.0, next_t - time.time()))
+            elif target_qps > 0:
+                burst_remaining -= 1
+                if burst_remaining <= 0:
+                    sleep_t = window_start + 1.0 - time.time()
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+
+    if do_warmup and warmup_duration > 0:
+        emit("META", {"mode": "pipeline_warmup_start", "writer_id": writer_id,
+                      "duration": warmup_duration, "ts": time.time()})
+        _run_phase(time.time() + warmup_duration, True)
+        emit("META", {"mode": "pipeline_warmup_end", "writer_id": writer_id,
+                      "ts": time.time()})
+    _run_phase(time.time() + duration, False)
     sys.stdout.flush()
 class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     """HTTP handler for reader: receives write notifications from writers."""
@@ -463,9 +504,10 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             keys = params.get("key", [])
             writer_id = params.get("writer_id", ["0"])[0]
             write_ts = float(params.get("write_ts", ["0"])[0])
+            is_warmup = params.get("warmup", ["0"])[0] == "1"
             for k in keys:
                 if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
-                    _PipelineNotifyHandler.queue.put((k, int(writer_id), write_ts))
+                    _PipelineNotifyHandler.queue.put((k, int(writer_id), write_ts, is_warmup))
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
@@ -486,8 +528,13 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
         pass  # suppress HTTP server logs
     do_GET = do_POST
 def _reader_worker(args, store, queue, deadline, results):
-    """Reader worker thread: dequeue keys, execute notify_pipeline, record latency."""
-    pipeline = args.notify_pipeline if isinstance(args.notify_pipeline, list) else ["getBuffer"]
+    """Reader worker thread: dequeue keys, execute notify_pipeline, record latency.
+
+    Warmup items (warmup=1 flag from the notify) are still processed — the
+    actual store reads warm up the reader->store path — but are tagged so
+    they stay out of the measured metrics.
+    """
+    pipeline = args.notify_pipeline if isinstance(args.notify_pipeline, list) else ["get"]
     value = load_value(args.remote_data_dir, args.scenario)
     local = []
     while time.time() < deadline:
@@ -497,7 +544,7 @@ def _reader_worker(args, store, queue, deadline, results):
             continue
         if item is None:
             break
-        key, writer_id, write_ts = item
+        key, writer_id, write_ts, is_warmup = item
         ok = True
         for step in pipeline:
             step = step.strip()
@@ -506,7 +553,7 @@ def _reader_worker(args, store, queue, deadline, results):
                 if ex <= 0:
                     ok = False
                     break
-            elif step == "getBuffer":
+            elif step == "get" or step == "getBuffer":
                 data = store.get(key)
                 if not data:
                     ok = False
@@ -516,6 +563,9 @@ def _reader_worker(args, store, queue, deadline, results):
                     break
             else:
                 pass
+        if is_warmup:
+            local.append(("pipeline_warmup_read", key, 0.0, "SKIP"))
+            continue
         lat_ms = (time.time() - write_ts) * 1000.0
         if ok:
             local.append(("pipeline_read", key, lat_ms, "OK"))
@@ -526,9 +576,8 @@ def cmd_pipeline(args, store, num_clients, client_id, num_threads, do_warmup):
     """Run pipeline (精排/召排) — dispatches to writer or reader based on --role."""
     role = args.role
     if role == "writer":
-        if do_warmup:
-            run_warmup(args, store)
-        _pipeline_writer(args, store)
+        # warmup is a short same-deployment run handled inside the writer
+        _pipeline_writer(args, store, do_warmup=do_warmup)
     elif role == "reader":
         _pipeline_reader(args, store)
     else:
@@ -580,28 +629,33 @@ def _pipeline_reader(args, store):
         server.shutdown()
     wall_s = duration
     data_size = parse_size(args.data_size)
-    total_bytes = len(results) * data_size
-    ok_count = sum(1 for r in results if r[3] == "OK")
-    fail_count = len(results) - ok_count
-    total = len(results)
-    latencies = sorted(r[2] for r in results)
+    # split off warmup items: processed (store reads warmed up) but not
+    # part of the measured metrics
+    warmup_total = sum(1 for r in results if r[0] == "pipeline_warmup_read")
+    measured = [r for r in results if r[0] != "pipeline_warmup_read"]
+    total_bytes = len(measured) * data_size
+    ok_count = sum(1 for r in measured if r[3] == "OK")
+    fail_count = len(measured) - ok_count
+    total = len(measured)
+    latencies = sorted(r[2] for r in measured)
     summary = {
         "mode": "pipeline_reader", "scenario": args.scenario,
         "pipeline_mode": args.scenario_mode or "recall", "protocol": args.protocol,
         "num_threads": num_threads,
         "total": total, "bytes": total_bytes, "wall_s": wall_s,
+        "warmup_total": warmup_total,
         "ok": ok_count, "fail": fail_count,
         "qps": (total / wall_s) if wall_s > 0 else 0.0,
         "fail_rate": (fail_count / total) if total else 0.0,
         "min_ms": _percentile(latencies, 0.0),
         "max_ms": _percentile(latencies, 1.0),
-        "avg_ms": (sum(r[2] for r in results) / total) if total else 0.0,
+        "avg_ms": (sum(r[2] for r in measured) / total) if total else 0.0,
         "p99_ms": _percentile(latencies, 0.99),
         "p999_ms": _percentile(latencies, 0.999),
         "data_size": data_size,
     }
     emit("SUMMARY", summary)
-    for opname, k, lat, status in results:
+    for opname, k, lat, status in measured:
         sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\n".format(opname, k, lat, status))
     sys.stdout.flush()
 
@@ -639,6 +693,8 @@ def _resolve_env(args):
         args.warmup_key_count = int(os.environ.get("MC_WARMUP_KEY_COUNT", "100"))
     if args.warmup_data_size is None:
         args.warmup_data_size = os.environ.get("MC_WARMUP_DATA_SIZE", None)
+    if args.warmup_duration is None:
+        args.warmup_duration = float(os.environ.get("MC_WARMUP_DURATION", "0"))
     if args.master_addr is None:
         args.master_addr = os.environ.get("MC_MASTER_ADDR", None)
     if args.metadata_server is None:
@@ -664,11 +720,11 @@ def _resolve_env(args):
     if args.reader_count is None:
         args.reader_count = int(os.environ.get("MC_READER_COUNT", "1"))
     if args.target_qps is None:
-        args.target_qps = int(os.environ.get("MC_TARGET_QPS", "200"))
-    if args.ttl is None:
-        args.ttl = int(os.environ.get("MC_TTL", "0"))
+        args.target_qps = float(os.environ.get("MC_TARGET_QPS", "200"))
     if args.notify_count is None:
         args.notify_count = int(os.environ.get("MC_NOTIFY_COUNT", "1"))
+    if args.notify_threads is None:
+        args.notify_threads = int(os.environ.get("MC_NOTIFY_THREADS", "1"))
     if args.notify_pipeline is None:
         raw = os.environ.get("MC_NOTIFY_PIPELINE", "getBuffer")
         args.notify_pipeline = [s.strip() for s in raw.split(",")]
@@ -711,11 +767,12 @@ def main():
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--warmup-key-count", type=int, default=None)
     parser.add_argument("--warmup-data-size", default=None)
+    parser.add_argument("--warmup-duration", type=float, default=None)
     parser.add_argument("--work-mode", default=None)
     parser.add_argument("--writer-count", type=int, default=None)
     parser.add_argument("--reader-count", type=int, default=None)
-    parser.add_argument("--target-qps", type=int, default=None)
-    parser.add_argument("--ttl", type=int, default=None)
+    parser.add_argument("--target-qps", type=float, default=None)
+    parser.add_argument("--notify-threads", type=int, default=None)
     parser.add_argument("--notify-count", type=int, default=None)
     parser.add_argument("--notify-pipeline", default=None)
     parser.add_argument("--traffic-mode", default=None)
