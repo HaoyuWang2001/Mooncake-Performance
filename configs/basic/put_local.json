@@ -103,5 +103,5 @@
     "num_clients": 1,
     "num_threads": 1
   },
-  "mode": "put"
+  "work_mode": "put"
 }

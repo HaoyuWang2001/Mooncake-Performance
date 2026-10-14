@@ -11,16 +11,13 @@
     {
       "num_clients": 1,
       "num_threads": 1
-   
-        }
- 
-    ],
+    }
+  ],
   "warmup": {
     "key_count": 100,
     "data_size": "1MB",
     "num_clients": 1,
     "num_threads": 1
- 
-    },
-  "mode": "get"
+  },
+  "work_mode": "get"
 }

@@ -104,5 +104,5 @@
     "num_clients": 1,
     "num_threads": 1
   },
-  "mode": "mixed"
+  "work_mode": "mixed"
 }
