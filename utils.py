@@ -55,9 +55,10 @@ def run_ssh(host, node, command, dry_run=False):
             result.returncode, host, command))
 
 
-def ssh_check_output(host, node, command, dry_run=False):
+def ssh_check_output(host, node, command, dry_run=False, quiet=False):
     cmd = ssh_args(node) + [command]
-    log("[ssh] {} : {}".format(host, command))
+    if not quiet:
+        log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
         return ""

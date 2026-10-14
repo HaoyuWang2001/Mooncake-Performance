@@ -239,6 +239,27 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
                  local_log_dir, dry_run=dry_run)
 
 
+def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False):
+    """Poll `kill -0 PID` until the remote process exits or times out.
+
+    Logs a single 'waiting' line up front and one result line at the end
+    (exited / timeout); per-poll ssh commands are not logged."""
+    n = get_node(cluster, node_name)
+    log("waiting {} (pid {}) on {} ...".format(what, pid, node_name))
+    t0 = time.time()
+    for _ in range(int(timeout_s)):
+        alive = ssh_check_output(
+            n["ip"], n,
+            "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
+            dry_run=dry_run, quiet=True)
+        if alive != "ALIVE":
+            log("{} exited after {:.0f}s".format(what, time.time() - t0))
+            return True
+        time.sleep(1)
+    log("[WARN] {} (pid {}) still running after {}s (timeout)".format(what, pid, timeout_s))
+    return False
+
+
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
     remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
     command = "bash {} {} {}".format(runner, mode, remote_log)
@@ -414,6 +435,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             r["port"], peers_json, nohup_log)
         pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
         reader_pids.append((r, pid))
+    # give readers a moment to boot before the health polling starts
+    if not dry:
+        time.sleep(1)
     # Step 2: wait for all readers to be healthy
     for r, peer in zip(plan["readers"], reader_peers):
         rn = get_node(cluster, r["node"])
@@ -450,16 +474,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
     duration = float(cfg.get("duration", 30))
     for w, pid in writer_pids:
-        wn = get_node(cluster, w["node"])
         if not dry and pid:
-            for _ in range(int(warmup_duration + duration) + 300):
-                alive = ssh_check_output(
-                    wn["ip"], wn,
-                    "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
-                    dry_run=dry)
-                if alive != "ALIVE":
-                    break
-                time.sleep(1)
+            wait_process_exit(cluster, w["node"], pid,
+                              "writer w{}".format(w["gid"]),
+                              int(warmup_duration + duration) + 300, dry_run=dry)
     # Step 5: shutdown readers and wait for their final logs
     for r, peer in zip(plan["readers"], reader_peers):
         rn = get_node(cluster, r["node"])
@@ -468,16 +486,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         if not dry:
             ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
     for r, pid in reader_pids:
-        rn = get_node(cluster, r["node"])
         if not dry and pid:
-            for _ in range(60):
-                alive = ssh_check_output(
-                    rn["ip"], rn,
-                    "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
-                    dry_run=dry)
-                if alive != "ALIVE":
-                    break
-                time.sleep(1)
+            wait_process_exit(cluster, r["node"], pid,
+                              "reader r{} (port {})".format(r["index"], r["port"]),
+                              60, dry_run=dry)
     # Step 6: remove empty .nohup redirect files (they capture script-level
     # errors only — empty on success). Non-empty ones are kept for diagnostics
     # and pulled back with the rest of the logs.
