@@ -309,12 +309,12 @@ def cmd_benchmark(args, store):
         bytes_per_op = batch_size * data_size
     else:
         bytes_per_op = data_size
-    total_bytes = len(results) * bytes_per_op
     ok_count = sum(1 for r in results if r[3] == "OK")
     fail_count = len(results) - ok_count
     total = len(results)
-    # latency statistics count successful samples only; failed ops still
-    # contribute to total/ok/fail counts but not to the latency percentiles
+    # throughput/bytes count successful operations only (failed ops moved no
+    # data); latency statistics also count successful samples only
+    total_bytes = ok_count * bytes_per_op
     lat_ok = [r[2] for r in results if r[3] == "OK"]
     latencies = sorted(lat_ok)
     summary = {
@@ -512,16 +512,22 @@ def _pipeline_writer(args, store, do_warmup=True):
     # reader/basic clients, so the orchestrator aggregation is uniform.
     keys_total = stats["keys_ok"] + stats["keys_fail"]
     lats = stats["lats"]
+    ok_bytes = stats["keys_ok"] * len(value)
+    busy_s = (sum(lats) / 1000.0) if lats else 0.0
     emit("SUMMARY", {
         "mode": "pipeline_writer_summary", "scenario": scenario,
         "work_mode": args.work_mode or "recall", "protocol": args.protocol,
         "writer_id": writer_id, "target_qps": target_qps,
         "traffic_mode": traffic_mode, "batch_size": batch_keys,
         "duration": duration, "warmup_duration": warmup_duration,
-        "total": keys_total, "bytes": keys_total * len(value),
+        "total": keys_total, "bytes": ok_bytes,
         "wall_s": duration, "ok": stats["keys_ok"], "fail": stats["keys_fail"],
         "qps": (keys_total / duration) if duration > 0 else 0.0,
         "fail_rate": (stats["keys_fail"] / keys_total) if keys_total else 0.0,
+        # interface throughput = successful bytes / sum of successful
+        # put_batch call durations (busy time, not wall clock)
+        "throughput_mb_s": (ok_bytes / busy_s / 1024.0 ** 2) if busy_s > 0 else 0.0,
+        "throughput_gb_s": (ok_bytes / busy_s / 1024.0 ** 3) if busy_s > 0 else 0.0,
         "min_ms": _percentile(sorted(lats), 0.0),
         "max_ms": _percentile(sorted(lats), 1.0),
         "avg_ms": (sum(lats) / len(lats)) if lats else 0.0,
@@ -717,12 +723,14 @@ def _pipeline_reader(args, store):
     # part of the measured metrics
     warmup_total = sum(1 for r in results if r[0] == "pipeline_warmup_read")
     measured = [r for r in results if r[0] != "pipeline_warmup_read"]
-    total_bytes = len(measured) * data_size
     ok_count = sum(1 for r in measured if r[3] == "OK")
     fail_count = len(measured) - ok_count
     total = len(measured)
+    # bytes/throughput count successful reads only
+    total_bytes = ok_count * data_size
     lat_ok = [r[2] for r in measured if r[3] == "OK"]
     latencies = sorted(lat_ok)
+    busy_s = (sum(lat_ok) / 1000.0) if lat_ok else 0.0
     queue_waits = [r[4] for r in results]
     summary = {
         "mode": "pipeline_reader", "scenario": args.scenario,
@@ -734,6 +742,10 @@ def _pipeline_reader(args, store):
         "ok": ok_count, "fail": fail_count,
         "qps": (total / meas_duration) if meas_duration > 0 else 0.0,
         "fail_rate": (fail_count / total) if total else 0.0,
+        # interface throughput = successful bytes / sum of successful store.get
+        # call durations (busy time, not wall clock)
+        "throughput_mb_s": (total_bytes / busy_s / 1024.0 ** 2) if busy_s > 0 else 0.0,
+        "throughput_gb_s": (total_bytes / busy_s / 1024.0 ** 3) if busy_s > 0 else 0.0,
         "min_ms": _percentile(latencies, 0.0),
         "max_ms": _percentile(latencies, 1.0),
         "avg_ms": (sum(lat_ok) / len(lat_ok)) if lat_ok else 0.0,
