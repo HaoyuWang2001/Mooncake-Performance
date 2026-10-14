@@ -43,7 +43,7 @@ cp -r mock/mooncake /tmp/opencode/mockvenv/lib/python3.*/site-packages/
 # 3. 本地测试集群配置中把 venv 指向 mockvenv（configs/cluster.json 的 venv 字段）
 {
   "venv": "/tmp/opencode/mockvenv/bin/python",
-  "nodes": { "node4": {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", ... } }
+  "nodes": { "writer_node1": {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", ... } }
 }
 ```
 

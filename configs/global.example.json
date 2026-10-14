@@ -2,7 +2,7 @@
   "_note": "本地测试版：TCP 协议、本地 master/metadata、buffer 降为 1GB。真机测试时改为正式参数。",
   "master_addr": "127.0.0.1:50051",
   "metadata_server": "http://127.0.0.1:9999/metadata",
-  "mooncake_store_nodes": ["node4"],
+  "mooncake_store_nodes": ["store1"],
   "protocol": {
     "ub": {
       "device": "bonding_dev_0"

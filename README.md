@@ -108,10 +108,12 @@ store 节点由 **global.json 的 `mooncake_store_nodes`**（cluster.json 节点
 store 节点列表），实际通信仍经 master 发现 store。
 
 - **部署语义**：writer/reader 各自在 client_nodes 的**每个节点**启动 count_per_node 个进程（节点列表
-  正序）；writer 全局编号按节点正序，reader 端口 9201..9200+池大小；n{N} = 参与 pipeline 的节点总数
-  （n1=node4、n2=node3+node4、n4=node1~node4）；
-- **负载语义**：总写入 QPS = base_qps × qps_multiple，由全部 writer（cpn × 节点数）均分（n2 双 writer
-  各半即原系统 "105/2" 语义，总量守恒；小数速率由窗口预算累积保证长期精确）；
+  正序）；writer 全局编号按节点正序，reader 端口 9201..9200+池大小；节点按角色命名（`writer_nodeX` /
+  `reader_nodeX`，见 cluster 配置）；**n{N} 表示 reader 侧参与节点数**（reader_node1..N），writer 数由
+  家族名固定：1w 家族仅 `writer_node1`（1 个 writer），2w 家族为 `writer_node1,2`（2 个 writer，
+  与 n 无关）；
+- **负载语义**：总写入 QPS = base_qps × qps_multiple，由全部 writer（cpn × 节点数）均分（2w 家族
+  双 writer 各半即原系统 "105/2" 语义，总量守恒；小数速率由窗口预算累积保证长期精确）；
 - **扇出语义**：每批写入后从 reader 池随机选 notify_count 个 reader，单次 HTTP 请求携带整批 key
   （读总量 = 写入批数 × notify_count）；
 - **warmup 语义**：正式测量前以相同部署形态运行 warmup.duration 秒（notify 带 warmup=1 标记，writer
@@ -245,10 +247,17 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 
 ```
 "nodes": {
-  "node4": { "ip": "141.61.84.151", "fabric_ip": "192.168.84.151", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" },
-  "node3": { "ip": "141.61.84.149", "fabric_ip": "192.168.84.149", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" }
+  "store1": { "ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" },
+  "node1": { "ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" },
+  "writer_node1": { "ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" },
+  "writer_node2": { "ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" },
+  "reader_node1": { "ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" },
+  "reader_node2": { "ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "root", "ssh_port": 22, "ssh_key": "" }
 }
 ```
+
+节点命名约定：`store1`（store 节点，basic `_local` 场景客户端）、`node1`（非 store 客户端，basic
+`_remote`）、`writer_nodeX` / `reader_nodeX`（pipeline 角色节点，n{N} 即 reader_node1..N）。
 
 ### 7.2 configs/global.json（业务无关全局超参）
 

@@ -11,7 +11,7 @@
     "operation": "put_batch",
     "notify_threads": 1,
     "client_nodes": [
-      "node4"
+      "writer_node1"
     ]
   },
   "reader": {
@@ -19,7 +19,7 @@
     "operation": "get",
     "num_threads": 1,
     "client_nodes": [
-      "node4"
+      "reader_node1"
     ]
   },
   "data_size": "512KB",

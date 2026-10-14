@@ -2,9 +2,58 @@
   "_note": "复制本文件为 cluster.json 并按实际环境修改后使用",
   "venv": "~/venvs/mooncake-benchmark/bin/python",
   "nodes": {
+    "store1": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
     "node1": {
-      "ip": "xxx.xxx.xxx.xxx",
-      "fabric_ip": "192.168.xxx.xxx",
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
+    "reader_node1": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
+    "reader_node2": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
+    "reader_node3": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
+    "reader_node4": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
+    "writer_node1": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    },
+    "writer_node2": {
+      "ip": "127.0.0.1",
+      "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
       "ssh_key": ""

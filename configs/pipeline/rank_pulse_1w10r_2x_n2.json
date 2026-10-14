@@ -2,7 +2,7 @@
   "scenario": "pipeline",
   "work_mode": "rank",
   "protocol": "ub",
-  "traffic_mode": "balanced",
+  "traffic_mode": "pulse",
   "base_qps": 105,
   "qps_multiple": 2,
   "notify_count": 10,
@@ -11,21 +11,16 @@
     "operation": "put_batch",
     "notify_threads": 1,
     "client_nodes": [
-      "node1",
-      "node2",
-      "node3",
-      "node4"
+      "writer_node1"
     ]
   },
   "reader": {
-    "count_per_node": 3,
+    "count_per_node": 5,
     "operation": "get",
     "num_threads": 1,
     "client_nodes": [
-      "node1",
-      "node2",
-      "node3",
-      "node4"
+      "reader_node1",
+      "reader_node2"
     ]
   },
   "data_size": "8MB",

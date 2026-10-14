@@ -2,7 +2,7 @@
   "scenario": "basic",
   "operation": "put_batch",
   "protocol": "ub",
-  "client_node": "node4",
+  "client_node": "store1",
   "key_prefix": "mc_bench",
   "key_count": 20,
   "data_size": "1MB",
