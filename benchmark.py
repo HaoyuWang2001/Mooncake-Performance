@@ -27,7 +27,7 @@ SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 DEFAULT_LD_PATH = ("/home/w00921547/stress-cluster-bench/lib/:/usr/local/cuda-12.9/lib64:"
                    "/usr/local/lib64:${LD_LIBRARY_PATH:-}")
-CSV_HEADER = [
+BASIC_CSV_HEADER = [
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_clients", "num_threads",
     "data_size", "key_count", "batch_size", "put_ratio", "duration", "warmup_duration",
@@ -38,6 +38,33 @@ CSV_HEADER = [
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
     "ok", "fail", "qps", "fail_rate",
 ]
+PIPELINE_CSV_HEADER = [
+    "config_name",
+    "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
+    "num_threads", "notify_threads",
+    "data_size", "batch_size", "duration", "warmup_duration",
+    "writer_count", "reader_count", "notify_count",
+    "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
+    "total", "success", "fail", "fail_rate",
+    "total_bytes", "wall_s", "qps",
+    "throughput_mb_s", "throughput_gb_s",
+    "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+]
+
+
+def collapse_config_name(rows):
+    """Fill config_name only on the first row of each group (previous-row
+    comparison), so repeated values stay blank for a grouped display."""
+    out = []
+    prev = None
+    for r in rows:
+        r2 = dict(r)
+        name = r2.get("config_name", "")
+        r2["config_name"] = name if name and name != prev else ""
+        if name:
+            prev = name
+        out.append(r2)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -106,12 +133,9 @@ def pipeline_plan(cfg):
 # --------------------------------------------------------------------------
 
 def apply_cli_overrides(cfg, args):
+    # --protocol has the highest priority and overrides the JSON config value
     if getattr(args, "protocol", None):
         cfg["protocol"] = args.protocol
-    if getattr(args, "key_count", None):
-        cfg["key_count"] = args.key_count
-    if getattr(args, "data_size", None):
-        cfg["data_size"] = args.data_size
 
 
 def scenario_paths(globals_cfg, ts, cfg_name):
@@ -127,27 +151,22 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
     return {
         "MC_MASTER_ADDR": globals_cfg.get("master_addr", ""),
         "MC_METADATA_SERVER": globals_cfg.get("metadata_server", ""),
-        "MC_PROTOCOL_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
+        "MC_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
         "MC_VENV": cluster.get("venv", ""),
         "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
         "MC_GLOBAL_SEGMENT_SIZE": str(globals_cfg.get("global_segment_size", 0)),
         "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
         "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
-        "MC_REMOTE_DIR": remote_dir,
         "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
-        "MC_REMOTE_RESULTS_DIR": globals_cfg.get("remote_results_dir", remote_dir + "/results"),
     }
 
 
 def base_scenario_params(cfg, work_mode, topology, primary_node_name):
     return {
         "MC_SCENARIO": cfg["scenario"],
-        "MC_SCENARIO_MODE": work_mode,
-        "MC_MODE": work_mode,
+        "MC_WORK_MODE": work_mode,
         "MC_OPERATION": cfg.get("operation", ""),
-        "MC_TOPOLOGY": topology,
         "MC_PROTOCOL": cfg["protocol"],
-        "MC_CLIENT_NODE": primary_node_name,
         "MC_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
         "MC_KEY_COUNT": str(cfg.get("key_count", 1000)),
         "MC_DATA_SIZE": cfg.get("data_size", "8MB"),
@@ -156,11 +175,10 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
         "MC_DURATION": str(cfg.get("duration", 0)),
         "MC_WARMUP_KEY_COUNT": str(cfg.get("warmup", {}).get("key_count", cfg.get("warmup_key_count", 100))),
         "MC_WARMUP_DATA_SIZE": cfg.get("warmup", {}).get("data_size", cfg.get("warmup_data_size", "1MB")),
-        "MC_PARAMS": json.dumps(cfg.get("params", [])),
     }
 
 
-def build_env_content(scenario_params, cluster_session, runtime, ld_path, fabric_ip):
+def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip):
     session = dict(cluster_session)
     session["MC_FABRIC_IP"] = fabric_ip
     lines = ["#!/usr/bin/env bash", ""]
@@ -171,21 +189,15 @@ def build_env_content(scenario_params, cluster_session, runtime, ld_path, fabric
     lines.append("")
     lines.append("# cluster / session")
     for k, v in sorted(session.items()):
-        if k in ("MC_PARAMS", "MC_PEERS") and isinstance(v, str) and v.startswith("{"):
-            lines.append("export {}='{}'".format(k, v))
-        else:
+        if v:
             lines.append('export {}="{}"'.format(k, v))
-    lines.append("")
-    lines.append("# runtime")
-    for k, v in sorted(runtime.items()):
-        lines.append('export {}="{}"'.format(k, v))
     lines.append("")
     lines.append('export LD_LIBRARY_PATH={}'.format(ld_path))
     lines.append("")
     return "\n".join(lines) + "\n"
 
 
-def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, runtime,
+def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    ld_path, remote_scripts, remote_log_dir, remote_runner, dry_run):
     """Generate a per-node env.sh (node-specific fabric_ip) and push the
     three orchestrator scripts to every involved node."""
@@ -194,7 +206,7 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, ru
         n = get_node(cluster, node_name)
         fab = n.get("fabric_ip", n.get("ip", ""))
         with open(env_sh_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(build_env_content(scenario_params, cluster_session, runtime, ld_path, fab))
+            f.write(build_env_content(scenario_params, cluster_session, ld_path, fab))
         log("env.sh written (node={}, fabric_ip={})".format(node_name, fab))
         run_ssh(n["ip"], n, "mkdir -p {} {}".format(
             remote_scripts, remote_log_dir), dry_run=dry_run)
@@ -229,7 +241,7 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
     remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
-    command = "bash {} {} 1 1 {}".format(runner, mode, remote_log)
+    command = "bash {} {} {}".format(runner, mode, remote_log)
     if extra:
         command += " " + extra
     run_ssh(host, node, command, dry_run=dry_run)
@@ -264,12 +276,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cfg_name, op, topology, cfg["protocol"], host))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
-    runtime = {
-        "MC_TIMESTAMP": ts,
-        "MC_LOG_DIR": remote_log_dir,
-    }
     ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
-    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, runtime,
+    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
     data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
     check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
@@ -294,15 +302,13 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                       extra="--scope full", dry_run=dry)
         name = "benchmark_c{}_t{}".format(c, t)
         remote_log = remote_log_path(remote_log_dir, cfg_name, name)
-        command = "bash {} benchmark {} {} {} --warmup {}".format(
-            remote_runner, c, t, remote_log, warmup)
+        command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
+            remote_runner, remote_log, c, t, warmup)
         run_ssh(host, node, command, dry_run=dry)
     # Final cleanup after all params complete
     run_stage(host, node, remote_runner,
               "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
     pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
-    if args.clean_up:
-        run_ssh(host, node, "rm -rf {}".format(remote_dir), dry_run=dry)
 
 
 # --------------------------------------------------------------------------
@@ -341,7 +347,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         cfg_name, op, topology, cfg["protocol"], host))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     scenario_params.update({
-        "MC_WORK_MODE": work_mode,
         "MC_WRITER_COUNT": str(len(plan["writers"])),
         "MC_READER_COUNT": str(len(plan["readers"])),
         "MC_TARGET_QPS": str(plan["per_writer_qps"]),
@@ -351,18 +356,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         "MC_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
         "MC_DURATION": str(cfg.get("duration", 30)),
         "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)),
+        # clear basic-only vars that are meaningless for pipeline
         "MC_OPERATION": "",
+        "MC_KEY_COUNT": "",
         "MC_WARMUP_KEY_COUNT": "",
         "MC_WARMUP_DATA_SIZE": "",
         "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
-    runtime = {
-        "MC_TIMESTAMP": ts,
-        "MC_LOG_DIR": remote_log_dir,
-    }
     ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
-    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session, runtime,
+    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
     data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
     check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
@@ -396,14 +399,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     peers_json = json.dumps(reader_peers)
     run_name = "benchmark_c1_t{}".format(reader_threads)
     base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
-    # Step 1: start all readers (one process per reader, unique port)
+    # Step 1: start all readers (one process per reader, unique port and id)
     reader_pids = []
     for r in plan["readers"]:
         rn = get_node(cluster, r["node"])
         merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
         nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
-        rcmd = "nohup bash {} pipeline 1 {} {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 > {} 2>&1 & echo $!".format(
-            remote_runner, reader_threads, merged_log,
+        rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 > {} 2>&1 & echo $!".format(
+            remote_runner, merged_log, r["index"], reader_threads,
             r["port"], peers_json, nohup_log)
         pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
         reader_pids.append((r, pid))
@@ -435,7 +438,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         wn = get_node(cluster, w["node"])
         merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
         nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
-        wcmd = "nohup bash {} pipeline 1 1 {} --role writer --client-id {} --peers '{}' --warmup {} > {} 2>&1 & echo $!".format(
+        wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} > {} 2>&1 & echo $!".format(
             remote_runner, merged_log, w["gid"], peers_json, warmup, nohup_log)
         pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
         writer_pids.append((w, pid))
@@ -489,8 +492,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     " ".join(nohup_files))
                 ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
     pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
-    if args.clean_up:
-        run_ssh(host, node, "rm -rf {}".format(remote_dir), dry_run=dry)
+
+
+def cleanup_cluster(cluster, globals_cfg, dry_run=False):
+    """Remove the remote test directory on every node in cluster.json."""
+    remote_dir = globals_cfg["remote_dir"]
+    for node_name in sorted(cluster.get("nodes", {})):
+        n = get_node(cluster, node_name)
+        log("cleanup {} : {}".format(node_name, remote_dir))
+        run_ssh(n["ip"], n, "rm -rf {}".format(remote_dir), dry_run=dry_run)
 
 
 # --------------------------------------------------------------------------
@@ -594,7 +604,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
                 op = (cfg.get("writer", {}) or {}).get("operation", "")
             else:
                 op = (cfg.get("reader", {}) or {}).get("operation", "")
+            w_cpn = (cfg.get("writer", {}) or {}).get("count_per_node", 1)
+            r_cpn = (cfg.get("reader", {}) or {}).get("count_per_node", 1)
             return {
+                "config_name": name,
                 "scenario": cfg["scenario"],
                 "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
                 "operation": op,
@@ -603,19 +616,15 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
                 "instance": instance,
                 "topology": ("local_node" if nodename == store_node else "remote_node") if nodename else "",
                 "protocol": cfg["protocol"],
-                "num_clients": "",
-                "num_threads": "",
+                "num_threads": plan["reader_threads"] if role == "reader" else "",
+                "notify_threads": plan["notify_threads"] if role == "writer" else "",
                 "data_size": cfg.get("data_size", ""),
-                "key_count": cfg.get("key_count", ""),
                 "batch_size": cfg.get("batch_size", ""),
-                "put_ratio": "",
                 "duration": cfg.get("duration", ""),
                 "warmup_duration": cfg.get("warmup", {}).get("duration", ""),
-                "writer_count": len(plan["writers"]),
-                "reader_count": len(plan["readers"]),
+                "writer_count": "N*{}".format(w_cpn),
+                "reader_count": "N*{}".format(r_cpn),
                 "notify_count": plan["notify_count"],
-                "notify_threads": plan["notify_threads"],
-                "reader_threads": plan["reader_threads"],
                 "base_qps": cfg.get("base_qps", ""),
                 "qps_multiple": cfg.get("qps_multiple", ""),
                 "target_qps": plan["total_qps"],
@@ -627,14 +636,16 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
             total = agg["total"]
             wall = duration if duration > 0 else agg["wall_s"]
             row["total"] = total
+            row["success"] = agg["ok"]
+            row["fail"] = agg["fail"]
+            row["fail_rate"] = agg["fail_rate"]
             row["total_bytes"] = int(total * bytes_per_op)
             row["wall_s"] = wall
+            row["qps"] = (total / wall) if wall > 0 else 0.0
             row["throughput_mb_s"] = (row["total_bytes"] / wall / 1e6) if wall > 0 else 0.0
             row["throughput_gb_s"] = (row["total_bytes"] / wall / 1e9) if wall > 0 else 0.0
-            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
-                      "ok", "fail", "fail_rate"):
+            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms"):
                 row[k] = agg[k]
-            row["qps"] = (total / wall) if wall > 0 else 0.0
             for k in ("wall_s", "throughput_mb_s", "throughput_gb_s",
                       "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
                       "qps", "fail_rate"):
@@ -648,6 +659,12 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
                 continue
             agg = parse_benchmark_log(f, op_filter="pipeline_write")
             row = base_row("writer", "w{}".format(w["gid"]), w["node"])
+            metrics_into(row, agg, batch_size * data_size_bytes)
+            rows.append(row)
+        # writer TOTAL row: all writers aggregated
+        if writer_files:
+            agg = parse_benchmark_log(list(writer_files.values()), op_filter="pipeline_write")
+            row = base_row("writer", "TOTAL", "")
             metrics_into(row, agg, batch_size * data_size_bytes)
             rows.append(row)
         for r in plan["readers"]:
@@ -718,11 +735,19 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path):
                 if v is not None and isinstance(v, float):
                     row[k] = round(v, 2)
             rows.append(row)
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    if is_pipeline:
+        write_rows = collapse_config_name(rows)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=PIPELINE_CSV_HEADER)
+            writer.writeheader()
+            for row in write_rows:
+                writer.writerow(row)
+    else:
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=BASIC_CSV_HEADER)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
     return rows
 
 
@@ -752,14 +777,13 @@ def parse_arguments(argv=None):
                         help="run all demo configs in the selected scenario category's demo/ subdir")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--protocol", default=None,
-                        help="override protocol (e.g. tcp) for local testing")
-    parser.add_argument("--key-count", type=int, default=None,
-                        help="override key_count for local scaled-down testing")
-    parser.add_argument("--data-size", default=None,
-                        help="override data_size (e.g. 1MB) for local scaled-down testing")
+    parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
+                        help="override protocol (tcp/rdma/ub); highest priority, "
+                             "overrides the JSON config value")
     parser.add_argument("--clean-up", action="store_true",
-                        help="after run, ssh delete all remote files (scripts, data, results)")
+                        help="remove the remote test directory on every node in "
+                             "cluster.json. Standalone: only cleanup and exit. "
+                             "Combined with --all/--demo/--config: cleanup after the run.")
     args = parser.parse_args(argv)
     if not os.path.exists(args.cluster):
         example = os.path.join(CONFIGS_DIR, "cluster.example.json")
@@ -777,8 +801,9 @@ def parse_arguments(argv=None):
     elif args.all or args.demo:
         if scenario_category is None:
             sys.exit("[ERROR] --all/--demo requires --scenario")
-    else:
-        sys.exit("[ERROR] provide --scenario with --all or --demo or --config")
+    elif not args.clean_up:
+        sys.exit("[ERROR] provide --scenario with --all or --demo or --config, "
+                 "or --clean-up for a standalone cluster cleanup")
     if args.scenario and not args.all and not args.config and not args.demo:
         sys.exit("[ERROR] --scenario provided but none of --all/--demo/--config is given")
     cfg_paths = []
@@ -804,6 +829,11 @@ def parse_arguments(argv=None):
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
     globals_cfg = load_json(args.global_cfg)
+    if not cfg_paths:
+        # standalone cleanup mode
+        cleanup_cluster(cluster, globals_cfg, dry_run=args.dry_run)
+        log("cleanup done")
+        return
     ts = time.strftime("%Y%m%d-%H%M")
     ts_dir = os.path.join(RESULTS_DIR, ts)
     n = 1
@@ -815,6 +845,7 @@ def main(args, cfg_paths):
         os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
         log("results root: {}".format(ts_dir))
     all_rows = []
+    categories = set()
     for cfg_path in cfg_paths:
         cfg = load_json(cfg_path)
         cfg["__cfg_path__"] = cfg_path
@@ -826,20 +857,40 @@ def main(args, cfg_paths):
                 run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
                 rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path)
-                all_rows.extend(rows)
+                if cfg.get("scenario") == "pipeline":
+                    categories.add("pipeline")
+                    # detail keeps only the aggregated writer/reader TOTAL rows
+                    all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
+                else:
+                    categories.add("basic")
+                    all_rows.extend(rows)
         except Exception as exc:
             log("[FAIL] scenario {}: {}".format(name, exc))
     if args.dry_run:
         log("dry-run complete, no artifacts written")
         return
+    if categories == {"pipeline"}:
+        detail_header = PIPELINE_CSV_HEADER
+        detail_rows = collapse_config_name(all_rows)
+    elif categories == {"basic"}:
+        detail_header = BASIC_CSV_HEADER
+        detail_rows = all_rows
+    else:
+        # mixed (not reachable through normal CLI): ordered union of both headers
+        detail_header = [c for c in BASIC_CSV_HEADER] + \
+                        [c for c in PIPELINE_CSV_HEADER if c not in BASIC_CSV_HEADER]
+        detail_rows = all_rows
     detail_csv = os.path.join(ts_dir, "benchmark_detail.csv")
     with open(detail_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        writer = csv.DictWriter(f, fieldnames=detail_header)
         writer.writeheader()
-        for row in all_rows:
+        for row in detail_rows:
             writer.writerow(row)
     log("detail -> {}".format(detail_csv))
     log("done. results in {}".format(ts_dir))
+    if args.clean_up:
+        cleanup_cluster(cluster, globals_cfg, dry_run=False)
+        log("cleanup done")
 
 
 if __name__ == "__main__":

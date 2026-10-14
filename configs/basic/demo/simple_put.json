@@ -5,8 +5,8 @@
   "client_node": "node4",
   "store_node": "node4",
   "key_prefix": "mc_bench",
-  "key_count": 1000,
-  "data_size": "8MB",
+  "key_count": 20,
+  "data_size": "1MB",
   "params": [
     {
       "num_clients": 1,
@@ -14,7 +14,7 @@
     }
   ],
   "warmup": {
-    "key_count": 100,
+    "key_count": 20,
     "data_size": "1MB",
     "num_clients": 1,
     "num_threads": 1

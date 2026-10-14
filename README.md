@@ -295,7 +295,11 @@ python benchmark.py --cluster configs/cluster.json --global configs/global.json 
     --scenario basic --config basic/put_local.json
 # 关闭预热；仅打印命令不执行
 python benchmark.py --scenario basic --config basic/put_local.json --no-warmup --dry-run
-# 运行后清理远程文件
+# 覆盖传输协议（tcp/rdma/ub，优先级最高，覆盖 JSON 配置值）
+python benchmark.py --scenario basic --config basic/put_local.json --protocol tcp
+# 独立清理：删除 cluster.json 全部节点的远程测试目录
+python benchmark.py --clean-up
+# 运行并追加清理阶段（与 --all/--demo/--config 共现时）
 python benchmark.py --scenario basic --config basic/get_local.json --clean-up
 ```
 
@@ -326,5 +330,5 @@ outputs/<时间戳，如 20261010-1308>/
 - `local_buffer_size` 需满足 `num_threads × data_size` 的并发占用，避免缓冲区不足；
 - `prepare-data` 阶段自动检测：每次运行前 ssh 检查 `value.bin` 的文件大小是否匹配当前
   `data_size`，匹配则跳过 prepare-data，避免重复生成浪费。种子变更或数据大小变更时自动触发重新生成；
-- `--clean-up` 参数：运行完成后 ssh 删除远程全部文件（`rm -rf $MC_REMOTE_DIR`），
-  本地结果已提前 scp 拉取不受影响。# Mooncake-Performance
+- `--clean-up` 参数：删除 cluster.json 中**全部节点**的远程测试目录（`rm -rf $MC_REMOTE_DIR`）。
+  独立使用（不带 --all/--demo/--config）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。

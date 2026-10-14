@@ -22,7 +22,7 @@
       "node4"
     ]
   },
-  "data_size": "3.5MB",
+  "data_size": "512KB",
   "store_node": "node4",
   "key_prefix": "mc_bench",
   "notify_pipeline": [

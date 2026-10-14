@@ -56,7 +56,7 @@ def make_store(args):
         global_segment_size=args.global_segment_size,
         local_buffer_size=args.local_buffer_size,
         protocol=args.protocol,
-        rdma_devices=args.device,
+        rdma_devices=args.ub_device,
         master_server_addr=args.master_addr,
         tenant_id=args.tenant_id,
     )
@@ -264,7 +264,7 @@ def _percentile(sorted_vals, p):
         return 0.0
     idx = int(round(p * (len(sorted_vals) - 1)))
     return sorted_vals[idx]
-def cmd_benchmark(args, store, num_clients, client_id, num_threads, do_warmup):
+def cmd_benchmark(args, store):
     value = load_value(args.remote_data_dir, args.scenario)
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     data_size = len(value)
@@ -277,29 +277,28 @@ def cmd_benchmark(args, store, num_clients, client_id, num_threads, do_warmup):
             sys.exit(1)
     else:
         duration = None
-    if do_warmup:
+    if args.warmup == "true":
         run_warmup(args, store)
-    n = len(keys)
-    start = (client_id - 1) * n // num_clients
-    end = client_id * n // num_clients
-    chunk = keys[start:end]
+    end_idx = args.key_end if args.key_end is not None else len(keys)
+    chunk = keys[args.key_start:end_idx]
     deadline = None
     if duration:
         deadline = time.time() + duration
     emit("META", {"mode": "benchmark", "scenario": args.scenario,
                   "operation": op, "protocol": args.protocol,
-                  "num_clients": num_clients, "client_id": client_id,
-                  "num_threads": num_threads, "warmup": bool(do_warmup),
+                  "client_id": args.client_id,
+                  "key_start": args.key_start, "key_end": end_idx,
+                  "num_threads": args.num_threads, "warmup": bool(args.warmup == "true"),
                   "chunk_keys": len(chunk), "start_ts": time.time()})
     results = []
     wall_t0 = time.perf_counter()
     if chunk:
         per_thread = []
-        for t in range(num_threads):
-            s = t * len(chunk) // num_threads
-            e = (t + 1) * len(chunk) // num_threads
+        for t in range(args.num_threads):
+            s = t * len(chunk) // args.num_threads
+            e = (t + 1) * len(chunk) // args.num_threads
             per_thread.append(chunk[s:e])
-        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+        with ThreadPoolExecutor(max_workers=args.num_threads) as pool:
             futures = [pool.submit(_run_thread, args, store, sub, value, results, deadline)
                        for sub in per_thread]
             for f in futures:
@@ -317,8 +316,9 @@ def cmd_benchmark(args, store, num_clients, client_id, num_threads, do_warmup):
     latencies = sorted(r[2] for r in results)
     summary = {
         "mode": "benchmark", "scenario": args.scenario, "operation": op,
-        "protocol": args.protocol, "num_clients": num_clients,
-        "client_id": client_id, "num_threads": num_threads,
+        "protocol": args.protocol, "client_id": args.client_id,
+        "key_start": args.key_start, "key_end": end_idx,
+        "num_threads": args.num_threads,
         "total": total, "bytes": total_bytes, "wall_s": wall_s,
         "ok": ok_count, "fail": fail_count,
         "qps": (total / wall_s) if wall_s > 0 else 0.0,
@@ -408,13 +408,14 @@ def _pipeline_writer(args, store, do_warmup=True):
     balanced = str(traffic_mode).lower() == "balanced"
     interval = (1.0 / target_qps) if (balanced and target_qps > 0) else 0.0
     emit("META", {"mode": "pipeline_writer", "scenario": scenario,
-                  "pipeline_mode": args.scenario_mode or "recall", "protocol": args.protocol,
+                  "work_mode": args.work_mode or "recall", "protocol": args.protocol,
                   "writer_id": writer_id, "target_qps": target_qps,
                   "traffic_mode": traffic_mode, "batch_size": batch_keys,
                   "duration": duration, "warmup_duration": warmup_duration,
                   "start_ts": time.time(),
                   "num_readers": len(readers), "notify_count": notify_count,
-                  "notify_threads": notify_threads})
+                  "notify_threads": notify_threads,
+                  "writer_count": args.writer_count, "reader_count": args.reader_count})
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     from concurrent.futures import ThreadPoolExecutor
@@ -572,13 +573,25 @@ def _reader_worker(args, store, queue, deadline, results):
         else:
             local.append(("pipeline_read", key, lat_ms, "MISS/MISMATCH"))
     results.extend(local)
-def cmd_pipeline(args, store, num_clients, client_id, num_threads, do_warmup):
+def cmd_pipeline(args, store):
     """Run pipeline (精排/召排) — dispatches to writer or reader based on --role."""
     role = args.role
     if role == "writer":
+        if not args.peers:
+            raise SystemExit("[ERROR] pipeline writer requires --peers "
+                             "(reader host/port list)")
+        try:
+            peer_list = json.loads(args.peers) if isinstance(args.peers, str) else args.peers
+        except ValueError:
+            raise SystemExit("[ERROR] --peers is not valid JSON: {}".format(args.peers))
+        readers = [p for p in peer_list if p.get("role") == "reader"]
+        if not readers:
+            raise SystemExit("[ERROR] --peers contains no reader entries")
         # warmup is a short same-deployment run handled inside the writer
-        _pipeline_writer(args, store, do_warmup=do_warmup)
+        _pipeline_writer(args, store, do_warmup=(args.warmup == "true"))
     elif role == "reader":
+        if args.listen_port is None:
+            raise SystemExit("[ERROR] pipeline reader requires --listen-port")
         _pipeline_reader(args, store)
     else:
         raise SystemExit("[ERROR] pipeline mode requires --role writer|reader")
@@ -593,7 +606,8 @@ def _pipeline_reader(args, store):
     my_port = args.listen_port
     my_port = args.listen_port
     emit("META", {"mode": "pipeline_reader", "scenario": args.scenario,
-                  "pipeline_mode": args.scenario_mode or "recall", "protocol": args.protocol,
+                  "work_mode": args.work_mode or "recall", "protocol": args.protocol,
+                  "client_id": args.client_id, "reader_count": args.reader_count,
                   "listen_port": my_port, "num_threads": num_threads,
                   "notify_pipeline": args.notify_pipeline,
                   "duration": duration, "start_ts": time.time()})
@@ -640,7 +654,8 @@ def _pipeline_reader(args, store):
     latencies = sorted(r[2] for r in measured)
     summary = {
         "mode": "pipeline_reader", "scenario": args.scenario,
-        "pipeline_mode": args.scenario_mode or "recall", "protocol": args.protocol,
+        "work_mode": args.work_mode or "recall", "protocol": args.protocol,
+        "client_id": args.client_id, "reader_count": args.reader_count,
         "num_threads": num_threads,
         "total": total, "bytes": total_bytes, "wall_s": wall_s,
         "warmup_total": warmup_total,
@@ -667,14 +682,10 @@ def _resolve_env(args):
         args.protocol = os.environ.get("MC_PROTOCOL", "tcp")
     if args.scenario is None:
         args.scenario = os.environ.get("MC_SCENARIO", None)
-    if args.scenario_mode is None:
-        args.scenario_mode = os.environ.get("MC_SCENARIO_MODE", None)
+    if args.work_mode is None:
+        args.work_mode = os.environ.get("MC_WORK_MODE", None)
     if args.operation is None:
         args.operation = os.environ.get("MC_OPERATION", None)
-    if args.topology is None:
-        args.topology = os.environ.get("MC_TOPOLOGY", None)
-    if args.client_node is None:
-        args.client_node = os.environ.get("MC_CLIENT_NODE", None)
     if args.key_prefix is None:
         args.key_prefix = os.environ.get("MC_KEY_PREFIX", "mc_bench")
     if args.key_count is None:
@@ -682,13 +693,15 @@ def _resolve_env(args):
     if args.data_size is None:
         args.data_size = os.environ.get("MC_DATA_SIZE", "8MB")
     if args.batch_size is None:
-        args.batch_size = int(os.environ.get("MC_BATCH_SIZE", "16"))
+        args.batch_size = int(os.environ.get("MC_BATCH_SIZE", "1"))
     if args.put_ratio is None:
         args.put_ratio = float(os.environ.get("MC_PUT_RATIO", "0.5"))
     if args.duration is None:
         dur = os.environ.get("MC_DURATION", None)
         if dur is not None:
             args.duration = float(dur)
+        else:
+            args.duration = 0.0
     if args.warmup_key_count is None:
         args.warmup_key_count = int(os.environ.get("MC_WARMUP_KEY_COUNT", "100"))
     if args.warmup_data_size is None:
@@ -701,12 +714,10 @@ def _resolve_env(args):
         args.metadata_server = os.environ.get("MC_METADATA_SERVER", None)
     if args.fabric_ip is None:
         args.fabric_ip = os.environ.get("MC_FABRIC_IP", None)
-    if args.device is None or args.device == "":
-        args.device = os.environ.get("MC_PROTOCOL_UB_DEVICE", "")
+    if args.ub_device is None or args.ub_device == "":
+        args.ub_device = os.environ.get("MC_UB_DEVICE", "")
     if args.remote_data_dir is None:
         args.remote_data_dir = os.environ.get("MC_REMOTE_DATA_DIR", "/tmp/mooncake_bench/data")
-    if args.remote_results_dir is None:
-        args.remote_results_dir = os.environ.get("MC_REMOTE_RESULTS_DIR", "/tmp/mooncake_bench/results")
     if args.local_buffer_size is None:
         args.local_buffer_size = int(os.environ.get("MC_LOCAL_BUFFER_SIZE", "1073741824"))
     if args.global_segment_size is None:
@@ -726,49 +737,45 @@ def _resolve_env(args):
     if args.notify_threads is None:
         args.notify_threads = int(os.environ.get("MC_NOTIFY_THREADS", "1"))
     if args.notify_pipeline is None:
-        raw = os.environ.get("MC_NOTIFY_PIPELINE", "getBuffer")
+        raw = os.environ.get("MC_NOTIFY_PIPELINE", "get")
         args.notify_pipeline = [s.strip() for s in raw.split(",")]
     if args.traffic_mode is None:
         args.traffic_mode = os.environ.get("MC_TRAFFIC_MODE", "pulse")
-    if args.duration is None:
-        args.duration = float(os.environ.get("MC_DURATION", "0"))
     if args.timeout is None:
         args.timeout = int(os.environ.get("MC_TIMEOUT", "300"))
-    if args.batch_size is None:
-        args.batch_size = int(os.environ.get("MC_BATCH_SIZE", "1"))
-    if args.role is None:
-        args.role = os.environ.get("MC_ROLE", None)
-    if args.listen_port is None:
-        args.listen_port = int(os.environ.get("MC_LISTEN_PORT", "9000"))
-    if args.peers is None:
-        raw = os.environ.get("MC_PEERS", None)
-        if raw:
-            args.peers = json.loads(raw)
 def main():
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
     parser.add_argument("--mode", required=True, choices=["prepare-data", "clean", "prepare-store", "benchmark", "pipeline"])
     parser.add_argument("--scope", default="key-prefix", choices=["key-prefix", "full"])
-    parser.add_argument("--num-clients", type=int, default=1)
-    parser.add_argument("--client-id", type=int, default=1)
-    parser.add_argument("--num-threads", type=int, default=1)
+    parser.add_argument("--client-id", type=int, default=1,
+                        help="process instance id within this test run "
+                             "(basic: 1..num-clients; pipeline writer: global writer id; "
+                             "pipeline reader: reader index)")
+    parser.add_argument("--key-start", type=int, default=0,
+                        help="first key index this process handles (basic benchmark)")
+    parser.add_argument("--key-end", type=int, default=None,
+                        help="one-past-last key index this process handles "
+                             "(basic benchmark; default = key_count, full range)")
+    parser.add_argument("--num-threads", type=int, default=1,
+                        help="worker threads: basic benchmark concurrency / "
+                             "pipeline reader queue consumers")
     parser.add_argument("--warmup", default="false", choices=["true", "false"])
     parser.add_argument("--scenario", default=None)
-    parser.add_argument("--scenario-mode", default=None)
+    parser.add_argument("--work-mode", default=None,
+                        help="business type (rank/recall) for pipeline; informational")
     parser.add_argument("--operation", default=None)
-    parser.add_argument("--topology", default=None)
     parser.add_argument("--protocol", default=None)
-    parser.add_argument("--client-node", default=None)
     parser.add_argument("--key-prefix", default=None)
     parser.add_argument("--key-count", type=int, default=None)
     parser.add_argument("--data-size", default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--put-ratio", type=float, default=None)
     parser.add_argument("--duration", type=float, default=None)
-    parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--timeout", type=int, default=None,
+                        help="pipeline reader lifetime in seconds")
     parser.add_argument("--warmup-key-count", type=int, default=None)
     parser.add_argument("--warmup-data-size", default=None)
     parser.add_argument("--warmup-duration", type=float, default=None)
-    parser.add_argument("--work-mode", default=None)
     parser.add_argument("--writer-count", type=int, default=None)
     parser.add_argument("--reader-count", type=int, default=None)
     parser.add_argument("--target-qps", type=float, default=None)
@@ -777,18 +784,21 @@ def main():
     parser.add_argument("--notify-pipeline", default=None)
     parser.add_argument("--traffic-mode", default=None)
     parser.add_argument("--role", default=None, choices=["writer", "reader"])
-    parser.add_argument("--listen-port", type=int, default=9000)
-    parser.add_argument("--peers", default=None)
+    parser.add_argument("--listen-port", type=int, default=None,
+                        help="pipeline reader HTTP notify port (required for reader)")
+    parser.add_argument("--peers", default=None,
+                        help="pipeline writer reader list JSON (required for writer)")
     parser.add_argument("--master-addr", default=None)
     parser.add_argument("--metadata-server", default=None)
     parser.add_argument("--fabric-ip", default=None)
     parser.add_argument("--local-buffer-size", type=int, default=None)
     parser.add_argument("--global-segment-size", type=int, default=None)
     parser.add_argument("--tenant-id", default=None)
-    parser.add_argument("--device", default=None)
+    parser.add_argument("--ub-device", default=None,
+                        help="ub protocol device name (passed to setup rdma_devices; "
+                             "empty for tcp/rdma)")
     parser.add_argument("--data-seed", type=int, default=None)
     parser.add_argument("--remote-data-dir", default=None)
-    parser.add_argument("--remote-results-dir", default=None)
     args = parser.parse_args()
     # Resolve env.sh fallbacks
     _resolve_env(args)
@@ -799,7 +809,7 @@ def main():
     if args.notify_pipeline is not None and isinstance(args.notify_pipeline, str):
         args.notify_pipeline = [s.strip() for s in args.notify_pipeline.split(",")]
     elif args.notify_pipeline is None:
-        args.notify_pipeline = ["getBuffer"]
+        args.notify_pipeline = ["get"]
     args.traffic_mode = str(args.traffic_mode)
     mode = args.mode
     if mode == "prepare-data":
@@ -812,11 +822,9 @@ def main():
         elif mode == "prepare-store":
             cmd_prepare_store(args, store)
         elif mode == "benchmark":
-            cmd_benchmark(args, store, args.num_clients, args.client_id,
-                          args.num_threads, args.warmup == "true")
+            cmd_benchmark(args, store)
         elif mode == "pipeline":
-            cmd_pipeline(args, store, args.num_clients, args.client_id,
-                        args.num_threads, args.warmup == "true")
+            cmd_pipeline(args, store)
         else:
             raise SystemExit("[ERROR] unknown mode: {}".format(mode))
     finally:
