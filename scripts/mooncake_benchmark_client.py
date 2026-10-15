@@ -1172,4 +1172,56 @@ def main():
     finally:
         store.close()
 if __name__ == "__main__":
-    main()
+    # ──────────────────────────────────────────────────────────────────────
+    # fast-exit wrapper（规避 mooncake store.so 退出阶段的 double-free）
+    #
+    # 背景/原因：mooncake 的 store.so 在 Python 解释器 shutdown 阶段存在
+    # 内存管理 bug——所有业务调用（setup / remove_all / close）都已成功返回
+    # success 之后，libc exit() 逆序执行 __cxa_atexit 注册的 C++/Go 静态析构
+    # 链（store.so 的 pybind11 对象、libetcd_wrapper.so 的 Go runtime 退出钩子、
+    # urma/ub 上下文等跨 .so 双重所有权资源）时，glibc 检测到 double free：
+    #   "double free or corruption (fasttop)" → abort() → SIGABRT
+    # 进程退出码被污染为 134（128+6），使本已成功的运行（rc 应为 0）被
+    # run_benchmark.sh 当作失败返回给编排器，进而误判 scenario FAIL。
+    #
+    # 规避原理：os._exit() 直接发起 exit 系统调用，内核立刻回收进程全部
+    # 资源，用户态清理链（atexit 处理器、C++/Go 静态析构、Python 终结化）
+    # 一行都不执行——触发崩溃的代码根本没有机会运行。一次性 CLI 进程
+    # 不需要这些清理，这是 CI 工具的标准做法。唯一代价是 os._exit 不会
+    # 自动 flush stdio，所以必须在调用前手动 flush（见下）。
+    #
+    # 若 Mooncake 上游修复该 bug：设置环境变量 MC_NORMAL_TEARDOWN=1 即可
+    # 恢复完整的解释器退出流程（含 teardown），无需改代码、无需重新部署；
+    # 或在代码审查时删除本 __main__ 块内 os._exit 分支、恢复 sys.exit(code)。
+    # ──────────────────────────────────────────────────────────────────────
+    code = 0
+    try:
+        main()
+    except SystemExit as e:
+        # 统一收口代码内所有 sys.exit(...)/raise SystemExit(...) 的退出：
+        # 业务退出码语义完全不变，仅从此单一出口离开。
+        if isinstance(e.code, int):
+            code = e.code                 # sys.exit(N) / argparse 的 SystemExit(2) 原样透传
+        elif e.code is None:
+            code = 0                      # sys.exit() 裸调用 → 0
+        else:
+            # SystemExit("消息") 的消息默认由解释器打印到 stderr；捕获后
+            # 必须自己打印，否则错误信息会静默丢失。
+            sys.stderr.write("{}\n".format(e.code))
+            code = 1
+    except BaseException:
+        # 意外异常：还原解释器默认行为（打印 traceback 后再退出），
+        # 只是退出码不再会被 teardown 崩溃污染。
+        import traceback
+        traceback.print_exc()
+        code = 1
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        # os._exit 不刷 stdio 缓冲，这里手动兜底保全 RESULT/SUMMARY 输出；
+        # 刷盘失败（如 broken pipe）也不改变退出码，保码优先。
+        pass
+    if os.environ.get("MC_NORMAL_TEARDOWN") != "1":
+        os._exit(code)
+    sys.exit(code)
