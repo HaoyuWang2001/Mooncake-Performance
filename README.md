@@ -80,7 +80,9 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16；mixed_batch 8 |
 | `put_ratio` | mixed 场景中 put 操作占比 | mixed 场景 0.5 |
 | `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
+| `target_qps` | 总限速 QPS（可选）：按该总 QPS 对操作均匀限速（跨 client×thread 均分，绝对时间表自纠偏） | 空/0：计数模式极速连发（现行为）；设置后用于低压时延对比 |
 
+- **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。

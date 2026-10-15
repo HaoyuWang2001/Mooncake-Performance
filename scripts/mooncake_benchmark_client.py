@@ -426,6 +426,20 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                     if time.time() >= deadline:
                         return
                     yield keys[j:j + batch_size]
+    # basic-mode pacing: if target_qps > 0, even-rate throttle across all
+    # client processes x threads (the orchestrator passes the per-client
+    # share; each thread then spaces ops by num_threads/share). Absolute
+    # schedule (self-correcting: an op that overruns its slot is followed
+    # immediately, so the long-run average stays exact). target_qps <= 0
+    # means free-run (current behaviour: count-based max-speed hammering).
+    per_client_qps = args.target_qps or 0.0
+    pacer_interval = (args.num_threads / per_client_qps) if per_client_qps > 0 else 0.0
+    pacer_next = time.time() + pacer_interval
+    def pace():
+        nonlocal pacer_next
+        if pacer_interval > 0:
+            pacer_next += pacer_interval
+            time.sleep(max(0.0, pacer_next - time.time()))
     if "/" in op:
         # mixed: operation = "<put_iface>/<get_iface>"; put/get alternate,
         # starting with put; each get reads a key the put side has written
@@ -445,6 +459,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                 group = put_keys[i * batch_size:(i + 1) * batch_size]
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[put_iface], group, value, ctx)
                 local.append(("put", group[0], lat, status))
+                pace()
             if i < n_get_units:
                 base = i * batch_size
                 gkeys = [put_keys[(base + k) % n_put] for k in range(batch_size)] if n_put else \
@@ -453,24 +468,29 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                 if gkeys:
                     lat, status = _run_iface(store, *GET_IFACE_DEFS[get_iface], gkeys, value, ctx)
                     local.append(("get", gkeys[0], lat, status))
+                    pace()
     elif op in PUT_IFACE_DEFS:
         if op in PUT_BATCH_IFACES:
             for group in groups_iter():
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
                 local.append((op, group[0], lat, status))
+                pace()
         else:
             for k in keys_iter():
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
                 local.append((op, k, lat, status))
+                pace()
     elif op in GET_IFACE_DEFS:
         if op in GET_BATCH_IFACES:
             for group in groups_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], group, value, ctx)
                 local.append((op, group[0], lat, status))
+                pace()
         else:
             for k in keys_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], [k], value, ctx)
                 local.append((op, k, lat, status))
+                pace()
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
     results.extend(local)
@@ -533,9 +553,10 @@ def cmd_benchmark(args, store):
                   "client_id": args.client_id,
                   "key_start": args.key_start, "key_end": end_idx,
                   "num_threads": args.num_threads, "warmup": bool(args.warmup == "true"),
-                  "chunk_keys": len(chunk), "start_ts": time.time()})
-    log("benchmark start (op={}, chunk_keys={}, threads={}, duration={})".format(
-        op, len(chunk), args.num_threads, duration or 0))
+                  "chunk_keys": len(chunk), "target_qps": args.target_qps or 0,
+                  "start_ts": time.time()})
+    log("benchmark start (op={}, chunk_keys={}, threads={}, duration={}, target_qps={})".format(
+        op, len(chunk), args.num_threads, duration or 0, args.target_qps or 0))
     results = []
     wall_t0 = time.perf_counter()
     try:
@@ -590,6 +611,7 @@ def cmd_benchmark(args, store):
         "p999_ms": _percentile(latencies, 0.999),
         "data_size": data_size,
         "key_count": len(keys),
+        "target_qps": args.target_qps or 0,
     }
     if op in PUT_BATCH_IFACES or op in GET_BATCH_IFACES:
         summary["batch_size"] = batch_size
@@ -1131,7 +1153,7 @@ def _resolve_env(args):
     if args.reader_count is None:
         args.reader_count = int(os.environ.get("MC_READER_COUNT", "1"))
     if args.target_qps is None:
-        args.target_qps = float(os.environ.get("MC_TARGET_QPS", "200"))
+        args.target_qps = float(os.environ.get("MC_TARGET_QPS", "0"))
     if args.notify_count is None:
         args.notify_count = int(os.environ.get("MC_NOTIFY_COUNT", "1"))
     if args.notify_threads is None:

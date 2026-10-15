@@ -438,8 +438,14 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_clean_before_run = op in PIPELINE_PUT_IFACES or "/" in op
-        log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}".format(
-            cfg_name, len(runs), warmup, need_clean_before_run))
+        # basic pacing: target_qps (total across the scenario) is optional;
+        # when set it is split per client process per combo. 0/absent keeps
+        # the current count-based max-speed behaviour.
+        total_target_qps = float(cfg.get("target_qps", 0) or 0)
+        if total_target_qps < 0:
+            raise RuntimeError("basic target_qps must be >= 0 (got {})".format(total_target_qps))
+        log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}, target_qps={}".format(
+            cfg_name, len(runs), warmup, need_clean_before_run, total_target_qps or "max-speed"))
         for c, t in runs:
             if need_clean_before_run:
                 run_stage(host, node, remote_runner,
@@ -449,6 +455,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             remote_log = remote_log_path(remote_log_dir, cfg_name, name)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
+            if total_target_qps > 0:
+                # basic target_qps is TOTAL across the scenario; each client
+                # process gets its share (client then divides across threads)
+                command += " --target-qps {}".format(total_target_qps / c)
             run_ssh(host, node, command, dry_run=dry)
         # Final cleanup after all params complete
         run_stage(host, node, remote_runner,
@@ -973,7 +983,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "reader_threads": "",
                 "base_qps": "",
                 "qps_multiple": "",
-                "target_qps": "",
+                "target_qps": cfg.get("target_qps", ""),
                 "notify_pipeline": "",
                 "traffic_mode": "",
             }
