@@ -215,15 +215,28 @@ GET_BATCH_IFACES = ("get_batch",)
 
 
 class _BufferCtx:
-    """ctypes buffer registered with the store for zero-copy interfaces
-    (put_from / get_into / get_buffer validation)."""
+    """Page-aligned buffer registered with the store for the zero-copy
+    interfaces (put_from / get_into).
+
+    Why mmap: URMA-based store.register_buffer() requires the registered
+    region to be page-aligned (base AND length). A plain ctypes heap array is
+    only 16-byte aligned (e.g. 0xfff9351fd010 ends in 0x010), and
+    urma_register_seg rejects it — the real cluster failed every zero-copy
+    scenario with urma_endpoint.cpp "Failed to register segment ...
+    Success [0]" (the errno print is bogus, it is a driver return failure).
+    mmap anonymous mapping guarantees a page-aligned base; the length is
+    rounded up to a page multiple as well. mooncake's own internal
+    allocation is aligned the same way (ub_allocator / staging pool 4096).
+    """
 
     def __init__(self, size):
         import ctypes
+        import mmap
         self.ctypes = ctypes
-        self.size = max(1, int(size))
-        self.buf = (ctypes.c_ubyte * self.size)()
-        self.ptr = ctypes.addressof(self.buf)
+        page = mmap.PAGESIZE
+        self.size = max(page, ((int(size) + page - 1) // page) * page)
+        self._mm = mmap.mmap(-1, self.size)
+        self.ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
         self.registered = False
 
     def setup(self, store):
@@ -240,6 +253,10 @@ class _BufferCtx:
             except Exception:
                 pass
             self.registered = False
+        try:
+            self._mm.close()
+        except Exception:
+            pass
 
     def write_value(self, value):
         self.ctypes.memmove(self.ptr, value, len(value))
@@ -439,11 +456,14 @@ def cmd_benchmark(args, store):
             sys.exit(1)
     else:
         duration = None
-    # zero-copy interfaces need a registered ctypes buffer
+    # zero-copy interfaces need a registered page-aligned buffer. get_buffer
+    # does NOT: it validates through the BufferHandle's own pointer, so it
+    # must not register anything (an unnecessary registration is both waste
+    # and an extra failure point).
     ctx = None
-    need_zero = (op in ("put_from", "get_into", "get_buffer")
+    need_zero = (op in ("put_from", "get_into")
                  or put_iface in ("put_from",)
-                 or get_iface in ("get_into", "get_buffer"))
+                 or get_iface in ("get_into",))
     if need_zero:
         ctx = _BufferCtx(data_size)
         if not ctx.setup(store):
@@ -907,7 +927,9 @@ def _pipeline_reader(args, store):
     if reader_op not in GET_HANDLERS:
         raise SystemExit("[ERROR] unsupported reader operation: {}".format(reader_op))
     ctx = None
-    if reader_op in ("get_into", "get_buffer"):
+    # only get_into needs a registered local buffer; get_buffer validates via
+    # the handle's own pointer and must not register anything
+    if reader_op in ("get_into",):
         ctx = _BufferCtx(parse_size(args.data_size))
         if not ctx.setup(store):
             raise SystemExit("[ERROR] reader register_buffer failed")

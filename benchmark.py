@@ -419,23 +419,27 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
-    data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
-    check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
-    data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
-    if data_status != "EXISTS":
-        run_stage(host, node, remote_runner,
-                  "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
-    run_stage(host, node, remote_runner,
-              "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-    if op in PIPELINE_GET_IFACES:
-        run_stage(host, node, remote_runner,
-                  "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
-    warmup = "false" if args.no_warmup else "true"
-    runs = build_runs(cfg)
-    need_clean_before_run = op in PIPELINE_PUT_IFACES or "/" in op
-    log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}".format(
-        cfg_name, len(runs), warmup, need_clean_before_run))
+    # The try MUST start here (before any stage): a failure in prepare-data /
+    # clean / prepare-store previously raised before the try block, so the
+    # FAIL path never pulled the remote logs — silent failure with no
+    # diagnosable evidence. All stages are now covered.
     try:
+        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
+        check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
+        data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
+        if data_status != "EXISTS":
+            run_stage(host, node, remote_runner,
+                      "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
+        run_stage(host, node, remote_runner,
+                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+        if op in PIPELINE_GET_IFACES:
+            run_stage(host, node, remote_runner,
+                      "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
+        warmup = "false" if args.no_warmup else "true"
+        runs = build_runs(cfg)
+        need_clean_before_run = op in PIPELINE_PUT_IFACES or "/" in op
+        log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}".format(
+            cfg_name, len(runs), warmup, need_clean_before_run))
         for c, t in runs:
             if need_clean_before_run:
                 run_stage(host, node, remote_runner,
@@ -1104,6 +1108,7 @@ def main(args, cfg_paths):
         log("results root: {}".format(ts_dir))
     all_rows = []
     categories = set()
+    failed_scenarios = []
     for cfg_path in cfg_paths:
         cfg = load_json(cfg_path)
         cfg["__cfg_path__"] = cfg_path
@@ -1125,6 +1130,7 @@ def main(args, cfg_paths):
                     all_rows.extend(rows)
         except Exception as exc:
             log("[FAIL] scenario {}: {}".format(name, exc))
+            failed_scenarios.append(name)
     if args.dry_run:
         log("dry-run complete, no artifacts written")
         return
@@ -1146,6 +1152,12 @@ def main(args, cfg_paths):
         for row in detail_rows:
             writer.writerow(row)
     log("detail -> {}".format(detail_csv))
+    if failed_scenarios:
+        log("SUMMARY: {} scenarios OK, {} FAILED: {}".format(
+            len(cfg_paths) - len(failed_scenarios), len(failed_scenarios),
+            ", ".join(failed_scenarios)))
+    else:
+        log("SUMMARY: all {} scenarios OK".format(len(cfg_paths)))
     log("done. results in {}".format(ts_dir))
     if args.clean_up:
         cleanup_cluster(cluster, globals_cfg, dry_run=False)
