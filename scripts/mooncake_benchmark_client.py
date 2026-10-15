@@ -61,6 +61,8 @@ def make_store(args):
     else:
         metadata_server = args.metadata_server or "http://{}/metadata".format(args.master_addr)
         master_addr = args.master_addr
+    mode = "etcd" if args.etcd_endpoints else "http"
+    log("connecting to mooncake master (mode={}, metadata_server={})".format(mode, metadata_server))
     store = MooncakeDistributedStore()
     ret = store.setup(
         local_hostname=local_hostname,
@@ -75,12 +77,29 @@ def make_store(args):
     if ret != 0:
         print("[ERROR] store.setup failed, ret={}".format(ret))
         sys.exit(1)
+    log("store.setup done (ret=0)")
     return store
 def emit(kind, payload):
     if isinstance(payload, dict):
         payload = json.dumps(payload)
     sys.stdout.write("{}\t{}\n".format(kind, payload))
     sys.stdout.flush()
+
+def log(msg):
+    """Timestamped free-text progress line (ignored by the orchestrator parser
+    which only reads RESULT/META/SUMMARY prefixes). Flushed immediately so the
+    output file is live while the process runs or hangs."""
+    sys.stdout.write("[{}] {}\n".format(time.strftime("%H:%M:%S"), msg))
+    sys.stdout.flush()
+
+def unbuffer_stdio():
+    """Make stdout/stderr line-buffered even when redirected to a file, so
+    progress lines appear in the log during execution (not only at exit)."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 # --------------------------------------------------------------------------
 
@@ -89,6 +108,8 @@ def emit(kind, payload):
 # --------------------------------------------------------------------------
 
 def cmd_prepare_data(args):
+    log("prepare-data start (scenario={}, data_size={}, key_count={})".format(
+        args.scenario, args.data_size, args.key_count))
     data_dir = scenario_data_dir(args.remote_data_dir, args.scenario)
     os.makedirs(data_dir, exist_ok=True)
     vpath = value_path(args.remote_data_dir, args.scenario)
@@ -101,10 +122,12 @@ def cmd_prepare_data(args):
     with open(kpath, "w", encoding="utf-8") as f:
         for k in keys:
             f.write(k + "\n")
+    log("prepare-data done (value={} bytes, keys={})".format(data_size, len(keys)))
     emit("META", {"mode": "prepare-data", "scenario": args.scenario,
                   "key_count": len(keys), "data_size_bytes": data_size,
                   "value_file": vpath, "keys_file": kpath, "seed": args.data_seed})
 def cmd_clean(args, store):
+    log("clean start (scope={}, scenario={})".format(args.scope, args.scenario))
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     scope = args.scope
     if scope == "full":
@@ -112,6 +135,7 @@ def cmd_clean(args, store):
         if ret < 0:
             print("[ERROR] clean full failed: remove_all returned {}".format(ret))
             sys.exit(1)
+        log("clean done (scope=full, cleared={})".format(max(ret, 0)))
         emit("META", {"mode": "clean", "scope": "full", "cleared": max(ret, 0)})
         return
     existence = store.batch_is_exist(keys)
@@ -135,6 +159,8 @@ def cmd_clean(args, store):
     emit("META", {"mode": "clean", "scope": "key-prefix",
                   "keys_attempted": len(keys), "keys_removed": removed,
                   "keys_not_found": not_found, "keys_failed": failed})
+    log("clean done (scope=key-prefix, removed={}, not_found={}, failed={})".format(
+        removed, not_found, failed))
     if failed_samples:
         print("[ERROR] clean failed for {} keys, samples:".format(failed))
         for s in failed_samples:
@@ -142,6 +168,7 @@ def cmd_clean(args, store):
     if failed > 0:
         sys.exit(1)
 def cmd_prepare_store(args, store):
+    log("prepare-store start (scenario={})".format(args.scenario))
     # Force release all segment space before preparing new data
     store.remove_all(force=True)
     value = load_value(args.remote_data_dir, args.scenario)
@@ -162,6 +189,8 @@ def cmd_prepare_store(args, store):
         written += len(chunk)
     emit("META", {"mode": "prepare-store", "scenario": args.scenario,
                   "total": len(keys), "existing": existing, "written": written})
+    log("prepare-store done (total={}, existing={}, written={})".format(
+        len(keys), existing, written))
 
 # --------------------------------------------------------------------------
 
@@ -426,6 +455,8 @@ def cmd_benchmark(args, store):
                   "key_start": args.key_start, "key_end": end_idx,
                   "num_threads": args.num_threads, "warmup": bool(args.warmup == "true"),
                   "chunk_keys": len(chunk), "start_ts": time.time()})
+    log("benchmark start (op={}, chunk_keys={}, threads={}, duration={})".format(
+        op, len(chunk), args.num_threads, duration or 0))
     results = []
     wall_t0 = time.perf_counter()
     try:
@@ -490,6 +521,8 @@ def cmd_benchmark(args, store):
     if duration:
         summary["duration"] = duration
     emit("SUMMARY", summary)
+    log("benchmark done (total={}, ok={}, fail={}, wall_s={:.3f})".format(
+        total, ok_count, fail_count, wall_s))
     for opname, k, lat, status in results:
         sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\n".format(opname, k, lat, status))
     sys.stdout.flush()
@@ -668,12 +701,18 @@ def _pipeline_writer(args, store, do_warmup=True):
                         time.sleep(sleep_t)
 
     if do_warmup and warmup_duration > 0:
+        log("pipeline writer warmup start (duration={}s, target_qps={})".format(
+            warmup_duration, target_qps))
         emit("META", {"mode": "pipeline_warmup_start", "writer_id": writer_id,
                       "duration": warmup_duration, "ts": time.time()})
         _run_phase(time.time() + warmup_duration, True)
         emit("META", {"mode": "pipeline_warmup_end", "writer_id": writer_id,
                       "ts": time.time()})
+        log("pipeline writer warmup done")
+    log("pipeline writer measured start (duration={}s)".format(duration))
     _run_phase(time.time() + duration, False)
+    log("pipeline writer measured done (keys_ok={}, keys_fail={})".format(
+        stats["keys_ok"], stats["keys_fail"]))
     sys.stdout.flush()
     if ctx is not None:
         ctx.teardown(store)
@@ -894,6 +933,8 @@ def _pipeline_reader(args, store):
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     emit("META", {"mode": "pipeline_reader_ready", "port": my_port, "ts": time.time()})
+    log("pipeline reader ready (port={}, operation={}, threads={})".format(
+        my_port, reader_op, num_threads))
     # Start worker threads
     with ThreadPoolExecutor(max_workers=num_threads) as pool:
         worker_futures = [pool.submit(_reader_worker, args, store, queue, deadline + exit_grace, results, ctx)
@@ -909,6 +950,7 @@ def _pipeline_reader(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
+    log("pipeline reader done (items={})".format(len(results)))
     if ctx is not None:
         ctx.teardown(store)
     data_size = parse_size(args.data_size)
@@ -1027,6 +1069,7 @@ def _resolve_env(args):
     if args.timeout is None:
         args.timeout = int(os.environ.get("MC_TIMEOUT", "300"))
 def main():
+    unbuffer_stdio()
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
     parser.add_argument("--mode", required=True, choices=["prepare-data", "clean", "prepare-store", "benchmark", "pipeline"])
     parser.add_argument("--scope", default="key-prefix", choices=["key-prefix", "full"])

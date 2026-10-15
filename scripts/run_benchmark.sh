@@ -63,9 +63,6 @@ fi
 PYTHON="${MC_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
-LOG_DIR="$LOG_FILE.d"
-rm -rf "$LOG_DIR"
-mkdir -p "$LOG_DIR"
 
 if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   KEY_COUNT="${MC_KEY_COUNT:-0}"
@@ -73,10 +70,15 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
     echo "[FATAL] MC_KEY_COUNT=$KEY_COUNT < num-clients=$NUM_CLIENTS" >&2
     exit 1
   fi
+  LOG_DIR="$LOG_FILE.d"
+  rm -rf "$LOG_DIR"
+  mkdir -p "$LOG_DIR"
   RC=0
   for i in $(seq 1 "$NUM_CLIENTS"); do
     START=$(( (i - 1) * KEY_COUNT / NUM_CLIENTS ))
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
+    # per-client ylt easylog file (absolute path; merged below with headers)
+    MC_YLT_LOG_PATH="$LOG_DIR/client.$i.ylt.log" \
     "$PYTHON" "$CLIENT" \
       --mode "$MODE" \
       --client-id "$i" --key-start "$START" --key-end "$END" \
@@ -86,11 +88,26 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   for pid in $(jobs -p); do
     wait "$pid" || RC=1
   done
+  # merge per-client logs + ylt easylog into the final LOG_FILE with headers
+  : > "$LOG_FILE"
+  for f in "$LOG_DIR"/client.*.log; do
+    [ -f "$f" ] || continue
+    cat "$f" >> "$LOG_FILE"
+  done
+  : > "$LOG_FILE.ylt.log"
+  for f in "$LOG_DIR"/client.*.ylt.log; do
+    [ -f "$f" ] || continue
+    echo "===== $(basename "$f") =====" >> "$LOG_FILE.ylt.log"
+    cat "$f" >> "$LOG_FILE.ylt.log"
+  done
+  rm -rf "$LOG_DIR"
 else
+  # single-process/stage mode: write DIRECTLY to LOG_FILE so the output is
+  # live while the process runs (Python output is line-buffered); ylt
+  # easylog -> absolute path next to the log
+  MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
   "$PYTHON" "$CLIENT" --mode "$MODE" "${ARGS[@]}" \
-    > "$LOG_DIR/client.1.log" 2>&1
+    > "$LOG_FILE" 2>&1
   RC=$?
 fi
-cat "$LOG_DIR"/client.*.log > "$LOG_FILE"
-rm -rf "$LOG_DIR"
 exit "$RC"

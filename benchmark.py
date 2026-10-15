@@ -164,6 +164,12 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
         "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
         "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
+        # ylt easylog (coro_rpc): level configurable, rotation capped so long
+        # runs cannot fill the disk; the path itself is set per-client by
+        # run_benchmark.sh (absolute, alongside the client log)
+        "MC_YLT_LOG_LEVEL": globals_cfg.get("ylt_log_level", "info"),
+        "MC_YLT_LOG_MAX_FILE_SIZE": "52428800",
+        "MC_YLT_LOG_MAX_FILES": "3",
     }
     if etcd_endpoints:
         # etcd mode: master_addr/metadata_server are mutually exclusive and not

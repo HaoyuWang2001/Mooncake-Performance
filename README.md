@@ -290,6 +290,7 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 | local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size |
 | global_segment_size | 本 client 贡献的存储大小，纯客户端设 0 |
 | tenant_id | 租户标识，默认 "default" |
+| ylt_log_level | C++ ylt easylog（coro_rpc 连接事件）日志级别：`warn`/`info`/`debug`，默认 `info` |
 | data_seed | 数据生成固定随机种子 |
 | remote_dir | 服务器端脚本/配置根目录 |
 | remote_data_dir / remote_results_dir | 服务器端数据 / 结果目录 |
@@ -298,7 +299,44 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 > 编排器启动时校验：混配或全空都会报错终止。etcd 模式下 `MC_MASTER_ADDR`/`MC_METADATA_SERVER`
 > 不导出到 env.sh（客户端只收到 `MC_ETCD_ENDPOINTS`）。
 
-### 7.3 configs/<category>/<scenario>.json（场景配置）
+### 7.3 日志体系
+
+客户端进程有三条日志流，落点如下（`<LOG_FILE>` 为对应 stage 的 client 日志，随
+`cfg_name.*` glob 自动拉回本地 `outputs/<ts>/logs/<cfg>/`）：
+
+| 日志流 | 承载内容 | 落点 |
+|---|---|---|
+| Python stdout（`log()`/`emit()`/RESULT） | 进度打点、META/SUMMARY/RESULT | 合并进 `<LOG_FILE>`（与 C++ stderr 按时间交织） |
+| C++ glog（`LOG()`/`MC_LOG()`） | setup 期连接证据：`ConnectToCvmSubmasters`、`connected to submaster`、`Loaded partition routing`、`Version mismatch`、`MountSegment` 等 | **stderr**，被 `2>&1` 合入 `<LOG_FILE>` |
+| C++ ylt easylog（coro_rpc 内部） | 连接池事件、建连失败细节（connect/fail/refuse/timeout） | `<LOG_FILE>.ylt.log`（绝对路径，multi-client 带 `===== client.N =====` 分节头） |
+
+关键说明：
+
+- **Python 输出实时可见**：客户端启动即把 stdout/stderr 设为行缓冲，重定向到文件也逐行落盘；
+  关键阶段（连接 master、setup 完成、clean/prepare 起止、pipeline 各阶段）都有带时间戳的
+  `[HH:MM:SS]` 进度行——挂死时最后一行即挂点（如 `connecting to mooncake master (...)` 表示
+  卡在 setup/建连，`clean start (scope=full)` 之后无 `clean done` 表示卡在 `remove_all`）。
+- **glog 级别不可从 Python 调整**：`store.so` 加载路径不调用 `InitGoogleLogging`，未初始化时
+  glog 全部输出到 stderr 且 `GLOG_v`/`minloglevel` 环境变量不生效——只能通过捕获 stderr 获取。
+  若其他库恰好初始化过 glog，日志会改写到 `/tmp/python3.<host>.<user>.log.*`，可用
+  `ls /tmp/python*.log*` 排除。
+- **ylt easylog 配置**：级别经 `MC_YLT_LOG_LEVEL`（global.json `ylt_log_level`，默认 `info`），
+  路径由 run_benchmark.sh 强制设为绝对路径（修复默认相对 `logs/rpc.log` 随 cwd 丢失的问题）；
+  轮转上限固定 `MC_YLT_LOG_MAX_FILE_SIZE=50MB`、`MC_YLT_LOG_MAX_FILES=3`。
+- **MC_LOG 异步刷盘**：C++ `MC_LOG` 走 ring buffer + 后台线程 + 1s 周期 flush，`kill -9` 会丢
+  最后一秒日志。排查挂死时先 `kill -TERM`（atexit flush）或等待 ≥1s 再读文件；编排器 FAIL
+  清理路径已按 `kill → sleep 1 → kill -9` 顺序执行。
+
+诊断 grep：
+
+```bash
+# glog 侧：连接建立证据
+grep -E "ConnectToCvmSubmasters|connected to submaster|Loaded partition routing|Version mismatch" <LOG_FILE>
+# ylt 侧：coro_rpc 建连细节（连接池对 submaster 的建连失败在这）
+grep -iE "connect|fail|refuse|timeout" <LOG_FILE>.ylt.log
+```
+
+### 7.4 configs/<category>/<scenario>.json（场景配置）
 
 场景配置按类别放在子目录中：
 
@@ -324,7 +362,7 @@ basic 场景字段：
 
 pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store_node）。
 
-### 7.4 测试阶段（--mode）
+### 7.5 测试阶段（--mode）
 
 - `prepare-data`：按固定种子生成数据文件并持久化
 - `clean`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`，失败即报错退出，无回退
@@ -332,7 +370,7 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 - `benchmark`：`--warmup true|false`，预热在正式测量前执行小规模运行
 - `pipeline`：生产-消费 pipeline 模式（精排/召排，按 `--role writer|reader` 分派）
 
-### 7.5 各操作类型完整流程
+### 7.6 各操作类型完整流程
 
 - `put / put_batch`：prepare-data → clean → warmup → benchmark
 - `get / get_batch`：prepare-data → prepare-store（先检查数据是否存在）→ warmup → benchmark
@@ -340,7 +378,7 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 
 `duration` 仅改变 benchmark 阶段 key 的遍历方式（跑一遍结束 vs 循环到截止），不改变上述阶段流程。
 
-### 7.6 key 格式
+### 7.7 key 格式
 
 正式数据：`mc_bench*{scenario}*{index:08d}`，例：`mc_bench*basic*00000000`（basic 各场景共享同一
 key 空间，靠 clean 串行隔离）。
