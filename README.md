@@ -282,8 +282,9 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 
 | 字段 | 说明 |
 | --- | --- |
-| etcd_endpoints | **etcd 模式**：经 etcd 连接 mooncake master 的完整 URI，如 `etcd://192.168.84.151:2379;192.168.84.149:2379`（分号分隔多节点）。非空时 `master_addr`/`metadata_server` 必须留空，客户端把该 URI 原样传给 `setup` 的 `metadata_server` 与 `master_server_addr` |
-| master_addr | **http 模式**：mooncake_master rpc 地址（必须用内网高性能网卡 IP），如 `192.168.84.151:50051`；`etcd_endpoints` 为空时必须设置 |
+| master_type | **必填**，选择连接 mooncake master 的方式：`"etcd"`（走 etcd_endpoints）或 `"http"`（走 master_addr） |
+| etcd_endpoints | **etcd 模式**：经 etcd 连接 master 的完整 URI，如 `etcd://192.168.84.151:2379;192.168.84.149:2379`（分号分隔多节点）。`master_type="etcd"` 时必须非空；客户端把该 URI 原样传给 `setup` 的 `metadata_server` 与 `master_server_addr` |
+| master_addr | **http 模式**：mooncake_master rpc 地址（必须用内网高性能网卡 IP），如 `192.168.84.151:50051`；`master_type="http"` 时必须非空 |
 | metadata_server | **http 模式**：`setup` 的 metadata_server 参数，如 `http://192.168.84.151:9999/metadata`（master 的 HTTP 元数据端口，必须用内网 IP）；可省略，默认 `http://{master_addr}/metadata` |
 | protocol.ub.device | ub 传输使用的设备名（如 `bonding_dev_0`）；tcp 场景不使用 |
 | mooncake_store_nodes | store 节点名列表（取自 cluster.json 的 nodes），可多个；仅用于指标行 local/remote 拓扑标注 |
@@ -295,9 +296,11 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 | remote_dir | 服务器端脚本/配置根目录 |
 | remote_data_dir / remote_results_dir | 服务器端数据 / 结果目录 |
 
-> **master 连接方式互斥**：`etcd_endpoints` 与 `master_addr`/`metadata_server` 二选一。
-> 编排器启动时校验：混配或全空都会报错终止。etcd 模式下 `MC_MASTER_ADDR`/`MC_METADATA_SERVER`
-> 不导出到 env.sh（客户端只收到 `MC_ETCD_ENDPOINTS`）。
+> **master 连接方式由 `master_type` 显式选择**（必填，`"http"` 或 `"etcd"`）。两套地址
+> （`etcd_endpoints` 与 `master_addr`/`metadata_server`）可以同时填写，只有选中的一套生效，
+> 未选中仅存档。etcd 模式下 env.sh 只导出 `MC_MASTER_TYPE`/`MC_ETCD_ENDPOINTS`（客户端
+> 把同一 etcd URI 传给 setup 两参数）；http 模式只导出 `MC_MASTER_TYPE`/`MC_MASTER_ADDR`/
+> `MC_METADATA_SERVER`。
 
 ### 7.3 日志体系
 

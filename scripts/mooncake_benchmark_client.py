@@ -48,20 +48,27 @@ def load_value(remote_data_dir, scenario):
 def make_store(args):
     from mooncake.store import MooncakeDistributedStore
     local_hostname = args.fabric_ip
-    if args.etcd_endpoints:
+    master_type = args.master_type or ""
+    if master_type not in ("http", "etcd"):
+        print("[ERROR] master_type not specified: pass --master-type http|etcd "
+              "or set MC_MASTER_TYPE")
+        sys.exit(1)
+    if master_type == "etcd":
         # etcd mode: the same etcd URI serves as both metadata_server and
-        # master_server_addr; http master_addr/metadata_server are mutually
-        # exclusive with it
-        if args.master_addr or args.metadata_server:
-            print("[ERROR] etcd_endpoints is mutually exclusive with "
-                  "master_addr/metadata_server (etcd mode must leave them empty)")
+        # master_server_addr; master_addr/metadata_server (if set) are dormant
+        if not args.etcd_endpoints:
+            print("[ERROR] master_type=etcd requires --etcd-endpoints "
+                  "(e.g. etcd://ip:2379;ip:2379)")
             sys.exit(1)
         metadata_server = args.etcd_endpoints
         master_addr = args.etcd_endpoints
     else:
+        if not args.master_addr:
+            print("[ERROR] master_type=http requires --master-addr")
+            sys.exit(1)
         metadata_server = args.metadata_server or "http://{}/metadata".format(args.master_addr)
         master_addr = args.master_addr
-    mode = "etcd" if args.etcd_endpoints else "http"
+    mode = master_type
     log("connecting to mooncake master (mode={}, metadata_server={})".format(mode, metadata_server))
     store = MooncakeDistributedStore()
     ret = store.setup(
@@ -1037,6 +1044,8 @@ def _resolve_env(args):
         args.metadata_server = os.environ.get("MC_METADATA_SERVER", None)
     if args.etcd_endpoints is None:
         args.etcd_endpoints = os.environ.get("MC_ETCD_ENDPOINTS", None)
+    if args.master_type is None:
+        args.master_type = os.environ.get("MC_MASTER_TYPE", None)
     if args.fabric_ip is None:
         args.fabric_ip = os.environ.get("MC_FABRIC_IP", None)
     if args.ub_device is None or args.ub_device == "":
@@ -1118,8 +1127,11 @@ def main():
     parser.add_argument("--metadata-server", default=None)
     parser.add_argument("--etcd-endpoints", default=None,
                         help="connect to mooncake master via etcd: "
-                             "etcd://ip:2379;ip:2379;... (mutually exclusive with "
-                             "--master-addr/--metadata-server)")
+                             "etcd://ip:2379;ip:2379;... (used when --master-type=etcd)")
+    parser.add_argument("--master-type", default=None, choices=["http", "etcd"],
+                        help="how to connect to the mooncake master (required): "
+                             "http (master_addr + metadata_server) or etcd "
+                             "(etcd_endpoints)")
     parser.add_argument("--fabric-ip", default=None)
     parser.add_argument("--local-buffer-size", type=int, default=None)
     parser.add_argument("--global-segment-size", type=int, default=None)

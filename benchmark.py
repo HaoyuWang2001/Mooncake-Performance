@@ -155,8 +155,9 @@ def scenario_paths(globals_cfg, ts, cfg_name):
 
 
 def build_cluster_session(cluster, globals_cfg, remote_dir):
-    etcd_endpoints = globals_cfg.get("etcd_endpoints", "")
+    master_type = globals_cfg.get("master_type", "") or ""
     session = {
+        "MC_MASTER_TYPE": master_type,
         "MC_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
         "MC_VENV": cluster.get("venv", ""),
         "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
@@ -171,35 +172,40 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_YLT_LOG_MAX_FILE_SIZE": "52428800",
         "MC_YLT_LOG_MAX_FILES": "3",
     }
-    if etcd_endpoints:
-        # etcd mode: master_addr/metadata_server are mutually exclusive and not
-        # exported; the client passes the same etcd URI to both setup params
-        session["MC_ETCD_ENDPOINTS"] = etcd_endpoints
+    if master_type == "etcd":
+        # etcd mode: only the etcd URI is exported; the client passes it to
+        # both setup params. master_addr/metadata_server (if set) are dormant.
+        session["MC_ETCD_ENDPOINTS"] = globals_cfg.get("etcd_endpoints", "")
     else:
+        # http mode: only rpc master + http metadata are exported
         session["MC_MASTER_ADDR"] = globals_cfg.get("master_addr", "")
         session["MC_METADATA_SERVER"] = globals_cfg.get("metadata_server", "")
     return session
 
 
 def _validate_master_mode(globals_cfg):
-    """etcd and http master connections are mutually exclusive; exactly one
-    mode must be configured."""
-    etcd = globals_cfg.get("etcd_endpoints", "") or ""
-    master = globals_cfg.get("master_addr", "") or ""
-    metadata = globals_cfg.get("metadata_server", "") or ""
-    if etcd:
-        if master or metadata:
+    """master_type selects how the client connects to the mooncake master.
+    Required field: 'http' (master_addr + metadata_server) or 'etcd'
+    (etcd_endpoints). Both address sets may coexist in the config; only the
+    selected one takes effect."""
+    master_type = globals_cfg.get("master_type", "") or ""
+    if not master_type:
+        raise RuntimeError(
+            "global config requires 'master_type' = \"http\" or \"etcd\" "
+            "to select the master connection mode (configs/global.json)")
+    if master_type not in ("http", "etcd"):
+        raise RuntimeError(
+            "invalid master_type {!r}: must be \"http\" or \"etcd\"".format(master_type))
+    if master_type == "etcd":
+        if not (globals_cfg.get("etcd_endpoints", "") or ""):
             raise RuntimeError(
-                "etcd mode is mutually exclusive with master_addr/metadata_server: "
-                "set 'etcd_endpoints' and leave the other two empty "
-                "(got etcd_endpoints={!r}, master_addr={!r}, metadata_server={!r})".format(
-                    etcd, master, metadata))
+                "master_type=etcd requires non-empty 'etcd_endpoints' "
+                "(e.g. \"etcd://ip:2379;ip:2379\") in configs/global.json")
     else:
-        if not master:
+        if not (globals_cfg.get("master_addr", "") or ""):
             raise RuntimeError(
-                "master connection not configured: set 'etcd_endpoints' "
-                "(etcd mode) or 'master_addr' (http mode) in {}".format(
-                    "configs/global.json"))
+                "master_type=http requires non-empty 'master_addr' "
+                "in configs/global.json")
 
 
 def base_scenario_params(cfg, work_mode, topology, primary_node_name):

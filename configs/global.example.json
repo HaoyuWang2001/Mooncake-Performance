@@ -1,6 +1,7 @@
 {
-  "_note": "两种连接 master 的方式互斥：etcd 模式（设 etcd_endpoints，master_addr/metadata_server 留空）或 http 模式（etcd_endpoints 留空，设 master_addr，metadata_server 可省略默认 http://{master_addr}/metadata）。本地测试用 http + mock。",
-  "etcd_endpoints": "",
+  "_note": "master_type（必填）选择连接 mooncake master 的方式：\"etcd\"（走 etcd_endpoints，同一 etcd:// URI 传给 setup 的 metadata_server 与 master_server_addr）或 \"http\"（走 master_addr，metadata_server 可省略默认 http://{master_addr}/metadata）。两套地址可同时填写，只有 master_type 选中的一套生效。",
+  "master_type": "http",
+  "etcd_endpoints": "etcd://192.168.84.151:2379;192.168.84.149:2379",
   "master_addr": "127.0.0.1:50051",
   "metadata_server": "http://127.0.0.1:9999/metadata",
   "ylt_log_level": "info",
