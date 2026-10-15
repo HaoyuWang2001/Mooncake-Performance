@@ -265,38 +265,85 @@ class _BufferCtx:
         return self.ctypes.string_at(self.ptr, n)
 
 
-def _put_iface(store, keys, value, ctx):
-    ret = store.put(keys[0], value)
-    return "OK" if ret == 0 else "ERR:{}".format(ret)
+class _NoCall(Exception):
+    """Raised by make_call when an interface call cannot be produced at all
+    (e.g. a required registered buffer is missing). No store invocation is
+    attempted, so there is no timed region."""
 
 
-def _put_batch_iface(store, keys, value, ctx):
-    ret = store.put_batch(keys, [value] * len(keys))
-    return "OK" if ret == 0 else "ERR:{}".format(ret)
+def _run_iface(store, make_call, check, keys, value, ctx):
+    """Run one interface operation with the timed region containing ONLY the
+    store interface call.
+
+    - make_call(store, keys, value, ctx): untimed argument preparation that
+      returns a callable performing the single store invocation (e.g. building
+      the batch values list, filling the zero-copy buffer).
+    - check(raw, keys, value, ctx): untimed result validation / status
+      derivation (OK / MISS / MISMATCH / ERR).
+
+    Latency therefore measures the raw interface invocation duration only.
+    """
+    try:
+        call = make_call(store, keys, value, ctx)
+    except _NoCall as exc:
+        return 0.0, "ERR:{}".format(exc)
+    t0 = time.perf_counter()
+    try:
+        raw = call()
+    except Exception as exc:
+        lat_ms = (time.perf_counter() - t0) * 1000.0
+        return lat_ms, "ERR:{}".format(type(exc).__name__)
+    lat_ms = (time.perf_counter() - t0) * 1000.0
+    return lat_ms, check(raw, keys, value, ctx)
 
 
-def _put_from_iface(store, keys, value, ctx):
+# --- put family -----------------------------------------------------------
+
+def _put_make_call(store, keys, value, ctx):
+    key, val = keys[0], value
+    return lambda: store.put(key, val)
+
+
+def _put_batch_make_call(store, keys, value, ctx):
+    values = [value] * len(keys)          # untimed argument preparation
+    return lambda: store.put_batch(keys, values)
+
+
+def _put_from_make_call(store, keys, value, ctx):
     if ctx is None:
-        return "ERR:no-buffer"
-    ctx.write_value(value)
-    ret = store.put_from(keys[0], ctx.ptr, len(value))
-    return "OK" if ret == 0 else "ERR:{}".format(ret)
+        raise _NoCall("no-buffer")
+    ctx.write_value(value)                # untimed buffer prep (full value)
+    key, ptr, size = keys[0], ctx.ptr, len(value)
+    return lambda: store.put_from(key, ptr, size)
 
 
-def _get_iface(store, keys, value, ctx):
-    data = store.get(keys[0])
-    if not data:
+def _put_check(raw, keys, value, ctx):
+    return "OK" if raw == 0 else "ERR:{}".format(raw)
+
+
+# --- get family -----------------------------------------------------------
+
+def _get_make_call(store, keys, value, ctx):
+    key = keys[0]
+    return lambda: store.get(key)
+
+
+def _get_check(raw, keys, value, ctx):
+    if not raw:
         return "MISS"
-    if len(data) != len(value) or data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+    if len(raw) != len(value) or raw[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
         return "MISMATCH"
     return "OK"
 
 
-def _get_batch_iface(store, keys, value, ctx):
-    data_list = store.get_batch(keys)
-    if len(data_list) != len(keys):
+def _get_batch_make_call(store, keys, value, ctx):
+    return lambda: store.get_batch(keys)
+
+
+def _get_batch_check(raw, keys, value, ctx):
+    if len(raw) != len(keys):
         return "ERR:batch-size"
-    for d in data_list:
+    for d in raw:
         if not d:
             return "MISS"
         if len(d) != len(value) or d[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
@@ -304,22 +351,31 @@ def _get_batch_iface(store, keys, value, ctx):
     return "OK"
 
 
-def _get_into_iface(store, keys, value, ctx):
+def _get_into_make_call(store, keys, value, ctx):
     if ctx is None:
-        return "ERR:no-buffer"
-    n = store.get_into(keys[0], ctx.ptr, ctx.size)
-    if n < 0:
-        return "ERR:{}".format(n)
-    if n != len(value):
+        raise _NoCall("no-buffer")
+    key, ptr, size = keys[0], ctx.ptr, ctx.size
+    return lambda: store.get_into(key, ptr, size)
+
+
+def _get_into_check(raw, keys, value, ctx):
+    if raw < 0:
+        return "ERR:{}".format(raw)
+    if raw != len(value):
         return "MISMATCH"
-    if ctx.read_bytes(len(value))[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+    if ctx.read_bytes(VALIDATE_BYTES) != value[:VALIDATE_BYTES]:
         return "MISMATCH"
     return "OK"
 
 
-def _get_buffer_iface(store, keys, value, ctx):
+def _get_buffer_make_call(store, keys, value, ctx):
+    key = keys[0]
+    return lambda: store.get_buffer(key)
+
+
+def _get_buffer_check(raw, keys, value, ctx):
     import ctypes
-    h = store.get_buffer(keys[0])
+    h = raw
     if h is None:
         return "MISS"
     try:
@@ -329,26 +385,22 @@ def _get_buffer_iface(store, keys, value, ctx):
         return "ERR:{}".format(type(exc).__name__)
     if size != len(value):
         return "MISMATCH"
-    data = ctypes.string_at(ptr, len(value))
-    if data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+    if ctypes.string_at(ptr, VALIDATE_BYTES) != value[:VALIDATE_BYTES]:
         return "MISMATCH"
     return "OK"
 
 
-PUT_HANDLERS = {"put": _put_iface, "put_batch": _put_batch_iface,
-                "put_from": _put_from_iface}
-GET_HANDLERS = {"get": _get_iface, "get_batch": _get_batch_iface,
-                "get_into": _get_into_iface, "get_buffer": _get_buffer_iface}
-
-
-def _timed(fn):
-    t0 = time.perf_counter()
-    try:
-        status = fn()
-    except Exception as exc:
-        status = "ERR:{}".format(type(exc).__name__)
-    lat_ms = (time.perf_counter() - t0) * 1000.0
-    return lat_ms, status
+PUT_IFACE_DEFS = {
+    "put": (_put_make_call, _put_check),
+    "put_batch": (_put_batch_make_call, _put_check),
+    "put_from": (_put_from_make_call, _put_check),
+}
+GET_IFACE_DEFS = {
+    "get": (_get_make_call, _get_check),
+    "get_batch": (_get_batch_make_call, _get_batch_check),
+    "get_into": (_get_into_make_call, _get_into_check),
+    "get_buffer": (_get_buffer_make_call, _get_buffer_check),
+}
 def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
     op = args.operation
     batch_size = max(1, args.batch_size)
@@ -378,7 +430,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
         # mixed: operation = "<put_iface>/<get_iface>"; put/get alternate,
         # starting with put; each get reads a key the put side has written
         put_iface, get_iface = op.split("/", 1)
-        if put_iface not in PUT_HANDLERS or get_iface not in GET_HANDLERS:
+        if put_iface not in PUT_IFACE_DEFS or get_iface not in GET_IFACE_DEFS:
             raise SystemExit("[ERROR] unsupported mixed operation {}: "
                              "put_iface={}, get_iface={}".format(op, put_iface, get_iface))
         put_count = int(len(keys) * put_ratio)
@@ -391,7 +443,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
         for i in range(max(n_put_units, n_get_units)):
             if i < n_put_units:
                 group = put_keys[i * batch_size:(i + 1) * batch_size]
-                lat, status = _timed(lambda g=group: PUT_HANDLERS[put_iface](store, g, value, ctx))
+                lat, status = _run_iface(store, *PUT_IFACE_DEFS[put_iface], group, value, ctx)
                 local.append(("put", group[0], lat, status))
             if i < n_get_units:
                 base = i * batch_size
@@ -399,25 +451,25 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                         get_keys[base:base + batch_size]
                 gkeys = gkeys[:n_get - base]
                 if gkeys:
-                    lat, status = _timed(lambda g=gkeys: GET_HANDLERS[get_iface](store, g, value, ctx))
+                    lat, status = _run_iface(store, *GET_IFACE_DEFS[get_iface], gkeys, value, ctx)
                     local.append(("get", gkeys[0], lat, status))
-    elif op in PUT_HANDLERS:
+    elif op in PUT_IFACE_DEFS:
         if op in PUT_BATCH_IFACES:
             for group in groups_iter():
-                lat, status = _timed(lambda g=group: PUT_HANDLERS[op](store, g, value, ctx))
+                lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
                 local.append((op, group[0], lat, status))
         else:
             for k in keys_iter():
-                lat, status = _timed(lambda k=k: PUT_HANDLERS[op](store, [k], value, ctx))
+                lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
                 local.append((op, k, lat, status))
-    elif op in GET_HANDLERS:
+    elif op in GET_IFACE_DEFS:
         if op in GET_BATCH_IFACES:
             for group in groups_iter():
-                lat, status = _timed(lambda g=group: GET_HANDLERS[op](store, g, value, ctx))
+                lat, status = _run_iface(store, *GET_IFACE_DEFS[op], group, value, ctx)
                 local.append((op, group[0], lat, status))
         else:
             for k in keys_iter():
-                lat, status = _timed(lambda k=k: GET_HANDLERS[op](store, [k], value, ctx))
+                lat, status = _run_iface(store, *GET_IFACE_DEFS[op], [k], value, ctx)
                 local.append((op, k, lat, status))
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
@@ -579,7 +631,7 @@ def _pipeline_writer(args, store, do_warmup=True):
     scenario = args.scenario
     writer_id = args.client_id
     writer_op = args.operation or "put_batch"
-    if writer_op not in PUT_HANDLERS:
+    if writer_op not in PUT_IFACE_DEFS:
         raise SystemExit("[ERROR] unsupported writer operation: {}".format(writer_op))
     ctx = None
     if writer_op == "put_from":
@@ -666,15 +718,11 @@ def _pipeline_writer(args, store, do_warmup=True):
             # put/put_from = one timed call per key (key_count=1 each)
             write_samples = []
             if writer_op in PUT_BATCH_IFACES:
-                t0 = time.perf_counter()
-                status = PUT_HANDLERS[writer_op](store, keys, value, ctx)
-                lat_ms = (time.perf_counter() - t0) * 1000.0
+                lat_ms, status = _run_iface(store, *PUT_IFACE_DEFS[writer_op], keys, value, ctx)
                 write_samples.append((keys[0], lat_ms, status, batch_keys))
             else:
                 for k in keys:
-                    t0 = time.perf_counter()
-                    status = PUT_HANDLERS[writer_op](store, [k], value, ctx)
-                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    lat_ms, status = _run_iface(store, *PUT_IFACE_DEFS[writer_op], [k], value, ctx)
                     write_samples.append((k, lat_ms, status, 1))
             batch_ok = all(s == "OK" for _, _, s, _ in write_samples)
             if not is_warmup:
@@ -837,7 +885,7 @@ def _reader_worker(args, store, queue, deadline, results, ctx=None):
     """
     pipeline = args.notify_pipeline if isinstance(args.notify_pipeline, list) else ["get"]
     reader_op = args.operation or "get"
-    if reader_op not in GET_HANDLERS:
+    if reader_op not in GET_IFACE_DEFS:
         raise SystemExit("[ERROR] unsupported reader operation: {}".format(reader_op))
     value = load_value(args.remote_data_dir, args.scenario)
     batch_mode = reader_op in GET_BATCH_IFACES
@@ -872,18 +920,14 @@ def _reader_worker(args, store, queue, deadline, results, ctx=None):
                 local.append(("pipeline_read", keys[0], 0.0, "MISS/MISMATCH", queue_wait_ms, len(keys)))
                 continue
         if batch_mode:
-            t0 = time.perf_counter()
-            status = GET_HANDLERS[reader_op](store, keys, value, ctx)
-            lat_ms = (time.perf_counter() - t0) * 1000.0
+            lat_ms, status = _run_iface(store, *GET_IFACE_DEFS[reader_op], keys, value, ctx)
             if is_warmup:
                 local.append(("pipeline_warmup_read", keys[0], lat_ms, "SKIP", queue_wait_ms, len(keys)))
                 continue
             local.append(("pipeline_read", keys[0], lat_ms, status, queue_wait_ms, len(keys)))
         else:
             for k in keys:
-                t0 = time.perf_counter()
-                status = GET_HANDLERS[reader_op](store, [k], value, ctx)
-                lat_ms = (time.perf_counter() - t0) * 1000.0
+                lat_ms, status = _run_iface(store, *GET_IFACE_DEFS[reader_op], [k], value, ctx)
                 if is_warmup:
                     local.append(("pipeline_warmup_read", k, lat_ms, "SKIP", queue_wait_ms, 1))
                     continue
@@ -924,7 +968,7 @@ def _pipeline_reader(args, store):
     num_threads = max(1, args.num_threads)
     my_port = args.listen_port
     reader_op = args.operation or "get"
-    if reader_op not in GET_HANDLERS:
+    if reader_op not in GET_IFACE_DEFS:
         raise SystemExit("[ERROR] unsupported reader operation: {}".format(reader_op))
     ctx = None
     # only get_into needs a registered local buffer; get_buffer validates via
