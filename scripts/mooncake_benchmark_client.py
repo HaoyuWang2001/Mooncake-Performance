@@ -157,16 +157,125 @@ def cmd_prepare_store(args, store):
 
 # --------------------------------------------------------------------------
 
-def _put(store, key, value):
-    ret = store.put(key, value)
+# Interface registry: basic + pipeline share these call semantics.
+# A put/get interface name resolves to a handler; batch handlers operate on a
+# whole key group in one call (bytes_per_op = batch_size * data_size).
+PUT_IFACES = ("put", "put_batch", "put_from")
+GET_IFACES = ("get", "get_batch", "get_into", "get_buffer")
+PUT_BATCH_IFACES = ("put_batch",)
+GET_BATCH_IFACES = ("get_batch",)
+
+
+class _BufferCtx:
+    """ctypes buffer registered with the store for zero-copy interfaces
+    (put_from / get_into / get_buffer validation)."""
+
+    def __init__(self, size):
+        import ctypes
+        self.ctypes = ctypes
+        self.size = max(1, int(size))
+        self.buf = (ctypes.c_ubyte * self.size)()
+        self.ptr = ctypes.addressof(self.buf)
+        self.registered = False
+
+    def setup(self, store):
+        try:
+            self.registered = store.register_buffer(self.ptr, self.size) == 0
+        except Exception:
+            self.registered = False
+        return self.registered
+
+    def teardown(self, store):
+        if self.registered:
+            try:
+                store.unregister_buffer(self.ptr)
+            except Exception:
+                pass
+            self.registered = False
+
+    def write_value(self, value):
+        self.ctypes.memmove(self.ptr, value, len(value))
+
+    def read_bytes(self, n):
+        return self.ctypes.string_at(self.ptr, n)
+
+
+def _put_iface(store, keys, value, ctx):
+    ret = store.put(keys[0], value)
     return "OK" if ret == 0 else "ERR:{}".format(ret)
-def _get(store, key, value):
-    data = store.get(key)
+
+
+def _put_batch_iface(store, keys, value, ctx):
+    ret = store.put_batch(keys, [value] * len(keys))
+    return "OK" if ret == 0 else "ERR:{}".format(ret)
+
+
+def _put_from_iface(store, keys, value, ctx):
+    if ctx is None:
+        return "ERR:no-buffer"
+    ctx.write_value(value)
+    ret = store.put_from(keys[0], ctx.ptr, len(value))
+    return "OK" if ret == 0 else "ERR:{}".format(ret)
+
+
+def _get_iface(store, keys, value, ctx):
+    data = store.get(keys[0])
     if not data:
         return "MISS"
     if len(data) != len(value) or data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
         return "MISMATCH"
     return "OK"
+
+
+def _get_batch_iface(store, keys, value, ctx):
+    data_list = store.get_batch(keys)
+    if len(data_list) != len(keys):
+        return "ERR:batch-size"
+    for d in data_list:
+        if not d:
+            return "MISS"
+        if len(d) != len(value) or d[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+            return "MISMATCH"
+    return "OK"
+
+
+def _get_into_iface(store, keys, value, ctx):
+    if ctx is None:
+        return "ERR:no-buffer"
+    n = store.get_into(keys[0], ctx.ptr, ctx.size)
+    if n < 0:
+        return "ERR:{}".format(n)
+    if n != len(value):
+        return "MISMATCH"
+    if ctx.read_bytes(len(value))[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+        return "MISMATCH"
+    return "OK"
+
+
+def _get_buffer_iface(store, keys, value, ctx):
+    import ctypes
+    h = store.get_buffer(keys[0])
+    if h is None:
+        return "MISS"
+    try:
+        size = h.size()
+        ptr = h.ptr()
+    except Exception as exc:
+        return "ERR:{}".format(type(exc).__name__)
+    if size != len(value):
+        return "MISMATCH"
+    data = ctypes.string_at(ptr, len(value))
+    if data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
+        return "MISMATCH"
+    return "OK"
+
+
+PUT_HANDLERS = {"put": _put_iface, "put_batch": _put_batch_iface,
+                "put_from": _put_from_iface}
+GET_HANDLERS = {"get": _get_iface, "get_batch": _get_batch_iface,
+                "get_into": _get_into_iface, "get_buffer": _get_buffer_iface}
+
+
 def _timed(fn):
     t0 = time.perf_counter()
     try:
@@ -175,7 +284,7 @@ def _timed(fn):
         status = "ERR:{}".format(type(exc).__name__)
     lat_ms = (time.perf_counter() - t0) * 1000.0
     return lat_ms, status
-def _run_thread(args, store, keys, value, results, deadline=None):
+def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
     op = args.operation
     batch_size = max(1, args.batch_size)
     put_ratio = args.put_ratio
@@ -200,49 +309,51 @@ def _run_thread(args, store, keys, value, results, deadline=None):
                     if time.time() >= deadline:
                         return
                     yield keys[j:j + batch_size]
-    if op == "put":
-        for k in keys_iter():
-            lat, status = _timed(lambda k=k: _put(store, k, value))
-            local.append(("put", k, lat, status))
-    elif op == "get":
-        for k in keys_iter():
-            lat, status = _timed(lambda k=k: _get(store, k, value))
-            local.append(("get", k, lat, status))
-    elif op == "put_batch":
-        for group in groups_iter():
-            values = [value] * len(group)
-            def do_batch_put(g=group, v=values):
-                ret = store.put_batch(g, v)
-                return "OK" if ret == 0 else "ERR:{}".format(ret)
-            lat, status = _timed(do_batch_put)
-            local.append(("put_batch", group[0], lat, status))
-    elif op == "get_batch":
-        for group in groups_iter():
-            def do_batch_get(g=group):
-                data_list = store.get_batch(g)
-                if len(data_list) != len(g):
-                    return "ERR:batch-size"
-                for d in data_list:
-                    if not d:
-                        return "MISS"
-                    if len(d) != len(value) or d[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
-                        return "MISMATCH"
-                return "OK"
-            lat, status = _timed(do_batch_get)
-            local.append(("get_batch", group[0], lat, status))
-    elif op == "mixed" or "/" in op and "put" in op and "get" in op:
+    if "/" in op:
+        # mixed: operation = "<put_iface>/<get_iface>"; put/get alternate,
+        # starting with put; each get reads a key the put side has written
+        put_iface, get_iface = op.split("/", 1)
+        if put_iface not in PUT_HANDLERS or get_iface not in GET_HANDLERS:
+            raise SystemExit("[ERROR] unsupported mixed operation {}: "
+                             "put_iface={}, get_iface={}".format(op, put_iface, get_iface))
         put_count = int(len(keys) * put_ratio)
-        # First, put all the put keys
         put_keys = keys[:put_count]
-        for k in put_keys:
-            lat, status = _timed(lambda k=k: _put(store, k, value))
-            local.append(("put", k, lat, status))
-        # Then, get from the same key pool, cycling if needed
         get_keys = keys[put_count:]
-        for i, k in enumerate(get_keys):
-            gk = put_keys[i % len(put_keys)] if put_keys else k
-            lat, status = _timed(lambda k=gk: _get(store, k, value))
-            local.append(("get", gk, lat, status))
+        n_put = len(put_keys)
+        n_get = len(get_keys)
+        n_put_units = (n_put + batch_size - 1) // batch_size if n_put else 0
+        n_get_units = (n_get + batch_size - 1) // batch_size if n_get else 0
+        for i in range(max(n_put_units, n_get_units)):
+            if i < n_put_units:
+                group = put_keys[i * batch_size:(i + 1) * batch_size]
+                lat, status = _timed(lambda g=group: PUT_HANDLERS[put_iface](store, g, value, ctx))
+                local.append(("put", group[0], lat, status))
+            if i < n_get_units:
+                base = i * batch_size
+                gkeys = [put_keys[(base + k) % n_put] for k in range(batch_size)] if n_put else \
+                        get_keys[base:base + batch_size]
+                gkeys = gkeys[:n_get - base]
+                if gkeys:
+                    lat, status = _timed(lambda g=gkeys: GET_HANDLERS[get_iface](store, g, value, ctx))
+                    local.append(("get", gkeys[0], lat, status))
+    elif op in PUT_HANDLERS:
+        if op in PUT_BATCH_IFACES:
+            for group in groups_iter():
+                lat, status = _timed(lambda g=group: PUT_HANDLERS[op](store, g, value, ctx))
+                local.append((op, group[0], lat, status))
+        else:
+            for k in keys_iter():
+                lat, status = _timed(lambda k=k: PUT_HANDLERS[op](store, [k], value, ctx))
+                local.append((op, k, lat, status))
+    elif op in GET_HANDLERS:
+        if op in GET_BATCH_IFACES:
+            for group in groups_iter():
+                lat, status = _timed(lambda g=group: GET_HANDLERS[op](store, g, value, ctx))
+                local.append((op, group[0], lat, status))
+        else:
+            for k in keys_iter():
+                lat, status = _timed(lambda k=k: GET_HANDLERS[op](store, [k], value, ctx))
+                local.append((op, k, lat, status))
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
     results.extend(local)
@@ -270,13 +381,26 @@ def cmd_benchmark(args, store):
     data_size = len(value)
     op = args.operation
     duration = args.duration
+    put_iface = get_iface = None
+    if "/" in op:
+        put_iface, get_iface = op.split("/", 1)
     if duration:
-        if op not in ("get", "get_batch"):
-            print("[ERROR] duration is only supported for get/get_batch, "
-                  "got operation={}".format(op))
+        if op not in GET_IFACES:
+            print("[ERROR] duration is only supported for get-family interfaces "
+                  "(get/get_batch/get_into/get_buffer), got operation={}".format(op))
             sys.exit(1)
     else:
         duration = None
+    # zero-copy interfaces need a registered ctypes buffer
+    ctx = None
+    need_zero = (op in ("put_from", "get_into", "get_buffer")
+                 or put_iface in ("put_from",)
+                 or get_iface in ("get_into", "get_buffer"))
+    if need_zero:
+        ctx = _BufferCtx(data_size)
+        if not ctx.setup(store):
+            print("[ERROR] register_buffer failed, cannot use zero-copy interfaces")
+            sys.exit(1)
     if args.warmup == "true":
         run_warmup(args, store)
     end_idx = args.key_end if args.key_end is not None else len(keys)
@@ -292,20 +416,24 @@ def cmd_benchmark(args, store):
                   "chunk_keys": len(chunk), "start_ts": time.time()})
     results = []
     wall_t0 = time.perf_counter()
-    if chunk:
-        per_thread = []
-        for t in range(args.num_threads):
-            s = t * len(chunk) // args.num_threads
-            e = (t + 1) * len(chunk) // args.num_threads
-            per_thread.append(chunk[s:e])
-        with ThreadPoolExecutor(max_workers=args.num_threads) as pool:
-            futures = [pool.submit(_run_thread, args, store, sub, value, results, deadline)
-                       for sub in per_thread]
-            for f in futures:
-                f.result()
+    try:
+        if chunk:
+            per_thread = []
+            for t in range(args.num_threads):
+                s = t * len(chunk) // args.num_threads
+                e = (t + 1) * len(chunk) // args.num_threads
+                per_thread.append(chunk[s:e])
+            with ThreadPoolExecutor(max_workers=args.num_threads) as pool:
+                futures = [pool.submit(_run_thread, args, store, sub, value, results, deadline, ctx)
+                           for sub in per_thread]
+                for f in futures:
+                    f.result()
+    finally:
+        if ctx is not None:
+            ctx.teardown(store)
     wall_s = time.perf_counter() - wall_t0
     batch_size = max(1, args.batch_size)
-    if op in ("put_batch", "get_batch"):
+    if op in PUT_BATCH_IFACES or op in GET_BATCH_IFACES:
         bytes_per_op = batch_size * data_size
     else:
         bytes_per_op = data_size
@@ -314,7 +442,14 @@ def cmd_benchmark(args, store):
     total = len(results)
     # throughput/bytes count successful operations only (failed ops moved no
     # data); latency statistics also count successful samples only
-    total_bytes = ok_count * bytes_per_op
+    if put_iface and get_iface:
+        put_bp = batch_size if put_iface in PUT_BATCH_IFACES else 1
+        get_bp = batch_size if get_iface in GET_BATCH_IFACES else 1
+        ok_put = sum(1 for r in results if r[0] == "put" and r[3] == "OK")
+        ok_get = sum(1 for r in results if r[0] == "get" and r[3] == "OK")
+        total_bytes = ok_put * put_bp * data_size + ok_get * get_bp * data_size
+    else:
+        total_bytes = ok_count * bytes_per_op
     lat_ok = [r[2] for r in results if r[3] == "OK"]
     latencies = sorted(lat_ok)
     summary = {
@@ -334,9 +469,9 @@ def cmd_benchmark(args, store):
         "data_size": data_size,
         "key_count": len(keys),
     }
-    if op in ("put_batch", "get_batch"):
+    if op in PUT_BATCH_IFACES or op in GET_BATCH_IFACES:
         summary["batch_size"] = batch_size
-    if op == "mixed" or ("/" in op and "put" in op and "get" in op):
+    if put_iface and get_iface:
         summary["put_ratio"] = args.put_ratio
         summary["put_total"] = sum(1 for r in results if r[0] == "put")
         summary["get_total"] = sum(1 for r in results if r[0] == "get")
@@ -371,6 +506,14 @@ def _pipeline_writer(args, store, do_warmup=True):
     prefix = args.key_prefix
     scenario = args.scenario
     writer_id = args.client_id
+    writer_op = args.operation or "put_batch"
+    if writer_op not in PUT_HANDLERS:
+        raise SystemExit("[ERROR] unsupported writer operation: {}".format(writer_op))
+    ctx = None
+    if writer_op == "put_from":
+        ctx = _BufferCtx(len(value))
+        if not ctx.setup(store):
+            raise SystemExit("[ERROR] writer register_buffer failed")
     duration = float(args.duration)
     warmup_duration = float(getattr(args, "warmup_duration", 0) or 0)
     target_qps = float(args.target_qps) if args.target_qps > 0 else 0
@@ -447,20 +590,33 @@ def _pipeline_writer(args, store, do_warmup=True):
             keys = ["{}*{}*w{}*{:08d}".format(prefix, scenario, writer_id, seq[0] + i)
                     for i in range(batch_keys)]
             seq[0] += batch_keys
-            t0 = time.perf_counter()
-            ret = store.put_batch(keys, [value] * len(keys))
-            lat_ms = (time.perf_counter() - t0) * 1000.0
-            if ret < 0:
-                if not is_warmup:
-                    stats["keys_fail"] += batch_keys
-                    stats["batches_fail"] += 1
-                    sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tERR:{}\n".format(keys[0], lat_ms, ret))
+            # interface dispatch: put_batch = one call per whole batch;
+            # put/put_from = one timed call per key (key_count=1 each)
+            write_samples = []
+            if writer_op in PUT_BATCH_IFACES:
+                t0 = time.perf_counter()
+                status = PUT_HANDLERS[writer_op](store, keys, value, ctx)
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                write_samples.append((keys[0], lat_ms, status, batch_keys))
             else:
-                if not is_warmup:
-                    stats["keys_ok"] += batch_keys
-                    stats["batches_ok"] += 1
-                    stats["lats"].append(lat_ms)
-                    sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\tOK\n".format(keys[0], lat_ms))
+                for k in keys:
+                    t0 = time.perf_counter()
+                    status = PUT_HANDLERS[writer_op](store, [k], value, ctx)
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    write_samples.append((k, lat_ms, status, 1))
+            batch_ok = all(s == "OK" for _, _, s, _ in write_samples)
+            if not is_warmup:
+                for k, lat_ms, status, kc in write_samples:
+                    if status == "OK":
+                        stats["keys_ok"] += kc
+                        stats["batches_ok"] += 1
+                        stats["lats"].append(lat_ms)
+                    else:
+                        stats["keys_fail"] += kc
+                        stats["batches_fail"] += 1
+                    sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\t{}\t{}\n".format(
+                        k, lat_ms, status, kc))
+            if batch_ok:
                 # Randomly select notify_count readers and deliver the whole
                 # batch in a single multi-key request per reader (bypass proxy;
                 # write_ts is retained for diagnostics only — reader latency is
@@ -507,6 +663,8 @@ def _pipeline_writer(args, store, do_warmup=True):
                       "ts": time.time()})
     _run_phase(time.time() + duration, False)
     sys.stdout.flush()
+    if ctx is not None:
+        ctx.teardown(store)
     # Writer performance summary (measured phase only; keys/duration based).
     # Keeps the writer log self-contained: META + SUMMARY pair like the
     # reader/basic clients, so the orchestrator aggregation is uniform.
@@ -558,16 +716,15 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             writer_id = params.get("writer_id", ["0"])[0]
             write_ts = float(params.get("write_ts", ["0"])[0])
             is_warmup = params.get("warmup", ["0"])[0] == "1"
-            for k in keys:
-                if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
-                    # arrival stamp uses the reader-local monotonic clock so
-                    # queue_wait stays comparable to the worker's dequeue time
-                    _PipelineNotifyHandler.queue.put(
-                        (k, int(writer_id), write_ts, is_warmup, time.perf_counter()))
-                    with _PipelineNotifyHandler.qlock:
-                        _PipelineNotifyHandler.qdepth += 1
-                        if _PipelineNotifyHandler.qdepth > _PipelineNotifyHandler.qmax:
-                            _PipelineNotifyHandler.qmax = _PipelineNotifyHandler.qdepth
+            # one queue item per notify batch (the writer's whole batch); the
+            # queue depth unit therefore counts pending notify batches
+            if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
+                _PipelineNotifyHandler.queue.put(
+                    (keys, int(writer_id), write_ts, is_warmup, time.perf_counter()))
+                with _PipelineNotifyHandler.qlock:
+                    _PipelineNotifyHandler.qdepth += 1
+                    if _PipelineNotifyHandler.qdepth > _PipelineNotifyHandler.qmax:
+                        _PipelineNotifyHandler.qmax = _PipelineNotifyHandler.qdepth
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
@@ -587,22 +744,25 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # suppress HTTP server logs
     do_GET = do_POST
-def _reader_worker(args, store, queue, deadline, results):
-    """Reader worker thread: dequeue keys, execute notify_pipeline, record the
-    local store interface latency.
+def _reader_worker(args, store, queue, deadline, results, ctx=None):
+    """Reader worker thread: dequeue a notify batch, run the optional exist
+    pre-checks, then execute the configured get interface (reader.operation).
 
-    Latency only wraps the store.get interface call (time.perf_counter(),
-    reader-local monotonic clock); the optional exist pre-check and the
-    value validation are not part of the timed region. The metric therefore
-    never depends on cross-node wall clocks. queue_wait (notify arrival ->
-    worker dequeue) and queue depth are tracked as backlog diagnostics.
+    Latency only wraps the store get-family interface call (time.perf_counter(),
+    reader-local monotonic clock); exist pre-checks and value validation are
+    not part of the timed region. queue_wait (notify arrival -> batch dequeue)
+    and queue depth (in notify batches) are tracked as backlog diagnostics.
 
     Warmup items (warmup=1 flag from the notify) are still processed — the
     actual store reads warm up the reader->store path — but are tagged so
     they stay out of the measured metrics.
     """
     pipeline = args.notify_pipeline if isinstance(args.notify_pipeline, list) else ["get"]
+    reader_op = args.operation or "get"
+    if reader_op not in GET_HANDLERS:
+        raise SystemExit("[ERROR] unsupported reader operation: {}".format(reader_op))
     value = load_value(args.remote_data_dir, args.scenario)
+    batch_mode = reader_op in GET_BATCH_IFACES
     local = []
     while time.time() < deadline:
         try:
@@ -611,38 +771,45 @@ def _reader_worker(args, store, queue, deadline, results):
             continue
         if item is None:
             break
-        key, writer_id, write_ts, is_warmup, arrival_mono = item
+        keys, writer_id, write_ts, is_warmup, arrival_mono = item
         with _PipelineNotifyHandler.qlock:
             _PipelineNotifyHandler.qdepth -= 1
-        status = "OK"
-        lat_ms = 0.0
         queue_wait_ms = (time.perf_counter() - arrival_mono) * 1000.0
-        try:
+        # exist pre-check (untimed) for every key of the batch
+        if pipeline:
+            ok = True
             for step in pipeline:
                 step = step.strip()
                 if step == "exist":
-                    ex = store.is_exist(key)
-                    if ex <= 0:
-                        status = "MISS/MISMATCH"
-                        break
-                elif step == "get" or step == "getBuffer":
-                    t0 = time.perf_counter()
-                    data = store.get(key)
-                    lat_ms += (time.perf_counter() - t0) * 1000.0
-                    if not data:
-                        status = "MISS/MISMATCH"
-                        break
-                    if len(data) != len(value) or data[:VALIDATE_BYTES] != value[:VALIDATE_BYTES]:
-                        status = "MISS/MISMATCH"
-                        break
-                else:
-                    pass
-        except Exception as exc:
-            status = "ERR:{}".format(type(exc).__name__)
-        if is_warmup:
-            local.append(("pipeline_warmup_read", key, lat_ms, "SKIP", queue_wait_ms))
-            continue
-        local.append(("pipeline_read", key, lat_ms, status, queue_wait_ms))
+                    for k in keys:
+                        if store.is_exist(k) <= 0:
+                            ok = False
+                            break
+                # "get"/"getBuffer" step names are ignored: the data interface
+                # is fully decided by reader.operation
+            if not ok:
+                if is_warmup:
+                    local.append(("pipeline_warmup_read", keys[0], 0.0, "SKIP", queue_wait_ms, len(keys)))
+                    continue
+                local.append(("pipeline_read", keys[0], 0.0, "MISS/MISMATCH", queue_wait_ms, len(keys)))
+                continue
+        if batch_mode:
+            t0 = time.perf_counter()
+            status = GET_HANDLERS[reader_op](store, keys, value, ctx)
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            if is_warmup:
+                local.append(("pipeline_warmup_read", keys[0], lat_ms, "SKIP", queue_wait_ms, len(keys)))
+                continue
+            local.append(("pipeline_read", keys[0], lat_ms, status, queue_wait_ms, len(keys)))
+        else:
+            for k in keys:
+                t0 = time.perf_counter()
+                status = GET_HANDLERS[reader_op](store, [k], value, ctx)
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                if is_warmup:
+                    local.append(("pipeline_warmup_read", k, lat_ms, "SKIP", queue_wait_ms, 1))
+                    continue
+                local.append(("pipeline_read", k, lat_ms, status, queue_wait_ms, 1))
     results.extend(local)
 def cmd_pipeline(args, store):
     """Run pipeline (精排/召排) — dispatches to writer or reader based on --role."""
@@ -678,6 +845,14 @@ def _pipeline_reader(args, store):
     exit_grace = 5.0
     num_threads = max(1, args.num_threads)
     my_port = args.listen_port
+    reader_op = args.operation or "get"
+    if reader_op not in GET_HANDLERS:
+        raise SystemExit("[ERROR] unsupported reader operation: {}".format(reader_op))
+    ctx = None
+    if reader_op in ("get_into", "get_buffer"):
+        ctx = _BufferCtx(parse_size(args.data_size))
+        if not ctx.setup(store):
+            raise SystemExit("[ERROR] reader register_buffer failed")
     emit("META", {"mode": "pipeline_reader", "scenario": args.scenario,
                   "work_mode": args.work_mode or "recall", "protocol": args.protocol,
                   "client_id": args.client_id, "reader_count": args.reader_count,
@@ -695,18 +870,22 @@ def _pipeline_reader(args, store):
     _PipelineNotifyHandler.qdepth = 0
     _PipelineNotifyHandler.qmax = 0
     _PipelineNotifyHandler.qlock = threading.Lock()
+    # Start HTTP server in a daemon thread BEFORE starting workers so a bind
+    # failure fails fast (workers would otherwise block the exception for the
+    # whole reader lifetime)
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    try:
+        server = socketserver.ThreadingTCPServer(("0.0.0.0", my_port), _PipelineNotifyHandler)
+    except OSError as exc:
+        raise SystemExit("[ERROR] reader failed to bind port {}: {}".format(my_port, exc))
+    server.daemon_threads = True
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    emit("META", {"mode": "pipeline_reader_ready", "port": my_port, "ts": time.time()})
     # Start worker threads
     with ThreadPoolExecutor(max_workers=num_threads) as pool:
-        worker_futures = [pool.submit(_reader_worker, args, store, queue, deadline + exit_grace, results)
+        worker_futures = [pool.submit(_reader_worker, args, store, queue, deadline + exit_grace, results, ctx)
                          for _ in range(num_threads)]
-        # Start HTTP server in a daemon thread — set allow_reuse_address
-        # BEFORE instantiation so server_bind() picks it up
-        socketserver.ThreadingTCPServer.allow_reuse_address = True
-        server = socketserver.ThreadingTCPServer(("0.0.0.0", my_port), _PipelineNotifyHandler)
-        server.daemon_threads = True
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        server_thread.start()
-        emit("META", {"mode": "pipeline_reader_ready", "port": my_port, "ts": time.time()})
         # Wait for deadline + grace, waking periodically to check shutdown
         remaining = deadline + exit_grace - time.time()
         while remaining > 0 and _PipelineNotifyHandler.deadline > 0:
@@ -718,16 +897,18 @@ def _pipeline_reader(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
+    if ctx is not None:
+        ctx.teardown(store)
     data_size = parse_size(args.data_size)
     # split off warmup items: processed (store reads warmed up) but not
-    # part of the measured metrics
-    warmup_total = sum(1 for r in results if r[0] == "pipeline_warmup_read")
+    # part of the measured metrics; counts are key-based (r[5] = key_count)
+    warmup_total = sum(r[5] for r in results if r[0] == "pipeline_warmup_read")
     measured = [r for r in results if r[0] != "pipeline_warmup_read"]
-    ok_count = sum(1 for r in measured if r[3] == "OK")
-    fail_count = len(measured) - ok_count
-    total = len(measured)
+    ok_keys = sum(r[5] for r in measured if r[3] == "OK")
+    fail_keys = sum(r[5] for r in measured if r[3] != "OK")
+    total = ok_keys + fail_keys
     # bytes/throughput count successful reads only
-    total_bytes = ok_count * data_size
+    total_bytes = ok_keys * data_size
     lat_ok = [r[2] for r in measured if r[3] == "OK"]
     latencies = sorted(lat_ok)
     busy_s = (sum(lat_ok) / 1000.0) if lat_ok else 0.0
@@ -739,9 +920,9 @@ def _pipeline_reader(args, store):
         "num_threads": num_threads,
         "total": total, "bytes": total_bytes, "wall_s": meas_duration,
         "warmup_total": warmup_total,
-        "ok": ok_count, "fail": fail_count,
+        "ok": ok_keys, "fail": fail_keys,
         "qps": (total / meas_duration) if meas_duration > 0 else 0.0,
-        "fail_rate": (fail_count / total) if total else 0.0,
+        "fail_rate": (fail_keys / total) if total else 0.0,
         # interface throughput = successful bytes / sum of successful store.get
         # call durations (busy time, not wall clock)
         "throughput_mb_s": (total_bytes / busy_s / 1024.0 ** 2) if busy_s > 0 else 0.0,
@@ -757,8 +938,9 @@ def _pipeline_reader(args, store):
         "data_size": data_size,
     }
     emit("SUMMARY", summary)
-    for opname, k, lat, status, qw in measured:
-        sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\t{:.6f}\n".format(opname, k, lat, status, qw))
+    for opname, k, lat, status, qw, kc in measured:
+        sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\t{:.6f}\t{}\n".format(
+            opname, k, lat, status, qw, kc))
     sys.stdout.flush()
 
 # --------------------------------------------------------------------------

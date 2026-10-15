@@ -8,8 +8,28 @@ for real on a single machine without a Mooncake deployment.
 Data directory: MOCK_STORE_DIR env var, default /tmp/mooncake_mock_store.
 See mock/README.md.
 """
+import ctypes
 import hashlib
 import os
+
+
+class _MockBufferHandle:
+    """Fake BufferHandle: keeps a copy of the value in a ctypes buffer and
+    exposes ptr()/size() like the real zero-copy handle."""
+
+    def __init__(self, data):
+        self._buf = (ctypes.c_ubyte * max(1, len(data)))()
+        ctypes.memmove(self._buf, data, len(data))
+        self._size = len(data)
+
+    def ptr(self):
+        return ctypes.addressof(self._buf)
+
+    def size(self):
+        return self._size
+
+    def __len__(self):
+        return self._size
 
 
 class MooncakeDistributedStore:
@@ -17,6 +37,7 @@ class MooncakeDistributedStore:
 
     def __init__(self):
         os.makedirs(self._dir, exist_ok=True)
+        self._buffers = {}
 
     def _kp(self, k):
         return os.path.join(self._dir, hashlib.md5(k.encode()).hexdigest())
@@ -46,6 +67,42 @@ class MooncakeDistributedStore:
 
     def get_batch(self, keys):
         return [self.get(k) for k in keys]
+
+    def register_buffer(self, ptr, size):
+        self._buffers[ptr] = size
+        return 0
+
+    def unregister_buffer(self, ptr):
+        self._buffers.pop(ptr, None)
+        return 0
+
+    def put_from(self, k, ptr, size, config=None):
+        try:
+            size = min(size, self._buffers[ptr])
+            data = ctypes.string_at(ptr, size)
+            self.put(k, data)
+            return 0
+        except KeyError:
+            return -1
+
+    def get_into(self, k, ptr, size):
+        try:
+            size = min(size, self._buffers[ptr])
+        except KeyError:
+            return -1
+        data = self.get(k)
+        if not data:
+            return -1
+        if size < len(data):
+            return -1
+        ctypes.memmove(ptr, data, len(data))
+        return len(data)
+
+    def get_buffer(self, k):
+        data = self.get(k)
+        if not data:
+            return None
+        return _MockBufferHandle(data)
 
     def remove_all(self, force=False):
         for name in os.listdir(self._dir):

@@ -27,6 +27,12 @@ SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 DEFAULT_LD_PATH = ("/home/w00921547/stress-cluster-bench/lib/:/usr/local/cuda-12.9/lib64:"
                    "/usr/local/lib64:${LD_LIBRARY_PATH:-}")
+# store interface families (mirror scripts/mooncake_benchmark_client.py so the
+# orchestrator can validate operation values and choose staging behaviour)
+PIPELINE_PUT_IFACES = ("put", "put_batch", "put_from")
+PIPELINE_GET_IFACES = ("get", "get_batch", "get_into", "get_buffer")
+PIPELINE_PUT_BATCH_IFACES = ("put_batch",)
+PIPELINE_GET_BATCH_IFACES = ("get_batch",)
 BASIC_CSV_HEADER = [
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_clients", "num_threads",
@@ -171,8 +177,10 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
         "MC_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
         "MC_KEY_COUNT": str(cfg.get("key_count", 1000)),
         "MC_DATA_SIZE": cfg.get("data_size", "8MB"),
-        "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)) if cfg.get("operation") in ("put_batch", "get_batch") else "",
-        "MC_PUT_RATIO": str(cfg.get("put_ratio", "")) if cfg.get("operation") in ("mixed", "put/get") else "",
+        "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)) if (
+            cfg.get("operation") in ("put_batch", "get_batch")
+            or any(s in ("put_batch", "get_batch") for s in str(cfg.get("operation", "")).split("/"))) else "",
+        "MC_PUT_RATIO": str(cfg.get("put_ratio", "")) if "/" in str(cfg.get("operation", "")) else "",
         "MC_DURATION": str(cfg.get("duration", 0)),
         "MC_WARMUP_KEY_COUNT": str(cfg.get("warmup", {}).get("key_count", cfg.get("warmup_key_count", 100))),
         "MC_WARMUP_DATA_SIZE": cfg.get("warmup", {}).get("data_size", cfg.get("warmup_data_size", "1MB")),
@@ -261,6 +269,67 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False):
     return False
 
 
+def _kill_remote_process(cluster, node_name, pid):
+    """Best-effort kill of a remote test process (graceful then -9)."""
+    n = get_node(cluster, node_name)
+    try:
+        ssh_check_output(n["ip"], n,
+                         "kill {} 2>/dev/null; sleep 1; kill -9 {} 2>/dev/null || true".format(pid, pid),
+                         quiet=True)
+    except Exception as exc:
+        log("[WARN] fail-cleanup: kill pid {} on {} failed: {}".format(pid, node_name, exc))
+
+
+def fail_cleanup_pipeline(cluster, plan, reader_peers, reader_pids, writer_pids,
+                          involved_nodes, remote_log_dir, cfg_name, local_log_dir):
+    """Best-effort cleanup after a pipeline scenario failure, so remote logs
+    (including the reader SUMMARY/RESULT that is only flushed at exit) are
+    preserved for diagnosis and ports are freed. Every step is guarded so the
+    original exception is never masked. Order: graceful reader shutdown ->
+    wait for exit -> kill stragglers -> pull all logs."""
+    log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
+    # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
+    for r, peer in zip(plan["readers"], reader_peers):
+        try:
+            rn = get_node(cluster, r["node"])
+            url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
+            ssh_check_output(rn["ip"], rn,
+                             "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(url),
+                             quiet=True)
+        except Exception as exc:
+            log("[WARN] fail-cleanup: reader {} shutdown failed: {}".format(r["index"], exc))
+    # 2. short wait for readers to exit (their final logs are written on exit)
+    for r, pid in reader_pids:
+        if pid:
+            try:
+                wait_process_exit(cluster, r["node"], pid,
+                                  "reader r{}".format(r["index"]), 30)
+            except Exception:
+                pass
+    # 3. kill any still-alive writers/readers
+    for w, pid in writer_pids:
+        if pid:
+            _kill_remote_process(cluster, w["node"], pid)
+    for r, pid in reader_pids:
+        if pid:
+            _kill_remote_process(cluster, r["node"], pid)
+    # 4. pull every log of this scenario (stage logs + reader/writer + nohup)
+    try:
+        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
+    except Exception as exc:
+        log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
+
+
+def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir):
+    """Best-effort log pull after a basic scenario failure (foreground
+    processes exit by themselves; only the evidence needs to be preserved)."""
+    log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
+    try:
+        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
+    except Exception as exc:
+        log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
+
+
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
     remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
     command = "bash {} {} {}".format(runner, mode, remote_log)
@@ -288,10 +357,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     # (mooncake_store_nodes from global.json)
     store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
     topology = "local_node" if primary_node_name in store_nodes else "remote_node"
-    if cfg.get("duration") and op not in ("get", "get_batch"):
+    if cfg.get("duration") and op not in PIPELINE_GET_IFACES:
         raise RuntimeError(
             "duration configured but operation={} does not support duration "
-            "stress (only get/get_batch)".format(op))
+            "stress (only get-family: get/get_batch/get_into/get_buffer)".format(op))
     remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
     if not dry:
@@ -311,28 +380,34 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                   "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
     run_stage(host, node, remote_runner,
               "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-    if op in ("get", "get_batch"):
+    if op in PIPELINE_GET_IFACES:
         run_stage(host, node, remote_runner,
                   "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
     warmup = "false" if args.no_warmup else "true"
     runs = build_runs(cfg)
-    need_clean_before_run = op in ("put", "put_batch") or "/" in op
+    need_clean_before_run = op in PIPELINE_PUT_IFACES or "/" in op
     log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}".format(
         cfg_name, len(runs), warmup, need_clean_before_run))
-    for c, t in runs:
-        if need_clean_before_run:
-            run_stage(host, node, remote_runner,
-                      "clean", remote_log_dir, cfg_name,
-                      extra="--scope full", dry_run=dry)
-        name = "benchmark_c{}_t{}".format(c, t)
-        remote_log = remote_log_path(remote_log_dir, cfg_name, name)
-        command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
-            remote_runner, remote_log, c, t, warmup)
-        run_ssh(host, node, command, dry_run=dry)
-    # Final cleanup after all params complete
-    run_stage(host, node, remote_runner,
-              "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-    pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+    try:
+        for c, t in runs:
+            if need_clean_before_run:
+                run_stage(host, node, remote_runner,
+                          "clean", remote_log_dir, cfg_name,
+                          extra="--scope full", dry_run=dry)
+            name = "benchmark_c{}_t{}".format(c, t)
+            remote_log = remote_log_path(remote_log_dir, cfg_name, name)
+            command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
+                remote_runner, remote_log, c, t, warmup)
+            run_ssh(host, node, command, dry_run=dry)
+        # Final cleanup after all params complete
+        run_stage(host, node, remote_runner,
+                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+    except Exception:
+        # FAIL path: preserve the remote logs for diagnosis, then re-raise
+        if not dry:
+            fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir)
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -357,6 +432,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     cfg_duration = cfg.get("duration", None)
     if not cfg_duration or float(cfg_duration) <= 0:
         raise RuntimeError("pipeline config requires duration > 0 (missing or invalid)")
+    # writer/reader operation must name a supported store interface
+    writer_op = (cfg.get("writer", {}) or {}).get("operation", "") or "put_batch"
+    reader_op = (cfg.get("reader", {}) or {}).get("operation", "") or "get"
+    if writer_op not in PIPELINE_PUT_IFACES:
+        raise RuntimeError("pipeline writer operation must be one of {} "
+                           "(got {})".format(PIPELINE_PUT_IFACES, writer_op))
+    if reader_op not in PIPELINE_GET_IFACES:
+        raise RuntimeError("pipeline reader operation must be one of {} "
+                           "(got {})".format(PIPELINE_GET_IFACES, reader_op))
     involved_nodes = []
     seen_nodes = set()
     for p in plan["writers"] + plan["readers"]:
@@ -398,122 +482,130 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
-    data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
-    check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
-    # value.bin must exist on EVERY node that runs a writer or reader
-    for node_name in involved_nodes:
-        n = get_node(cluster, node_name)
-        data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
-        if data_status != "EXISTS":
-            run_stage(n["ip"], n, remote_runner,
-                      "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
-    run_stage(host, node, remote_runner,
-              "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-    warmup = "false" if args.no_warmup else "true"
-    reader_threads = plan["reader_threads"]
-    log("scenario {} (pipeline, {}): writers={}, readers={}, notify_count={}, "
-        "total_qps={}, per_writer_qps={}, traffic={}".format(
-            cfg_name, work_mode, len(plan["writers"]), len(plan["readers"]),
-            plan["notify_count"], plan["total_qps"], plan["per_writer_qps"],
-            cfg.get("traffic_mode", "pulse")))
-    # Reader peers: host resolved from each reader node's fabric_ip so the
-    # same config works unchanged on any deployment.
     reader_peers = []
-    for r in plan["readers"]:
-        rn = get_node(cluster, r["node"])
-        reader_peers.append({
-            "role": "reader",
-            "host": rn.get("fabric_ip", rn.get("ip", "")),
-            "port": r["port"],
-            "node": r["node"],
-        })
-    peers_json = json.dumps(reader_peers)
-    run_name = "benchmark_c1_t{}".format(reader_threads)
-    base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
-    # Step 1: start all readers (one process per reader, unique port and id)
     reader_pids = []
-    for r in plan["readers"]:
-        rn = get_node(cluster, r["node"])
-        merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
-        nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
-        rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 > {} 2>&1 & echo $!".format(
-            remote_runner, merged_log, r["index"], reader_threads,
-            r["port"], peers_json, nohup_log)
-        pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
-        reader_pids.append((r, pid))
-    # give readers a moment to boot before the health polling starts
-    if not dry:
-        time.sleep(5)
-    # Step 2: wait for all readers to be healthy
-    for r, peer in zip(plan["readers"], reader_peers):
-        rn = get_node(cluster, r["node"])
-        health_url = "http://{}:{}/health".format(peer["host"], r["port"])
-        HEALTHY = False
-        for attempt in range(10):
-            health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
-            result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry) if not dry else "HEALTHY"
-            if "HEALTHY" in result:
-                HEALTHY = True
-                break
-            time.sleep(1)
-        if not dry:
-            if not HEALTHY:
-                err_msg = "reader at {}:{} not ready after 30s".format(peer["host"], r["port"])
-                log("[ERROR] " + err_msg)
-                raise RuntimeError(err_msg)
-            else:
-                log("reader at {}:{}=READY".format(peer["host"], r["port"]))
-    # Step 3: start all writers in parallel (one invocation per writer; the
-    # explicit --client-id in EXTRA overrides the per-invocation default
-    # and gives each writer a globally unique id). ALL writers run the
-    # warmup phase so every writer's store/notify connections are warmed.
     writer_pids = []
-    for w in plan["writers"]:
-        wn = get_node(cluster, w["node"])
-        merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
-        nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
-        wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} > {} 2>&1 & echo $!".format(
-            remote_runner, merged_log, w["gid"], peers_json, warmup, nohup_log)
-        pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
-        writer_pids.append((w, pid))
-    # Step 4: wait for all writers to finish (warmup + measured run)
-    warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
-    duration = float(cfg.get("duration", 30))
-    for w, pid in writer_pids:
-        if not dry and pid:
-            wait_process_exit(cluster, w["node"], pid,
-                              "writer w{}".format(w["gid"]),
-                              int(warmup_duration + duration) + 300, dry_run=dry)
-    # Step 5: shutdown readers and wait for their final logs
-    for r, peer in zip(plan["readers"], reader_peers):
-        rn = get_node(cluster, r["node"])
-        shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
-        curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
-        if not dry:
-            ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
-    for r, pid in reader_pids:
-        if not dry and pid:
-            wait_process_exit(cluster, r["node"], pid,
-                              "reader r{} (port {})".format(r["index"], r["port"]),
-                              60, dry_run=dry)
-    # Step 6: remove empty .nohup redirect files (they capture script-level
-    # errors only — empty on success). Non-empty ones are kept for diagnostics
-    # and pulled back with the rest of the logs.
-    if not dry:
+    try:
+        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
+        check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
+        # value.bin must exist on EVERY node that runs a writer or reader
         for node_name in involved_nodes:
             n = get_node(cluster, node_name)
-            nohup_files = []
-            for r in plan["readers"]:
-                if r["node"] == node_name:
-                    nohup_files.append("{}.reader_port{}.nohup".format(base_noext, r["port"]))
-            for w in plan["writers"]:
-                if w["node"] == node_name:
-                    nohup_files.append("{}.writer{}.nohup".format(base_noext, w["gid"]))
-            if nohup_files:
-                cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
-                    " ".join(nohup_files))
-                ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
-    pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+            data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
+            if data_status != "EXISTS":
+                run_stage(n["ip"], n, remote_runner,
+                          "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
+        run_stage(host, node, remote_runner,
+                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+        warmup = "false" if args.no_warmup else "true"
+        reader_threads = plan["reader_threads"]
+        log("scenario {} (pipeline, {}): writers={}, readers={}, notify_count={}, "
+            "total_qps={}, per_writer_qps={}, traffic={}".format(
+                cfg_name, work_mode, len(plan["writers"]), len(plan["readers"]),
+                plan["notify_count"], plan["total_qps"], plan["per_writer_qps"],
+                cfg.get("traffic_mode", "pulse")))
+        # Reader peers: host resolved from each reader node's fabric_ip so the
+        # same config works unchanged on any deployment.
+        for r in plan["readers"]:
+            rn = get_node(cluster, r["node"])
+            reader_peers.append({
+                "role": "reader",
+                "host": rn.get("fabric_ip", rn.get("ip", "")),
+                "port": r["port"],
+                "node": r["node"],
+            })
+        peers_json = json.dumps(reader_peers)
+        run_name = "benchmark_c1_t{}".format(reader_threads)
+        base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
+        # Step 1: start all readers (one process per reader, unique port and id)
+        for r in plan["readers"]:
+            rn = get_node(cluster, r["node"])
+            merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
+            nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
+            rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} > {} 2>&1 & echo $!".format(
+                remote_runner, merged_log, r["index"], reader_threads,
+                r["port"], peers_json, reader_op, nohup_log)
+            pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
+            reader_pids.append((r, pid))
+        # give readers a moment to boot before the health polling starts
+        if not dry:
+            time.sleep(5)
+        # Step 2: wait for all readers to be healthy
+        for r, peer in zip(plan["readers"], reader_peers):
+            rn = get_node(cluster, r["node"])
+            health_url = "http://{}:{}/health".format(peer["host"], r["port"])
+            HEALTHY = False
+            for attempt in range(10):
+                health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
+                result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry, quiet=True) if not dry else "HEALTHY"
+                if "HEALTHY" in result:
+                    HEALTHY = True
+                    break
+                time.sleep(1)
+            if not dry:
+                if not HEALTHY:
+                    err_msg = "reader at {}:{} not ready after 30s".format(peer["host"], r["port"])
+                    log("[ERROR] " + err_msg)
+                    raise RuntimeError(err_msg)
+                else:
+                    log("reader at {}:{}=READY".format(peer["host"], r["port"]))
+        # Step 3: start all writers in parallel (one invocation per writer; the
+        # explicit --client-id in EXTRA overrides the per-invocation default
+        # and gives each writer a globally unique id). ALL writers run the
+        # warmup phase so every writer's store/notify connections are warmed.
+        for w in plan["writers"]:
+            wn = get_node(cluster, w["node"])
+            merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
+            nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
+            wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} > {} 2>&1 & echo $!".format(
+                remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, nohup_log)
+            pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
+            writer_pids.append((w, pid))
+        # Step 4: wait for all writers to finish (warmup + measured run)
+        warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
+        duration = float(cfg.get("duration", 30))
+        for w, pid in writer_pids:
+            if not dry and pid:
+                wait_process_exit(cluster, w["node"], pid,
+                                  "writer w{}".format(w["gid"]),
+                                  int(warmup_duration + duration) + 300, dry_run=dry)
+        # Step 5: shutdown readers and wait for their final logs
+        for r, peer in zip(plan["readers"], reader_peers):
+            rn = get_node(cluster, r["node"])
+            shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
+            curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
+            if not dry:
+                ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
+        for r, pid in reader_pids:
+            if not dry and pid:
+                wait_process_exit(cluster, r["node"], pid,
+                                  "reader r{} (port {})".format(r["index"], r["port"]),
+                                  60, dry_run=dry)
+        # Step 6: remove empty .nohup redirect files (they capture script-level
+        # errors only — empty on success). Non-empty ones are kept for diagnostics
+        # and pulled back with the rest of the logs.
+        if not dry:
+            for node_name in involved_nodes:
+                n = get_node(cluster, node_name)
+                nohup_files = []
+                for r in plan["readers"]:
+                    if r["node"] == node_name:
+                        nohup_files.append("{}.reader_port{}.nohup".format(base_noext, r["port"]))
+                for w in plan["writers"]:
+                    if w["node"] == node_name:
+                        nohup_files.append("{}.writer{}.nohup".format(base_noext, w["gid"]))
+                if nohup_files:
+                    cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
+                        " ".join(nohup_files))
+                    ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+    except Exception:
+        # FAIL path: preserve every remote log (reader SUMMARY/RESULT is only
+        # flushed on exit) and free ports, then re-raise for main's [FAIL]
+        if not dry:
+            fail_cleanup_pipeline(cluster, plan, reader_peers, reader_pids, writer_pids,
+                                  involved_nodes, remote_log_dir, cfg_name, local_log_dir)
+        raise
 
 
 def cleanup_cluster(cluster, globals_cfg, dry_run=False):
@@ -549,13 +641,24 @@ def parse_benchmark_log(paths, op_filter=None):
                     continue
                 if op_filter is not None and parts[1] != op_filter:
                     continue
-                # latency statistics count successful samples only
+                # key_count (pipeline): writer 6th field, reader 7th field;
+                # basic lines and old logs have no key_count -> 1
+                kc = 1
+                try:
+                    if parts[1] == "pipeline_write" and len(parts) > 5:
+                        kc = int(parts[5])
+                    elif parts[1] == "pipeline_read" and len(parts) > 6:
+                        kc = int(parts[6])
+                except ValueError:
+                    pass
+                # latency statistics count successful samples only; totals are
+                # key-based for pipeline (kc per RESULT line)
                 if parts[4] == "OK":
-                    ok += 1
+                    ok += kc
                     latencies.append(float(parts[3]))
                     lat_sum_ms += float(parts[3])
                 else:
-                    fail += 1
+                    fail += kc
                 if len(parts) > 5 and parts[1] == "pipeline_read":
                     try:
                         queue_waits.append(float(parts[5]))
@@ -669,23 +772,24 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "traffic_mode": cfg.get("traffic_mode", ""),
             }
 
-        def busy_throughput_mb(files, op_filter, count_mult, bytes_per_op):
+        def busy_throughput_mb(files, op_filter, bytes_per_op):
             """Sum of per-instance busy-time throughput (successful bytes /
-            sum of successful interface call durations), 1024-based."""
+            sum of successful interface call durations), 1024-based. parse
+            already returns key-based counts."""
             total = 0.0
             for f in files:
                 a = parse_benchmark_log(f, op_filter=op_filter)
                 busy_s = a["lat_sum_ms"] / 1000.0
                 if busy_s > 0:
-                    total += (a["ok"] * count_mult * bytes_per_op) / busy_s / 1024.0 ** 2
+                    total += (a["ok"] * bytes_per_op) / busy_s / 1024.0 ** 2
             return total
 
-        def metrics_into(row, agg, bytes_per_op, count_mult=1, with_queue=False, throughput_mb=None):
-            # pipeline counts are key-based: writer ops are put_batch calls,
-            # each moving batch_size keys, so totals scale by batch_size
-            total = agg["total"] * count_mult
-            ok = agg["ok"] * count_mult
-            fail = agg["fail"] * count_mult
+        def metrics_into(row, agg, bytes_per_op, with_queue=False, throughput_mb=None):
+            # pipeline counts are key-based: RESULT lines carry key_count so
+            # parse returns total/ok/fail already in keys
+            total = agg["total"]
+            ok = agg["ok"]
+            fail = agg["fail"]
             wall = duration if duration > 0 else agg["wall_s"]
             row["total"] = total
             row["success"] = ok
@@ -725,16 +829,16 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 continue
             agg = parse_benchmark_log(f, op_filter="pipeline_write")
             row = base_row("writer", "w{}".format(w["gid"]), w["node"])
-            metrics_into(row, agg, data_size_bytes, count_mult=batch_size)
+            metrics_into(row, agg, data_size_bytes)
             rows.append(row)
         # writer TOTAL row: all writers aggregated; throughput = sum of each
         # writer's busy-time throughput
         if writer_files:
             agg = parse_benchmark_log(list(writer_files.values()), op_filter="pipeline_write")
             row = base_row("writer", "TOTAL", "")
-            metrics_into(row, agg, data_size_bytes, count_mult=batch_size,
+            metrics_into(row, agg, data_size_bytes,
                          throughput_mb=busy_throughput_mb(
-                             writer_files.values(), "pipeline_write", batch_size, data_size_bytes))
+                             writer_files.values(), "pipeline_write", data_size_bytes))
             rows.append(row)
         for r in plan["readers"]:
             f = reader_files.get(r["port"])
@@ -752,7 +856,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
             row = base_row("reader", "TOTAL", "")
             metrics_into(row, agg, data_size_bytes, with_queue=True,
                          throughput_mb=busy_throughput_mb(
-                             reader_files.values(), "pipeline_read", 1, data_size_bytes))
+                             reader_files.values(), "pipeline_read", data_size_bytes))
             rows.append(row)
     else:
         pattern = os.path.join(local_log_dir, "{}.*.log".format(name))
@@ -777,7 +881,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                     row[k] = round(v, 2)
 
         op_label = cfg.get("operation", "")
-        is_mixed = op_label == "mixed" or ("/" in op_label and "put" in op_label and "get" in op_label)
+        batch_size = max(1, int(cfg.get("batch_size", 1)))
+        put_iface = get_iface = None
+        if "/" in op_label:
+            put_iface, get_iface = op_label.split("/", 1)
+        is_mixed = bool(put_iface and get_iface)
         data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
         for path in sorted(glob.glob(pattern)):
             base = os.path.basename(path)
@@ -801,8 +909,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "num_threads": t,
                 "data_size": cfg.get("data_size", ""),
                 "key_count": cfg.get("key_count", ""),
-                "batch_size": cfg.get("batch_size", "") if cfg.get("operation") in ("put_batch", "get_batch") else "",
-                "put_ratio": cfg.get("put_ratio", "") if cfg.get("operation") in ("mixed", "put/get") else "",
+                "batch_size": cfg.get("batch_size", "") if (op_label in ("put_batch", "get_batch") or
+                                                            put_iface in ("put_batch",) or
+                                                            get_iface in ("get_batch",)) else "",
+                "put_ratio": cfg.get("put_ratio", "") if "/" in op_label else "",
                 "duration": cfg.get("duration", ""),
                 "warmup_duration": "",
                 "writer_count": "",
@@ -818,14 +928,17 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
             }
             if is_mixed:
                 # mixed must be split: put and get latencies are statistically
-                # independent and are aggregated/输出 as separate rows
-                for sub in ("put", "get"):
-                    agg = parse_benchmark_log(path, op_filter=sub)
+                # independent and are output as separate rows labelled with the
+                # actual interface used on each side
+                subs = ((put_iface, "put"), (get_iface, "get"))
+                for iface, role in subs:
+                    agg = parse_benchmark_log(path, op_filter=role)
                     row = dict(base_row_vals)
                     # parse bytes come from the combined SUMMARY; recompute per
-                    # sub-op counting successful operations only
-                    agg = dict(agg, total_bytes=int(agg["ok"] * data_size_bytes))
-                    fill_basic_row(row, agg, sub)
+                    # side counting successful ops with the side's interface
+                    bp = batch_size if iface in ("put_batch", "get_batch") else 1
+                    agg = dict(agg, total_bytes=int(agg["ok"] * bp * data_size_bytes))
+                    fill_basic_row(row, agg, iface)
                     rows.append(row)
             else:
                 agg = parse_benchmark_log(path)

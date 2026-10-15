@@ -49,12 +49,14 @@ CLI 的 `--protocol` 可选值为 `tcp / rdma / ub`，优先级最高、可覆�
 
 | 目录 | 说明 |
 | --- | --- |
-| `configs/basic/` | 接口级 benchmark（5 种操作 × 2 种拓扑 = 10 个场景） |
+| `configs/basic/` | 接口级 benchmark（put/put_batch/put_from、get/get_batch/get_into/get_buffer、mixed `put_iface/get_iface`，各 × local/remote） |
 | `configs/basic/demo/` | basic 冒烟用例（simple-*，非主测试，用于打通验证） |
-| `configs/pipeline/` | 精排/召排 pipeline 场景（36 个正式场景） |
+| `configs/pipeline/` | 精排/召排 pipeline 场景（48 个正式场景） |
 | `configs/pipeline/demo/` | pipeline 冒烟用例 |
 | `configs/cluster.example.json` | 集群基础设施模板（复制为 cluster.json 后修改） |
 | `configs/global.example.json` | 全局超参模板（复制为 global.json 后修改） |
+
+接口清单、签名与梯队分类详见 **`Mooncake-api.md`**。
 
 ### 3.1 并发维度（params 组合）
 
@@ -72,14 +74,23 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 
 | 参数 | 说明 | 测试场景使用值 |
 | --- | --- | --- |
+| `operation` | 使用的 store 接口：`put / put_batch / put_from`（写）或 `get / get_batch / get_into / get_buffer`（读）；mixed 场景为 `"<写接口>/<读接口>"`（如 `put/get`、`put_batch/get_batch`、`put_from/get_buffer`） | 见各场景 |
 | `data_size` | 单个 value 的大小 | put/get 单 key 场景 8MB；mixed 场景 3.5MB；预热 1MB |
 | `key_count` | key 数量 | 正式测量 1000（数据总量 8GB，适配单 store ~12GB 内存限制）；预热场景 100 |
-| `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16 |
+| `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16；mixed_batch 8 |
 | `put_ratio` | mixed 场景中 put 操作占比 | mixed 场景 0.5 |
-| `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get / get_batch） |
+| `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
+
+- **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
+  每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
+  `put_ratio × key_count`（put）/ 余量（get）。
+- 零拷贝接口（put_from / get_into / get_buffer）在场景进程内自动 `register_buffer` 并注销，
+  无需额外配置。
+- **pipeline 同样由 operation 指定接口**：`writer.operation`（写接口，`put_batch` 等）与
+  `reader.operation`（读接口，`get` 等）真实驱动调用（见 3.3）。
 
 > 压测模式（duration）备注：由于 `put` 为 create-only（key 已存在时 no-op 不覆盖），重复写入会失效，
-> 因此 duration 目前仅适用于 **get 与 get_batch**。
+> 因此 duration 目前仅适用于 **get 家族**（get / get_batch / get_into / get_buffer）。
 
 ### 3.3 pipeline（精排/召排）模式
 
@@ -96,12 +107,12 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `base_qps` | 基准写入 QPS | 105 | 35 |
 | `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读） | 10 | 1 |
-| `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 操作（put_batch）/ notify 发送线程池 / 部署节点 | cpn=1 | cpn=1 |
-| `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 操作（get，mooncake 单 key 接口）/ 消费线程数 / 部署节点 | n1:10, n2:5, n4:3 | 恒 1 |
+| `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / 部署节点 | cpn=1 | cpn=1 |
+| `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / 部署节点 | n1:10, n2:5, n4:3 | 恒 1 |
 | `data_size` | 单个 value 大小 | 8MB | 3.5MB |
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
-| `batch_size` | writer 每批写入的 key 数（reader 逐 key 读取） | 1 | 1 |
+| `batch_size` | writer 每批写入的 key 数（reader 按 notify 批处理） | 1 | 1 |
 
 store 节点由 **global.json 的 `mooncake_store_nodes`**（cluster.json 节点名列表，可多个）统一标识，
 各场景配置**不再携带 store_node**；该列表仅用于指标行的 local/remote 拓扑标注（local = 该节点 ∈
@@ -115,14 +126,19 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **负载语义**：总写入 QPS = base_qps × qps_multiple，由全部 writer（cpn × 节点数）均分（2w 家族
   双 writer 各半即原系统 "105/2" 语义，总量守恒；小数速率由窗口预算累积保证长期精确）；
 - **扇出语义**：每批写入后从 reader 池随机选 notify_count 个 reader，单次 HTTP 请求携带整批 key
-  （读总量 = 写入批数 × notify_count）；
+  （读总量 = 写入批数 × notify_count）；reader 侧**按 notify 批入队处理**（queue 深度单位 = 待处理
+  notify 批数，`max_depth` 以此计）；
 - **warmup 语义**：正式测量前以相同部署形态运行 warmup.duration 秒（notify 带 warmup=1 标记，writer
   不输出 RESULT、reader 照常读取但不记录，SUMMARY 计入 warmup_total）；
-- **operation 角色化**：writer.operation（CSV writer 行显示）与 reader.operation（reader 行显示）
-  分别配置，对齐原系统测试表的 operation（SET/GET）列；reader 的 `get` 即 mooncake 单 key `get()`
-  接口（原 getBuffer 步骤名的落地），零拷贝 `get_buffer()` 留作后续优化；
+- **operation 角色化**：`writer.operation`（写接口）与 `reader.operation`（读接口）**真实驱动调用**
+  ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`（逐 key 调用），reader 支持
+  `get`/`get_into`/`get_buffer`（逐 key）与 `get_batch`（整批一次调用）；时延样本 = 单次接口调用
+  （逐 key 接口每 key 一条、批量接口每批一条，RESULT 行携带 key_count，total/qps 均按 key 计）；
+  `notify_pipeline` 收敛为预检步骤（`exist`），`get/getBuffer` 步骤名不再承担读数据职责；
 - **指标输出**：每个 writer 一行、每 writer 聚合一行、每个 reader 一行、全 reader 聚合一行
   （instance=TOTAL），`role/node/instance/topology` 列区分；
+- **FAIL 处理**：场景失败时先优雅 shutdown reader（使其落盘 SUMMARY/RESULT）→ kill 残留进程 → 
+  拉取全部远程日志，再继续后续场景（端口随进程结束释放，避免级联失败）；
 - 1写7读（notify=7）用例范围暂不实现；
 - **运行**：
 
