@@ -155,9 +155,8 @@ def scenario_paths(globals_cfg, ts, cfg_name):
 
 
 def build_cluster_session(cluster, globals_cfg, remote_dir):
-    return {
-        "MC_MASTER_ADDR": globals_cfg.get("master_addr", ""),
-        "MC_METADATA_SERVER": globals_cfg.get("metadata_server", ""),
+    etcd_endpoints = globals_cfg.get("etcd_endpoints", "")
+    session = {
         "MC_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
         "MC_VENV": cluster.get("venv", ""),
         "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
@@ -166,6 +165,35 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
         "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
     }
+    if etcd_endpoints:
+        # etcd mode: master_addr/metadata_server are mutually exclusive and not
+        # exported; the client passes the same etcd URI to both setup params
+        session["MC_ETCD_ENDPOINTS"] = etcd_endpoints
+    else:
+        session["MC_MASTER_ADDR"] = globals_cfg.get("master_addr", "")
+        session["MC_METADATA_SERVER"] = globals_cfg.get("metadata_server", "")
+    return session
+
+
+def _validate_master_mode(globals_cfg):
+    """etcd and http master connections are mutually exclusive; exactly one
+    mode must be configured."""
+    etcd = globals_cfg.get("etcd_endpoints", "") or ""
+    master = globals_cfg.get("master_addr", "") or ""
+    metadata = globals_cfg.get("metadata_server", "") or ""
+    if etcd:
+        if master or metadata:
+            raise RuntimeError(
+                "etcd mode is mutually exclusive with master_addr/metadata_server: "
+                "set 'etcd_endpoints' and leave the other two empty "
+                "(got etcd_endpoints={!r}, master_addr={!r}, metadata_server={!r})".format(
+                    etcd, master, metadata))
+    else:
+        if not master:
+            raise RuntimeError(
+                "master connection not configured: set 'etcd_endpoints' "
+                "(etcd mode) or 'master_addr' (http mode) in {}".format(
+                    "configs/global.json"))
 
 
 def base_scenario_params(cfg, work_mode, topology, primary_node_name):
@@ -1039,6 +1067,7 @@ def parse_arguments(argv=None):
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
     globals_cfg = load_json(args.global_cfg)
+    _validate_master_mode(globals_cfg)
     if not cfg_paths:
         # standalone cleanup mode
         cleanup_cluster(cluster, globals_cfg, dry_run=args.dry_run)
