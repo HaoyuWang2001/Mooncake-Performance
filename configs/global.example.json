@@ -5,6 +5,7 @@
   "master_addr": "127.0.0.1:50051",
   "metadata_server": "http://127.0.0.1:9999/metadata",
   "ylt_log_level": "info",
+  "mc_hifreq_log_sample_rate": 0.01,
   "mooncake_store_nodes": ["store1"],
   "protocol": {
     "ub": {

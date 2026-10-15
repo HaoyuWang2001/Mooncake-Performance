@@ -171,6 +171,13 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_YLT_LOG_LEVEL": globals_cfg.get("ylt_log_level", "info"),
         "MC_YLT_LOG_MAX_FILE_SIZE": "52428800",
         "MC_YLT_LOG_MAX_FILES": "3",
+        # mooncake per-RPC high-frequency logs (master_rpc_client_breakdown
+        # etc., gated by ShouldSampleHiFreqLog) are noisy at full sampling
+        # (35-315 lines/s during measured runs). Default 0.01 = 1% sampling:
+        # keeps the slow-RPC diagnostic (rpc_call_us anomalies) at ~100x less
+        # volume. 1.0 = full trace, 0 = silence. Parsed once at process start,
+        # so it must be in env.sh (it is: generated before launch).
+        "MC_HIFREQ_LOG_SAMPLE_RATE": str(globals_cfg.get("mc_hifreq_log_sample_rate", 0.01)),
     }
     if master_type == "etcd":
         # etcd mode: only the etcd URI is exported; the client passes it to

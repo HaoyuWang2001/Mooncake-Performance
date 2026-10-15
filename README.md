@@ -292,6 +292,7 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 | global_segment_size | 本 client 贡献的存储大小，纯客户端设 0 |
 | tenant_id | 租户标识，默认 "default" |
 | ylt_log_level | C++ ylt easylog（coro_rpc 连接事件）日志级别：`warn`/`info`/`debug`，默认 `info` |
+| mc_hifreq_log_sample_rate | mooncake per-request 高频日志（`master_rpc_client_breakdown` 等，经 `ShouldSampleHiFreqLog` 门控）采样率：默认 `0.01`（1% 采样，保留慢 RPC 诊断能力），`1.0` 全量追踪，`0` 完全关闭 |
 | data_seed | 数据生成固定随机种子 |
 | remote_dir | 服务器端脚本/配置根目录 |
 | remote_data_dir / remote_results_dir | 服务器端数据 / 结果目录 |
