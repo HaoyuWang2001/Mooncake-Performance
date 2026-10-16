@@ -1,7 +1,7 @@
 # Mooncake Mock（本地端到端验证用）
 
 本目录提供一个 `mooncake` Python 包的**假实现**，用于在没有 Mooncake 部署的机器上
-完整跑通基准测试流程：编排器（benchmark.py）→ 真实 ssh/scp → run_benchmark.sh →
+完整跑通基准测试流程：编排器（benchmark.py）→ 真实 ssh/scp → run_benchmark_basic.sh / run_benchmark_pipeline.sh →
 mooncake_benchmark_client.py（真实代码）。**唯一被替换的是 `mooncake.store` 接口**，
 其余全部是真实代码。
 

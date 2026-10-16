@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# run_benchmark.sh — launch mooncake_benchmark_client.py processes on the server.
+# run_benchmark_basic.sh — launch mooncake_benchmark_client.py processes for
+# basic (interface benchmark) scenarios on the server.
 #
-# Usage: run_benchmark.sh MODE LOG_FILE [client args...]
-#   MODE: prepare-data | clean | prepare-store | benchmark | pipeline
+# Usage: run_benchmark_basic.sh MODE LOG_FILE [client args...]
+#   MODE: generate-data | remove-keys | prepare-store | benchmark
 #
 # MODE semantics:
-#   - stage modes (prepare-data / clean / prepare-store): single foreground
-#     process; all extra args are passed through.
+#   - stage modes (generate-data / remove-keys / prepare-store): single
+#     foreground process; all extra args are passed through.
 #   - benchmark: --num-clients N is a SCRIPT-level flag (NOT forwarded to the
 #     client). The script reads MC_KEY_COUNT from env.sh, splits the key
 #     range evenly, and spawns N parallel processes, injecting
 #     --client-id i --key-start S --key-end E into each. All other args are
-#     passed through.
-#   - pipeline: single process; --role/--client-id/--listen-port/--peers etc.
-#     are passed through (writer: --client-id is the global writer id;
-#     reader: --client-id is the reader index).
+#     passed through. --numa-bind is also script-level (binds client i to
+#     NUMA node (i-1)%K, K = NUMA node count on this host).
 #
 # All scenario/cluster configuration comes from env.sh (sourced here).
 # Per-client stdout goes to $LOG_FILE.d/client.$i.log and is merged into
@@ -32,7 +31,7 @@ LOG_FILE=$2
 shift 2
 
 case "$MODE" in
-  prepare-data|clean|prepare-store|benchmark|pipeline) ;;
+  generate-data|remove-keys|prepare-store|benchmark) ;;
   *) echo "[FATAL] unknown MODE: $MODE" >&2; usage ;;
 esac
 

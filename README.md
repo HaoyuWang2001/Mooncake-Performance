@@ -94,7 +94,7 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `numa_bind` | 客户端 NUMA 绑定（可选）：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配） | 空/`null`：不绑定（现行为） |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
-- **NUMA 绑定**：`numa_bind: true` 时（basic 默认值在 `_basic.json` 中，置空即不绑定），basic 的多 client 由 `run_benchmark.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
+- **NUMA 绑定**：`numa_bind: true` 时（basic 默认值在 `_basic.json` 中，置空即不绑定），basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。
@@ -169,7 +169,7 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
   - `keys.txt`：全部 key 列表（每行一个），与正式测试的 key 集合一致；
 - **共享 value**：全部 key 共享同一份 `value.bin` 内容（与原 datasystem 一致），get 场景通过校验
   返回数据前 64 字节是否与预期一致来判断成功；
-- **可复现性**：固定种子保证数据文件被删除后重新生成的内容完全一致；`prepare-data` 阶段自动检测
+- **可复现性**：固定种子保证数据文件被删除后重新生成的内容完全一致；`generate-data` 阶段自动检测
   `value.bin` 大小是否匹配当前 `data_size`，匹配则跳过生成，避免重复浪费；
 - **预热数据隔离**：预热使用独立前缀 `mc_warmup*{scenario}*{pid}_*`，测试结束后即删除，不污染
   正式数据（`mc_bench_*`）与持久化数据集。
@@ -213,10 +213,10 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 - `mooncake_master` 与 `mooncake_store` 由运维手动启动，本套件不管理其生命周期；
 - store 实例部署在 `mooncake_store_nodes` 指定的节点上；local 场景 client 与 store 同节点，
   remote 场景 client 在不同节点；
-- 每个 benchmark 运行由 `run_benchmark.sh` 在本节点并行拉起 `num_clients` 个
+- 每个 benchmark 运行由 `run_benchmark_basic.sh` 在本节点并行拉起 `num_clients` 个
   `mooncake_benchmark_client.py` 进程（basic），每个进程内再开启 `num_threads` 个工作线程；
 - **不再上传 JSON 配置文件**：benchmark.py 读取 JSON 后生成 `env.sh`（环境变量形式），仅上传
-  `env.sh` + `run_benchmark.sh` + `mooncake_benchmark_client.py` 三个文件到服务器。
+  `env.sh` + `run_benchmark_basic.sh` + `run_benchmark_pipeline.sh` + `mooncake_benchmark_client.py` 四个文件到服务器。
 
 ## 6. 输出指标
 
@@ -257,7 +257,7 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 ## 7. 配置文件
 
 测试使用一个 Python 编排程序（`benchmark.py`）+ 服务器端 Python 测试程序
-（`scripts/mooncake_benchmark_client.py`）+ Shell 启动脚本（`scripts/run_benchmark.sh`），
+（`scripts/mooncake_benchmark_client.py`）+ Shell 启动脚本（`scripts/run_benchmark_basic.sh` / `scripts/run_benchmark_pipeline.sh`），
 行为由 JSON 配置文件驱动。
 配置流程：benchmark.py 读取 `cluster.json` + `global.json` + 场景 JSON → 合并生成
 `scripts/env.sh`（环境变量形式）→ scp 上传到服务器。mooncake_benchmark_client.py
@@ -331,15 +331,15 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 关键说明：
 
 - **Python 输出实时可见**：客户端启动即把 stdout/stderr 设为行缓冲，重定向到文件也逐行落盘；
-  关键阶段（连接 master、setup 完成、clean/prepare 起止、pipeline 各阶段）都有带时间戳的
+  关键阶段（连接 master、setup 完成、generate-data/remove-keys/prepare 起止、pipeline 各阶段）都有带时间戳的
   `[HH:MM:SS]` 进度行——挂死时最后一行即挂点（如 `connecting to mooncake master (...)` 表示
-  卡在 setup/建连，`clean start (scope=full)` 之后无 `clean done` 表示卡在 `remove_all`）。
+  卡在 setup/建连，`remove-keys start (scope=full)` 之后无 `remove-keys done` 表示卡在 `remove_all`）。
 - **glog 级别不可从 Python 调整**：`store.so` 加载路径不调用 `InitGoogleLogging`，未初始化时
   glog 全部输出到 stderr 且 `GLOG_v`/`minloglevel` 环境变量不生效——只能通过捕获 stderr 获取。
   若其他库恰好初始化过 glog，日志会改写到 `/tmp/python3.<host>.<user>.log.*`，可用
   `ls /tmp/python*.log*` 排除。
 - **ylt easylog 配置**：级别经 `MC_YLT_LOG_LEVEL`（global.json `ylt_log_level`，默认 `info`），
-  路径由 run_benchmark.sh 强制设为绝对路径（修复默认相对 `logs/rpc.log` 随 cwd 丢失的问题）；
+  路径由 run_benchmark_*.sh 强制设为绝对路径（修复默认相对 `logs/rpc.log` 随 cwd 丢失的问题）；
   轮转上限固定 `MC_YLT_LOG_MAX_FILE_SIZE=50MB`、`MC_YLT_LOG_MAX_FILES=3`。
 - **MC_LOG 异步刷盘**：C++ `MC_LOG` 走 ring buffer + 后台线程 + 1s 周期 flush，`kill -9` 会丢
   最后一秒日志。排查挂死时先 `kill -TERM`（atexit flush）或等待 ≥1s 再读文件；编排器 FAIL
@@ -382,24 +382,24 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 
 ### 7.5 测试阶段（--mode）
 
-- `prepare-data`：按固定种子生成数据文件并持久化
-- `clean`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`，失败即报错退出，无回退
+- `generate-data`：按固定种子生成数据文件并持久化
+- `remove-keys`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`，失败即报错退出，无回退
 - `prepare-store`：`batch_is_exist` 检查存在性，仅对缺失 key 执行 `put_batch` 补写
 - `benchmark`：`--warmup true|false`，预热在正式测量前执行小规模运行
 - `pipeline`：生产-消费 pipeline 模式（精排/召排，按 `--role writer|reader` 分派）
 
 ### 7.6 各操作类型完整流程
 
-- `put / put_batch`：prepare-data → clean → warmup → benchmark
-- `get / get_batch`：prepare-data → prepare-store（先检查数据是否存在）→ warmup → benchmark
-- `mixed`：prepare-data → clean → prepare-store → warmup → benchmark
+- `put / put_batch`：generate-data → remove-keys → warmup → benchmark
+- `get / get_batch`：generate-data → prepare-store（先检查数据是否存在）→ warmup → benchmark
+- `mixed`：generate-data → remove-keys → prepare-store → warmup → benchmark
 
 `duration` 仅改变 benchmark 阶段 key 的遍历方式（跑一遍结束 vs 循环到截止），不改变上述阶段流程。
 
 ### 7.7 key 格式
 
 正式数据：`mc_bench*{scenario}*{index:08d}`，例：`mc_bench*basic*00000000`（basic 各场景共享同一
-key 空间，靠 clean 串行隔离）。
+key 空间，靠 remove-keys 串行隔离）。
 预热数据：`mc_warmup*{scenario}*{pid}*{index:08d}`，测试结束即删除。
 
 ## 8. 运行方式
@@ -451,9 +451,9 @@ outputs/<时间戳，如 20261010-1308>/
 ├── benchmark_detail.csv        # 全部用例汇总（pipeline 仅 writer/reader TOTAL 行）
 └── logs/
     └── <配置名>/               # 每个配置一个子目录
-        ├── <配置名>.prepare-data.log
+        ├── <配置名>.generate-data.log
         ├── <配置名>.prepare-store.log
-        ├── <配置名>.clean.log
+        ├── <配置名>.remove-keys.log
         ├── <配置名>.benchmark_c{clients}_t{threads}.log
         └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port}.log / .writer{gid}.log ...
             （脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
@@ -462,13 +462,13 @@ outputs/<时间戳，如 20261010-1308>/
 ## 10. 注意事项与待验证项
 
 - API 语义以 `mooncake_api.md` 为准：`put` 为 create-only（key 存在时 no-op 不覆盖），因此 put
-  类场景必须保证先 clean 再 put（编排流程已保证，clean 失败会终止场景）；
+  类场景必须保证先 remove-keys 再 put（编排流程已保证，remove-keys 失败会终止场景）；
 - `get` 缺失时返回空 bytes `b""`，本套件 value 恒非空，故以空结果判定 MISS；
-- 数据路径错误码为 int 负值（如 OBJECT_NOT_FOUND），`clean` 通过 `batch_is_exist` 前置判定区分
+- 数据路径错误码为 int 负值（如 OBJECT_NOT_FOUND），`remove-keys` 通过 `batch_is_exist` 前置判定区分
   "key 不存在"与"删除失败"，失败即报错退出；
 - 构造使用无参 `MooncakeDistributedStore()` + `setup(...)`，`setup` 返回非 0 即报错退出；
 - `local_buffer_size` 需满足 `num_threads × data_size` 的并发占用，避免缓冲区不足；
-- `prepare-data` 阶段自动检测：每次运行前 ssh 检查 `value.bin` 的文件大小是否匹配当前 `data_size`，
-  匹配则跳过 prepare-data，避免重复生成浪费。种子变更或数据大小变更时自动触发重新生成；
+- `generate-data` 阶段自动检测：每次运行前 ssh 检查 `value.bin` 的文件大小是否匹配当前 `data_size`，
+  匹配则跳过 generate-data，避免重复生成浪费。种子变更或数据大小变更时自动触发重新生成；
 - `--clean-up` 参数：删除 cluster.json 中**全部节点**的远程测试目录（`rm -rf $MC_REMOTE_DIR`）。
   独立使用（不带 --all/--demo/--config）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。

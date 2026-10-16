@@ -2,10 +2,10 @@
 """Remote test process for the Mooncake performance benchmark.
 Runs on the server node that hosts the test client (single node, multi client).
 Usage:
-  python3 mooncake_benchmark_client.py --mode prepare-data|clean|prepare-store|benchmark|pipeline   
+  python3 mooncake_benchmark_client.py --mode generate-data|remove-keys|prepare-store|benchmark|pipeline   
       [--scope key-prefix|full] [--num-clients N --client-id ID --num-threads T]   
       [--warmup true|false] [other params...]
-Output (stdout, captured by run_benchmark.sh into per-client log files):
+Output (stdout, captured by run_benchmark_*.sh into per-client log files):
   META\t                       run metadata
   RESULT\t\t\t\t   one line per measured op
   SUMMARY\t                    per-client summary
@@ -44,7 +44,7 @@ def value_path(remote_data_dir, scenario):
 def load_value(remote_data_dir, scenario):
     path = value_path(remote_data_dir, scenario)
     if not os.path.exists(path):
-        raise SystemExit("[ERROR] data not prepared yet, run --mode prepare-data first")
+        raise SystemExit("[ERROR] data not generated yet, run --mode generate-data first")
     with open(path, "rb") as f:
         return f.read()
 def make_store(args):
@@ -213,8 +213,8 @@ def _fmt_cpu_list(cpus):
 
 # --------------------------------------------------------------------------
 
-def cmd_prepare_data(args):
-    log("prepare-data start (scenario={}, data_size={}, key_count={})".format(
+def cmd_generate_data(args):
+    log("generate-data start (scenario={}, data_size={}, key_count={})".format(
         args.scenario, args.data_size, args.key_count))
     data_dir = scenario_data_dir(args.remote_data_dir, args.scenario)
     os.makedirs(data_dir, exist_ok=True)
@@ -228,26 +228,26 @@ def cmd_prepare_data(args):
     with open(kpath, "w", encoding="utf-8") as f:
         for k in keys:
             f.write(k + "\n")
-    log("prepare-data done (value={} bytes, keys={})".format(data_size, len(keys)))
-    emit("META", {"mode": "prepare-data", "scenario": args.scenario,
+    log("generate-data done (value={} bytes, keys={})".format(data_size, len(keys)))
+    emit("META", {"mode": "generate-data", "scenario": args.scenario,
                   "key_count": len(keys), "data_size_bytes": data_size,
                   "value_file": vpath, "keys_file": kpath, "seed": args.data_seed})
-def cmd_clean(args, store):
-    log("clean start (scope={}, scenario={})".format(args.scope, args.scenario))
+def cmd_remove_keys(args, store):
+    log("remove-keys start (scope={}, scenario={})".format(args.scope, args.scenario))
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     scope = args.scope
     if scope == "full":
         ret = store.remove_all(force=True)
         if ret < 0:
-            print("[ERROR] clean full failed: remove_all returned {}".format(ret))
+            print("[ERROR] remove-keys full failed: remove_all returned {}".format(ret))
             sys.exit(1)
-        log("clean done (scope=full, cleared={})".format(max(ret, 0)))
-        emit("META", {"mode": "clean", "scope": "full", "cleared": max(ret, 0)})
+        log("remove-keys done (scope=full, cleared={})".format(max(ret, 0)))
+        emit("META", {"mode": "remove-keys", "scope": "full", "cleared": max(ret, 0)})
         return
     existence = store.batch_is_exist(keys)
     statuses = store.batch_remove(keys, force=True)
     if len(existence) != len(keys) or len(statuses) != len(keys):
-        print("[ERROR] clean failed: batch_is_exist/batch_remove returned unexpected result size")
+        print("[ERROR] remove-keys failed: batch_is_exist/batch_remove returned unexpected result size")
         sys.exit(1)
     removed = 0
     not_found = 0
@@ -262,13 +262,13 @@ def cmd_clean(args, store):
             failed += 1
             if len(failed_samples) < 20:
                 failed_samples.append("{} (is_exist={}, remove={})".format(k, ex, st))
-    emit("META", {"mode": "clean", "scope": "key-prefix",
+    emit("META", {"mode": "remove-keys", "scope": "key-prefix",
                   "keys_attempted": len(keys), "keys_removed": removed,
                   "keys_not_found": not_found, "keys_failed": failed})
-    log("clean done (scope=key-prefix, removed={}, not_found={}, failed={})".format(
+    log("remove-keys done (scope=key-prefix, removed={}, not_found={}, failed={})".format(
         removed, not_found, failed))
     if failed_samples:
-        print("[ERROR] clean failed for {} keys, samples:".format(failed))
+        print("[ERROR] remove-keys failed for {} keys, samples:".format(failed))
         for s in failed_samples:
             print("  " + s)
     if failed > 0:
@@ -1267,7 +1267,7 @@ def _resolve_env(args):
 def main():
     unbuffer_stdio()
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
-    parser.add_argument("--mode", required=True, choices=["prepare-data", "clean", "prepare-store", "benchmark", "pipeline"])
+    parser.add_argument("--mode", required=True, choices=["generate-data", "remove-keys", "prepare-store", "benchmark", "pipeline"])
     parser.add_argument("--scope", default="key-prefix", choices=["key-prefix", "full"])
     parser.add_argument("--client-id", type=int, default=1,
                         help="process instance id within this test run "
@@ -1350,13 +1350,13 @@ def main():
         args.notify_pipeline = ["get"]
     args.traffic_mode = str(args.traffic_mode)
     mode = args.mode
-    if mode == "prepare-data":
-        cmd_prepare_data(args)
+    if mode == "generate-data":
+        cmd_generate_data(args)
         return
     store = make_store(args)
     try:
-        if mode == "clean":
-            cmd_clean(args, store)
+        if mode == "remove-keys":
+            cmd_remove_keys(args, store)
         elif mode == "prepare-store":
             cmd_prepare_store(args, store)
         elif mode == "benchmark":
@@ -1378,7 +1378,7 @@ if __name__ == "__main__":
     # urma/ub 上下文等跨 .so 双重所有权资源）时，glibc 检测到 double free：
     #   "double free or corruption (fasttop)" → abort() → SIGABRT
     # 进程退出码被污染为 134（128+6），使本已成功的运行（rc 应为 0）被
-    # run_benchmark.sh 当作失败返回给编排器，进而误判 scenario FAIL。
+    # run_benchmark_*.sh 当作失败返回给编排器，进而误判 scenario FAIL。
     #
     # 规避原理：os._exit() 直接发起 exit 系统调用，内核立刻回收进程全部
     # 资源，用户态清理链（atexit 处理器、C++/Go 静态析构、Python 终结化）

@@ -162,9 +162,11 @@ def scenario_paths(globals_cfg, ts, cfg_name):
     remote_dir = globals_cfg["remote_dir"]
     remote_scripts = remote_dir + "/scripts"
     remote_log_dir = "{}/{}/logs".format(globals_cfg["remote_results_dir"], ts)
-    remote_runner = remote_scripts + "/run_benchmark.sh"
+    remote_runner_basic = remote_scripts + "/run_benchmark_basic.sh"
+    remote_runner_pipeline = remote_scripts + "/run_benchmark_pipeline.sh"
     local_log_dir = os.path.join(RESULTS_DIR, ts, "logs", cfg_name)
-    return remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir
+    return (remote_dir, remote_scripts, remote_log_dir,
+            remote_runner_basic, remote_runner_pipeline, local_log_dir)
 
 
 def build_cluster_session(cluster, globals_cfg, remote_dir):
@@ -180,7 +182,7 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
         # ylt easylog (coro_rpc): level configurable, rotation capped so long
         # runs cannot fill the disk; the path itself is set per-client by
-        # run_benchmark.sh (absolute, alongside the client log)
+        # run_benchmark_*.sh (absolute, alongside the client log)
         "MC_YLT_LOG_LEVEL": globals_cfg.get("ylt_log_level", "info"),
         "MC_YLT_LOG_MAX_FILE_SIZE": "52428800",
         "MC_YLT_LOG_MAX_FILES": "3",
@@ -267,9 +269,10 @@ def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip):
 
 
 def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   ld_path, remote_scripts, remote_log_dir, remote_runner, dry_run):
+                   ld_path, remote_scripts, remote_log_dir, dry_run):
     """Generate a per-node env.sh (node-specific fabric_ip) and push the
-    three orchestrator scripts to every involved node."""
+    orchestrator scripts (both runner variants + client) to every involved
+    node."""
     env_sh_path = os.path.join(SCRIPTS_DIR, "env.sh")
     for node_name in involved_nodes:
         n = get_node(cluster, node_name)
@@ -281,11 +284,14 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
             remote_scripts, remote_log_dir), dry_run=dry_run)
         scp_push(n["ip"], n,
                  [env_sh_path,
-                  os.path.join(SCRIPTS_DIR, "run_benchmark.sh"),
+                  os.path.join(SCRIPTS_DIR, "run_benchmark_basic.sh"),
+                  os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
                   os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")],
                  remote_scripts, dry_run=dry_run)
-        run_ssh(n["ip"], n, "chmod +x {} {}".format(
-            remote_scripts + "/env.sh", remote_runner), dry_run=dry_run)
+        run_ssh(n["ip"], n, "chmod +x {} {} {}".format(
+            remote_scripts + "/env.sh",
+            remote_scripts + "/run_benchmark_basic.sh",
+            remote_scripts + "/run_benchmark_pipeline.sh"), dry_run=dry_run)
 
 
 def value_check_cmd(remote_data_dir, scenario, data_size_bytes):
@@ -421,8 +427,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         raise RuntimeError(
             "duration configured but operation={} does not support duration "
             "stress (only get-family: get/get_batch/get_into/get_buffer)".format(op))
-    remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir = \
+    remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
+        remote_runner_pipeline, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
+    remote_runner = remote_runner_basic
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
     log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
@@ -431,17 +439,17 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
-    # The try MUST start here (before any stage): a failure in prepare-data /
-    # clean / prepare-store previously raised before the try block, so the
-    # FAIL path never pulled the remote logs — silent failure with no
+                   ld_path, remote_scripts, remote_log_dir, dry)
+    # The try MUST start here (before any stage): a failure in generate-data /
+    # remove-keys / prepare-store previously raised before the try block, so
+    # the FAIL path never pulled the remote logs — silent failure with no
     # diagnosable evidence. All stages are now covered.
     try:
         run_stage(host, node, remote_runner,
-                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
-        need_clean_before_run = op in PIPELINE_PUT_IFACES or "/" in op
+        need_remove_before_run = op in PIPELINE_PUT_IFACES or "/" in op
         # basic pacing: target_qps (total across the scenario) is optional;
         # when set it is split per client process per combo. 0/absent keeps
         # the current count-based max-speed behaviour.
@@ -449,8 +457,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if total_target_qps < 0:
             raise RuntimeError("basic target_qps must be >= 0 (got {})".format(total_target_qps))
         numa_bind = bool(cfg.get("numa_bind"))
-        log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}, target_qps={}".format(
-            cfg_name, len(runs), warmup, need_clean_before_run, total_target_qps or "max-speed"))
+        log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
+            cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
         current_ds = None
         for c, t, ds, ds_explicit in runs:
             if ds != current_ds:
@@ -461,15 +469,15 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
                 if data_status != "EXISTS":
                     run_stage(host, node, remote_runner,
-                              "prepare-data", remote_log_dir, cfg_name,
+                              "generate-data", remote_log_dir, cfg_name,
                               extra="--data-size {}".format(ds), dry_run=dry)
                 if op in PIPELINE_GET_IFACES:
                     run_stage(host, node, remote_runner,
                               "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
                 current_ds = ds
-            if need_clean_before_run:
+            if need_remove_before_run:
                 run_stage(host, node, remote_runner,
-                          "clean", remote_log_dir, cfg_name,
+                          "remove-keys", remote_log_dir, cfg_name,
                           extra="--scope full", dry_run=dry)
             # suffix the run file when data_size came from the params entry,
             # so different sizes under the same (c, t) do not collide
@@ -480,8 +488,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
             if numa_bind:
-                # script-level flag: run_benchmark.sh binds each client to a
-                # NUMA node (round-robin across the node's topology)
+                # script-level flag: run_benchmark_basic.sh binds each client
+                # to a NUMA node (round-robin across the node's topology)
                 command += " --numa-bind"
             if total_target_qps > 0:
                 # basic target_qps is TOTAL across the scenario; each client
@@ -490,7 +498,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             run_ssh(host, node, command, dry_run=dry)
         # Final cleanup after all params complete
         run_stage(host, node, remote_runner,
-                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
     except Exception:
         # FAIL path: preserve the remote logs for diagnosis, then re-raise
@@ -543,8 +551,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     # (mooncake_store_nodes from global.json)
     store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
     topology = "local_node" if primary_node_name in store_nodes else "remote_node"
-    remote_dir, remote_scripts, remote_log_dir, remote_runner, local_log_dir = \
+    remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
+        remote_runner_pipeline, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
+    remote_runner = remote_runner_pipeline
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
     log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
@@ -570,7 +580,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   ld_path, remote_scripts, remote_log_dir, remote_runner, dry)
+                   ld_path, remote_scripts, remote_log_dir, dry)
     reader_peers = []
     reader_pids = []
     writer_pids = []
@@ -603,9 +613,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
             if data_status != "EXISTS":
                 run_stage(n["ip"], n, remote_runner,
-                          "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
+                          "generate-data", remote_log_dir, cfg_name, dry_run=dry)
         run_stage(host, node, remote_runner,
-                  "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
         warmup = "false" if args.no_warmup else "true"
         reader_threads = plan["reader_threads"]
         log("scenario {} (pipeline, {}): writers={}, readers={}, notify_count={}, "
