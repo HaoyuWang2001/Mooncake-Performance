@@ -91,8 +91,10 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `put_ratio` | mixed 场景中 put 操作占比 | mixed 场景 0.5 |
 | `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
 | `target_qps` | 总限速 QPS（可选）：按该总 QPS 对操作均匀限速（跨 client×thread 均分，绝对时间表自纠偏） | 空/0：计数模式极速连发（现行为）；设置后用于低压时延对比 |
+| `numa_bind` | 客户端 NUMA 绑定（可选）：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配） | 空/`null`：不绑定（现行为） |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
+- **NUMA 绑定**：`numa_bind: true` 时（basic 默认值在 `_basic.json` 中，置空即不绑定），basic 的多 client 由 `run_benchmark.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。

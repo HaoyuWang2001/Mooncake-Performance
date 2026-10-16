@@ -448,6 +448,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         total_target_qps = float(cfg.get("target_qps", 0) or 0)
         if total_target_qps < 0:
             raise RuntimeError("basic target_qps must be >= 0 (got {})".format(total_target_qps))
+        numa_bind = bool(cfg.get("numa_bind"))
         log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_clean_before_run, total_target_qps or "max-speed"))
         current_ds = None
@@ -478,6 +479,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             remote_log = remote_log_path(remote_log_dir, cfg_name, name)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
+            if numa_bind:
+                # script-level flag: run_benchmark.sh binds each client to a
+                # NUMA node (round-robin across the node's topology)
+                command += " --numa-bind"
             if total_target_qps > 0:
                 # basic target_qps is TOTAL across the scenario; each client
                 # process gets its share (client then divides across threads)
@@ -569,6 +574,26 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     reader_peers = []
     reader_pids = []
     writer_pids = []
+    # optional NUMA binding: per node, round-robin the node's client
+    # processes (readers launched first, then writers) across its NUMA nodes.
+    numa_bind = bool(cfg.get("numa_bind"))
+    numa_node_count = {}
+    numa_counter = {}
+    if numa_bind:
+        for node_name in involved_nodes:
+            n = get_node(cluster, node_name)
+            count = ssh_check_output(
+                n["ip"], n,
+                "k=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l); "
+                "[ \"$k\" -gt 0 ] && echo \"$k\" || lscpu 2>/dev/null | "
+                "grep -cE '^NUMA[[:space:]]+node[0-9]+[[:space:]]+CPU\\(s\\):' || echo 0",
+                quiet=True, dry_run=dry)
+            try:
+                numa_node_count[node_name] = max(1, int(count.strip()))
+            except ValueError:
+                raise RuntimeError(
+                    "numa_bind: failed to probe NUMA topology on {}".format(node_name))
+            numa_counter[node_name] = 0
     try:
         data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
         check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
@@ -606,9 +631,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             rn = get_node(cluster, r["node"])
             merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
             nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
-            rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} > {} 2>&1 & echo $!".format(
+            numa_arg = ""
+            if numa_bind:
+                numa_arg = "--numa-node {}".format(
+                    numa_counter[r["node"]] % numa_node_count[r["node"]])
+                numa_counter[r["node"]] += 1
+            rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} {} > {} 2>&1 & echo $!".format(
                 remote_runner, merged_log, r["index"], reader_threads,
-                r["port"], peers_json, reader_op, nohup_log)
+                r["port"], peers_json, reader_op, numa_arg, nohup_log)
             pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
             reader_pids.append((r, pid))
         # give readers a moment to boot before the health polling starts
@@ -641,8 +671,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             wn = get_node(cluster, w["node"])
             merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
             nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
-            wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} > {} 2>&1 & echo $!".format(
-                remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, nohup_log)
+            numa_arg = ""
+            if numa_bind:
+                numa_arg = "--numa-node {}".format(
+                    numa_counter[w["node"]] % numa_node_count[w["node"]])
+                numa_counter[w["node"]] += 1
+            wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} {} > {} 2>&1 & echo $!".format(
+                remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, numa_arg, nohup_log)
             pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
             writer_pids.append((w, pid))
         # Step 4: wait for all writers to finish (warmup + measured run)

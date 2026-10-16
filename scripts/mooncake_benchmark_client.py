@@ -14,6 +14,8 @@ import argparse
 import json
 import os
 import random
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -107,6 +109,103 @@ def unbuffer_stdio():
         sys.stderr.reconfigure(line_buffering=True)
     except Exception:
         pass
+
+
+# --- NUMA / CPU affinity binding ------------------------------------------
+
+def parse_cpu_list(spec):
+    """Parse a CPU list spec ('0-83,90' or '0-19') into a set of cpu ids.
+    Raises ValueError on malformed input."""
+    cpus = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo, hi = int(lo), int(hi)
+            if lo < 0 or hi < lo:
+                raise ValueError("invalid cpu range: {}".format(part))
+            cpus.update(range(lo, hi + 1))
+        else:
+            cpus.add(int(part))
+    if not cpus:
+        raise ValueError("empty cpu list: {!r}".format(spec))
+    return cpus
+
+
+def parse_lscpu_numa(text, node):
+    """Extract the CPU list of a NUMA node from lscpu output ('NUMA nodeN
+    CPU(s): 0-83' lines). Returns None if the node is absent."""
+    for line in text.splitlines():
+        m = re.match(r"NUMA\s+node(\d+)\s+CPU\(s\):\s*(.+)", line.strip())
+        if m and int(m.group(1)) == node:
+            return m.group(2).strip()
+    return None
+
+
+def numa_node_cpu_list(node):
+    """CPU list string for NUMA node N: /sys/devices/system/node/nodeN/cpulist
+    first, lscpu parsing as fallback. Returns None when unavailable."""
+    sysfs = "/sys/devices/system/node/node{}/cpulist".format(node)
+    if os.path.exists(sysfs):
+        with open(sysfs) as f:
+            return f.read().strip()
+    try:
+        out = subprocess.check_output(["lscpu"], text=True,
+                                      stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    return parse_lscpu_numa(out, node)
+
+
+def apply_cpu_binding(args):
+    """Bind this process to a NUMA node (--numa-node) or a direct CPU list
+    (--cpu-bind, takes precedence) via os.sched_setaffinity. Logs the actual
+    bound set. Returns silently when no binding is requested. Binding is
+    applied before any store work so all measurement threads inherit it."""
+    if args.cpu_bind:
+        try:
+            cpus = parse_cpu_list(args.cpu_bind)
+        except ValueError as exc:
+            sys.exit("[ERROR] invalid --cpu-bind {!r}: {}".format(args.cpu_bind, exc))
+        source = "cpu_bind={}".format(args.cpu_bind)
+    elif args.numa_node is not None and args.numa_node >= 0:
+        spec = numa_node_cpu_list(args.numa_node)
+        if spec is None:
+            sys.exit("[ERROR] --numa-node {}: NUMA topology not available on this node".format(
+                args.numa_node))
+        try:
+            cpus = parse_cpu_list(spec)
+        except ValueError as exc:
+            sys.exit("[ERROR] bad cpu list for NUMA node {} ({}): {}".format(
+                args.numa_node, spec, exc))
+        source = "numa_node={}".format(args.numa_node)
+    else:
+        return
+    try:
+        os.sched_setaffinity(0, sorted(cpus))
+    except OSError as exc:
+        sys.exit("[ERROR] sched_setaffinity failed ({}): {}".format(source, exc))
+    bound = sorted(os.sched_getaffinity(0))
+    log("cpu binding: {} bound_cpus={} ({} cpus)".format(source, _fmt_cpu_list(bound), len(bound)))
+
+
+def _fmt_cpu_list(cpus):
+    """Render a sorted cpu set compactly (e.g. {0..9, 12} -> '0-9,12')."""
+    cpus = sorted(cpus)
+    if not cpus:
+        return ""
+    parts = []
+    start = prev = cpus[0]
+    for c in cpus[1:]:
+        if c == prev + 1:
+            prev = c
+            continue
+        parts.append("{}".format(start) if start == prev else "{}-{}".format(start, prev))
+        start = prev = c
+    parts.append("{}".format(start) if start == prev else "{}-{}".format(start, prev))
+    return ",".join(parts)
 
 # --------------------------------------------------------------------------
 
@@ -1229,9 +1328,18 @@ def main():
                              "empty for tcp/rdma)")
     parser.add_argument("--data-seed", type=int, default=None)
     parser.add_argument("--remote-data-dir", default=None)
+    parser.add_argument("--numa-node", type=int, default=None,
+                        help="bind this process to a NUMA node (cpu affinity); "
+                             "the node's cpu list is probed locally (sysfs/lscpu)")
+    parser.add_argument("--cpu-bind", default=None,
+                        help="bind this process to a direct cpu list (e.g. 0-83,90); "
+                             "takes precedence over --numa-node")
     args = parser.parse_args()
     # Resolve env.sh fallbacks
     _resolve_env(args)
+    # Bind to NUMA node / cpu list before any store work so all measurement
+    # threads inherit the affinity
+    apply_cpu_binding(args)
     # Resolve peers from JSON string
     if isinstance(args.peers, str):
         args.peers = json.loads(args.peers)

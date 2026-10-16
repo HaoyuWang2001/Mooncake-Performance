@@ -5,6 +5,7 @@
   "key_count": 1000,
   "data_size": "8MB",
   "target_qps": null,
+  "numa_bind": null,
   "warmup": {
     "key_count": 100,
     "data_size": "1MB",
