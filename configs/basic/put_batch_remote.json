@@ -1,13 +1,7 @@
 {
-  "scenario": "basic",
   "operation": "put_batch",
-  "protocol": "ub",
   "client_node": "node1",
-  "key_prefix": "mc_bench",
-  "key_count": 1000,
-  "data_size": "8MB",
-  "target_qps": null,
-  "batch_size": 16,
+  "work_mode": "put_batch",
   "params": [
     {
       "num_clients": 1,
@@ -98,11 +92,5 @@
       "num_threads": 8
     }
   ],
-  "warmup": {
-    "key_count": 100,
-    "data_size": "1MB",
-    "num_clients": 1,
-    "num_threads": 1
-  },
-  "work_mode": "put_batch"
+  "batch_size": 16
 }

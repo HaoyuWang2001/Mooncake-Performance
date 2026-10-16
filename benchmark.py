@@ -83,8 +83,21 @@ def remote_log_path(remote_log_dir, scenario, name):
 
 
 def build_runs(cfg):
+    """Resolve the run matrix: each params entry becomes
+    (num_clients, num_threads, data_size, explicit_data_size). data_size per
+    entry falls back to the config-level value, then to the 8MB default,
+    enabling per-combo data size sweeps beyond the num_clients/num_threads
+    grid. explicit_data_size marks entries that carry data_size inline (used
+    to suffix run filenames so different sizes under the same (c, t) do not
+    collide)."""
+    cfg_ds = cfg.get("data_size", "8MB")
     params = cfg["params"]
-    return [(int(p["num_clients"]), int(p["num_threads"])) for p in params]
+    runs = []
+    for p in params:
+        ds = p.get("data_size")
+        runs.append((int(p["num_clients"]), int(p["num_threads"]),
+                     str(ds or cfg_ds), ds is not None))
+    return runs
 
 
 def pipeline_plan(cfg):
@@ -424,17 +437,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     # FAIL path never pulled the remote logs — silent failure with no
     # diagnosable evidence. All stages are now covered.
     try:
-        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
-        check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
-        data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
-        if data_status != "EXISTS":
-            run_stage(host, node, remote_runner,
-                      "prepare-data", remote_log_dir, cfg_name, dry_run=dry)
         run_stage(host, node, remote_runner,
                   "clean", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
-        if op in PIPELINE_GET_IFACES:
-            run_stage(host, node, remote_runner,
-                      "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_clean_before_run = op in PIPELINE_PUT_IFACES or "/" in op
@@ -446,12 +450,31 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             raise RuntimeError("basic target_qps must be >= 0 (got {})".format(total_target_qps))
         log("scenario {}: {} run combos, warmup={}, need_clean_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_clean_before_run, total_target_qps or "max-speed"))
-        for c, t in runs:
+        current_ds = None
+        for c, t, ds, ds_explicit in runs:
+            if ds != current_ds:
+                # data_size changed: (re)build value.bin at this size and
+                # re-prefill the store for get-family combos
+                ds_bytes = parse_data_size(ds)
+                check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, ds_bytes)
+                data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
+                if data_status != "EXISTS":
+                    run_stage(host, node, remote_runner,
+                              "prepare-data", remote_log_dir, cfg_name,
+                              extra="--data-size {}".format(ds), dry_run=dry)
+                if op in PIPELINE_GET_IFACES:
+                    run_stage(host, node, remote_runner,
+                              "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
+                current_ds = ds
             if need_clean_before_run:
                 run_stage(host, node, remote_runner,
                           "clean", remote_log_dir, cfg_name,
                           extra="--scope full", dry_run=dry)
+            # suffix the run file when data_size came from the params entry,
+            # so different sizes under the same (c, t) do not collide
             name = "benchmark_c{}_t{}".format(c, t)
+            if ds_explicit:
+                name += "_{}".format(ds)
             remote_log = remote_log_path(remote_log_dir, cfg_name, name)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
@@ -947,15 +970,22 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
         if "/" in op_label:
             put_iface, get_iface = op_label.split("/", 1)
         is_mixed = bool(put_iface and get_iface)
-        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
         for path in sorted(glob.glob(pattern)):
             base = os.path.basename(path)
             try:
-                c_part = base.split("benchmark_c")[1].split("_t")[0]
-                t_part = base.split("_t")[1].replace(".log", "")
-                c, t = int(c_part), int(t_part)
+                # run name: benchmark_c{c}_t{t}[_{data_size}].log — the data
+                # size suffix exists only when the params entry carried one
+                core = base.split(".benchmark_c")[1].replace(".log", "")
+                c_part = core.split("_t")[0]
+                t_ds = core.split("_t")[1].split("_")
+                c = int(c_part)
+                t = int(t_ds[0])
+                ds = t_ds[1] if len(t_ds) > 1 else None
             except (IndexError, ValueError):
                 continue
+            # per-run data_size: suffix wins, otherwise the merged config default
+            row_data_size = ds or cfg.get("data_size", "8MB")
+            row_data_size_bytes = parse_data_size(row_data_size)
             topo = "local_node" if cfg["client_node"] in store_nodes else "remote_node"
             base_row_vals = {
                 "scenario": cfg["scenario"],
@@ -968,7 +998,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "protocol": cfg["protocol"],
                 "num_clients": c,
                 "num_threads": t,
-                "data_size": cfg.get("data_size", ""),
+                "data_size": row_data_size,
                 "key_count": cfg.get("key_count", ""),
                 "batch_size": cfg.get("batch_size", "") if (op_label in ("put_batch", "get_batch") or
                                                             put_iface in ("put_batch",) or
@@ -998,7 +1028,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                     # parse bytes come from the combined SUMMARY; recompute per
                     # side counting successful ops with the side's interface
                     bp = batch_size if iface in ("put_batch", "get_batch") else 1
-                    agg = dict(agg, total_bytes=int(agg["ok"] * bp * data_size_bytes))
+                    agg = dict(agg, total_bytes=int(agg["ok"] * bp * row_data_size_bytes))
                     fill_basic_row(row, agg, iface)
                     rows.append(row)
             else:
@@ -1025,6 +1055,26 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
 # --------------------------------------------------------------------------
 # CLI entry
 # --------------------------------------------------------------------------
+
+def load_scenario_config(cfg_path):
+    """Load a scenario config; configs under configs/basic/ inherit shared
+    defaults from configs/basic/_basic.json (shallow merge — the specific
+    config overrides any key present). The defaults fragment itself is not a
+    runnable scenario and is rejected if passed directly."""
+    cfg = load_json(cfg_path)
+    if os.path.basename(cfg_path).startswith("_"):
+        raise RuntimeError(
+            "{} is a shared-defaults fragment, not a runnable scenario".format(cfg_path))
+    cfg_dir = os.path.normpath(os.path.dirname(os.path.abspath(cfg_path)))
+    basic_dir = os.path.normpath(os.path.join(CONFIGS_DIR, "basic"))
+    if cfg_dir == basic_dir or cfg_dir.startswith(basic_dir + os.sep):
+        defaults_path = os.path.join(basic_dir, "_basic.json")
+        if os.path.exists(defaults_path):
+            merged = dict(load_json(defaults_path))
+            merged.update(cfg)          # specific config wins on conflicts
+            cfg = merged
+    return cfg
+
 
 def parse_arguments(argv=None):
     """Parse CLI args, validate combinations, and collect config paths.
@@ -1089,7 +1139,8 @@ def parse_arguments(argv=None):
     elif args.all:
         scenario_dir = os.path.join(CONFIGS_DIR, scenario_category)
         for f in sorted(os.listdir(scenario_dir)):
-            if f.endswith(".json"):
+            # skip shared-defaults fragments (e.g. _basic.json)
+            if f.endswith(".json") and not f.startswith("_"):
                 cfg_paths.append(os.path.join(scenario_dir, f))
     elif args.demo:
         scenario_dir = os.path.join(CONFIGS_DIR, scenario_category, "demo")
@@ -1124,7 +1175,7 @@ def main(args, cfg_paths):
     categories = set()
     failed_scenarios = []
     for cfg_path in cfg_paths:
-        cfg = load_json(cfg_path)
+        cfg = load_scenario_config(cfg_path)
         cfg["__cfg_path__"] = cfg_path
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         try:
