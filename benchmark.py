@@ -496,10 +496,20 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 # process gets its share (client then divides across threads)
                 command += " --target-qps {}".format(total_target_qps / c)
             run_ssh(host, node, command, dry_run=dry)
-        # Final cleanup after all params complete
-        run_stage(host, node, remote_runner,
-                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+        # Config end: remove only the keys this config wrote (key-prefix
+        # scope, bounded by MC_KEY_COUNT from env.sh). Full scope here would
+        # wipe shared store data written by other nodes/scenarios; the full
+        # sweep is deferred to the sweep-end remove-all in main(). The log
+        # name is distinct (<cfg>.remove-keys-end.log) so it sits next to the
+        # config-start remove-keys log instead of overwriting it.
+        remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
+        command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
+        run_ssh(host, node, command, dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # Sweep-end remove-all is issued by main() on the last successful
+        # config's node; hand it this config's coordinates.
+        return {"host": host, "node": primary_node_name, "runner": remote_runner,
+                "remote_log_dir": remote_log_dir}
     except Exception:
         # FAIL path: preserve the remote logs for diagnosis, then re-raise
         if not dry:
@@ -727,7 +737,19 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
                         " ".join(nohup_files))
                     ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+        # Config end: remove-all — clears everything this config's writers
+        # wrote. Pipeline env clears MC_KEY_COUNT, so the key-prefix scope has
+        # no key count to work with; a full sweep here is short and precise
+        # enough. The log name is distinct (<cfg>.remove-keys-end.log) so it
+        # sits next to the config-start remove-keys log.
+        remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
+        command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
+        run_ssh(host, node, command, dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # Sweep-end remove-all is issued by main() on the last successful
+        # config's node; hand it this config's coordinates.
+        return {"host": host, "node": primary_node_name, "runner": remote_runner,
+                "remote_log_dir": remote_log_dir}
     except Exception:
         # FAIL path: preserve every remote log (reader SUMMARY/RESULT is only
         # flushed on exit) and free ports, then re-raise for main's [FAIL]
@@ -1219,15 +1241,19 @@ def main(args, cfg_paths):
     all_rows = []
     categories = set()
     failed_scenarios = []
+    # coordinates of the last successful config — the sweep-end remove-all
+    # runs on its node (failed configs skip their own end-remove, so the
+    # sweep-end pass is what guarantees the store gets emptied)
+    sweep_remove = None
     for cfg_path in cfg_paths:
         cfg = load_scenario_config(cfg_path)
         cfg["__cfg_path__"] = cfg_path
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         try:
             if cfg.get("scenario") == "pipeline":
-                run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
+                sweep_remove = run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
             else:
-                run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
+                sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
                 rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
                                           globals_cfg.get("mooncake_store_nodes", []))
@@ -1244,6 +1270,24 @@ def main(args, cfg_paths):
     if args.dry_run:
         log("dry-run complete, no artifacts written")
         return
+    # Sweep end: remove-all on the last successful config's primary node.
+    # Failed configs never reach their own end-remove, so this final pass is
+    # what guarantees the store ends the sweep empty. Removing from an empty
+    # store is a no-op (safe), and failure here must not fail the whole sweep
+    # — hence WARN-only. The log is scp'd out because it does not match the
+    # per-config glob used by pull_logs.
+    if sweep_remove:
+        try:
+            nd = get_node(cluster, sweep_remove["node"])
+            run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
+                      sweep_remove["remote_log_dir"], "final",
+                      extra="--scope full", dry_run=False)
+            scp_pull(sweep_remove["host"], nd,
+                     "{}/final.remove-keys.log".format(sweep_remove["remote_log_dir"]),
+                     ts_dir, dry_run=False)
+            log("sweep-end remove-keys -> {}".format(os.path.join(ts_dir, "final.remove-keys.log")))
+        except Exception as exc:
+            log("[WARN] sweep-end remove-keys failed: {}".format(exc))
     if categories == {"pipeline"}:
         detail_header = PIPELINE_CSV_HEADER
         detail_rows = collapse_config_name(all_rows)

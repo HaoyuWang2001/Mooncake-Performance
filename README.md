@@ -396,6 +396,32 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 
 `duration` 仅改变 benchmark 阶段 key 的遍历方式（跑一遍结束 vs 循环到截止），不改变上述阶段流程。
 
+### 7.6.1 remove-keys 触发时机
+
+层级约定：**场景** = 一次 `benchmark.py` 调用（可含多套配置）；**配置** = 单个配置文件运行。
+
+basic 场景：
+
+| 时机 | 动作 | 日志 |
+| --- | --- | --- |
+| 场景启动 | 无 | — |
+| 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
+| put/put_batch/mixed 每个 combo 运行前 | remove-all（`--scope full`，保证写入隔离） | `<配置名>.remove-keys.log`（覆盖） |
+| 配置结束 | 仅删除本配置写入的 key（`--scope key-prefix`） | `<配置名>.remove-keys-end.log` |
+| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留） | `final.remove-keys.log`（scp 回结果目录） |
+
+pipeline 场景：
+
+| 时机 | 动作 | 日志 |
+| --- | --- | --- |
+| 场景启动 | 无 | — |
+| 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
+| 配置结束 | remove-all（`--scope full`；pipeline 运行期清空了 `MC_KEY_COUNT`，key-prefix 不可用） | `<配置名>.remove-keys-end.log` |
+| 场景结束 | remove-all（`--scope full`，兜底） | `final.remove-keys.log` |
+
+场景结束的 remove-all 在**最后一个成功配置**的主节点上执行（该配置返回的 runner/日志目录可复用）；
+配置失败时其配置结束清理不会执行，因此场景结束兜底必须执行。该步骤失败仅 `[WARN]`，不影响整体结果汇总。
+
 ### 7.7 key 格式
 
 正式数据：`mc_bench*{scenario}*{index:08d}`，例：`mc_bench*basic*00000000`（basic 各场景共享同一
