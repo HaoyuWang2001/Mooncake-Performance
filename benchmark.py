@@ -983,7 +983,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "reader_threads": "",
                 "base_qps": "",
                 "qps_multiple": "",
-                "target_qps": cfg.get("target_qps", ""),
+                "target_qps": cfg.get("target_qps") or "",
                 "notify_pipeline": "",
                 "traffic_mode": "",
             }
@@ -1041,7 +1041,9 @@ def parse_arguments(argv=None):
                         choices=["basic", "pipeline"],
                         help="scenario category: basic (interface tests) or pipeline (recall/refine)")
     parser.add_argument("--config", "-f", default=None,
-                        help="full path to scenario config json, e.g. basic/get_remote.json or basic/demo/simple_get.json")
+                        help="scenario config json, resolved as given (relative to CWD "
+                             "or absolute; NOT relative to configs/), e.g. "
+                             "configs/pipeline/demo/simple_recall.json or /path/to/cfg.json")
     parser.add_argument("--all", action="store_true",
                         help="run all configs in the selected scenario category (excludes demo/ subdir)")
     parser.add_argument("--demo", action="store_true",
@@ -1066,7 +1068,9 @@ def parse_arguments(argv=None):
     scenario_category = args.scenario
     cfg_path = None
     if args.config:
-        cfg_path = os.path.join(CONFIGS_DIR, args.config)
+        # --config is resolved verbatim (relative to CWD or absolute); it is
+        # NOT joined with CONFIGS_DIR, so arbitrary external config paths work.
+        cfg_path = args.config
         if scenario_category is None:
             scenario_category = args.config.replace("\\", "/").split("/")[0]
     elif args.all or args.demo:

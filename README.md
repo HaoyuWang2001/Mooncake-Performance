@@ -145,7 +145,7 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **运行**：
 
 ```
-python benchmark.py --scenario pipeline --config pipeline/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --config configs/pipeline/rank_pulse_2w10r_3x_n2.json
 python benchmark.py --scenario pipeline --all     # 跑全部 pipeline 场景
 python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 ```
@@ -405,28 +405,30 @@ cp configs/cluster.example.json configs/cluster.json
 cp configs/global.example.json configs/global.json
 ```
 
+> `--config` 按给定路径**原样**解析（相对当前目录或绝对路径），不再默认拼接 `configs/` 前缀。
+
 ```
 # 运行 basic 类别下全部 10 个场景
 python benchmark.py --scenario basic --all
 # 只运行 basic 类别下指定场景
-python benchmark.py --scenario basic --config basic/get_remote.json
+python benchmark.py --scenario basic --config configs/basic/get_remote.json
 # 运行 demo 冒烟用例
 python benchmark.py --scenario basic --demo
 # 运行 pipeline 场景全部
 python benchmark.py --scenario pipeline --all
 # 运行 pipeline 指定场景
-python benchmark.py --scenario pipeline --config pipeline/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --config configs/pipeline/rank_pulse_2w10r_3x_n2.json
 # 指定集群/全局配置文件
 python benchmark.py --cluster configs/cluster.json --global configs/global.json \
-    --scenario basic --config basic/put_local.json
+    --scenario basic --config configs/basic/put_local.json
 # 关闭预热；仅打印命令不执行
-python benchmark.py --scenario basic --config basic/put_local.json --no-warmup --dry-run
+python benchmark.py --scenario basic --config configs/basic/put_local.json --no-warmup --dry-run
 # 覆盖传输协议（tcp/rdma/ub，优先级最高，覆盖 JSON 配置值）
-python benchmark.py --scenario basic --config basic/put_local.json --protocol tcp
+python benchmark.py --scenario basic --config configs/basic/put_local.json --protocol tcp
 # 独立清理：删除 cluster.json 全部节点的远程测试目录
 python benchmark.py --clean-up
 # 运行并追加清理阶段（与 --all/--demo/--config 共现时）
-python benchmark.py --scenario basic --config basic/get_local.json --clean-up
+python benchmark.py --scenario basic --config configs/basic/get_local.json --clean-up
 ```
 
 ## 9. 结果目录结构
