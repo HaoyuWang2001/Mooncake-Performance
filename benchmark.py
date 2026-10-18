@@ -1205,6 +1205,30 @@ def load_scenario_config(cfg_path):
     return cfg
 
 
+def collect_config_files(directory, recursive=False):
+    """Collect scenario config files under directory in deterministic order.
+
+    Non-recursive: *.json directly inside directory (shared-defaults
+    fragments prefixed with "_" are skipped). Recursive: walk subdirectories
+    as well (sorted); the demo/ subdir is always skipped there — it is the
+    smoke-test area handled by --demo. "_"-prefixed fragments are skipped at
+    every level.
+    """
+    found = []
+    if not recursive:
+        for f in sorted(os.listdir(directory)):
+            path = os.path.join(directory, f)
+            if os.path.isfile(path) and f.endswith(".json") and not f.startswith("_"):
+                found.append(path)
+        return found
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = sorted(d for d in dirs if d != "demo")
+        for f in sorted(files):
+            if f.endswith(".json") and not f.startswith("_"):
+                found.append(os.path.join(root, f))
+    return found
+
+
 def parse_arguments(argv=None):
     """Parse CLI args, validate combinations, and collect config paths.
 
@@ -1223,10 +1247,19 @@ def parse_arguments(argv=None):
                         help="scenario config json, resolved as given (relative to CWD "
                              "or absolute; NOT relative to configs/), e.g. "
                              "configs/pipeline/demo/simple_recall.json or /path/to/cfg.json")
+    parser.add_argument("--config-dir", default=None,
+                        help="run every scenario config under this directory. Values that "
+                             "are not an existing path resolve to configs/<scenario>/<value> "
+                             "(e.g. --config-dir 2-nodes --scenario pipeline). Only the "
+                             "directory's top level is scanned unless --recursive is given")
     parser.add_argument("--all", action="store_true",
-                        help="run all configs in the selected scenario category (excludes demo/ subdir)")
+                        help="run all configs of the selected scenario category, "
+                             "RECURSIVELY (demo/ and _-prefixed fragments always skipped)")
     parser.add_argument("--demo", action="store_true",
                         help="run all demo configs in the selected scenario category's demo/ subdir")
+    parser.add_argument("--recursive", action="store_true",
+                        help="with --config-dir: also descend into subdirectories "
+                             "(demo/ and _-prefixed fragments always skipped)")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
@@ -1235,7 +1268,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--clean-up", action="store_true",
                         help="remove the remote test directory on every node in "
                              "cluster.json. Standalone: only cleanup and exit. "
-                             "Combined with --all/--demo/--config: cleanup after the run.")
+                             "Combined with --all/--demo/--config/--config-dir: cleanup after the run.")
     args = parser.parse_args(argv)
     if not os.path.exists(args.cluster):
         example = os.path.join(CONFIGS_DIR, "cluster.example.json")
@@ -1244,33 +1277,60 @@ def parse_arguments(argv=None):
                      args.cluster, example, os.path.join(CONFIGS_DIR, "cluster.json")))
     if not os.path.exists(args.global_cfg):
         sys.exit("[ERROR] global config not found: {}".format(args.global_cfg))
+    # exactly one selector among --config/--config-dir/--all/--demo
+    selectors = sum(1 for x in (args.config, args.config_dir, args.all, args.demo) if x)
+    if selectors > 1:
+        sys.exit("[ERROR] --config/--config-dir/--all/--demo are mutually exclusive; pick one")
+    if args.recursive and not (args.all or args.config_dir):
+        sys.exit("[ERROR] --recursive requires --all or --config-dir")
     scenario_category = args.scenario
     cfg_path = None
+    cfg_dir = None
     if args.config:
         # --config is resolved verbatim (relative to CWD or absolute); it is
         # NOT joined with CONFIGS_DIR, so arbitrary external config paths work.
         cfg_path = args.config
         if scenario_category is None:
             scenario_category = args.config.replace("\\", "/").split("/")[0]
+    elif args.config_dir:
+        # --config-dir resolves to configs/<scenario>/<value> unless the value
+        # is already an existing directory path (absolute or CWD-relative).
+        cand = args.config_dir
+        if not os.path.isdir(cand) and scenario_category is not None:
+            cand = os.path.join(CONFIGS_DIR, scenario_category, cand)
+        if not os.path.isdir(cand):
+            sys.exit("[ERROR] config dir not found: {}{}".format(
+                args.config_dir,
+                "" if scenario_category is not None else
+                " (hint: pass --scenario so it resolves to configs/<scenario>/{} )".format(
+                    args.config_dir)))
+        cfg_dir = cand
     elif args.all or args.demo:
         if scenario_category is None:
             sys.exit("[ERROR] --all/--demo requires --scenario")
     elif not args.clean_up:
-        sys.exit("[ERROR] provide --scenario with --all or --demo or --config, "
+        sys.exit("[ERROR] provide --scenario with --all/--demo/--config/--config-dir, "
                  "or --clean-up for a standalone cluster cleanup")
-    if args.scenario and not args.all and not args.config and not args.demo:
-        sys.exit("[ERROR] --scenario provided but none of --all/--demo/--config is given")
+    if args.scenario and selectors == 0 and not args.clean_up:
+        sys.exit("[ERROR] --scenario provided but none of --all/--demo/--config/--config-dir is given")
     cfg_paths = []
     if args.config:
         if not os.path.exists(cfg_path):
             sys.exit("[ERROR] config not found: {}".format(cfg_path))
         cfg_paths = [cfg_path]
+    elif args.config_dir:
+        cfg_paths = collect_config_files(cfg_dir, recursive=args.recursive)
+        if not cfg_paths:
+            sys.exit("[ERROR] no config json found under {} (recursive={})".format(
+                cfg_dir, args.recursive))
     elif args.all:
+        # --all is recursive: the pipeline category keeps its configs in
+        # per-tier subdirectories (1-nodes/2-nodes/4-nodes), basic has them
+        # at the top level; demo/ is skipped either way.
         scenario_dir = os.path.join(CONFIGS_DIR, scenario_category)
-        for f in sorted(os.listdir(scenario_dir)):
-            # skip shared-defaults fragments (e.g. _basic.json)
-            if f.endswith(".json") and not f.startswith("_"):
-                cfg_paths.append(os.path.join(scenario_dir, f))
+        cfg_paths = collect_config_files(scenario_dir, recursive=True)
+        if not cfg_paths:
+            sys.exit("[ERROR] no config json found under {}".format(scenario_dir))
     elif args.demo:
         scenario_dir = os.path.join(CONFIGS_DIR, scenario_category, "demo")
         if not os.path.isdir(scenario_dir):
