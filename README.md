@@ -120,7 +120,8 @@ x-nodes 层（writer/reader 骨架，client_nodes 按层配置）→ rank|recall
 base_qps、data_size；recall 另含 notify_count/writer.notify_threads/reader.count_per_node）→
 用例（rank：traffic_mode/qps_multiple/notify_count/writer.notify_threads/reader.count_per_node，
 5 字段；recall：traffic_mode/qps_multiple，2 字段）。numa_bind 属全局配置（global.json，
-默认 true，用例/层级可覆盖）。详见 configs/pipeline/README.md 与 configs/basic/README.md。
+默认 true，用例/层级可覆盖）。字段语义与可选值（writer/reader.operation、
+notify_pipeline 步骤）详见 configs/pipeline/README.md 的「配置总览」。
 `--config-dir` 指定某目录运行：用例已下沉到 rank|recall 层，指向 x-nodes 层需配 `--recursive`
 （如 `--config-dir 2-nodes --recursive`），或直接指向叶子目录（如 `--config-dir 2-nodes/rank`）。
 
