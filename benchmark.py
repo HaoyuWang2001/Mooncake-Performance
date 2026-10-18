@@ -186,13 +186,9 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_YLT_LOG_LEVEL": globals_cfg.get("ylt_log_level", "info"),
         "MC_YLT_LOG_MAX_FILE_SIZE": "52428800",
         "MC_YLT_LOG_MAX_FILES": "3",
-        # mooncake per-RPC high-frequency logs (master_rpc_client_breakdown
-        # etc., gated by ShouldSampleHiFreqLog) are noisy at full sampling
-        # (35-315 lines/s during measured runs). Default 0.01 = 1% sampling:
-        # keeps the slow-RPC diagnostic (rpc_call_us anomalies) at ~100x less
-        # volume. 1.0 = full trace, 0 = silence. Parsed once at process start,
-        # so it must be in env.sh (it is: generated before launch).
-        "MC_HIFREQ_LOG_SAMPLE_RATE": str(globals_cfg.get("mc_hifreq_log_sample_rate", 0.01)),
+        # NOTE: MC_HIFREQ_LOG_SAMPLE_RATE is intentionally NOT generated here.
+        # Its ownership moved to scripts/env.mooncake.sh (hand-editable tuning
+        # panel, sourced by the runner scripts after env.sh) — see that file.
     }
     if master_type == "etcd":
         # etcd mode: only the etcd URI is exported; the client passes it to
@@ -271,9 +267,13 @@ def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip):
 def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    ld_path, remote_scripts, remote_log_dir, dry_run):
     """Generate a per-node env.sh (node-specific fabric_ip) and push the
-    orchestrator scripts (both runner variants + client) to every involved
-    node."""
+    orchestrator scripts (both runner variants + client + the hand-editable
+    env.mooncake.sh tuning panel) to every involved node."""
     env_sh_path = os.path.join(SCRIPTS_DIR, "env.sh")
+    # env.mooncake.sh is a static, git-tracked tuning file (sourced by both
+    # runner scripts after env.sh). If it is missing the run still works —
+    # the runners guard the source with a -f check.
+    mooncake_env_path = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
     for node_name in involved_nodes:
         n = get_node(cluster, node_name)
         fab = n.get("fabric_ip", n.get("ip", ""))
@@ -282,12 +282,13 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
         log("env.sh written (node={}, fabric_ip={})".format(node_name, fab))
         run_ssh(n["ip"], n, "mkdir -p {} {}".format(
             remote_scripts, remote_log_dir), dry_run=dry_run)
-        scp_push(n["ip"], n,
-                 [env_sh_path,
-                  os.path.join(SCRIPTS_DIR, "run_benchmark_basic.sh"),
-                  os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
-                  os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")],
-                 remote_scripts, dry_run=dry_run)
+        push_files = [env_sh_path,
+                      os.path.join(SCRIPTS_DIR, "run_benchmark_basic.sh"),
+                      os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
+                      os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")]
+        if os.path.exists(mooncake_env_path):
+            push_files.append(mooncake_env_path)
+        scp_push(n["ip"], n, push_files, remote_scripts, dry_run=dry_run)
         run_ssh(n["ip"], n, "chmod +x {} {} {}".format(
             remote_scripts + "/env.sh",
             remote_scripts + "/run_benchmark_basic.sh",

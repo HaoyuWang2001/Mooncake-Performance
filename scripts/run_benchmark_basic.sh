@@ -15,9 +15,10 @@
 #     passed through. --numa-bind is also script-level (binds client i to
 #     NUMA node (i-1)%K, K = NUMA node count on this host).
 #
-# All scenario/cluster configuration comes from env.sh (sourced here).
-# Per-client stdout goes to $LOG_FILE.d/client.$i.log and is merged into
-# LOG_FILE afterwards.
+# All scenario/cluster configuration comes from env.sh (sourced here), then
+# env.mooncake.sh (hand-editable mooncake store/SDK tuning defaults; same-name
+# vars in env.mooncake.sh win). Per-client stdout goes to
+# $LOG_FILE.d/client.$i.log and is merged into LOG_FILE afterwards.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,6 +41,11 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 source "$ENV_FILE"
+# Hand-editable mooncake tuning defaults (git-tracked, pushed by deploy_scripts).
+# Sourced AFTER env.sh: same-name vars here override the generated env.sh.
+# -f guard keeps the script working without the file (local ad-hoc runs).
+# Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
+[ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
 
 # Collect passthrough args; extract script-level flags (--num-clients and
 # --numa-bind are consumed here and NOT forwarded to the client).

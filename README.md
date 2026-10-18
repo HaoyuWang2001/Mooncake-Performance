@@ -191,10 +191,10 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 ```
 +-----------------------------------------------------------+
 | 编排机（Linux/WSL）                                        |
-|   benchmark.py : 读配置 -> 生成 env.sh -> scp 上传(3文件)    |
+|   benchmark.py : 读配置 -> 生成 env.sh -> scp 上传(5文件)    |
 |                  -> ssh 驱动阶段 -> scp 收集 -> 汇总整理      |
 +----------------------------+------------------------------+
-                            | ssh / scp（仅上传 3 个文件）
+                            | ssh / scp（仅上传 5 个文件）
 +----------------------------+------------------------------+
 | 节点A：mooncake_master + mooncake_store（store 实例）        |
 |                                                            |
@@ -216,7 +216,8 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 - 每个 benchmark 运行由 `run_benchmark_basic.sh` 在本节点并行拉起 `num_clients` 个
   `mooncake_benchmark_client.py` 进程（basic），每个进程内再开启 `num_threads` 个工作线程；
 - **不再上传 JSON 配置文件**：benchmark.py 读取 JSON 后生成 `env.sh`（环境变量形式），仅上传
-  `env.sh` + `run_benchmark_basic.sh` + `run_benchmark_pipeline.sh` + `mooncake_benchmark_client.py` 四个文件到服务器。
+  `env.sh` + `run_benchmark_basic.sh` + `run_benchmark_pipeline.sh` + `mooncake_benchmark_client.py`
+  + `env.mooncake.sh` 五个文件到服务器。
 
 ## 6. 输出指标
 
@@ -260,7 +261,8 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 （`scripts/mooncake_benchmark_client.py`）+ Shell 启动脚本（`scripts/run_benchmark_basic.sh` / `scripts/run_benchmark_pipeline.sh`），
 行为由 JSON 配置文件驱动。
 配置流程：benchmark.py 读取 `cluster.json` + `global.json` + 场景 JSON → 合并生成
-`scripts/env.sh`（环境变量形式）→ scp 上传到服务器。mooncake_benchmark_client.py
+`scripts/env.sh`（环境变量形式）→ 连同手工调优面板 `scripts/env.mooncake.sh`
+（见 7.2.1）一起 scp 上传到服务器。mooncake_benchmark_client.py
 从环境变量读取配置，同时也支持显式 CLI 参数覆写。
 
 ### 7.1 configs/cluster.json（集群基础设施）
@@ -306,7 +308,6 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 | global_segment_size | 本 client 贡献的存储大小，纯客户端设 0 |
 | tenant_id | 租户标识，默认 "default" |
 | ylt_log_level | C++ ylt easylog（coro_rpc 连接事件）日志级别：`warn`/`info`/`debug`，默认 `info` |
-| mc_hifreq_log_sample_rate | mooncake per-request 高频日志（`master_rpc_client_breakdown` 等，经 `ShouldSampleHiFreqLog` 门控）采样率：默认 `0.01`（1% 采样，保留慢 RPC 诊断能力），`1.0` 全量追踪，`0` 完全关闭 |
 | data_seed | 数据生成固定随机种子 |
 | remote_dir | 服务器端脚本/配置根目录 |
 | remote_data_dir / remote_results_dir | 服务器端数据 / 结果目录 |
@@ -316,6 +317,26 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 > 未选中仅存档。etcd 模式下 env.sh 只导出 `MC_MASTER_TYPE`/`MC_ETCD_ENDPOINTS`（客户端
 > 把同一 etcd URI 传给 setup 两参数）；http 模式只导出 `MC_MASTER_TYPE`/`MC_MASTER_ADDR`/
 > `MC_METADATA_SERVER`。
+
+### 7.2.1 scripts/env.mooncake.sh（手工调优面板）
+
+mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`（git 跟踪，手工编辑），
+与编排器生成的 `env.sh` 分离——调优项可自由增删改而不会在每次运行时被覆盖。
+
+- **内容**：连接与容错（`MC_STORE_CLIENT_SETUP_RETRIES`/`MC_STORE_WARMUP`/
+  `MC_STORE_CLIENT_METRIC_BANDWIDTH`）、ylt RPC 连接池（`MC_YLT_RPC_POOL_*`/
+  `MC_OFFLOAD_RPC_THREAD_NUM`）、日志（`MC_HIFREQ_LOG_SAMPLE_RATE`/`MC_LOG_ENABLE`/
+  `MC_LOG_DIR`）、传输层（`MC_SLICE_SIZE`/`MC_WORKERS_PER_CTX`/`MC_NUM_CQ_PER_CTX`/
+  `MC_MAX_WR`/`MC_URMA_TRANS_MODE`/`MC_OFFLOAD_PUSH`）。
+- **部署**：`deploy_scripts` 自动随 env.sh / runner / client 一起推送到所有参与节点；
+- **加载**：两个 runner 脚本在 `source env.sh` 之后 source 本文件（带 `-f` 防御检查，
+  文件缺失不报错）；generate-data / remove-keys / prepare-store / benchmark / pipeline
+  全模式生效；
+- **覆盖顺序**：`env.sh`（编排器生成）→ `env.mooncake.sh`（同名变量以本文件为准）→
+  命令行 inline 注入（如 `MC_YLT_LOG_PATH`，永远最优先）；
+- **所有权变更**：`MC_HIFREQ_LOG_SAMPLE_RATE` 原由 global.json 的
+  `mc_hifreq_log_sample_rate` 注入 env.sh，现迁移至本文件（global.json 字段已删除），
+  默认 `1.0` 全量追踪（调低可降低 per-request 高频日志量）。
 
 ### 7.3 日志体系
 

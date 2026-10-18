@@ -13,9 +13,10 @@
 #     reader: --client-id is the reader index). There are NO script-level
 #     flags — everything is forwarded to the client.
 #
-# All scenario/cluster configuration comes from env.sh (sourced here).
-# Output is written DIRECTLY to LOG_FILE (live while the process runs);
-# ylt easylog goes to $LOG_FILE.ylt.log.
+# All scenario/cluster configuration comes from env.sh (sourced here), then
+# env.mooncake.sh (hand-editable mooncake store/SDK tuning defaults; same-name
+# vars in env.mooncake.sh win). Output is written DIRECTLY to LOG_FILE (live
+# while the process runs); ylt easylog goes to $LOG_FILE.ylt.log.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -38,6 +39,11 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 source "$ENV_FILE"
+# Hand-editable mooncake tuning defaults (git-tracked, pushed by deploy_scripts).
+# Sourced AFTER env.sh: same-name vars here override the generated env.sh.
+# -f guard keeps the script working without the file (local ad-hoc runs).
+# Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
+[ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
 
 PYTHON="${MC_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
