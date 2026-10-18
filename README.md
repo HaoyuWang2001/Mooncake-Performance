@@ -329,12 +329,15 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | protocol.ub.device | ub 传输使用的设备名（如 `bonding_dev_0`）；tcp 场景不使用 |
 | mooncake_store_nodes | store 节点名列表（取自 cluster.json 的 nodes），可多个；仅用于指标行 local/remote 拓扑标注 |
 | local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size |
-| global_segment_size | 本 client 贡献的存储大小，纯客户端设 0 |
 | tenant_id | 租户标识，默认 "default" |
-| ylt_log_level | C++ ylt easylog（coro_rpc 连接事件）日志级别：`warn`/`info`/`debug`，默认 `info` |
 | data_seed | 数据生成固定随机种子 |
 | remote_dir | 服务器端脚本/配置根目录 |
 | remote_data_dir / remote_results_dir | 服务器端数据 / 结果目录 |
+
+> 已迁移至 `env.mooncake.sh` 手工调优面板（global.json 同名字段已删除）：`ylt_log_level`、
+> `global_segment_size`（更早还有 `mc_hifreq_log_sample_rate`）。SDK 调优旋钮统一由面板管理，
+> global.json 仅保留编排决策输入、部署路径与硬件/身份属性。注意覆盖顺序：面板在 env.sh 之后
+> source，**即使 global.json 写回同名字段也会被面板覆盖**。
 
 > **master 连接方式由 `master_type` 显式选择**（必填，`"http"` 或 `"etcd"`）。两套地址
 > （`etcd_endpoints` 与 `master_addr`/`metadata_server`）可以同时填写，只有选中的一套生效，
@@ -348,19 +351,23 @@ mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`�
 与编排器生成的 `env.sh` 分离——调优项可自由增删改而不会在每次运行时被覆盖。
 
 - **内容**：连接与容错（`MC_STORE_CLIENT_SETUP_RETRIES`/`MC_STORE_WARMUP`/
-  `MC_STORE_CLIENT_METRIC_BANDWIDTH`）、ylt RPC 连接池（`MC_YLT_RPC_POOL_*`/
-  `MC_OFFLOAD_RPC_THREAD_NUM`）、日志（`MC_HIFREQ_LOG_SAMPLE_RATE`/`MC_LOG_ENABLE`/
-  `MC_LOG_DIR`）、传输层（`MC_SLICE_SIZE`/`MC_WORKERS_PER_CTX`/`MC_NUM_CQ_PER_CTX`/
-  `MC_MAX_WR`/`MC_URMA_TRANS_MODE`/`MC_OFFLOAD_PUSH`）。
+  `MC_STORE_CLIENT_METRIC_BANDWIDTH`）、客户端资源（`MC_GLOBAL_SEGMENT_SIZE`）、
+  ylt RPC 连接池（`MC_YLT_RPC_POOL_*`/`MC_OFFLOAD_RPC_THREAD_NUM`）、日志
+  （`MC_HIFREQ_LOG_SAMPLE_RATE`/`MC_LOG_ENABLE`/`MC_LOG_DIR`/`MC_YLT_LOG_LEVEL`/
+  `MC_YLT_LOG_MAX_FILE_SIZE`/`MC_YLT_LOG_MAX_FILES`）、传输层（`MC_SLICE_SIZE`/
+  `MC_WORKERS_PER_CTX`/`MC_NUM_CQ_PER_CTX`/`MC_MAX_WR`/`MC_URMA_TRANS_MODE`/
+  `MC_OFFLOAD_PUSH`）。
 - **部署**：`deploy_scripts` 自动随 env.sh / runner / client 一起推送到所有参与节点；
 - **加载**：两个 runner 脚本在 `source env.sh` 之后 source 本文件（带 `-f` 防御检查，
   文件缺失不报错）；generate-data / remove-keys / prepare-store / benchmark / pipeline
   全模式生效；
 - **覆盖顺序**：`env.sh`（编排器生成）→ `env.mooncake.sh`（同名变量以本文件为准）→
   命令行 inline 注入（如 `MC_YLT_LOG_PATH`，永远最优先）；
-- **所有权变更**：`MC_HIFREQ_LOG_SAMPLE_RATE` 原由 global.json 的
-  `mc_hifreq_log_sample_rate` 注入 env.sh，现迁移至本文件（global.json 字段已删除），
-  默认 `1.0` 全量追踪（调低可降低 per-request 高频日志量）。
+- **所有权变更**：以下变量已从 global.json / 编排器硬编码迁移至本文件（原字段/生成行
+  已删除，写回 global.json 也会被本文件覆盖）：`MC_HIFREQ_LOG_SAMPLE_RATE`（原
+  `mc_hifreq_log_sample_rate`，默认 `1.0` 全量追踪）、`MC_YLT_LOG_LEVEL`（原
+  `ylt_log_level`）、`MC_YLT_LOG_MAX_FILE_SIZE`/`MC_YLT_LOG_MAX_FILES`（原编排器
+  硬编码 50MB/3）、`MC_GLOBAL_SEGMENT_SIZE`（原 `global_segment_size`，纯客户端 0）。
 
 ### 7.3 日志体系
 
@@ -383,9 +390,15 @@ mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`�
   glog 全部输出到 stderr 且 `GLOG_v`/`minloglevel` 环境变量不生效——只能通过捕获 stderr 获取。
   若其他库恰好初始化过 glog，日志会改写到 `/tmp/python3.<host>.<user>.log.*`，可用
   `ls /tmp/python*.log*` 排除。
-- **ylt easylog 配置**：级别经 `MC_YLT_LOG_LEVEL`（global.json `ylt_log_level`，默认 `info`），
+- **ylt easylog 配置**：级别经 `MC_YLT_LOG_LEVEL`（env.mooncake.sh，默认 `info`），
   路径由 run_benchmark_*.sh 强制设为绝对路径（修复默认相对 `logs/rpc.log` 随 cwd 丢失的问题）；
-  轮转上限固定 `MC_YLT_LOG_MAX_FILE_SIZE=50MB`、`MC_YLT_LOG_MAX_FILES=3`。
+  轮转上限 `MC_YLT_LOG_MAX_FILE_SIZE=50MB`、`MC_YLT_LOG_MAX_FILES=3`（均在 env.mooncake.sh）。
+  **空 `.ylt.log` 为已知行为**：Mooncake 以 async 写且 `flush_every_time=false`（硬编码）初始化
+  easylog，info 级日志量通常不足以撑满 ofstream 缓冲，叠加客户端 `os._exit`（双 free 规避）
+  跳过静态析构 flush → 缓冲内容永不落盘。诊断 coro_rpc 问题时在 env.mooncake.sh 临时改
+  `MC_YLT_LOG_LEVEL=debug` 靠日志量自然落盘（尾部可能缺最后几 KB）；per-RPC 高频诊断日志
+  走 glog（`MC_LOG`）不依赖该文件。未来 Mooncake 将 `flush_every_time` env 化
+  （`MC_YLT_LOG_FLUSH`）后取消面板注释即逐条实时落盘。
 - **MC_LOG 异步刷盘**：C++ `MC_LOG` 走 ring buffer + 后台线程 + 1s 周期 flush，`kill -9` 会丢
   最后一秒日志。排查挂死时先 `kill -TERM`（atexit flush）或等待 ≥1s 再读文件；编排器 FAIL
   清理路径已按 `kill → sleep 1 → kill -9` 顺序执行。

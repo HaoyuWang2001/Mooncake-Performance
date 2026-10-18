@@ -190,19 +190,14 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
         "MC_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
         "MC_VENV": cluster.get("venv", ""),
         "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
-        "MC_GLOBAL_SEGMENT_SIZE": str(globals_cfg.get("global_segment_size", 0)),
         "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
         "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
         "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
-        # ylt easylog (coro_rpc): level configurable, rotation capped so long
-        # runs cannot fill the disk; the path itself is set per-client by
-        # run_benchmark_*.sh (absolute, alongside the client log)
-        "MC_YLT_LOG_LEVEL": globals_cfg.get("ylt_log_level", "info"),
-        "MC_YLT_LOG_MAX_FILE_SIZE": "52428800",
-        "MC_YLT_LOG_MAX_FILES": "3",
-        # NOTE: MC_HIFREQ_LOG_SAMPLE_RATE is intentionally NOT generated here.
-        # Its ownership moved to scripts/env.mooncake.sh (hand-editable tuning
+        # NOTE: MC_GLOBAL_SEGMENT_SIZE, MC_YLT_LOG_LEVEL, MC_YLT_LOG_MAX_FILE_SIZE
+        # and MC_YLT_LOG_MAX_FILES are intentionally NOT generated here. Their
+        # ownership moved to scripts/env.mooncake.sh (hand-editable tuning
         # panel, sourced by the runner scripts after env.sh) — see that file.
+        # Same for MC_HIFREQ_LOG_SAMPLE_RATE (moved earlier).
     }
     if master_type == "etcd":
         # etcd mode: only the etcd URI is exported; the client passes it to
