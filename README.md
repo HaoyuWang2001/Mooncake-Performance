@@ -79,21 +79,21 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 下层补充/覆盖上层（dict 递归深合并、其余类型整体替换），用例文件最后合并、
 永远最优先。`_configs.json` 本身不作为场景运行（收集时自动跳过 `_` 前缀文件）。
 basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字段
-（`scenario/protocol/key_prefix/key_count/data_size/target_qps/warmup/numa_bind`）。
+（`scenario/protocol/key_prefix/key_count/data_size/target_qps/duration/warmup`，`duration` 显式默认 0 = 不启用压测模式；`numa_bind` 已移交 global.json）。
 
 | 参数 | 说明 | 测试场景使用值 |
 | --- | --- | --- |
 | `operation` | 使用的 store 接口：`put / put_batch / put_from`（写）或 `get / get_batch / get_into / get_buffer`（读）；mixed 场景为 `"<写接口>/<读接口>"`（如 `put/get`、`put_batch/get_batch`、`put_from/get_buffer`） | 见各场景 |
-| `data_size` | **必填，数组形式**（如 `["8MB"]` 或 `["128KB", "1MB", "4MB", "8MB"]`）：数组内逐个 size 循环运行（basic 按 params × size 笛卡尔积；pipeline 每个 size 完整跑一轮写读流水）。不同尺寸间自动重建 `value.bin` 并（get 家族）重新预填充 store；运行日志/CSV 行以 size 后缀区分 | basic 默认 `["128KB", "1MB", "4MB", "8MB"]`（`_configs.json`）；pipeline 的 data_size 不进基座、逐用例携带；预热 1MB |
+| `data_size` | **必填，数组形式**（如 `["8MB"]` 或 `["128KB", "1MB", "4MB", "8MB"]`）：数组内逐个 size 循环运行（basic 按 params × size 笛卡尔积；pipeline 每个 size 完整跑一轮写读流水）。不同尺寸间自动重建 `value.bin` 并（get 家族）重新预填充 store；运行日志/CSV 行以 size 后缀区分 | basic 默认 `["128KB", "1MB", "4MB", "8MB"]`；pipeline 默认按 work_mode 层供给：rank `["8MB"]`、recall `["3.5MB"]`（rank|recall 层 `_configs.json`，用例可覆盖）；预热 1MB |
 | `key_count` | key 数量 | 正式测量 1000（数据总量 8GB，适配单 store ~12GB 内存限制）；预热场景 100 |
 | `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16；mixed_batch 8 |
 | `put_ratio` | mixed 场景中 put 操作占比 | mixed 场景 0.5 |
 | `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
 | `target_qps` | 总限速 QPS（可选）：按该总 QPS 对操作均匀限速（跨 client×thread 均分，绝对时间表自纠偏） | 空/0：计数模式极速连发（现行为）；设置后用于低压时延对比 |
-| `numa_bind` | 客户端 NUMA 绑定（可选）：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配） | 空/`null`：不绑定（现行为） |
+| `numa_bind` | 客户端 NUMA 绑定：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配）。解析优先级：用例/层级显式值 > global.json（默认 true）> 代码缺省 true | `true` |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
-- **NUMA 绑定**：`numa_bind` **默认开启**（缺省/null 即 true，仅显式 false 关闭；basic/pipeline 基座均显式写 true）。开启时basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
+- **NUMA 绑定**：`numa_bind` **默认开启**（解析优先级：用例/层级显式值 > global.json `numa_bind`（默认 true）> 代码缺省 true；仅显式 false 关闭）。开启时basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。
@@ -115,11 +115,12 @@ basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字
 **配置组织**：`configs/pipeline/` 顶层仅放根基座 `_configs.json` 与 `demo/`，正式配置按
 reader 侧节点数归档进 `1-nodes/`、`2-nodes/`、`4-nodes/`，其下再按 work_mode 分 `rank/` 与
 `recall/` 子目录。每层 `_configs.json` 逐层继承：根基座（scenario/protocol/key_prefix/
-notify_pipeline/warmup/duration/batch_size/numa_bind，不含 data_size/writer/reader）→
+notify_pipeline/warmup/duration/batch_size，不含 data_size/writer/reader/numa_bind）→
 x-nodes 层（writer/reader 骨架，client_nodes 按层配置）→ rank|recall 层（work_mode、
-base_qps；recall 另含 notify_count/writer.notify_threads/reader.count_per_node）→
-用例（rank：traffic_mode/qps_multiple/notify_count/writer.notify_threads/reader.count_per_node/
-data_size；recall：traffic_mode/qps_multiple/data_size）。data_size 一律逐用例携带。
+base_qps、data_size；recall 另含 notify_count/writer.notify_threads/reader.count_per_node）→
+用例（rank：traffic_mode/qps_multiple/notify_count/writer.notify_threads/reader.count_per_node，
+5 字段；recall：traffic_mode/qps_multiple，2 字段）。numa_bind 属全局配置（global.json，
+默认 true，用例/层级可覆盖）。详见 configs/pipeline/README.md 与 configs/basic/README.md。
 `--config-dir` 指定某目录运行：用例已下沉到 rank|recall 层，指向 x-nodes 层需配 `--recursive`
 （如 `--config-dir 2-nodes --recursive`），或直接指向叶子目录（如 `--config-dir 2-nodes/rank`）。
 
@@ -365,7 +366,7 @@ mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`�
   命令行 inline 注入（如 `MC_YLT_LOG_PATH`，永远最优先）；
 - **所有权变更**：以下变量已从 global.json / 编排器硬编码迁移至本文件（原字段/生成行
   已删除，写回 global.json 也会被本文件覆盖）：`MC_HIFREQ_LOG_SAMPLE_RATE`（原
-  `mc_hifreq_log_sample_rate`，默认 `1.0` 全量追踪）、`MC_YLT_LOG_LEVEL`（原
+  `mc_hifreq_log_sample_rate`，默认 `0.01` 即 1% 采样）、`MC_YLT_LOG_LEVEL`（原
   `ylt_log_level`）、`MC_YLT_LOG_MAX_FILE_SIZE`/`MC_YLT_LOG_MAX_FILES`（原编排器
   硬编码 50MB/3）、`MC_GLOBAL_SEGMENT_SIZE`（原 `global_segment_size`，纯客户端 0）。
 

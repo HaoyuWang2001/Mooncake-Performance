@@ -9,6 +9,5 @@
     "duration": 5
   },
   "duration": 30,
-  "batch_size": 1,
-  "numa_bind": true
+  "batch_size": 1
 }

@@ -32,7 +32,7 @@ export MC_YLT_RPC_POOL_SHORT_IDLE_TIMEOUT_MS=5000     # 短空闲超时（5 秒�
 # --- 日志 ---
 export MC_LOG_ENABLE=on                       # glog 开关
 # export MC_LOG_DIR=/var/log/mooncake         # glog 目录（默认 stdout，按需启用）
-export MC_HIFREQ_LOG_SAMPLE_RATE=1.0          # 高频日志采样率（1.0 = 全量；走 glog，已在客户端日志采集）
+export MC_HIFREQ_LOG_SAMPLE_RATE=0.01         # 高频日志采样率（1% 采样保留慢 RPC 诊断；走 glog，已在客户端日志采集）
 export MC_YLT_LOG_LEVEL=info                  # ylt easylog（coro_rpc 内部事件）级别
 export MC_YLT_LOG_MAX_FILE_SIZE=52428800      # ylt 单文件上限（50MB）
 export MC_YLT_LOG_MAX_FILES=3                 # ylt 轮转文件数

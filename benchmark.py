@@ -481,9 +481,12 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         total_target_qps = float(cfg.get("target_qps", 0) or 0)
         if total_target_qps < 0:
             raise RuntimeError("basic target_qps must be >= 0 (got {})".format(total_target_qps))
-        # numa_bind defaults to true: absent or null enables binding, only an
-        # explicit false disables it
+        # numa_bind resolution: case/layer explicit value > global.json
+        # ("numa_bind", default true) > code default true. Only an explicit
+        # false disables binding.
         numa_bind = cfg.get("numa_bind")
+        if numa_bind is None:
+            numa_bind = globals_cfg.get("numa_bind")
         numa_bind = True if numa_bind is None else bool(numa_bind)
         log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
@@ -624,8 +627,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     writer_pids = []
     # optional NUMA binding: per node, round-robin the node's client
     # processes (readers launched first, then writers) across its NUMA nodes.
-    # Defaults to true (absent/null enables, explicit false disables).
+    # Resolution: case/layer explicit value > global.json ("numa_bind",
+    # default true) > code default true; explicit false disables.
     numa_bind = cfg.get("numa_bind")
+    if numa_bind is None:
+        numa_bind = globals_cfg.get("numa_bind")
     numa_bind = True if numa_bind is None else bool(numa_bind)
     numa_node_count = {}
     numa_counter = {}

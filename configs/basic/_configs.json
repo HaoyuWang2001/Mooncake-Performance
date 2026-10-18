@@ -10,7 +10,7 @@
     "8MB"
   ],
   "target_qps": null,
-  "numa_bind": true,
+  "duration": 0,
   "warmup": {
     "key_count": 100,
     "data_size": "1MB",

@@ -7,8 +7,5 @@
   },
   "reader": {
     "count_per_node": 5
-  },
-  "data_size": [
-    "8MB"
-  ]
+  }
 }
