@@ -429,7 +429,7 @@ basic 场景：
 | 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
 | put/put_batch/mixed 每个 combo 运行前 | remove-all（`--scope full`，保证写入隔离） | `<配置名>.remove-keys.log`（覆盖） |
 | 配置结束 | 仅删除本配置写入的 key（`--scope key-prefix`） | `<配置名>.remove-keys-end.log` |
-| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留） | `final.remove-keys.log`（scp 回结果目录） |
+| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留） | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
 
 pipeline 场景：
 
@@ -438,7 +438,7 @@ pipeline 场景：
 | 场景启动 | 无 | — |
 | 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
 | 配置结束 | remove-all（`--scope full`；pipeline 运行期清空了 `MC_KEY_COUNT`，key-prefix 不可用） | `<配置名>.remove-keys-end.log` |
-| 场景结束 | remove-all（`--scope full`，兜底） | `final.remove-keys.log` |
+| 场景结束 | remove-all（`--scope full`，兜底） | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
 
 场景结束的 remove-all 在**最后一个成功配置**的主节点上执行（该配置返回的 runner/日志目录可复用）；
 配置失败时其配置结束清理不会执行，因此场景结束兜底必须执行。该步骤失败仅 `[WARN]`，不影响整体结果汇总。
@@ -497,6 +497,7 @@ outputs/<时间戳，如 20261010-1308>/
 ├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 为双 Schema 40 列）
 ├── benchmark_detail.csv        # 全部用例汇总（pipeline 仅 writer/reader TOTAL 行）
 └── logs/
+    ├── final.remove-keys.log   # 场景结束兜底 remove-all 日志（最后一个成功配置节点）
     └── <配置名>/               # 每个配置一个子目录
         ├── <配置名>.generate-data.log
         ├── <配置名>.prepare-store.log

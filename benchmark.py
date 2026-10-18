@@ -1285,8 +1285,9 @@ def main(args, cfg_paths):
                       extra="--scope full", dry_run=False)
             scp_pull(sweep_remove["host"], nd,
                      "{}/final.remove-keys.log".format(sweep_remove["remote_log_dir"]),
-                     ts_dir, dry_run=False)
-            log("sweep-end remove-keys -> {}".format(os.path.join(ts_dir, "final.remove-keys.log")))
+                     os.path.join(ts_dir, "logs"), dry_run=False)
+            log("sweep-end remove-keys -> {}".format(
+                os.path.join(ts_dir, "logs", "final.remove-keys.log")))
         except Exception as exc:
             log("[WARN] sweep-end remove-keys failed: {}".format(exc))
     if categories == {"pipeline"}:
