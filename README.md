@@ -61,15 +61,12 @@ CLI 的 `--protocol` 可选值为 `tcp / rdma / ub`，优先级最高、可覆�
 ### 3.1 并发维度（params 组合）
 
 并发维度由场景配置中的 `params` 数组显式指定，每个元素为一个
-`{"num_clients": N, "num_threads": T}` 组合，逐组顺序执行；basic 场景
-每个条目还可携带 `data_size` 以进行**数据尺寸扫描**（同 (num_clients,
-num_threads) 不同尺寸时运行日志/CSV 以 `_<data_size>` 后缀区分）：
+`{"num_clients": N, "num_threads": T}` 组合，逐组顺序执行。basic 场景的
+运行矩阵为 **params × data_size 的笛卡尔积**（外层 data_size、内层 params，
+CSV 行序与执行顺序一致）：
 
 - `num_clients`：独立测试进程数（basic 场景，单节点多 client）
 - `num_threads`：单进程内工作线程数
-- `data_size`（可选，basic）：本条目的 value 大小；缺省时回退到配置顶层
-  `data_size`，再回退 8MB。不同尺寸组合间会自动重建 `value.bin` 并（get 家族）
-  重新预填充 store
 
 默认场景扫描 22 组组合：
 `1×1, 1×4, 1×8, 1×16, 1×32, 2×1, 2×4, 2×8, 2×16, 2×32, 4×1, 4×4, 4×8, 4×16, 4×32, 8×1, 8×4, 8×8, 8×16, 16×1, 16×4, 16×8`。
@@ -85,7 +82,7 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | 参数 | 说明 | 测试场景使用值 |
 | --- | --- | --- |
 | `operation` | 使用的 store 接口：`put / put_batch / put_from`（写）或 `get / get_batch / get_into / get_buffer`（读）；mixed 场景为 `"<写接口>/<读接口>"`（如 `put/get`、`put_batch/get_batch`、`put_from/get_buffer`） | 见各场景 |
-| `data_size` | 单个 value 的大小（配置顶层默认值；`params` 条目可逐组合覆盖，见 3.1） | 默认 8MB（`_basic.json`）；预热 1MB |
+| `data_size` | **必填，数组形式**（如 `["8MB"]` 或 `["128KB", "1MB", "4MB", "8MB"]`）：数组内逐个 size 循环运行（basic 按 params × size 笛卡尔积；pipeline 每个 size 完整跑一轮写读流水）。不同尺寸间自动重建 `value.bin` 并（get 家族）重新预填充 store；运行日志/CSV 行以 size 后缀区分 | 默认 `["128KB", "1MB", "4MB", "8MB"]`（`_basic.json`）；pipeline 默认 `["8MB"]`（`_pipeline.json`）；预热 1MB |
 | `key_count` | key 数量 | 正式测量 1000（数据总量 8GB，适配单 store ~12GB 内存限制）；预热场景 100 |
 | `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16；mixed_batch 8 |
 | `put_ratio` | mixed 场景中 put 操作占比 | mixed 场景 0.5 |

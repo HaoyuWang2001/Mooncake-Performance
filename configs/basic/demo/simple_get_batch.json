@@ -1,11 +1,9 @@
 {
-  "scenario": "basic",
   "operation": "get_batch",
-  "protocol": "ub",
   "client_node": "store1",
-  "key_prefix": "mc_bench",
-  "key_count": 20,
-  "data_size": "1MB",
+  "data_size": [
+    "1MB"
+  ],
   "batch_size": 16,
   "params": [
     {

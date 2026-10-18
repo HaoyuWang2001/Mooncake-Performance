@@ -82,22 +82,36 @@ def remote_log_path(remote_log_dir, scenario, name):
     return "{}/{}.{}.log".format(remote_log_dir, scenario, name)
 
 
+def data_size_list(cfg):
+    """Validate and return the scenario's data_size entries.
+
+    ``data_size`` must be a non-empty array of size strings (e.g.
+    ``["8MB"]`` or ``["128KB", "1MB", "4MB", "8MB"]``). Both basic and
+    pipeline scenarios sweep over the entries: one full run per size.
+    """
+    raw = cfg.get("data_size")
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(
+            'data_size must be a non-empty array, e.g. ["8MB"] '
+            'or ["128KB", "1MB", "4MB", "8MB"] (got {})'.format(raw))
+    return [str(s) for s in raw]
+
+
 def build_runs(cfg):
-    """Resolve the run matrix: each params entry becomes
-    (num_clients, num_threads, data_size, explicit_data_size). data_size per
-    entry falls back to the config-level value, then to the 8MB default,
-    enabling per-combo data size sweeps beyond the num_clients/num_threads
-    grid. explicit_data_size marks entries that carry data_size inline (used
-    to suffix run filenames so different sizes under the same (c, t) do not
-    collide)."""
-    cfg_ds = cfg.get("data_size", "8MB")
+    """Resolve the basic run matrix.
+
+    The matrix is the cross product: every params (num_clients,
+    num_threads) combo runs once per data_size, ordered outer-by-size so
+    the remote value.bin rebuild happens once per size group.
+
+    Returns a list of (num_clients, num_threads, data_size) tuples.
+    """
+    sizes = data_size_list(cfg)
     params = cfg["params"]
-    runs = []
-    for p in params:
-        ds = p.get("data_size")
-        runs.append((int(p["num_clients"]), int(p["num_threads"]),
-                     str(ds or cfg_ds), ds is not None))
-    return runs
+    combos = [(int(p["num_clients"]), int(p["num_threads"])) for p in params]
+    if not combos:
+        raise RuntimeError("params resolved to an empty run matrix")
+    return [(c, t, ds) for ds in sizes for (c, t) in combos]
 
 
 def pipeline_plan(cfg):
@@ -226,7 +240,26 @@ def _validate_master_mode(globals_cfg):
                 "in configs/global.json")
 
 
+def resolve_store_node_ips(cluster, store_node_names):
+    """Resolve global.json 'mooncake_store_nodes' (node NAMES from
+    cluster.json) into the set of their management IPs. Unknown names fail
+    loudly: a store node that cluster.json does not define is a config error.
+    """
+    ips = set()
+    for name in store_node_names or []:
+        n = get_node(cluster, name)
+        ips.add(n["ip"])
+    return ips
+
+
 def base_scenario_params(cfg, work_mode, topology, primary_node_name):
+    # data_size may be a sweep list (basic) or a single string (pipeline at
+    # this stage); the env var carries the first entry / the string as a
+    # fallback only — the actual per-run size reaches the client via the
+    # generate-data stage's --data-size and the value.bin file length.
+    cfg_ds = cfg.get("data_size", "8MB")
+    if isinstance(cfg_ds, list):
+        cfg_ds = cfg_ds[0] if cfg_ds else "8MB"
     return {
         "MC_SCENARIO": cfg["scenario"],
         "MC_WORK_MODE": work_mode,
@@ -234,7 +267,7 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
         "MC_PROTOCOL": cfg["protocol"],
         "MC_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
         "MC_KEY_COUNT": str(cfg.get("key_count", 1000)),
-        "MC_DATA_SIZE": cfg.get("data_size", "8MB"),
+        "MC_DATA_SIZE": str(cfg_ds),
         "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)) if (
             cfg.get("operation") in ("put_batch", "get_batch")
             or any(s in ("put_batch", "get_batch") for s in str(cfg.get("operation", "")).split("/"))) else "",
@@ -420,10 +453,11 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     involved_nodes = [primary_node_name]
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
-    # topology: local iff the primary client node is one of the store nodes
-    # (mooncake_store_nodes from global.json)
-    store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
-    topology = "local_node" if primary_node_name in store_nodes else "remote_node"
+    # topology: local iff the client node's IP is one of the store nodes' IPs
+    # (mooncake_store_nodes from global.json, resolved via cluster.json)
+    store_node_ips = resolve_store_node_ips(
+        cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+    topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
     if cfg.get("duration") and op not in PIPELINE_GET_IFACES:
         raise RuntimeError(
             "duration configured but operation={} does not support duration "
@@ -461,7 +495,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
         current_ds = None
-        for c, t, ds, ds_explicit in runs:
+        for c, t, ds in runs:
             if ds != current_ds:
                 # data_size changed: (re)build value.bin at this size and
                 # re-prefill the store for get-family combos
@@ -480,11 +514,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 run_stage(host, node, remote_runner,
                           "remove-keys", remote_log_dir, cfg_name,
                           extra="--scope full", dry_run=dry)
-            # suffix the run file when data_size came from the params entry,
-            # so different sizes under the same (c, t) do not collide
-            name = "benchmark_c{}_t{}".format(c, t)
-            if ds_explicit:
-                name += "_{}".format(ds)
+            # data_size is always part of the run file name, so different
+            # sizes under the same (c, t) never collide
+            name = "benchmark_c{}_t{}_{}".format(c, t, ds)
             remote_log = remote_log_path(remote_log_dir, cfg_name, name)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
@@ -861,8 +893,22 @@ def parse_benchmark_log(paths, op_filter=None):
     }
 
 
-def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
-    store_nodes = store_nodes or []
+def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
+                       mooncake_store_nodes=None):
+    """拓扑判定（IP 匹配）：节点的 cluster.json `ip` 出现在
+    mooncake_store_nodes 各节点的 `ip` 集合中即 local_node。"""
+    store_ips = resolve_store_node_ips(
+        cluster or {}, mooncake_store_nodes or [])
+
+    def topo_of(nodename):
+        if not nodename or cluster is None:
+            return ""
+        try:
+            nip = get_node(cluster, nodename)["ip"]
+        except (KeyError, RuntimeError):
+            return "remote_node"
+        return "local_node" if nip in store_ips else "remote_node"
+
     name = os.path.splitext(os.path.basename(cfg_path))[0]
     out_csv = os.path.join(RESULTS_DIR, ts, "{}.csv".format(name))
     rows = []
@@ -906,7 +952,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "role": role,
                 "node": nodename,
                 "instance": instance,
-                "topology": ("local_node" if nodename in store_nodes else "remote_node") if nodename else "",
+                "topology": topo_of(nodename) if nodename else "",
                 "protocol": cfg["protocol"],
                 "num_threads": plan["reader_threads"] if role == "reader" else "",
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
@@ -1011,7 +1057,6 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                              reader_files.values(), "pipeline_read", data_size_bytes))
             rows.append(row)
     else:
-        pattern = os.path.join(local_log_dir, "{}.*.log".format(name))
         def fill_basic_row(row, agg, op_label):
             row["operation"] = op_label
             row.update({k: agg[k] for k in (
@@ -1038,23 +1083,14 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
         if "/" in op_label:
             put_iface, get_iface = op_label.split("/", 1)
         is_mixed = bool(put_iface and get_iface)
-        for path in sorted(glob.glob(pattern)):
-            base = os.path.basename(path)
-            try:
-                # run name: benchmark_c{c}_t{t}[_{data_size}].log — the data
-                # size suffix exists only when the params entry carried one
-                core = base.split(".benchmark_c")[1].replace(".log", "")
-                c_part = core.split("_t")[0]
-                t_ds = core.split("_t")[1].split("_")
-                c = int(c_part)
-                t = int(t_ds[0])
-                ds = t_ds[1] if len(t_ds) > 1 else None
-            except (IndexError, ValueError):
+        topo = topo_of(cfg["client_node"])
+        # rows follow run order: outer data_size, inner params order —
+        # identical to how run_basic_scenario executes the runs
+        for c, t, ds in build_runs(cfg):
+            path = os.path.join(local_log_dir, "{}.benchmark_c{}_t{}_{}.log".format(name, c, t, ds))
+            if not os.path.exists(path):
                 continue
-            # per-run data_size: suffix wins, otherwise the merged config default
-            row_data_size = ds or cfg.get("data_size", "8MB")
-            row_data_size_bytes = parse_data_size(row_data_size)
-            topo = "local_node" if cfg["client_node"] in store_nodes else "remote_node"
+            row_data_size_bytes = parse_data_size(ds)
             base_row_vals = {
                 "scenario": cfg["scenario"],
                 "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
@@ -1066,7 +1102,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
                 "protocol": cfg["protocol"],
                 "num_clients": c,
                 "num_threads": t,
-                "data_size": row_data_size,
+                "data_size": ds,
                 "key_count": cfg.get("key_count", ""),
                 "batch_size": cfg.get("batch_size", "") if (op_label in ("put_batch", "get_batch") or
                                                             put_iface in ("put_batch",) or
@@ -1125,22 +1161,28 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, store_nodes=None):
 # --------------------------------------------------------------------------
 
 def load_scenario_config(cfg_path):
-    """Load a scenario config; configs under configs/basic/ inherit shared
-    defaults from configs/basic/_basic.json (shallow merge — the specific
-    config overrides any key present). The defaults fragment itself is not a
-    runnable scenario and is rejected if passed directly."""
+    """Load a scenario config; configs under configs/<category>/ inherit
+    shared defaults from configs/<category>/_<category>.json (shallow merge —
+    the specific config overrides any key present; demo/ subdirectories are
+    covered as well). The defaults fragment itself is not a runnable scenario
+    and is rejected if passed directly."""
     cfg = load_json(cfg_path)
     if os.path.basename(cfg_path).startswith("_"):
         raise RuntimeError(
             "{} is a shared-defaults fragment, not a runnable scenario".format(cfg_path))
     cfg_dir = os.path.normpath(os.path.dirname(os.path.abspath(cfg_path)))
-    basic_dir = os.path.normpath(os.path.join(CONFIGS_DIR, "basic"))
-    if cfg_dir == basic_dir or cfg_dir.startswith(basic_dir + os.sep):
-        defaults_path = os.path.join(basic_dir, "_basic.json")
-        if os.path.exists(defaults_path):
-            merged = dict(load_json(defaults_path))
-            merged.update(cfg)          # specific config wins on conflicts
-            cfg = merged
+    defaults_path = None
+    for category in ("basic", "pipeline"):
+        category_dir = os.path.normpath(os.path.join(CONFIGS_DIR, category))
+        if cfg_dir == category_dir or cfg_dir.startswith(category_dir + os.sep):
+            candidate = os.path.join(category_dir, "_{}.json".format(category))
+            if os.path.exists(candidate):
+                defaults_path = candidate
+            break
+    if defaults_path:
+        merged = dict(load_json(defaults_path))
+        merged.update(cfg)          # specific config wins on conflicts
+        cfg = merged
     return cfg
 
 
@@ -1257,7 +1299,7 @@ def main(args, cfg_paths):
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
                 rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
-                                          globals_cfg.get("mooncake_store_nodes", []))
+                                          cluster, globals_cfg.get("mooncake_store_nodes", []))
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows

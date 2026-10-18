@@ -1,11 +1,9 @@
 {
-  "scenario": "basic",
   "operation": "put",
-  "protocol": "ub",
   "client_node": "store1",
-  "key_prefix": "mc_bench",
-  "key_count": 20,
-  "data_size": "1MB",
+  "data_size": [
+    "1MB"
+  ],
   "params": [
     {
       "num_clients": 1,
