@@ -1,7 +1,5 @@
 {
-  "scenario": "pipeline",
   "work_mode": "rank",
-  "protocol": "ub",
   "traffic_mode": "pulse",
   "base_qps": 105,
   "qps_multiple": 3,
@@ -26,14 +24,7 @@
       "reader_node4"
     ]
   },
-  "data_size": "8MB",
-  "key_prefix": "mc_bench",
-  "notify_pipeline": [
-    "get"
-  ],
-  "warmup": {
-    "duration": 5
-  },
-  "duration": 30,
-  "batch_size": 1
+  "data_size": [
+    "8MB"
+  ]
 }

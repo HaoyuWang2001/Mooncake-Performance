@@ -22,7 +22,9 @@
       "reader_node1"
     ]
   },
-  "data_size": "512KB",
+  "data_size": [
+    "512KB"
+  ],
   "key_prefix": "mc_bench",
   "notify_pipeline": [
     "get"

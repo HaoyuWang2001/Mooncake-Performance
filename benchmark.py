@@ -253,13 +253,9 @@ def resolve_store_node_ips(cluster, store_node_names):
 
 
 def base_scenario_params(cfg, work_mode, topology, primary_node_name):
-    # data_size may be a sweep list (basic) or a single string (pipeline at
-    # this stage); the env var carries the first entry / the string as a
+    # data_size is a sweep list; the env var carries the first entry as a
     # fallback only — the actual per-run size reaches the client via the
     # generate-data stage's --data-size and the value.bin file length.
-    cfg_ds = cfg.get("data_size", "8MB")
-    if isinstance(cfg_ds, list):
-        cfg_ds = cfg_ds[0] if cfg_ds else "8MB"
     return {
         "MC_SCENARIO": cfg["scenario"],
         "MC_WORK_MODE": work_mode,
@@ -267,7 +263,7 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
         "MC_PROTOCOL": cfg["protocol"],
         "MC_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
         "MC_KEY_COUNT": str(cfg.get("key_count", 1000)),
-        "MC_DATA_SIZE": str(cfg_ds),
+        "MC_DATA_SIZE": data_size_list(cfg)[0],
         "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)) if (
             cfg.get("operation") in ("put_batch", "get_batch")
             or any(s in ("put_batch", "get_batch") for s in str(cfg.get("operation", "")).split("/"))) else "",
@@ -590,10 +586,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
-    # topology: local iff the primary client node is one of the store nodes
-    # (mooncake_store_nodes from global.json)
-    store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
-    topology = "local_node" if primary_node_name in store_nodes else "remote_node"
+    # topology: local iff the primary client node's IP is one of the store
+    # nodes' IPs (mooncake_store_nodes from global.json, resolved via
+    # cluster.json)
+    store_node_ips = resolve_store_node_ips(
+        cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+    topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
     remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
         remote_runner_pipeline, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
@@ -648,128 +646,141 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "numa_bind: failed to probe NUMA topology on {}".format(node_name))
             numa_counter[node_name] = 0
     try:
-        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
-        check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, data_size_bytes)
-        # value.bin must exist on EVERY node that runs a writer or reader
-        for node_name in involved_nodes:
-            n = get_node(cluster, node_name)
-            data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
-            if data_status != "EXISTS":
-                run_stage(n["ip"], n, remote_runner,
-                          "generate-data", remote_log_dir, cfg_name, dry_run=dry)
-        run_stage(host, node, remote_runner,
-                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+        sizes = data_size_list(cfg)
         warmup = "false" if args.no_warmup else "true"
         reader_threads = plan["reader_threads"]
         log("scenario {} (pipeline, {}): writers={}, readers={}, notify_count={}, "
-            "total_qps={}, per_writer_qps={}, traffic={}".format(
+            "total_qps={}, per_writer_qps={}, traffic={}, sizes={}".format(
                 cfg_name, work_mode, len(plan["writers"]), len(plan["readers"]),
                 plan["notify_count"], plan["total_qps"], plan["per_writer_qps"],
-                cfg.get("traffic_mode", "pulse")))
-        # Reader peers: host resolved from each reader node's fabric_ip so the
-        # same config works unchanged on any deployment.
-        for r in plan["readers"]:
-            rn = get_node(cluster, r["node"])
-            reader_peers.append({
-                "role": "reader",
-                "host": rn.get("fabric_ip", rn.get("ip", "")),
-                "port": r["port"],
-                "node": r["node"],
-            })
-        peers_json = json.dumps(reader_peers)
-        run_name = "benchmark_c1_t{}".format(reader_threads)
-        base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
-        # Step 1: start all readers (one process per reader, unique port and id)
-        for r in plan["readers"]:
-            rn = get_node(cluster, r["node"])
-            merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
-            nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
-            numa_arg = ""
-            if numa_bind:
-                numa_arg = "--numa-node {}".format(
-                    numa_counter[r["node"]] % numa_node_count[r["node"]])
-                numa_counter[r["node"]] += 1
-            rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} {} > {} 2>&1 & echo $!".format(
-                remote_runner, merged_log, r["index"], reader_threads,
-                r["port"], peers_json, reader_op, numa_arg, nohup_log)
-            pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
-            reader_pids.append((r, pid))
-        # give readers a moment to boot before the health polling starts
-        if not dry:
-            time.sleep(5)
-        # Step 2: wait for all readers to be healthy
-        for r, peer in zip(plan["readers"], reader_peers):
-            rn = get_node(cluster, r["node"])
-            health_url = "http://{}:{}/health".format(peer["host"], r["port"])
-            HEALTHY = False
-            for attempt in range(10):
-                health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
-                result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry, quiet=True) if not dry else "HEALTHY"
-                if "HEALTHY" in result:
-                    HEALTHY = True
-                    break
-                time.sleep(1)
+                cfg.get("traffic_mode", "pulse"), sizes))
+        current_ds = None
+        for ds in sizes:
+            if ds != current_ds:
+                # data_size changed: (re)build value.bin at this size on every
+                # node that runs a writer or reader
+                ds_bytes = parse_data_size(ds)
+                check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, ds_bytes)
+                for node_name in involved_nodes:
+                    n = get_node(cluster, node_name)
+                    data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
+                    if data_status != "EXISTS":
+                        run_stage(n["ip"], n, remote_runner,
+                                  "generate-data", remote_log_dir, cfg_name,
+                                  extra="--data-size {}".format(ds), dry_run=dry)
+                current_ds = ds
+            run_stage(host, node, remote_runner,
+                      "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+            # Reader peers: host resolved from each reader node's fabric_ip so the
+            # same config works unchanged on any deployment. Rebuilt per size so
+            # the fail-path cleanup only ever sees the current run's processes.
+            reader_peers = []
+            reader_pids = []
+            writer_pids = []
+            for r in plan["readers"]:
+                rn = get_node(cluster, r["node"])
+                reader_peers.append({
+                    "role": "reader",
+                    "host": rn.get("fabric_ip", rn.get("ip", "")),
+                    "port": r["port"],
+                    "node": r["node"],
+                })
+            peers_json = json.dumps(reader_peers)
+            # data_size is always part of the run file name, so different
+            # sizes never share writer/reader logs
+            run_name = "benchmark_c1_t{}_{}".format(reader_threads, ds)
+            base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
+            # Step 1: start all readers (one process per reader, unique port and id)
+            for r in plan["readers"]:
+                rn = get_node(cluster, r["node"])
+                merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
+                nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
+                numa_arg = ""
+                if numa_bind:
+                    numa_arg = "--numa-node {}".format(
+                        numa_counter[r["node"]] % numa_node_count[r["node"]])
+                    numa_counter[r["node"]] += 1
+                rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} {} > {} 2>&1 & echo $!".format(
+                    remote_runner, merged_log, r["index"], reader_threads,
+                    r["port"], peers_json, reader_op, numa_arg, nohup_log)
+                pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
+                reader_pids.append((r, pid))
+            # give readers a moment to boot before the health polling starts
             if not dry:
-                if not HEALTHY:
-                    err_msg = "reader at {}:{} not ready after 30s".format(peer["host"], r["port"])
-                    log("[ERROR] " + err_msg)
-                    raise RuntimeError(err_msg)
-                else:
-                    log("reader at {}:{}=READY".format(peer["host"], r["port"]))
-        # Step 3: start all writers in parallel (one invocation per writer; the
-        # explicit --client-id in EXTRA overrides the per-invocation default
-        # and gives each writer a globally unique id). ALL writers run the
-        # warmup phase so every writer's store/notify connections are warmed.
-        for w in plan["writers"]:
-            wn = get_node(cluster, w["node"])
-            merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
-            nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
-            numa_arg = ""
-            if numa_bind:
-                numa_arg = "--numa-node {}".format(
-                    numa_counter[w["node"]] % numa_node_count[w["node"]])
-                numa_counter[w["node"]] += 1
-            wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} {} > {} 2>&1 & echo $!".format(
-                remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, numa_arg, nohup_log)
-            pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
-            writer_pids.append((w, pid))
-        # Step 4: wait for all writers to finish (warmup + measured run)
-        warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
-        duration = float(cfg.get("duration", 30))
-        for w, pid in writer_pids:
-            if not dry and pid:
-                wait_process_exit(cluster, w["node"], pid,
-                                  "writer w{}".format(w["gid"]),
-                                  int(warmup_duration + duration) + 300, dry_run=dry)
-        # Step 5: shutdown readers and wait for their final logs
-        for r, peer in zip(plan["readers"], reader_peers):
-            rn = get_node(cluster, r["node"])
-            shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
-            curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
+                time.sleep(5)
+            # Step 2: wait for all readers to be healthy
+            for r, peer in zip(plan["readers"], reader_peers):
+                rn = get_node(cluster, r["node"])
+                health_url = "http://{}:{}/health".format(peer["host"], r["port"])
+                HEALTHY = False
+                for attempt in range(10):
+                    health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
+                    result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry, quiet=True) if not dry else "HEALTHY"
+                    if "HEALTHY" in result:
+                        HEALTHY = True
+                        break
+                    time.sleep(1)
+                if not dry:
+                    if not HEALTHY:
+                        err_msg = "reader at {}:{} not ready after 30s".format(peer["host"], r["port"])
+                        log("[ERROR] " + err_msg)
+                        raise RuntimeError(err_msg)
+                    else:
+                        log("reader at {}:{}=READY".format(peer["host"], r["port"]))
+            # Step 3: start all writers in parallel (one invocation per writer; the
+            # explicit --client-id in EXTRA overrides the per-invocation default
+            # and gives each writer a globally unique id). ALL writers run the
+            # warmup phase so every writer's store/notify connections are warmed.
+            for w in plan["writers"]:
+                wn = get_node(cluster, w["node"])
+                merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
+                nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
+                numa_arg = ""
+                if numa_bind:
+                    numa_arg = "--numa-node {}".format(
+                        numa_counter[w["node"]] % numa_node_count[w["node"]])
+                    numa_counter[w["node"]] += 1
+                wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} {} > {} 2>&1 & echo $!".format(
+                    remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, numa_arg, nohup_log)
+                pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
+                writer_pids.append((w, pid))
+            # Step 4: wait for all writers to finish (warmup + measured run)
+            warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
+            duration = float(cfg.get("duration", 30))
+            for w, pid in writer_pids:
+                if not dry and pid:
+                    wait_process_exit(cluster, w["node"], pid,
+                                      "writer w{}".format(w["gid"]),
+                                      int(warmup_duration + duration) + 300, dry_run=dry)
+            # Step 5: shutdown readers and wait for their final logs
+            for r, peer in zip(plan["readers"], reader_peers):
+                rn = get_node(cluster, r["node"])
+                shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
+                curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
+                if not dry:
+                    ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
+            for r, pid in reader_pids:
+                if not dry and pid:
+                    wait_process_exit(cluster, r["node"], pid,
+                                      "reader r{} (port {})".format(r["index"], r["port"]),
+                                      60, dry_run=dry)
+            # Step 6: remove empty .nohup redirect files (they capture script-level
+            # errors only — empty on success). Non-empty ones are kept for diagnostics
+            # and pulled back with the rest of the logs.
             if not dry:
-                ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
-        for r, pid in reader_pids:
-            if not dry and pid:
-                wait_process_exit(cluster, r["node"], pid,
-                                  "reader r{} (port {})".format(r["index"], r["port"]),
-                                  60, dry_run=dry)
-        # Step 6: remove empty .nohup redirect files (they capture script-level
-        # errors only — empty on success). Non-empty ones are kept for diagnostics
-        # and pulled back with the rest of the logs.
-        if not dry:
-            for node_name in involved_nodes:
-                n = get_node(cluster, node_name)
-                nohup_files = []
-                for r in plan["readers"]:
-                    if r["node"] == node_name:
-                        nohup_files.append("{}.reader_port{}.nohup".format(base_noext, r["port"]))
-                for w in plan["writers"]:
-                    if w["node"] == node_name:
-                        nohup_files.append("{}.writer{}.nohup".format(base_noext, w["gid"]))
-                if nohup_files:
-                    cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
-                        " ".join(nohup_files))
-                    ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+                for node_name in involved_nodes:
+                    n = get_node(cluster, node_name)
+                    nohup_files = []
+                    for r in plan["readers"]:
+                        if r["node"] == node_name:
+                            nohup_files.append("{}.reader_port{}.nohup".format(base_noext, r["port"]))
+                    for w in plan["writers"]:
+                        if w["node"] == node_name:
+                            nohup_files.append("{}.writer{}.nohup".format(base_noext, w["gid"]))
+                    if nohup_files:
+                        cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
+                            " ".join(nohup_files))
+                        ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
         # Config end: remove-all — clears everything this config's writers
         # wrote. Pipeline env clears MC_KEY_COUNT, so the key-prefix scope has
         # no key count to work with; a full sweep here is short and precise
@@ -915,29 +926,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
     is_pipeline = cfg.get("scenario") == "pipeline"
     if is_pipeline:
         plan = pipeline_plan(cfg)
-        data_size_bytes = parse_data_size(cfg.get("data_size", "8MB"))
         batch_size = int(cfg.get("batch_size", 1))
         duration = float(cfg.get("duration", 0) or 0)
-        writer_files = {}
-        for p in sorted(glob.glob(os.path.join(local_log_dir, "{}*writer*".format(name)))):
-            if os.path.isdir(p) or p.endswith(".nohup"):
-                continue
-            try:
-                gid = int(os.path.basename(p).replace(".log", "").split(".writer")[-1])
-            except ValueError:
-                continue
-            writer_files[gid] = p
-        reader_files = {}
-        for p in sorted(glob.glob(os.path.join(local_log_dir, "{}*reader_port*".format(name)))):
-            if os.path.isdir(p) or p.endswith(".nohup"):
-                continue
-            try:
-                port = int(os.path.basename(p).replace(".log", "").split(".reader_port")[-1])
-            except ValueError:
-                continue
-            reader_files[port] = p
 
-        def base_row(role, instance, nodename):
+        def base_row(role, instance, nodename, ds):
             if role == "writer":
                 op = (cfg.get("writer", {}) or {}).get("operation", "")
             else:
@@ -956,7 +948,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "protocol": cfg["protocol"],
                 "num_threads": plan["reader_threads"] if role == "reader" else "",
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
-                "data_size": cfg.get("data_size", ""),
+                "data_size": ds,
                 "batch_size": cfg.get("batch_size", ""),
                 "duration": cfg.get("duration", ""),
                 "warmup_duration": cfg.get("warmup", {}).get("duration", ""),
@@ -1021,41 +1013,68 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 if isinstance(v, float):
                     row[k] = round(v, 2)
 
-        for w in plan["writers"]:
-            f = writer_files.get(w["gid"])
-            if not f:
-                continue
-            agg = parse_benchmark_log(f, op_filter="pipeline_write")
-            row = base_row("writer", "w{}".format(w["gid"]), w["node"])
-            metrics_into(row, agg, data_size_bytes)
-            rows.append(row)
-        # writer TOTAL row: all writers aggregated; throughput = sum of each
-        # writer's busy-time throughput
-        if writer_files:
-            agg = parse_benchmark_log(list(writer_files.values()), op_filter="pipeline_write")
-            row = base_row("writer", "TOTAL", "")
-            metrics_into(row, agg, data_size_bytes,
-                         throughput_mb=busy_throughput_mb(
-                             writer_files.values(), "pipeline_write", data_size_bytes))
-            rows.append(row)
-        for r in plan["readers"]:
-            f = reader_files.get(r["port"])
-            if not f:
-                continue
-            agg = parse_benchmark_log(f, op_filter="pipeline_read")
-            row = base_row("reader", "r{}".format(r["index"]), r["node"])
-            metrics_into(row, agg, data_size_bytes, with_queue=True)
-            rows.append(row)
-        # TOTAL row: all readers aggregated (aligns with the datasystem
-        # single GET row per test group); throughput = sum of each reader's
-        # busy-time throughput
-        if reader_files:
-            agg = parse_benchmark_log(list(reader_files.values()), op_filter="pipeline_read")
-            row = base_row("reader", "TOTAL", "")
-            metrics_into(row, agg, data_size_bytes, with_queue=True,
-                         throughput_mb=busy_throughput_mb(
-                             reader_files.values(), "pipeline_read", data_size_bytes))
-            rows.append(row)
+        # one block of rows per data_size, in config order: writer rows,
+        # writer TOTAL, reader rows, reader TOTAL
+        for ds in data_size_list(cfg):
+            ds_bytes = parse_data_size(ds)
+            run_name = "benchmark_c1_t{}_{}".format(plan["reader_threads"], ds)
+            writer_files = {}
+            for p in sorted(glob.glob(os.path.join(
+                    local_log_dir, "{}.{}.writer*.log".format(name, run_name)))):
+                base = os.path.basename(p)
+                if ".ylt." in base:
+                    continue
+                try:
+                    gid = int(base.replace(".log", "").split(".writer")[-1])
+                except ValueError:
+                    continue
+                writer_files[gid] = p
+            reader_files = {}
+            for p in sorted(glob.glob(os.path.join(
+                    local_log_dir, "{}.{}.reader_port*.log".format(name, run_name)))):
+                base = os.path.basename(p)
+                if ".ylt." in base:
+                    continue
+                try:
+                    port = int(base.replace(".log", "").split(".reader_port")[-1])
+                except ValueError:
+                    continue
+                reader_files[port] = p
+            for w in plan["writers"]:
+                f = writer_files.get(w["gid"])
+                if not f:
+                    continue
+                agg = parse_benchmark_log(f, op_filter="pipeline_write")
+                row = base_row("writer", "w{}".format(w["gid"]), w["node"], ds)
+                metrics_into(row, agg, ds_bytes)
+                rows.append(row)
+            # writer TOTAL row: all writers aggregated; throughput = sum of each
+            # writer's busy-time throughput
+            if writer_files:
+                agg = parse_benchmark_log(list(writer_files.values()), op_filter="pipeline_write")
+                row = base_row("writer", "TOTAL", "", ds)
+                metrics_into(row, agg, ds_bytes,
+                             throughput_mb=busy_throughput_mb(
+                                 writer_files.values(), "pipeline_write", ds_bytes))
+                rows.append(row)
+            for r in plan["readers"]:
+                f = reader_files.get(r["port"])
+                if not f:
+                    continue
+                agg = parse_benchmark_log(f, op_filter="pipeline_read")
+                row = base_row("reader", "r{}".format(r["index"]), r["node"], ds)
+                metrics_into(row, agg, ds_bytes, with_queue=True)
+                rows.append(row)
+            # TOTAL row: all readers aggregated (aligns with the datasystem
+            # single GET row per test group); throughput = sum of each reader's
+            # busy-time throughput
+            if reader_files:
+                agg = parse_benchmark_log(list(reader_files.values()), op_filter="pipeline_read")
+                row = base_row("reader", "TOTAL", "", ds)
+                metrics_into(row, agg, ds_bytes, with_queue=True,
+                             throughput_mb=busy_throughput_mb(
+                                 reader_files.values(), "pipeline_read", ds_bytes))
+                rows.append(row)
     else:
         def fill_basic_row(row, agg, op_label):
             row["operation"] = op_label

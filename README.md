@@ -120,7 +120,7 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读） | 10 | 1 |
 | `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / 部署节点 | cpn=1 | cpn=1 |
 | `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / 部署节点 | n1:10, n2:5, n4:3 | 恒 1 |
-| `data_size` | 单个 value 大小 | 8MB | 3.5MB |
+| `data_size` | **必填，数组形式**：逐个 size 循环，每个 size 完整跑一轮写读流水（value.bin 自动按尺寸重建）；单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` | `["8MB"]` | `["3.5MB"]` |
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
 | `batch_size` | writer 每批写入的 key 数（reader 按 notify 批处理） | 1 | 1 |

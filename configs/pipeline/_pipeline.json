@@ -1,0 +1,11 @@
+{
+  "scenario": "pipeline",
+  "protocol": "ub",
+  "key_prefix": "mc_bench",
+  "data_size": ["8MB"],
+  "notify_pipeline": ["get"],
+  "warmup": { "duration": 5 },
+  "duration": 30,
+  "batch_size": 1,
+  "numa_bind": false
+}
