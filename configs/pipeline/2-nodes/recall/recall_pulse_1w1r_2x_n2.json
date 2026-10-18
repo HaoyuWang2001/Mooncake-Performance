@@ -1,0 +1,7 @@
+{
+  "traffic_mode": "pulse",
+  "qps_multiple": 2,
+  "data_size": [
+    "3.5MB"
+  ]
+}

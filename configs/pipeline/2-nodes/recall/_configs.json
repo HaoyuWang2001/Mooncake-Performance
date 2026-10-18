@@ -1,0 +1,11 @@
+{
+  "work_mode": "recall",
+  "base_qps": 35,
+  "notify_count": 1,
+  "writer": {
+    "notify_threads": 1
+  },
+  "reader": {
+    "count_per_node": 1
+  }
+}

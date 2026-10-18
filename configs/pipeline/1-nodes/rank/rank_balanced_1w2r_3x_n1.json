@@ -1,0 +1,14 @@
+{
+  "traffic_mode": "balanced",
+  "qps_multiple": 3,
+  "notify_count": 2,
+  "writer": {
+    "notify_threads": 2
+  },
+  "reader": {
+    "count_per_node": 2
+  },
+  "data_size": [
+    "8MB"
+  ]
+}

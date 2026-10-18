@@ -74,15 +74,17 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 
 ### 3.2 参数配置
 
-**basic 公共默认值**：`configs/basic/_basic.json` 存放 18 个正式场景共用的
-字段（`scenario/protocol/key_prefix/key_count/data_size/target_qps/warmup`），
-各场景配置加载时与其浅合并——**具体配置中出现相同字段即覆盖**；`_basic.json`
-本身不作为场景运行（`--all`/`--config-dir` 收集时自动跳过 `_` 前缀文件）。
+**分层公共默认（`_configs.json`）**：每个目录层级可放一个 `_configs.json`，
+加载用例时从场景根目录（如 `configs/pipeline/`）沿目录链逐层读取并合并——
+下层补充/覆盖上层（dict 递归深合并、其余类型整体替换），用例文件最后合并、
+永远最优先。`_configs.json` 本身不作为场景运行（收集时自动跳过 `_` 前缀文件）。
+basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字段
+（`scenario/protocol/key_prefix/key_count/data_size/target_qps/warmup/numa_bind`）。
 
 | 参数 | 说明 | 测试场景使用值 |
 | --- | --- | --- |
 | `operation` | 使用的 store 接口：`put / put_batch / put_from`（写）或 `get / get_batch / get_into / get_buffer`（读）；mixed 场景为 `"<写接口>/<读接口>"`（如 `put/get`、`put_batch/get_batch`、`put_from/get_buffer`） | 见各场景 |
-| `data_size` | **必填，数组形式**（如 `["8MB"]` 或 `["128KB", "1MB", "4MB", "8MB"]`）：数组内逐个 size 循环运行（basic 按 params × size 笛卡尔积；pipeline 每个 size 完整跑一轮写读流水）。不同尺寸间自动重建 `value.bin` 并（get 家族）重新预填充 store；运行日志/CSV 行以 size 后缀区分 | 默认 `["128KB", "1MB", "4MB", "8MB"]`（`_basic.json`）；pipeline 默认 `["8MB"]`（`_pipeline.json`）；预热 1MB |
+| `data_size` | **必填，数组形式**（如 `["8MB"]` 或 `["128KB", "1MB", "4MB", "8MB"]`）：数组内逐个 size 循环运行（basic 按 params × size 笛卡尔积；pipeline 每个 size 完整跑一轮写读流水）。不同尺寸间自动重建 `value.bin` 并（get 家族）重新预填充 store；运行日志/CSV 行以 size 后缀区分 | basic 默认 `["128KB", "1MB", "4MB", "8MB"]`（`_configs.json`）；pipeline 的 data_size 不进基座、逐用例携带；预热 1MB |
 | `key_count` | key 数量 | 正式测量 1000（数据总量 8GB，适配单 store ~12GB 内存限制）；预热场景 100 |
 | `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16；mixed_batch 8 |
 | `put_ratio` | mixed 场景中 put 操作占比 | mixed 场景 0.5 |
@@ -91,7 +93,7 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `numa_bind` | 客户端 NUMA 绑定（可选）：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配） | 空/`null`：不绑定（现行为） |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
-- **NUMA 绑定**：`numa_bind: true` 时（basic 默认值在 `_basic.json` 中，置空即不绑定），basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
+- **NUMA 绑定**：`numa_bind` **默认开启**（缺省/null 即 true，仅显式 false 关闭；basic/pipeline 基座均显式写 true）。开启时basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。
@@ -110,9 +112,16 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 精排/召排是**生产-消费（pipeline）**测试模式，与单接口 benchmark 并列。通过
 `scenario: "pipeline"` 识别。
 
-**配置组织**：`configs/pipeline/` 顶层仅放 `_pipeline.json` 公共默认与 `demo/`，正式配置按
-reader 侧节点数归档进 `1-nodes/`、`2-nodes/`、`4-nodes/` 子目录（每个目录下还可再设子目录或
-直接放配置文件，`--config-dir` 可指定运行其中某目录，`--recursive` 递归）。
+**配置组织**：`configs/pipeline/` 顶层仅放根基座 `_configs.json` 与 `demo/`，正式配置按
+reader 侧节点数归档进 `1-nodes/`、`2-nodes/`、`4-nodes/`，其下再按 work_mode 分 `rank/` 与
+`recall/` 子目录。每层 `_configs.json` 逐层继承：根基座（scenario/protocol/key_prefix/
+notify_pipeline/warmup/duration/batch_size/numa_bind，不含 data_size/writer/reader）→
+x-nodes 层（writer/reader 骨架，client_nodes 按层配置）→ rank|recall 层（work_mode、
+base_qps；recall 另含 notify_count/writer.notify_threads/reader.count_per_node）→
+用例（rank：traffic_mode/qps_multiple/notify_count/writer.notify_threads/reader.count_per_node/
+data_size；recall：traffic_mode/qps_multiple/data_size）。data_size 一律逐用例携带。
+`--config-dir` 指定某目录运行：用例已下沉到 rank|recall 层，指向 x-nodes 层需配 `--recursive`
+（如 `--config-dir 2-nodes --recursive`），或直接指向叶子目录（如 `--config-dir 2-nodes/rank`）。
 
 **配置命名**：`{work_mode}_{traffic_mode}_1w{notify}r_{倍数}x_n{节点数}.json`
 （单 writer 家族中名字里的 `{notify}r` 即 notify_count 扇出数，非 reader 池大小；池 = cpn×节点数 ≥ notify_count）
@@ -169,7 +178,7 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **运行**：
 
 ```
-python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
 python benchmark.py --scenario pipeline --all     # 递归跑全部 pipeline 场景（跳 demo/ 与 _ 前缀）
 python benchmark.py --scenario pipeline --config-dir 2-nodes          # 跑 2-nodes 目录全部配置
 python benchmark.py --scenario pipeline --config-dir 4-nodes --recursive   # 含子目录递归
@@ -484,7 +493,7 @@ cp configs/global.example.json configs/global.json
 > `--config` 按给定路径**原样**解析（相对当前目录或绝对路径），不再默认拼接 `configs/` 前缀。
 
 ```
-# 运行 basic 类别下全部场景（自动跳过 _basic.json 公共默认）
+# 运行 basic 类别下全部场景（自动跳过 _configs.json 公共默认）
 python benchmark.py --scenario basic --all
 # 只运行 basic 类别下指定场景
 python benchmark.py --scenario basic --config configs/basic/get_remote.json
@@ -493,7 +502,7 @@ python benchmark.py --scenario basic --demo
 # 运行 pipeline 场景全部（递归收集 1/2/4-nodes 子目录，跳过 demo/ 与 _ 前缀）
 python benchmark.py --scenario pipeline --all
 # 运行 pipeline 指定场景
-python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
 # 运行 pipeline 指定目录下全部配置（按 reader 节点数分层的目录）
 python benchmark.py --scenario pipeline --config-dir 2-nodes
 # 目录递归（含其下所有子目录；demo/ 与 _ 前缀始终跳过）

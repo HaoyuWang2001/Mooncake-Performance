@@ -1,0 +1,14 @@
+{
+  "traffic_mode": "pulse",
+  "qps_multiple": 1,
+  "notify_count": 16,
+  "writer": {
+    "notify_threads": 16
+  },
+  "reader": {
+    "count_per_node": 4
+  },
+  "data_size": [
+    "8MB"
+  ]
+}

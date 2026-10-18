@@ -1,0 +1,7 @@
+{
+  "traffic_mode": "balanced",
+  "qps_multiple": 3,
+  "data_size": [
+    "3.5MB"
+  ]
+}

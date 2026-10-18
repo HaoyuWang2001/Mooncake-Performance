@@ -486,7 +486,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         total_target_qps = float(cfg.get("target_qps", 0) or 0)
         if total_target_qps < 0:
             raise RuntimeError("basic target_qps must be >= 0 (got {})".format(total_target_qps))
-        numa_bind = bool(cfg.get("numa_bind"))
+        # numa_bind defaults to true: absent or null enables binding, only an
+        # explicit false disables it
+        numa_bind = cfg.get("numa_bind")
+        numa_bind = True if numa_bind is None else bool(numa_bind)
         log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
         current_ds = None
@@ -626,7 +629,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     writer_pids = []
     # optional NUMA binding: per node, round-robin the node's client
     # processes (readers launched first, then writers) across its NUMA nodes.
-    numa_bind = bool(cfg.get("numa_bind"))
+    # Defaults to true (absent/null enables, explicit false disables).
+    numa_bind = cfg.get("numa_bind")
+    numa_bind = True if numa_bind is None else bool(numa_bind)
     numa_node_count = {}
     numa_counter = {}
     if numa_bind:
@@ -1178,30 +1183,57 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
 # CLI entry
 # --------------------------------------------------------------------------
 
+def _deep_merge(base, overlay):
+    """Recursively merge overlay into base: dict values merge key-by-key (so
+    a child _configs.json can extend a parent's writer/reader skeleton
+    without repeating every field), any other type replaces outright."""
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 def load_scenario_config(cfg_path):
-    """Load a scenario config; configs under configs/<category>/ inherit
-    shared defaults from configs/<category>/_<category>.json (shallow merge —
-    the specific config overrides any key present; demo/ subdirectories are
-    covered as well). The defaults fragment itself is not a runnable scenario
-    and is rejected if passed directly."""
+    """Load a scenario config with layered _configs.json inheritance.
+
+    Configs under configs/<category>/ inherit shared defaults from every
+    _configs.json on the directory chain from the category root down to the
+    config's own directory, e.g. for 2-nodes/rank/x.json:
+      configs/pipeline/_configs.json
+      -> configs/pipeline/2-nodes/_configs.json
+      -> configs/pipeline/2-nodes/rank/_configs.json
+      -> the config file itself
+    Each level supplements/overrides the level above (dicts deep-merge,
+    other values replace); the config file is merged last and always wins.
+    External config paths (outside configs/) get no inheritance. The
+    fragments themselves are not runnable scenarios and are rejected if
+    passed directly."""
     cfg = load_json(cfg_path)
     if os.path.basename(cfg_path).startswith("_"):
         raise RuntimeError(
             "{} is a shared-defaults fragment, not a runnable scenario".format(cfg_path))
     cfg_dir = os.path.normpath(os.path.dirname(os.path.abspath(cfg_path)))
-    defaults_path = None
+    merged = {}
     for category in ("basic", "pipeline"):
         category_dir = os.path.normpath(os.path.join(CONFIGS_DIR, category))
         if cfg_dir == category_dir or cfg_dir.startswith(category_dir + os.sep):
-            candidate = os.path.join(category_dir, "_{}.json".format(category))
-            if os.path.exists(candidate):
-                defaults_path = candidate
+            # directory chain: category root -> ... -> the config's own dir
+            chain = [category_dir]
+            rel = os.path.relpath(cfg_dir, category_dir)
+            if rel != ".":
+                acc = category_dir
+                for part in rel.split(os.sep):
+                    acc = os.path.join(acc, part)
+                    chain.append(acc)
+            for level in chain:
+                frag = os.path.join(level, "_configs.json")
+                if os.path.isfile(frag):
+                    _deep_merge(merged, load_json(frag))
             break
-    if defaults_path:
-        merged = dict(load_json(defaults_path))
-        merged.update(cfg)          # specific config wins on conflicts
-        cfg = merged
-    return cfg
+    _deep_merge(merged, cfg)
+    return merged
 
 
 def collect_config_files(directory, recursive=False):
