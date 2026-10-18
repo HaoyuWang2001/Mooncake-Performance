@@ -77,7 +77,7 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 **basic 公共默认值**：`configs/basic/_basic.json` 存放 18 个正式场景共用的
 字段（`scenario/protocol/key_prefix/key_count/data_size/target_qps/warmup`），
 各场景配置加载时与其浅合并——**具体配置中出现相同字段即覆盖**；`_basic.json`
-本身不作为场景运行（`--all` 自动跳过 `_` 前缀文件）。
+本身不作为场景运行（`--all`/`--config-dir` 收集时自动跳过 `_` 前缀文件）。
 
 | 参数 | 说明 | 测试场景使用值 |
 | --- | --- | --- |
@@ -100,16 +100,22 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 - **pipeline 同样由 operation 指定接口**：`writer.operation`（写接口，`put_batch` 等）与
   `reader.operation`（读接口，`get` 等）真实驱动调用（见 3.3）。
 
-> 压测模式（duration）备注：由于 `put` 为 create-only（key 已存在时 no-op 不覆盖），重复写入会失效，
-> 因此 duration 目前仅适用于 **get 家族**（get / get_batch / get_into / get_buffer）。
+> 压测模式（duration）备注：**全部 basic 操作均支持**。get 家族循环读取预填数据；put 家族与
+> mixed 以"完整 key 遍历"为一轮——put 跑满一轮后由客户端清除**自己的** key（`batch_remove`，
+> 维护动作不计时、不产生 RESULT）再进入下一轮；mixed 按 put/get 交替，put 侧写满一轮后清空
+> 本轮 put key 继续循环。多客户端/多线程按 key 分片各清各的，互不干扰。
 
 ### 3.3 pipeline（精排/召排）模式
 
 精排/召排是**生产-消费（pipeline）**测试模式，与单接口 benchmark 并列。通过
 `scenario: "pipeline"` 识别。
 
-**配置命名**：`{work_mode}_{traffic_mode}_{W}w{notify}r_{倍数}x_n{节点数}.json`
-（W = writer 真实数量 = count_per_node × 节点数；`10r` = notify_count 扇出数，非 reader 池大小）
+**配置组织**：`configs/pipeline/` 顶层仅放 `_pipeline.json` 公共默认与 `demo/`，正式配置按
+reader 侧节点数归档进 `1-nodes/`、`2-nodes/`、`4-nodes/` 子目录（每个目录下还可再设子目录或
+直接放配置文件，`--config-dir` 可指定运行其中某目录，`--recursive` 递归）。
+
+**配置命名**：`{work_mode}_{traffic_mode}_1w{notify}r_{倍数}x_n{节点数}.json`
+（单 writer 家族中名字里的 `{notify}r` 即 notify_count 扇出数，非 reader 池大小；池 = cpn×节点数 ≥ notify_count）
 
 | 参数 | 说明 | rank 值 | recall 值 |
 | --- | --- | --- | --- |
@@ -117,13 +123,23 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 | `traffic_mode` | `balanced`=均衡（按 QPS 均匀节流）/ `pulse`=脉冲（每秒窗口集中突发） | 两者皆测 | 两者皆测 |
 | `base_qps` | 基准写入 QPS | 105 | 35 |
 | `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
-| `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读） | 10 | 1 |
-| `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / 部署节点 | cpn=1 | cpn=1 |
-| `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / 部署节点 | n1:10, n2:5, n4:3 | 恒 1 |
+| `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
+| `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / 部署节点 | cpn=1（notify_threads=notify_count） | cpn=1 |
+| `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / 部署节点 | 见下方档位表 | 恒 1 |
 | `data_size` | **必填，数组形式**：逐个 size 循环，每个 size 完整跑一轮写读流水（value.bin 自动按尺寸重建）；单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` | `["8MB"]` | `["3.5MB"]` |
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
 | `batch_size` | writer 每批写入的 key 数（reader 按 notify 批处理） | 1 | 1 |
+
+rank 档位矩阵（按 reader 参与节点数归档进同名目录；每档均跑 pulse/balanced × 1x/2x/3x）：
+
+| 目录 | 档位（1w{x}r = notify x） | reader 池（cpn×节点） |
+| --- | --- | --- |
+| 1-nodes/ | 1w1r_n1、1w2r_n1、1w4r_n1；另有 1w10r_n1（池 10） | 1 / 2 / 4 / 10 |
+| 2-nodes/ | 1w2r_n2、1w4r_n2、1w8r_n2；另有 1w10r_n2（池 10）、2w10r_n2（双写） | 2 / 4 / 8 / 10 |
+| 4-nodes/ | 1w4r_n4、1w8r_n4、1w16r_n4；另有 1w10r_n4（池 12=3×4）、2w10r_n4（双写） | 4 / 8 / 16 / 12 |
+
+recall（1w1r，notify=1，恒 cpn=1）按 n1/n2/n4 同样归档进三个目录。
 
 store 节点由 **global.json 的 `mooncake_store_nodes`**（cluster.json 节点名列表，可多个）统一标识，
 各场景配置**不再携带 store_node**；该列表仅用于指标行的 local/remote 拓扑标注（local = 该节点 ∈
@@ -150,12 +166,13 @@ store 节点列表），实际通信仍经 master 发现 store。
   （instance=TOTAL），`role/node/instance/topology` 列区分；
 - **FAIL 处理**：场景失败时先优雅 shutdown reader（使其落盘 SUMMARY/RESULT）→ kill 残留进程 → 
   拉取全部远程日志，再继续后续场景（端口随进程结束释放，避免级联失败）；
-- 1写7读（notify=7）用例范围暂不实现；
 - **运行**：
 
 ```
-python benchmark.py --scenario pipeline --config configs/pipeline/rank_pulse_2w10r_3x_n2.json
-python benchmark.py --scenario pipeline --all     # 跑全部 pipeline 场景
+python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --all     # 递归跑全部 pipeline 场景（跳 demo/ 与 _ 前缀）
+python benchmark.py --scenario pipeline --config-dir 2-nodes          # 跑 2-nodes 目录全部配置
+python benchmark.py --scenario pipeline --config-dir 4-nodes --recursive   # 含子目录递归
 python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 ```
 
@@ -173,15 +190,16 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 
 ## 4. 用例矩阵
 
-5 种操作 × 2 种拓扑 = 10 个场景：
+basic：9 种操作 × 2 种拓扑 = 18 个场景（`configs/basic/` 顶层平铺）：
 
-| 操作 / 拓扑 | local_node | remote_node |
+| 操作族 / 拓扑 | local_node | remote_node |
 | --- | --- | --- |
-| put | put_local | put_remote |
-| get | get_local | get_remote |
-| put_batch | put_batch_local | put_batch_remote |
-| get_batch | get_batch_local | get_batch_remote |
-| mixed | mixed_local | mixed_remote |
+| put / put_batch / put_from | put_local、put_batch_local、put_from_local | put_remote、put_batch_remote、put_from_remote |
+| get / get_batch / get_into / get_buffer | get_local、get_batch_local、get_into_local、get_buffer_local | get_remote、get_batch_remote、get_into_remote、get_buffer_remote |
+| mixed / mixed_batch | mixed_local、mixed_batch_local | mixed_remote、mixed_batch_remote |
+
+pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-nodes/` 下（102 个，见 3.3
+档位矩阵表），demo/ 另有 2 个冒烟配置。
 
 ## 5. 测试部署架构
 
@@ -412,7 +430,9 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 - `get / get_batch`：generate-data → prepare-store（先检查数据是否存在）→ warmup → benchmark
 - `mixed`：generate-data → remove-keys → prepare-store → warmup → benchmark
 
-`duration` 仅改变 benchmark 阶段 key 的遍历方式（跑一遍结束 vs 循环到截止），不改变上述阶段流程。
+`duration`（可选，全部 basic 操作支持）改变 benchmark 阶段的负载形态：缺省跑一遍结束；设置后
+get 家族循环读取预填数据直至到时；put 家族与 mixed 以"完整遍历自己 key 分片"为一轮，put 侧跑满
+一轮后客户端清除自己的 key（维护动作不计时、不产生 RESULT）再进入下一轮，直至到时。阶段流程不变。
 
 ### 7.6.1 remove-keys 触发时机
 
@@ -470,10 +490,14 @@ python benchmark.py --scenario basic --all
 python benchmark.py --scenario basic --config configs/basic/get_remote.json
 # 运行 demo 冒烟用例
 python benchmark.py --scenario basic --demo
-# 运行 pipeline 场景全部
+# 运行 pipeline 场景全部（递归收集 1/2/4-nodes 子目录，跳过 demo/ 与 _ 前缀）
 python benchmark.py --scenario pipeline --all
 # 运行 pipeline 指定场景
-python benchmark.py --scenario pipeline --config configs/pipeline/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank_pulse_2w10r_3x_n2.json
+# 运行 pipeline 指定目录下全部配置（按 reader 节点数分层的目录）
+python benchmark.py --scenario pipeline --config-dir 2-nodes
+# 目录递归（含其下所有子目录；demo/ 与 _ 前缀始终跳过）
+python benchmark.py --scenario pipeline --config-dir 4-nodes --recursive
 # 指定集群/全局配置文件
 python benchmark.py --cluster configs/cluster.json --global configs/global.json \
     --scenario basic --config configs/basic/put_local.json
@@ -483,7 +507,7 @@ python benchmark.py --scenario basic --config configs/basic/put_local.json --no-
 python benchmark.py --scenario basic --config configs/basic/put_local.json --protocol tcp
 # 独立清理：删除 cluster.json 全部节点的远程测试目录
 python benchmark.py --clean-up
-# 运行并追加清理阶段（与 --all/--demo/--config 共现时）
+# 运行并追加清理阶段（与 --all/--demo/--config/--config-dir 共现时）
 python benchmark.py --scenario basic --config configs/basic/get_local.json --clean-up
 ```
 
@@ -516,4 +540,4 @@ outputs/<时间戳，如 20261010-1308>/
 - `generate-data` 阶段自动检测：每次运行前 ssh 检查 `value.bin` 的文件大小是否匹配当前 `data_size`，
   匹配则跳过 generate-data，避免重复生成浪费。种子变更或数据大小变更时自动触发重新生成；
 - `--clean-up` 参数：删除 cluster.json 中**全部节点**的远程测试目录（`rm -rf $MC_REMOTE_DIR`）。
-  独立使用（不带 --all/--demo/--config）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。
+  独立使用（不带 --all/--demo/--config/--config-dir）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。

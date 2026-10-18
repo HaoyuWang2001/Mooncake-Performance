@@ -553,7 +553,10 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
         n_get = len(get_keys)
         n_put_units = (n_put + batch_size - 1) // batch_size if n_put else 0
         n_get_units = (n_get + batch_size - 1) // batch_size if n_get else 0
-        for i in range(max(n_put_units, n_get_units)):
+        n_units = max(n_put_units, n_get_units)
+
+        def run_mixed_unit(i):
+            # one put/get alternation unit (put group i, then its paired get)
             if i < n_put_units:
                 group = put_keys[i * batch_size:(i + 1) * batch_size]
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[put_iface], group, value, ctx)
@@ -568,17 +571,77 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                     lat, status = _run_iface(store, *GET_IFACE_DEFS[get_iface], gkeys, value, ctx)
                     local.append(("get", gkeys[0], lat, status))
                     pace()
+
+        if deadline is None:
+            for i in range(n_units):
+                run_mixed_unit(i)
+        else:
+            # duration mode: put/get cycles. When the put side has written
+            # all of its keys (full pass completed), it clears them and the
+            # next cycle rewrites — the remove is maintenance and is NOT
+            # timed (no RESULT line), only the put/get calls are measured.
+            # Each thread removes only its own sub-chunk keys, so parallel
+            # threads and client processes never interfere.
+            cycles = 0
+            while time.time() < deadline:
+                cycles += 1
+                for i in range(n_units):
+                    if time.time() >= deadline:
+                        break
+                    run_mixed_unit(i)
+                else:
+                    store.batch_remove(put_keys, force=True)
+                    log("mixed cycle {}: removed {} put keys (untimed maintenance)".format(
+                        cycles, len(put_keys)))
     elif op in PUT_IFACE_DEFS:
         if op in PUT_BATCH_IFACES:
-            for group in groups_iter():
-                lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                local.append((op, group[0], lat, status))
-                pace()
+            if deadline is None:
+                for group in groups_iter():
+                    lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
+                    local.append((op, group[0], lat, status))
+                    pace()
+            else:
+                # duration mode: full-key passes; after each completed pass
+                # the thread clears its own keys (untimed maintenance — no
+                # RESULT line) and the next cycle rewrites them. Threads and
+                # client processes own disjoint key ranges, so the remove
+                # never interferes with concurrent writers.
+                cycles = 0
+                while time.time() < deadline:
+                    cycles += 1
+                    for j in range(0, len(keys), batch_size):
+                        if time.time() >= deadline:
+                            break
+                        group = keys[j:j + batch_size]
+                        lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
+                        local.append((op, group[0], lat, status))
+                        pace()
+                    else:
+                        store.batch_remove(keys, force=True)
+                        log("put_batch cycle {}: removed {} keys (untimed maintenance)".format(
+                            cycles, len(keys)))
         else:
-            for k in keys_iter():
-                lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                local.append((op, k, lat, status))
-                pace()
+            if deadline is None:
+                for k in keys_iter():
+                    lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
+                    local.append((op, k, lat, status))
+                    pace()
+            else:
+                # duration mode: full-key passes with untimed self-clear
+                # between cycles (see the put_batch branch above)
+                cycles = 0
+                while time.time() < deadline:
+                    cycles += 1
+                    for k in keys:
+                        if time.time() >= deadline:
+                            break
+                        lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
+                        local.append((op, k, lat, status))
+                        pace()
+                    else:
+                        store.batch_remove(keys, force=True)
+                        log("put cycle {}: removed {} keys (untimed maintenance)".format(
+                            cycles, len(keys)))
     elif op in GET_IFACE_DEFS:
         if op in GET_BATCH_IFACES:
             for group in groups_iter():
@@ -620,12 +683,10 @@ def cmd_benchmark(args, store):
     put_iface = get_iface = None
     if "/" in op:
         put_iface, get_iface = op.split("/", 1)
-    if duration:
-        if op not in GET_IFACES:
-            print("[ERROR] duration is only supported for get-family interfaces "
-                  "(get/get_batch/get_into/get_buffer), got operation={}".format(op))
-            sys.exit(1)
-    else:
+    if not duration:
+        # duration mode: get-family loops over prefilled keys; put-family and
+        # mixed run full-key passes with untimed self-clear between cycles
+        # (see _run_thread). All basic operations support it.
         duration = None
     # zero-copy interfaces need a registered page-aligned buffer. get_buffer
     # does NOT: it validates through the BufferHandle's own pointer, so it

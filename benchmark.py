@@ -454,10 +454,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     store_node_ips = resolve_store_node_ips(
         cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
     topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
-    if cfg.get("duration") and op not in PIPELINE_GET_IFACES:
-        raise RuntimeError(
-            "duration configured but operation={} does not support duration "
-            "stress (only get-family: get/get_batch/get_into/get_buffer)".format(op))
+    # duration mode is supported by ALL basic operations: get-family loops
+    # over prefilled keys; put-family/mixed run full-key passes with untimed
+    # self-clear between cycles (client _run_thread)
     remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
         remote_runner_pipeline, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
