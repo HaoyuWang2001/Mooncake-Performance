@@ -1,0 +1,27 @@
+{
+  "work_mode": "rank",
+  "traffic_mode": "balanced",
+  "base_qps": 105,
+  "qps_multiple": 3,
+  "notify_count": 8,
+  "writer": {
+    "count_per_node": 1,
+    "operation": "put_batch",
+    "notify_threads": 8,
+    "client_nodes": [
+      "writer_node1"
+    ]
+  },
+  "reader": {
+    "count_per_node": 4,
+    "operation": "get",
+    "num_threads": 1,
+    "client_nodes": [
+      "reader_node1",
+      "reader_node2"
+    ]
+  },
+  "data_size": [
+    "8MB"
+  ]
+}
