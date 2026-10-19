@@ -552,7 +552,29 @@ outputs/<时间戳，如 20261010-1308>/
             （脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
 ```
 
-## 10. 注意事项与待验证项
+## 10. 本地分析工具
+
+### 10.1 plot_latency.py（时延统计图）
+
+根据客户端日志中的 RESULT 行绘制**点线图**：横轴 = 第 i 个请求，纵轴 = 时延(ms)；
+横向虚线标注 `avg`/`p99`/`max`（不同颜色 + 数值），`1ms`/`2ms` 灰色点划参考线；
+高于离群阈值的样本从主序列剥离并以红色 `x` 单独标注。
+
+```bash
+# 单个日志（图落在日志同目录，即 outputs/<ts>/logs/<配置名>/）
+python scripts/plot_latency.py --log outputs/20261019-1012/logs/put_local/put_local.benchmark_c1_t8_8MB.log
+# 整个配置目录（递归扫描 *.log，逐文件出图；pipeline_read 日志自动加绘 queue_wait 图）
+python scripts/plot_latency.py --log outputs/20261019-1012/logs/rank_pulse_1w2r_1x_n2
+# 指定离群阈值（缺省自动 = p99 × 10 取整）与输出目录
+python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
+```
+
+- 仅 `OK` 样本进入主序列；ERR/MISS/离群数量见图题角注与控制台输出
+- pipeline reader 日志（7 字段 RESULT）自动额外生成 `<日志主干>.queuewait.png`
+  （queue_wait 独立按自身分布计算离群阈值）
+- 依赖 matplotlib：`pip install matplotlib`；输出 PNG（dpi 150）
+
+## 11. 注意事项与待验证项
 
 - API 语义以 `mooncake_api.md` 为准：`put` 为 create-only（key 存在时 no-op 不覆盖），因此 put
   类场景必须保证先 remove-keys 再 put（编排流程已保证，remove-keys 失败会终止场景）；
