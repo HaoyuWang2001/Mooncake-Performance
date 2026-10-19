@@ -15,6 +15,7 @@ import csv
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
+# RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
+# legacy rows start with the op name directly (see parse_benchmark_log)
+TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
 DEFAULT_LD_PATH = ("/home/w00921547/stress-cluster-bench/lib/:/usr/local/cuda-12.9/lib64:"
                    "/usr/local/lib64:${LD_LIBRARY_PATH:-}")
 # store interface families (mirror scripts/mooncake_benchmark_client.py so the
@@ -838,31 +842,37 @@ def parse_benchmark_log(paths, op_filter=None):
             line = line.rstrip("\n")
             if line.startswith("RESULT\t"):
                 parts = line.split("\t")
-                if len(parts) < 5:
+                # RESULT rows carry a leading wall-clock timestamp
+                # (HH:MM:SS.micro) since the plotting feature; legacy rows
+                # from older runs start with the op name directly. Detect
+                # and offset accordingly — both formats stay parseable.
+                off = 1 if len(parts) > 1 and TS_PREFIX.match(parts[1]) else 0
+                if len(parts) < 5 + off:
                     continue
-                if op_filter is not None and parts[1] != op_filter:
+                op = parts[1 + off]
+                if op_filter is not None and op != op_filter:
                     continue
-                # key_count (pipeline): writer 6th field, reader 7th field;
-                # basic lines and old logs have no key_count -> 1
+                # key_count (pipeline): writer 6th field, reader 7th field
+                # (after op); basic lines and old logs have none -> 1
                 kc = 1
                 try:
-                    if parts[1] == "pipeline_write" and len(parts) > 5:
-                        kc = int(parts[5])
-                    elif parts[1] == "pipeline_read" and len(parts) > 6:
-                        kc = int(parts[6])
+                    if op == "pipeline_write" and len(parts) > 5 + off:
+                        kc = int(parts[5 + off])
+                    elif op == "pipeline_read" and len(parts) > 6 + off:
+                        kc = int(parts[6 + off])
                 except ValueError:
                     pass
                 # latency statistics count successful samples only; totals are
                 # key-based for pipeline (kc per RESULT line)
-                if parts[4] == "OK":
+                if parts[4 + off] == "OK":
                     ok += kc
-                    latencies.append(float(parts[3]))
-                    lat_sum_ms += float(parts[3])
+                    latencies.append(float(parts[3 + off]))
+                    lat_sum_ms += float(parts[3 + off])
                 else:
                     fail += kc
-                if len(parts) > 5 and parts[1] == "pipeline_read":
+                if op == "pipeline_read" and len(parts) > 5 + off:
                     try:
-                        queue_waits.append(float(parts[5]))
+                        queue_waits.append(float(parts[5 + off]))
                     except ValueError:
                         pass
             elif line.startswith("META\t"):

@@ -172,6 +172,10 @@ store 节点列表），实际通信仍经 master 发现 store。
   ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`（逐 key 调用），reader 支持
   `get`/`get_into`/`get_buffer`（逐 key）与 `get_batch`（整批一次调用）；时延样本 = 单次接口调用
   （逐 key 接口每 key 一条、批量接口每批一条，RESULT 行携带 key_count，total/qps 均按 key 计）；
+- **RESULT 行首字段为本地墙钟时间戳**（`HH:MM:SS.micro`，tab 分隔第 2 列）：仅用于性能问题
+  定位与跨日志关联（与客户端进度行 `[HH:MM:SS]` 同风格），不参与时延测量与 CSV 聚合；
+  跨节点墙钟存在偏差，reader 时延始终以本地 `perf_counter` 计；CSV 解析器自动兼容
+  新旧两种格式（旧日志无时间戳列）；
   `notify_pipeline` 收敛为预检步骤（`exist`），`get/getBuffer` 步骤名不再承担读数据职责；
 - **指标输出**：每个 writer 一行、每 writer 聚合一行、每个 reader 一行、全 reader 聚合一行
   （instance=TOTAL），`role/node/instance/topology` 列区分；
@@ -572,6 +576,10 @@ python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
 - 仅 `OK` 样本进入主序列；ERR/MISS/离群数量见图题角注与控制台输出
 - pipeline reader 日志（7 字段 RESULT）自动额外生成 `<日志主干>.queuewait.png`
   （queue_wait 独立按自身分布计算离群阈值）
+- **横轴时间线**：新格式日志（首字段时间戳）横轴为时间（HH:MM:SS 刻度），顶部次轴同时
+  标注 request #i；旧格式日志自动回退为 request#i 横轴
+- **离群双图**：存在离群值时每个统计量出两幅——原名图（包含离群值，红 x 标注，分位线按
+  全量计算）+ `.trimmed.png`（剔除离群值，分位线按剔除后数据重算）；无离群仅单图
 - 依赖 matplotlib：`pip install matplotlib`；输出 PNG（dpi 150）
 - **新 run 自动绘图**：benchmark.py 主流程结束后自动对本 run 的 `outputs/<ts>/logs/`
   全量出图（子进程隔离，绘图失败仅 `[WARN]` 不影响测试结果）；`--no-plot` 跳过

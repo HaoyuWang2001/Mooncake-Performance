@@ -370,6 +370,17 @@ class _NoCall(Exception):
     attempted, so there is no timed region."""
 
 
+def now_hms():
+    """Local wall-clock timestamp for RESULT rows (HH:MM:SS.microseconds).
+
+    Localization aid only — latency values come from the timed region; wall
+    clock may skew across nodes and is never used for measurement.
+    """
+    t = time.time()
+    return time.strftime("%H:%M:%S", time.localtime(t)) + ".{:06d}".format(
+        int((t % 1) * 1e6))
+
+
 def _run_iface(store, make_call, check, keys, value, ctx):
     """Run one interface operation with the timed region containing ONLY the
     store interface call.
@@ -560,7 +571,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if i < n_put_units:
                 group = put_keys[i * batch_size:(i + 1) * batch_size]
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[put_iface], group, value, ctx)
-                local.append(("put", group[0], lat, status))
+                local.append(("put", group[0], lat, status, now_hms()))
                 pace()
             if i < n_get_units:
                 base = i * batch_size
@@ -569,7 +580,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                 gkeys = gkeys[:n_get - base]
                 if gkeys:
                     lat, status = _run_iface(store, *GET_IFACE_DEFS[get_iface], gkeys, value, ctx)
-                    local.append(("get", gkeys[0], lat, status))
+                    local.append(("get", gkeys[0], lat, status, now_hms()))
                     pace()
 
         if deadline is None:
@@ -598,7 +609,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if deadline is None:
                 for group in groups_iter():
                     lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                    local.append((op, group[0], lat, status))
+                    local.append((op, group[0], lat, status, now_hms()))
                     pace()
             else:
                 # duration mode: full-key passes; after each completed pass
@@ -614,7 +625,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                             break
                         group = keys[j:j + batch_size]
                         lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                        local.append((op, group[0], lat, status))
+                        local.append((op, group[0], lat, status, now_hms()))
                         pace()
                     else:
                         store.batch_remove(keys, force=True)
@@ -624,7 +635,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if deadline is None:
                 for k in keys_iter():
                     lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                    local.append((op, k, lat, status))
+                    local.append((op, k, lat, status, now_hms()))
                     pace()
             else:
                 # duration mode: full-key passes with untimed self-clear
@@ -636,7 +647,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                         if time.time() >= deadline:
                             break
                         lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                        local.append((op, k, lat, status))
+                        local.append((op, k, lat, status, now_hms()))
                         pace()
                     else:
                         store.batch_remove(keys, force=True)
@@ -646,12 +657,12 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
         if op in GET_BATCH_IFACES:
             for group in groups_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], group, value, ctx)
-                local.append((op, group[0], lat, status))
+                local.append((op, group[0], lat, status, now_hms()))
                 pace()
         else:
             for k in keys_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], [k], value, ctx)
-                local.append((op, k, lat, status))
+                local.append((op, k, lat, status, now_hms()))
                 pace()
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
@@ -784,8 +795,9 @@ def cmd_benchmark(args, store):
     emit("SUMMARY", summary)
     log("benchmark done (total={}, ok={}, fail={}, wall_s={:.3f})".format(
         total, ok_count, fail_count, wall_s))
-    for opname, k, lat, status in results:
-        sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\n".format(opname, k, lat, status))
+    for opname, k, lat, status, ts in results:
+        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\n".format(
+            ts, opname, k, lat, status))
     sys.stdout.flush()
 
 # --------------------------------------------------------------------------
@@ -916,8 +928,8 @@ def _pipeline_writer(args, store, do_warmup=True):
                     else:
                         stats["keys_fail"] += kc
                         stats["batches_fail"] += 1
-                    sys.stdout.write("RESULT\tpipeline_write\t{}\t{:.6f}\t{}\t{}\n".format(
-                        k, lat_ms, status, kc))
+                    sys.stdout.write("RESULT\t{}\tpipeline_write\t{}\t{:.6f}\t{}\t{}\n".format(
+                        now_hms(), k, lat_ms, status, kc))
             if batch_ok:
                 # Randomly select notify_count readers and deliver the whole
                 # batch in a single multi-key request per reader (bypass proxy;
@@ -935,8 +947,8 @@ def _pipeline_writer(args, store, do_warmup=True):
                     try:
                         opener.open(url, timeout=0.5)
                     except Exception as exc:
-                        sys.stdout.write("RESULT\tpipeline_notify\t{}\t0\tERR:{} target={}:{}\n".format(
-                            ks[0], exc, r["host"], r["port"]))
+                        sys.stdout.write("RESULT\t{}\tpipeline_notify\t{}\t0\tERR:{} target={}:{}\n".format(
+                            now_hms(), ks[0], exc, r["host"], r["port"]))
                 # blocking submit = natural backpressure; pacing accounts for
                 # the slowest in-flight notify instead of the sequential sum
                 futures = [notify_pool.submit(_notify, r) for r in selected]
@@ -1097,23 +1109,23 @@ def _reader_worker(args, store, queue, deadline, results, ctx=None):
                 # is fully decided by reader.operation
             if not ok:
                 if is_warmup:
-                    local.append(("pipeline_warmup_read", keys[0], 0.0, "SKIP", queue_wait_ms, len(keys)))
+                    local.append(("pipeline_warmup_read", keys[0], 0.0, "SKIP", queue_wait_ms, len(keys), now_hms()))
                     continue
-                local.append(("pipeline_read", keys[0], 0.0, "MISS/MISMATCH", queue_wait_ms, len(keys)))
+                local.append(("pipeline_read", keys[0], 0.0, "MISS/MISMATCH", queue_wait_ms, len(keys), now_hms()))
                 continue
         if batch_mode:
             lat_ms, status = _run_iface(store, *GET_IFACE_DEFS[reader_op], keys, value, ctx)
             if is_warmup:
-                local.append(("pipeline_warmup_read", keys[0], lat_ms, "SKIP", queue_wait_ms, len(keys)))
+                local.append(("pipeline_warmup_read", keys[0], lat_ms, "SKIP", queue_wait_ms, len(keys), now_hms()))
                 continue
-            local.append(("pipeline_read", keys[0], lat_ms, status, queue_wait_ms, len(keys)))
+            local.append(("pipeline_read", keys[0], lat_ms, status, queue_wait_ms, len(keys), now_hms()))
         else:
             for k in keys:
                 lat_ms, status = _run_iface(store, *GET_IFACE_DEFS[reader_op], [k], value, ctx)
                 if is_warmup:
-                    local.append(("pipeline_warmup_read", k, lat_ms, "SKIP", queue_wait_ms, 1))
+                    local.append(("pipeline_warmup_read", k, lat_ms, "SKIP", queue_wait_ms, 1, now_hms()))
                     continue
-                local.append(("pipeline_read", k, lat_ms, status, queue_wait_ms, 1))
+                local.append(("pipeline_read", k, lat_ms, status, queue_wait_ms, 1, now_hms()))
     results.extend(local)
 def cmd_pipeline(args, store):
     """Run pipeline (精排/召排) — dispatches to writer or reader based on --role."""
@@ -1247,9 +1259,9 @@ def _pipeline_reader(args, store):
         "data_size": data_size,
     }
     emit("SUMMARY", summary)
-    for opname, k, lat, status, qw, kc in measured:
-        sys.stdout.write("RESULT\t{}\t{}\t{:.6f}\t{}\t{:.6f}\t{}\n".format(
-            opname, k, lat, status, qw, kc))
+    for opname, k, lat, status, qw, kc, ts in measured:
+        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\t{:.6f}\t{}\n".format(
+            ts, opname, k, lat, status, qw, kc))
     sys.stdout.flush()
 
 # --------------------------------------------------------------------------
