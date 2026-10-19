@@ -11,6 +11,7 @@ Output (stdout, captured by run_benchmark_*.sh into per-client log files):
   SUMMARY\t                    per-client summary
 """
 import argparse
+import copy
 import json
 import os
 import random
@@ -667,19 +668,40 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
     results.extend(local)
-def run_warmup(args, store):
-    count = args.warmup_key_count
-    size = parse_size(args.warmup_data_size or "1MB")
-    warm_value = make_value(size, args.data_seed)
+def run_warmup(args, store, value, ctx=None):
+    """Duration-based warmup at full scale.
+
+    Uses an INDEPENDENT key prefix (mc_warmup*, removed afterwards) at the
+    SAME key_count and data_size as the measured phase, and loops the real
+    operation until the warmup duration expires (same cycle semantics as
+    duration stress: get loops reads, put/mixed write full passes with
+    self-clear). Pure get-family operations pre-fill the warmup keys with
+    one untimed batch put first; put and mixed must NOT be pre-filled — put
+    is create-only, so pre-written keys would turn warmup puts into no-ops.
+    Warmup runs unpaced (target_qps ignored) and its samples are discarded.
+    """
+    duration = float(getattr(args, "warmup_duration", 0) or 0)
+    if duration <= 0:
+        return
     prefix = "mc_warmup*{}*{}".format(args.scenario, os.getpid())
-    keys = ["{}*{:08d}".format(prefix, i) for i in range(count)]
-    for k in keys:
-        ret = store.put(k, warm_value)
+    keys = ["{}*{:08d}".format(prefix, i) for i in range(args.key_count)]
+    op = args.operation
+    put_iface = get_iface = None
+    if "/" in op:
+        put_iface, get_iface = op.split("/", 1)
+    pure_get = op in GET_IFACE_DEFS or (get_iface is not None and put_iface is None)
+    if pure_get:
+        ret = store.put_batch(keys, [value] * len(keys))
         if ret != 0:
-            print("[WARN] warmup put failed for {}: {}".format(k, ret))
-    for k in keys:
-        store.get(k)
+            print("[WARN] warmup prefill put_batch ret={}".format(ret))
+    log("warmup start (duration={}s, keys={}, op={})".format(duration, len(keys), op))
+    wargs = copy.copy(args)
+    wargs.target_qps = 0  # warmup free-runs; pacing is for measured phase
+    results = []
+    _run_thread(wargs, store, keys, value, results, deadline=time.time() + duration,
+                ctx=ctx)
     store.batch_remove(keys, force=True)
+    log("warmup done (ops={})".format(len(results)))
 def _percentile(sorted_vals, p):
     if not sorted_vals:
         return 0.0
@@ -713,7 +735,7 @@ def cmd_benchmark(args, store):
             print("[ERROR] register_buffer failed, cannot use zero-copy interfaces")
             sys.exit(1)
     if args.warmup == "true":
-        run_warmup(args, store)
+        run_warmup(args, store, value, ctx)
     end_idx = args.key_end if args.key_end is not None else len(keys)
     chunk = keys[args.key_start:end_idx]
     deadline = None
@@ -1292,10 +1314,6 @@ def _resolve_env(args):
             args.duration = float(dur)
         else:
             args.duration = 0.0
-    if args.warmup_key_count is None:
-        args.warmup_key_count = int(os.environ.get("MC_WARMUP_KEY_COUNT", "100"))
-    if args.warmup_data_size is None:
-        args.warmup_data_size = os.environ.get("MC_WARMUP_DATA_SIZE", None)
     if args.warmup_duration is None:
         args.warmup_duration = float(os.environ.get("MC_WARMUP_DURATION", "0"))
     if args.master_addr is None:
@@ -1368,8 +1386,6 @@ def main():
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--timeout", type=int, default=None,
                         help="pipeline reader lifetime in seconds")
-    parser.add_argument("--warmup-key-count", type=int, default=None)
-    parser.add_argument("--warmup-data-size", default=None)
     parser.add_argument("--warmup-duration", type=float, default=None)
     parser.add_argument("--writer-count", type=int, default=None)
     parser.add_argument("--reader-count", type=int, default=None)

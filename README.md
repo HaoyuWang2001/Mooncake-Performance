@@ -269,8 +269,10 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
   - pipeline TOTAL 行：`吞吐 = 各实例忙时吞吐之和`（保留多实例聚合视角）；
 - 每条结果（CSV 行）同时打印本次运行配置的核心参数：`data_size`、`key_count`、
   `batch_size`（put_batch / get_batch 场景）、`put_ratio`（mixed 场景）、`duration`（仅配置时）；
-- **basic 与 pipeline 使用不同 CSV Schema**：basic 保留 `num_clients/key_count/put_ratio/ok` 等列；
-  pipeline 采用 `config_name/success/num_threads/notify_threads/writer_count(N*{cpn})` 等 40 列，
+- **basic 与 pipeline 使用不同 CSV Schema**：basic 29 列（`node` 列填 client 管理网 IP，
+  含 `num_clients/key_count/put_ratio/target_qps/duration/warmup_duration/ok` 等；pipeline 专属
+  列 role/instance/writer_count/reader_count/notify_*/base_qps/qps_multiple/notify_pipeline/
+  traffic_mode 已移除）；pipeline 保持 40 列（`node` 列同样统一为管理网 IP），
   每个 writer 与 reader 各一行 + 各聚合（TOTAL）一行；
 - **pipeline 多行输出**：每个 writer 一行（指标取 pipeline_write 时延）、全 writer 聚合一行、
   每个 reader 一行（指标取 pipeline_read 时延，含 node/instance/topology 列以区分不同节点与 store
@@ -440,7 +442,7 @@ basic 场景字段：
 | key_count / data_size / batch_size / put_ratio | 见 3.2 |
 | duration | 压测时长（秒，可选），仅 get / get_batch 支持 |
 | params | 并发组合数组 `[{"num_clients": N, "num_threads": T}, ...]`，逐组顺序执行 |
-| warmup | 预热参数 `{key_count, data_size, num_clients, num_threads}` |
+| warmup | 预热配置 `{duration: N}`（默认 5s）：以**正式同规模**（同 key_count/data_size，独立前缀 `mc_warmup*`）循环执行正式操作至到期，预热数据即删；纯读族先一次性批量预填（put 为 create-only，写/混场景不预填以免正式轮 no-op） |
 
 pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store_node）。
 

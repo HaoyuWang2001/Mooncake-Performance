@@ -12,10 +12,7 @@
     }
   ],
   "warmup": {
-    "key_count": 20,
-    "data_size": "1MB",
-    "num_clients": 1,
-    "num_threads": 1
+    "duration": 5
   },
   "work_mode": "put_batch"
 }

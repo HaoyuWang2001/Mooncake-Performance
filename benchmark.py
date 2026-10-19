@@ -39,11 +39,10 @@ PIPELINE_GET_IFACES = ("get", "get_batch", "get_into", "get_buffer")
 PIPELINE_PUT_BATCH_IFACES = ("put_batch",)
 PIPELINE_GET_BATCH_IFACES = ("get_batch",)
 BASIC_CSV_HEADER = [
-    "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
+    "scenario", "work_mode", "operation", "node", "topology", "protocol",
     "num_clients", "num_threads",
     "data_size", "key_count", "batch_size", "put_ratio", "duration", "warmup_duration",
-    "writer_count", "reader_count", "notify_count", "notify_threads", "reader_threads",
-    "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
+    "target_qps",
     "total", "total_bytes", "wall_s",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
@@ -269,8 +268,7 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
             or any(s in ("put_batch", "get_batch") for s in str(cfg.get("operation", "")).split("/"))) else "",
         "MC_PUT_RATIO": str(cfg.get("put_ratio", "")) if "/" in str(cfg.get("operation", "")) else "",
         "MC_DURATION": str(cfg.get("duration", 0)),
-        "MC_WARMUP_KEY_COUNT": str(cfg.get("warmup", {}).get("key_count", cfg.get("warmup_key_count", 100))),
-        "MC_WARMUP_DATA_SIZE": cfg.get("warmup", {}).get("data_size", cfg.get("warmup_data_size", "1MB")),
+        "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
     }
 
 
@@ -619,8 +617,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # clear basic-only vars that are meaningless for pipeline
         "MC_OPERATION": "",
         "MC_KEY_COUNT": "",
-        "MC_WARMUP_KEY_COUNT": "",
-        "MC_WARMUP_DATA_SIZE": "",
         "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
@@ -952,13 +948,18 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 op = (cfg.get("reader", {}) or {}).get("operation", "")
             w_cpn = (cfg.get("writer", {}) or {}).get("count_per_node", 1)
             r_cpn = (cfg.get("reader", {}) or {}).get("count_per_node", 1)
+            # node 列统一填管理网 IP（解析失败回退节点名）
+            try:
+                node_ip = get_node(cluster, nodename)["ip"] if cluster else nodename
+            except (KeyError, RuntimeError):
+                node_ip = nodename
             return {
                 "config_name": name,
                 "scenario": cfg["scenario"],
                 "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
                 "operation": op,
                 "role": role,
-                "node": nodename,
+                "node": node_ip,
                 "instance": instance,
                 "topology": topo_of(nodename) if nodename else "",
                 "protocol": cfg["protocol"],
@@ -1119,6 +1120,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             put_iface, get_iface = op_label.split("/", 1)
         is_mixed = bool(put_iface and get_iface)
         topo = topo_of(cfg["client_node"])
+        node_ip = get_node(cluster, cfg["client_node"])["ip"] if cluster else ""
+        warmup_duration = cfg.get("warmup", {}).get("duration", 0)
         # rows follow run order: outer data_size, inner params order —
         # identical to how run_basic_scenario executes the runs
         for c, t, ds in build_runs(cfg):
@@ -1130,9 +1133,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "scenario": cfg["scenario"],
                 "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
                 "operation": op_label,
-                "role": "",
-                "node": "",
-                "instance": "",
+                "node": node_ip,
                 "topology": topo,
                 "protocol": cfg["protocol"],
                 "num_clients": c,
@@ -1144,17 +1145,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                                                             get_iface in ("get_batch",)) else "",
                 "put_ratio": cfg.get("put_ratio", "") if "/" in op_label else "",
                 "duration": cfg.get("duration", ""),
-                "warmup_duration": "",
-                "writer_count": "",
-                "reader_count": "",
-                "notify_count": "",
-                "notify_threads": "",
-                "reader_threads": "",
-                "base_qps": "",
-                "qps_multiple": "",
+                "warmup_duration": warmup_duration,
                 "target_qps": cfg.get("target_qps") or "",
-                "notify_pipeline": "",
-                "traffic_mode": "",
             }
             if is_mixed:
                 # mixed must be split: put and get latencies are statistically
