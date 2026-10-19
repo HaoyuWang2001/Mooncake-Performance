@@ -15,6 +15,7 @@ import csv
 import glob
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -1293,6 +1294,9 @@ def parse_arguments(argv=None):
                         help="with --config-dir: also descend into subdirectories "
                              "(demo/ and _-prefixed fragments always skipped)")
     parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="skip the automatic latency/queue-wait plotting of "
+                             "this run's logs (default: plotted after the sweep)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
                         help="override protocol (tcp/rdma/ub); highest priority, "
@@ -1468,6 +1472,22 @@ def main(args, cfg_paths):
     else:
         log("SUMMARY: all {} scenarios OK".format(len(cfg_paths)))
     log("done. results in {}".format(ts_dir))
+    # auto-plot: latency/queue-wait figures for every config under this run's
+    # logs/ (subprocess isolation — a broken matplotlib must never affect the
+    # benchmark result or exit code). Opt out with --no-plot.
+    if not args.no_plot:
+        plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
+        try:
+            proc = subprocess.run(
+                [sys.executable, plot_script,
+                 "--log", os.path.join(ts_dir, "logs")],
+                check=False)
+            if proc.returncode != 0:
+                log("[WARN] auto-plot failed (rc={}); figures skipped. "
+                    "Is matplotlib installed? (pip install matplotlib)".format(
+                        proc.returncode))
+        except Exception as exc:
+            log("[WARN] auto-plot failed: {}".format(exc))
     if args.clean_up:
         cleanup_cluster(cluster, globals_cfg, dry_run=False)
         log("cleanup done")

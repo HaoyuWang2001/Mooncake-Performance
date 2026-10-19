@@ -16,16 +16,20 @@ RESULT 行三种格式（tab 分隔，与 mooncake_benchmark_client.py 输出一
     --type     both（缺省，read 日志出时延+queue_wait 双图）| latency | queue-wait
 
 输出：<日志主干>.latency.png / <日志主干>.queuewait.png（dpi 150）。
-依赖：matplotlib（pip install matplotlib）。
+benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用本脚本
+（--no-plot 关闭）。依赖：matplotlib（pip install matplotlib）。
 """
 import argparse
 import os
 import sys
 
-import matplotlib
+try:
+    import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    sys.exit("[ERROR] matplotlib is required: pip install matplotlib")
 
 STAT_HLINES = [("avg", "tab:blue"), ("p99", "tab:orange"), ("max", "tab:red")]
 REF_LINES = [(1.0, "1ms"), (2.0, "2ms")]

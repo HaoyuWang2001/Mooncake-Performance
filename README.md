@@ -573,6 +573,8 @@ python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
 - pipeline reader 日志（7 字段 RESULT）自动额外生成 `<日志主干>.queuewait.png`
   （queue_wait 独立按自身分布计算离群阈值）
 - 依赖 matplotlib：`pip install matplotlib`；输出 PNG（dpi 150）
+- **新 run 自动绘图**：benchmark.py 主流程结束后自动对本 run 的 `outputs/<ts>/logs/`
+  全量出图（子进程隔离，绘图失败仅 `[WARN]` 不影响测试结果）；`--no-plot` 跳过
 
 ## 11. 注意事项与待验证项
 
