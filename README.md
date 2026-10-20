@@ -594,7 +594,7 @@ python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
 
 ```bash
 cd schedule && cp plan.example.json plan.json   # 编辑自己的计划（plan.json 已 gitignore）
-nohup python run_schedule.py --plan plan.json > schedule.log 2>&1 &
+python run_schedule.py --plan plan.json
 python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
 ```
 

@@ -9,7 +9,6 @@
 
 用法：
   python run_schedule.py --plan plan.json [--dry-run]
-  夜间挂法：nohup python run_schedule.py --plan plan.json > schedule.log 2>&1 &
 
 计划文件格式见 plan.example.json。
 """
