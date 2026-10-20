@@ -7,8 +7,8 @@
 
 ```bash
 cp schedule/plan.example.json schedule/plan.json    # 编辑自己的计划（plan.json 已被 gitignore）
-python schedule/run_schedule.py --plan plan.json
-python schedule/run_schedule.py --plan plan.json --dry-run   # 核对执行计划（不真跑）
+python schedule/run_schedule.py --plan schedule/plan.json
+python schedule/run_schedule.py --plan schedule/plan.json --dry-run   # 核对执行计划（不真跑）
 ```
 
 ## 计划文件字段
