@@ -587,6 +587,22 @@ python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
 - **新 run 自动绘图**：benchmark.py 主流程结束后自动对本 run 的 `outputs/<ts>/logs/`
   全量出图（子进程隔离，绘图失败仅 `[WARN]` 不影响测试结果）；`--no-plot` 跳过
 
+### 10.2 run_schedule.py（夜间定时串行执行）
+
+在指定时刻串行运行命令（夜间无人值守性能测试），命令输出追加写入各自指定的
+文件。脚本与计划位于 `schedule/` 目录，纯标准库无第三方依赖：
+
+```bash
+cd schedule && cp plan.example.json plan.json   # 编辑自己的计划（plan.json 已 gitignore）
+nohup python run_schedule.py --plan plan.json > schedule.log 2>&1 &
+python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
+```
+
+触发模型（混合）：任务显式带 `date`+`time` 则睡到该时刻（已过点立即执行）；
+省略时刻则链式（上一条完成 + `wait_seconds`）。失败按 `on_fail`（continue/abort）。
+输出文件带 `===== 起止/rc/耗时 =====` 分隔头，多次运行追加不丢历史。
+计划文件格式详见 `schedule/README.md`。
+
 ## 11. 注意事项与待验证项
 
 - API 语义以 `mooncake_api.md` 为准：`put` 为 create-only（key 存在时 no-op 不覆盖），因此 put

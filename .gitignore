@@ -14,3 +14,5 @@ configs/*
 !configs/pipeline
 
 示例.xlsx
+
+schedule/plan.json

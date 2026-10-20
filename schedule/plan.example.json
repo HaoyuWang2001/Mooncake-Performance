@@ -1,0 +1,16 @@
+{
+  "wait_seconds": 60,
+  "on_fail": "continue",
+  "tasks": [
+    {
+      "date": "2026-10-21",
+      "time": "22:00",
+      "command": "python benchmark.py --scenario pipeline --demo",
+      "output": "logs/night/pipeline_demo.log"
+    },
+    {
+      "command": "python benchmark.py --scenario basic --demo",
+      "output": "logs/night/basic_demo.log"
+    }
+  ]
+}
