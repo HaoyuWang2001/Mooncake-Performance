@@ -21,7 +21,7 @@ import sys
 import time
 
 from utils import (get_node, load_json, log, parse_data_size, percentile,
-                   run_ssh, scp_pull, scp_push, ssh_check_output)
+                   run_ssh, scp_pull, scp_push, ssh_args, ssh_check_output)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
@@ -373,24 +373,59 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
                  local_log_dir, dry_run=dry_run)
 
 
-def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False):
+def format_duration(seconds):
+    """Seconds -> 'x分x秒' / 'x小时x分x秒' style progress string."""
+    seconds = int(max(0, round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "{}小时{}分{}秒".format(h, m, s)
+    return "{}分{}秒".format(m, s)
+
+
+# progress-line cadence for long waits (wait_process_exit / run_ssh_with_progress)
+WAIT_PROGRESS_INTERVAL = 30
+
+
+def _eta_note(t0, expected_s):
+    if not expected_s:
+        return "（无法预估结束时间）"
+    from datetime import datetime as _dt
+    end = _dt.fromtimestamp(t0 + expected_s)
+    return "/ 预计结束 {}（预期 {}）".format(
+        end.strftime("%H:%M:%S"), format_duration(expected_s))
+
+
+def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
+                      expected_s=None):
     """Poll `kill -0 PID` until the remote process exits or times out.
 
-    Logs a single 'waiting' line up front and one result line at the end
-    (exited / timeout); per-poll ssh commands are not logged."""
+    Logs a single 'waiting' line up front, a progress line every
+    WAIT_PROGRESS_INTERVAL seconds while running (elapsed x分x秒 plus the
+    estimated end wall time when expected_s is given), and one result line
+    at the end (exited / timeout); per-poll ssh commands are not logged."""
     n = get_node(cluster, node_name)
     log("waiting {} (pid {}) on {} ...".format(what, pid, node_name))
     t0 = time.time()
+    eta = _eta_note(t0, expected_s)
+    last_progress = t0
     for _ in range(int(timeout_s)):
         alive = ssh_check_output(
             n["ip"], n,
             "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
             dry_run=dry_run, quiet=True)
         if alive != "ALIVE":
-            log("{} exited after {:.0f}s".format(what, time.time() - t0))
+            log("{} exited after {} ({:.0f}s)".format(
+                what, format_duration(time.time() - t0), time.time() - t0))
             return True
+        now = time.time()
+        if now - last_progress >= WAIT_PROGRESS_INTERVAL:
+            log("[wait] {} running... 已等待 {} {}".format(
+                what, format_duration(now - t0), eta))
+            last_progress = now
         time.sleep(1)
-    log("[WARN] {} (pid {}) still running after {}s (timeout)".format(what, pid, timeout_s))
+    log("[WARN] {} (pid {}) still running after {} ({}s timeout)".format(
+        what, pid, format_duration(timeout_s), timeout_s))
     return False
 
 
@@ -453,6 +488,32 @@ def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
     except Exception as exc:
         log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
+
+
+def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False):
+    """run_ssh variant for long-blocking commands (e.g. the basic benchmark
+    stage): launches the ssh child with Popen and prints a progress line
+    every WAIT_PROGRESS_INTERVAL seconds (elapsed x分x秒 plus the estimated
+    end wall time when expected_s is given). rc!=0 raises like run_ssh."""
+    log("[ssh] {} : {}".format(host, command))
+    if dry_run:
+        log("      (dry-run, skipped)")
+        return
+    proc = subprocess.Popen(ssh_args(node) + [command])
+    t0 = time.time()
+    eta = _eta_note(t0, expected_s)
+    last_progress = t0
+    while proc.poll() is None:
+        now = time.time()
+        if now - last_progress >= WAIT_PROGRESS_INTERVAL:
+            log("[wait] {} running... 已等待 {} {}".format(
+                label, format_duration(now - t0), eta))
+            last_progress = now
+        time.sleep(1)
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
+            rc, host, command))
 
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
@@ -558,7 +619,17 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 # basic target_qps is TOTAL across the scenario; each client
                 # process gets its share (client then divides across threads)
                 command += " --target-qps {}".format(total_target_qps / c)
-            run_ssh(host, node, command, dry_run=dry)
+            # long-blocking stage: progress lines with elapsed/ETA while the
+            # ssh child runs. ETA is only computable in duration mode
+            # (warmup 5s + duration + small buffer); count-based runs have
+            # no predictable end -> elapsed only.
+            expected = None
+            cfg_duration = float(cfg.get("duration", 0) or 0)
+            if cfg_duration > 0:
+                expected = cfg_duration + (5 if warmup == "true" else 0) + 10
+            run_ssh_with_progress(host, node, command,
+                                  "benchmark {} c{} t{} ({})".format(name, c, t, ds),
+                                  expected_s=expected, dry_run=dry)
         # Config end: remove only the keys this config wrote (key-prefix
         # scope, bounded by MC_KEY_COUNT from env.sh). Full scope here would
         # wipe shared store data written by other nodes/scenarios; the full
@@ -788,7 +859,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 if not dry and pid:
                     wait_process_exit(cluster, w["node"], pid,
                                       "writer w{}".format(w["gid"]),
-                                      int(warmup_duration + duration) + 300, dry_run=dry)
+                                      int(warmup_duration + duration) + 300, dry_run=dry,
+                                      expected_s=warmup_duration + duration)
             # Step 5: shutdown readers and wait for their final logs
             for r, peer in zip(plan["readers"], reader_peers):
                 rn = get_node(cluster, r["node"])
@@ -800,7 +872,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 if not dry and pid:
                     wait_process_exit(cluster, r["node"], pid,
                                       "reader r{} (port {})".format(r["index"], r["port"]),
-                                      60, dry_run=dry)
+                                      60, dry_run=dry, expected_s=60)
             # Step 6: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
