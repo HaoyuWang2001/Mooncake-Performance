@@ -306,6 +306,11 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
 def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip):
     session = dict(cluster_session)
     session["MC_FABRIC_IP"] = fabric_ip
+    # TCP transport bind address: every client process on this node must bind
+    # the node's fabric IP, or store-side connections wedge during setup
+    # (observed on the real cluster: readers hung unresponsive to /health and
+    # /shutdown). Same value for all processes on the node -> per-node env.sh.
+    session["MC_TCP_BIND_ADDRESS"] = fabric_ip
     lines = ["#!/usr/bin/env bash", ""]
     lines.append("# scenario params")
     for k, v in sorted(scenario_params.items()):

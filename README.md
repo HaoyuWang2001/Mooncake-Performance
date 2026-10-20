@@ -305,7 +305,7 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | 字段 | 说明 |
 | --- | --- |
 | venvs | 服务器端 Python 虚拟环境**字典**（名称 → 解释器路径，如 `{"mooncake-benchmark": "/root/venvs/mooncake-benchmark/bin/python"}`），供 global.json 的 `venv` 按名称选用；旧版字符串形式 `"venv": "路径"` 仍兼容 |
-| nodes | 可用节点列表，每个节点含 `ip`（仅用于 ssh/scp 登录，管理网地址）、`fabric_ip`（内网高性能网卡地址，客户端 local_hostname 使用，可省略则回退到 ip）、`ssh_user`、`ssh_port`、`ssh_key`（空 = 默认密钥，仅支持 ssh 免密登录） |
+| nodes | 可用节点列表，每个节点含 `ip`（仅用于 ssh/scp 登录，管理网地址）、`fabric_ip`（内网高性能网卡地址，作为 `MC_FABRIC_IP`（客户端 local_hostname）与 `MC_TCP_BIND_ADDRESS`（TCP transport 绑定地址）注入该节点 env.sh，**必填**——缺省时 transport 绑定错误地址会导致 client 初始化挂死，可省略则回退到 ip）、`ssh_user`、`ssh_port`、`ssh_key`（空 = 默认密钥，仅支持 ssh 免密登录） |
 
 节点示例：
 
