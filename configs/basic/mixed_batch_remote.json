@@ -1,7 +1,0 @@
-{
-  "operation": "put_batch/get_batch",
-  "client_node": "node1",
-  "work_mode": "mixed",
-  "put_ratio": 0.5,
-  "batch_size": 8
-}

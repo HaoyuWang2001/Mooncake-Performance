@@ -1,5 +1,4 @@
 {
   "operation": "get",
-  "client_node": "store1",
   "work_mode": "get"
 }

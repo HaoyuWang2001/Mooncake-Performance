@@ -1,6 +1,5 @@
 {
   "operation": "put/get",
-  "client_node": "store1",
   "work_mode": "mixed",
   "put_ratio": 0.5
 }

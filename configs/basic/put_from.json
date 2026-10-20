@@ -1,5 +1,4 @@
 {
   "operation": "put_from",
-  "client_node": "node1",
   "work_mode": "put_from"
 }

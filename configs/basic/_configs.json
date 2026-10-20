@@ -3,6 +3,7 @@
   "protocol": "ub",
   "key_prefix": "mc_bench",
   "key_count": 1000,
+  "client_node": "store1",
   "data_size": [
     "128KB",
     "1MB",

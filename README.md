@@ -205,13 +205,15 @@ python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
 
 ## 4. 用例矩阵
 
-basic：9 种操作 × 2 种拓扑 = 18 个场景（`configs/basic/` 顶层平铺）：
+basic：9 种操作各一个场景（`configs/basic/` 顶层平铺，client 节点由
+`_configs.json` 的 `client_node` 统一指定，改一处全部生效；CSV `topology`
+列按 client 节点 IP 是否属于 store 节点自动判定 local/remote）：
 
-| 操作族 / 拓扑 | local_node | remote_node |
-| --- | --- | --- |
-| put / put_batch / put_from | put_local、put_batch_local、put_from_local | put_remote、put_batch_remote、put_from_remote |
-| get / get_batch / get_into / get_buffer | get_local、get_batch_local、get_into_local、get_buffer_local | get_remote、get_batch_remote、get_into_remote、get_buffer_remote |
-| mixed / mixed_batch | mixed_local、mixed_batch_local | mixed_remote、mixed_batch_remote |
+| 操作族 | 配置 |
+| --- | --- |
+| 写 | put、put_batch、put_from |
+| 读 | get、get_batch、get_into、get_buffer |
+| 混合 | mixed（put/get）、mixed_batch（put_batch/get_batch） |
 
 pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-nodes/` 下（102 个，见 3.3
 档位矩阵表），demo/ 另有 2 个冒烟配置。
@@ -518,7 +520,7 @@ cp configs/global.example.json configs/global.json
 # 运行 basic 类别下全部场景（自动跳过 _configs.json 公共默认）
 python benchmark.py --scenario basic --all
 # 只运行 basic 类别下指定场景
-python benchmark.py --scenario basic --config configs/basic/get_remote.json
+python benchmark.py --scenario basic --config configs/basic/get.json
 # 运行 demo 冒烟用例
 python benchmark.py --scenario basic --demo
 # 运行 pipeline 场景全部（递归收集 1/2/4-nodes 子目录，跳过 demo/ 与 _ 前缀）
@@ -531,11 +533,11 @@ python benchmark.py --scenario pipeline --config-dir 2-nodes
 python benchmark.py --scenario pipeline --config-dir 4-nodes --recursive
 # 指定集群/全局配置文件
 python benchmark.py --cluster configs/cluster.json --global configs/global.json \
-    --scenario basic --config configs/basic/put_local.json
+    --scenario basic --config configs/basic/put.json
 # 关闭预热；仅打印命令不执行
-python benchmark.py --scenario basic --config configs/basic/put_local.json --no-warmup --dry-run
+python benchmark.py --scenario basic --config configs/basic/put.json --no-warmup --dry-run
 # 覆盖传输协议（tcp/rdma/ub，优先级最高，覆盖 JSON 配置值）
-python benchmark.py --scenario basic --config configs/basic/put_local.json --protocol tcp
+python benchmark.py --scenario basic --config configs/basic/put.json --protocol tcp
 # 独立清理：删除 cluster.json 全部节点的远程测试目录
 python benchmark.py --clean-up
 # 运行并追加清理阶段（与 --all/--demo/--config/--config-dir 共现时）
@@ -569,7 +571,7 @@ outputs/<时间戳，如 20261010-1308>/
 
 ```bash
 # 单个日志（图落在日志同目录，即 outputs/<ts>/logs/<配置名>/）
-python scripts/plot_latency.py --log outputs/20261019-1012/logs/put_local/put_local.benchmark_c1_t8_8MB.log
+python scripts/plot_latency.py --log outputs/20261019-1012/logs/put/put.benchmark_c1_t8_8MB.log
 # 整个配置目录（递归扫描 *.log，逐文件出图；pipeline_read 日志自动加绘 queue_wait 图）
 python scripts/plot_latency.py --log outputs/20261019-1012/logs/rank_pulse_1w2r_1x_n2
 # 指定离群阈值（缺省自动 = p99 × 10 取整）与输出目录

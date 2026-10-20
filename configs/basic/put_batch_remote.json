@@ -1,6 +1,0 @@
-{
-  "operation": "put_batch",
-  "client_node": "node1",
-  "work_mode": "put_batch",
-  "batch_size": 16
-}

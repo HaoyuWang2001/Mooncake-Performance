@@ -1,5 +1,4 @@
 {
   "operation": "put",
-  "client_node": "store1",
   "work_mode": "put"
 }

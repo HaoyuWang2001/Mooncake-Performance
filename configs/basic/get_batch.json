@@ -1,6 +1,5 @@
 {
   "operation": "get_batch",
-  "client_node": "store1",
   "work_mode": "get_batch",
   "batch_size": 16
 }
