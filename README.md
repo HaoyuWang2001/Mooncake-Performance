@@ -603,6 +603,12 @@ python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
 输出文件带 `===== 起止/rc/耗时 =====` 分隔头，多次运行追加不丢历史。
 计划文件格式详见 `schedule/README.md`。
 
+- **进程台账 `.state`**：所有远端 client 进程（pipeline reader/writer、basic 客户端）启动即记录
+  （ip/节点/端口/pid，仓库根 `.state`，已 gitignore）；正常/失败退出自动清除对应行。编排器每次
+  启动与 `--clean-up` 时自动 **reap** 残留：kill 前校验远端 `/proc/<pid>/cmdline` 含
+  `mooncake_benchmark_client`（防 pid 重用误杀）、有端口的 reader 先 HTTP /shutdown 优雅关停，
+  再 TERM → KILL。手动终止编排器后再次运行即可自动清场上次残留。
+
 ## 11. 注意事项与待验证项
 
 - API 语义以 `mooncake_api.md` 为准：`put` 为 create-only（key 存在时 no-op 不覆盖），因此 put

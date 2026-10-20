@@ -21,6 +21,8 @@
 # $LOG_FILE.d/client.$i.log and is merged into LOG_FILE afterwards.
 
 set -u
+# kill backgrounded clients if this shell is interrupted or exits
+trap 'kill $(jobs -p) 2>/dev/null' EXIT HUP INT TERM
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/env.sh"
 
@@ -106,6 +108,9 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   else
     K=1
   fi
+  # client pids are exported for the orchestrator's .state ledger (crash
+  # recovery: a killed orchestrator can still find and kill these later)
+  : > "$LOG_FILE.pids"
   for i in $(seq 1 "$NUM_CLIENTS"); do
     START=$(( (i - 1) * KEY_COUNT / NUM_CLIENTS ))
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
@@ -117,6 +122,7 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
       ${NUMA_BIND:+--numa-node $(( (i - 1) % K ))} \
       "${ARGS[@]}" \
       > "$LOG_DIR/client.$i.log" 2>&1 &
+    echo $! >> "$LOG_FILE.pids"
   done
   for pid in $(jobs -p); do
     wait "$pid" || RC=1

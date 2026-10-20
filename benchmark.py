@@ -495,11 +495,17 @@ def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_
         log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
 
 
-def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False):
+def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False,
+                          pids_file=None, cfg_name=None, node_name=None):
     """run_ssh variant for long-blocking commands (e.g. the basic benchmark
     stage): launches the ssh child with Popen and prints a progress line
     every WAIT_PROGRESS_INTERVAL seconds (elapsed x分x秒 plus the estimated
-    end wall time when expected_s is given). rc!=0 raises like run_ssh."""
+    end wall time when expected_s is given). rc!=0 raises like run_ssh.
+
+    pids_file: when given, the first poll reads that remote file (client
+    pids written by the runner script) and records every pid into the
+    .state ledger under cfg_name — so a crashed orchestrator still leaves a
+    killable trail."""
     log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
@@ -508,8 +514,24 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     t0 = time.time()
     eta = _eta_note(t0, expected_s)
     last_progress = t0
+    recorded = False
     while proc.poll() is None:
         now = time.time()
+        if not recorded and pids_file:
+            try:
+                raw = ssh_check_output(
+                    host, node,
+                    "cat {f} 2>/dev/null || true".format(f=pids_file), quiet=True)
+            except Exception:
+                raw = ""
+            pids = [x for x in raw.split() if x.strip().isdigit()]
+            if pids:
+                state_append([{
+                    "ip": host, "node": node_name or "", "port": None,
+                    "fabric_host": None, "pid": p,
+                    "label": "{} client".format(label), "cfg": cfg_name,
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")} for p in pids])
+                recorded = True
         if now - last_progress >= WAIT_PROGRESS_INTERVAL:
             log("[wait] {} running... 已等待 {} {}".format(
                 label, format_duration(now - t0), eta))
@@ -519,6 +541,143 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     if rc != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
             rc, host, command))
+
+
+# ---------------------------------------------------------------------------
+# process ledger (.state): every remote client process started by this
+# orchestrator is recorded (ip/node/port/fabric_host/pid) so it can always
+# be cleaned up, even after a crashed or manually killed orchestrator run.
+# ---------------------------------------------------------------------------
+
+STATE_FILE = os.path.join(ROOT, ".state")
+
+
+def state_append(entries):
+    if not entries:
+        return
+    with open(STATE_FILE, "a", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def state_load():
+    if not os.path.exists(STATE_FILE):
+        return []
+    out = []
+    for line in open(STATE_FILE, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _state_write(entries):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def state_remove(entries):
+    """Drop the given entries (matched by ip+pid) from the ledger."""
+    drop = {(e.get("ip"), str(e.get("pid"))) for e in entries}
+    have = state_load()
+    kept = [e for e in have if (e.get("ip"), str(e.get("pid"))) not in drop]
+    if len(kept) != len(have):
+        _state_write(kept)
+
+
+def state_remove_cfg(cfg_name):
+    """Drop every ledger row recorded for one scenario config."""
+    have = state_load()
+    kept = [e for e in have if e.get("cfg") != cfg_name]
+    if len(kept) != len(have):
+        _state_write(kept)
+
+
+def reap_state_entries(cluster):
+    """Kill leftover client processes recorded in .state and clean the ledger.
+
+    Guards against pid reuse: a remote pid is only killed when its
+    /proc/<pid>/cmdline still contains the benchmark client script name.
+    Readers with a recorded port get a graceful HTTP /shutdown first.
+    Every step is best-effort; unreachable nodes keep their records for a
+    later reap."""
+    entries = state_load()
+    if not entries:
+        log(".state: no leftover process records")
+        return 0
+    log(".state: {} leftover process record(s); reaping ...".format(len(entries)))
+    removed = []
+    for e in entries:
+        ip, pid = e.get("ip"), str(e.get("pid"))
+        node_name = e.get("node") or ""
+        label = e.get("label") or "pid {}".format(pid)
+        if not ip or not pid or pid.isdigit() is False:
+            removed.append(e)
+            continue
+        try:
+            node = get_node(cluster, node_name) if node_name else {"ip": ip}
+        except Exception:
+            node = {"ip": ip}
+        try:
+            alive = ssh_check_output(
+                ip, node,
+                "kill -0 {pid} 2>/dev/null && echo ALIVE || echo DEAD".format(pid=pid),
+                quiet=True)
+        except Exception as exc:
+            log("[WARN] .state reap: {} on {} unreachable ({}); kept".format(label, ip, exc))
+            continue
+        if alive != "ALIVE":
+            removed.append(e)  # already gone -> just drop the stale row
+            continue
+        try:
+            marker = ssh_check_output(
+                ip, node,
+                "tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null | grep -c mooncake_benchmark_client || true".format(pid=pid),
+                quiet=True)
+        except Exception:
+            marker = "0"
+        if marker.strip() in ("", "0"):
+            # pid reuse (or a foreign process): never kill, drop stale row
+            log("[WARN] .state reap: pid {} on {} is not a benchmark client; "
+                "skipping kill, dropping stale record".format(pid, ip))
+            removed.append(e)
+            continue
+        port, fab = e.get("port"), e.get("fabric_host")
+        if port and fab:
+            try:
+                ssh_check_output(
+                    ip, node,
+                    "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 "
+                    "-X POST http://{fab}:{port}/shutdown || true".format(fab=fab, port=port),
+                    quiet=True)
+                time.sleep(2)
+            except Exception:
+                pass
+        try:
+            ssh_check_output(ip, node,
+                             "kill {pid} 2>/dev/null || true".format(pid=pid), quiet=True)
+            time.sleep(2)
+            still = ssh_check_output(
+                ip, node,
+                "kill -0 {pid} 2>/dev/null && echo ALIVE || echo DEAD".format(pid=pid),
+                quiet=True)
+            if still == "ALIVE":
+                ssh_check_output(ip, node,
+                                 "kill -9 {pid} 2>/dev/null || true".format(pid=pid), quiet=True)
+            log(".state reap: killed {} (pid {} on {})".format(label, pid, ip))
+        except Exception as exc:
+            log("[WARN] .state reap: {} kill failed: {}; kept".format(label, exc))
+            continue
+        removed.append(e)
+    state_remove(removed)
+    log(".state reap done: {} handled, {} record(s) remaining".format(
+        len(removed), len(state_load())))
+    return len(removed)
 
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
@@ -634,7 +793,12 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 expected = cfg_duration + (5 if warmup == "true" else 0) + 10
             run_ssh_with_progress(host, node, command,
                                   "benchmark {} c{} t{} ({})".format(name, c, t, ds),
-                                  expected_s=expected, dry_run=dry)
+                                  expected_s=expected, dry_run=dry,
+                                  pids_file=remote_log + ".pids",
+                                  cfg_name=cfg_name, node_name=primary_node_name)
+            # clients exited naturally -> drop their ledger rows
+            if not dry:
+                state_remove_cfg(cfg_name)
         # Config end: remove only the keys this config wrote (key-prefix
         # scope, bounded by MC_KEY_COUNT from env.sh). Full scope here would
         # wipe shared store data written by other nodes/scenarios; the full
@@ -650,9 +814,11 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
                 "remote_log_dir": remote_log_dir}
     except Exception:
-        # FAIL path: preserve the remote logs for diagnosis, then re-raise
+        # FAIL path: preserve the remote logs for diagnosis, then re-raise.
+        # Basic clients may have been orphaned mid-run -> reap the ledger.
         if not dry:
             fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir)
+            reap_state_entries(cluster)
         raise
 
 
@@ -804,7 +970,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             run_name = "benchmark_c1_t{}_{}".format(reader_threads, ds)
             base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
             # Step 1: start all readers (one process per reader, unique port and id)
-            for r in plan["readers"]:
+            for r, peer in zip(plan["readers"], reader_peers):
                 rn = get_node(cluster, r["node"])
                 merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
                 nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
@@ -818,6 +984,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     r["port"], peers_json, reader_op, numa_arg, nohup_log)
                 pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
                 reader_pids.append((r, pid))
+                if not dry and pid:
+                    # ledger: this reader can always be found & killed later
+                    state_append([{
+                        "ip": rn["ip"], "node": r["node"], "port": r["port"],
+                        "fabric_host": peer["host"],
+                        "pid": pid.strip(), "label": "reader r{}".format(r["index"]),
+                        "cfg": cfg_name,
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
             # give readers a moment to boot before the health polling starts
             if not dry:
                 time.sleep(5)
@@ -857,6 +1031,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, numa_arg, nohup_log)
                 pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
                 writer_pids.append((w, pid))
+                if not dry and pid:
+                    state_append([{
+                        "ip": wn["ip"], "node": w["node"], "port": None,
+                        "fabric_host": None,
+                        "pid": pid.strip(), "label": "writer w{}".format(w["gid"]),
+                        "cfg": cfg_name,
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
             # Step 4: wait for all writers to finish (warmup + measured run)
             warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
             duration = float(cfg.get("duration", 30))
@@ -904,6 +1085,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # All pipeline processes exited naturally -> drop their ledger rows.
+        if not dry:
+            state_remove_cfg(cfg_name)
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -914,6 +1098,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         if not dry:
             fail_cleanup_pipeline(cluster, plan, reader_peers, reader_pids, writer_pids,
                                   involved_nodes, remote_log_dir, cfg_name, local_log_dir)
+            # 复核台账：已死删行、杀不死的保留待下次 reap
+            reap_state_entries(cluster)
         raise
 
 
@@ -1491,6 +1677,13 @@ def main(args, cfg_paths):
     cluster = load_json(args.cluster)
     globals_cfg = load_json(args.global_cfg)
     _validate_master_mode(globals_cfg)
+    # .state ledger check: reap any client processes left over from previous
+    # runs (crashed/killed orchestrator) BEFORE anything else touches nodes.
+    if not args.dry_run:
+        try:
+            reap_state_entries(cluster)
+        except Exception as exc:
+            log("[WARN] .state reap failed: {}".format(exc))
     if not cfg_paths:
         # standalone cleanup mode
         cleanup_cluster(cluster, globals_cfg, dry_run=args.dry_run)
@@ -1599,6 +1792,12 @@ def main(args, cfg_paths):
         except Exception as exc:
             log("[WARN] auto-plot failed: {}".format(exc))
     if args.clean_up:
+        # reap first: recorded processes must be killed before their
+        # scripts/binaries vanish with the remote directory
+        try:
+            reap_state_entries(cluster)
+        except Exception as exc:
+            log("[WARN] .state reap failed: {}".format(exc))
         cleanup_cluster(cluster, globals_cfg, dry_run=False)
         log("cleanup done")
 
