@@ -187,12 +187,43 @@ def scenario_paths(globals_cfg, ts, cfg_name):
             remote_runner_basic, remote_runner_pipeline, local_log_dir)
 
 
+def resolve_venv(cluster, globals_cfg):
+    """Resolve the server-side Python interpreter for the benchmark client.
+
+    Preferred form: cluster.json carries named venvs and global.json selects
+    one by name:
+      cluster.json: "venvs": {"mooncake-benchmark": "/…/bin/python", …}
+      global.json:  "venv": "mooncake-benchmark"
+    Empty name with exactly one entry auto-selects it; an unknown name fails
+    loudly listing the available ones. Legacy form (a bare string
+    cluster.json "venv": "/…/bin/python") is still accepted unchanged.
+    """
+    venvs = cluster.get("venvs") or {}
+    name = str(globals_cfg.get("venv", "") or "")
+    if isinstance(venvs, dict) and venvs:
+        if name:
+            if name not in venvs:
+                raise RuntimeError(
+                    "global.json venv={!r} not found in cluster.json venvs; "
+                    "available: {}".format(name, ", ".join(sorted(venvs))))
+            return venvs[name]
+        if len(venvs) == 1:
+            return next(iter(venvs.values()))
+        raise RuntimeError(
+            "global.json venv is empty but cluster.json venvs has {} entries; "
+            "pick one of: {}".format(len(venvs), ", ".join(sorted(venvs))))
+    legacy = cluster.get("venv", "")
+    if legacy:
+        return legacy  # legacy bare-string form, kept for old cluster.json
+    return ""
+
+
 def build_cluster_session(cluster, globals_cfg, remote_dir):
     master_type = globals_cfg.get("master_type", "") or ""
     session = {
         "MC_MASTER_TYPE": master_type,
         "MC_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
-        "MC_VENV": cluster.get("venv", ""),
+        "MC_VENV": resolve_venv(cluster, globals_cfg),
         "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
         "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
         "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),

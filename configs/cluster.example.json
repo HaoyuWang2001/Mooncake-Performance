@@ -1,6 +1,9 @@
 {
   "_note": "复制本文件为 cluster.json 并按实际环境修改后使用",
-  "venv": "~/venvs/mooncake-benchmark/bin/python",
+  "venvs": {
+    "mooncake-benchmark": "~/venvs/mooncake-benchmark/bin/python",
+    "dev": "~/venvs/dev/bin/python"
+  },
   "nodes": {
     "store1": {
       "ip": "127.0.0.1",

@@ -304,7 +304,7 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 
 | 字段 | 说明 |
 | --- | --- |
-| venv | 服务器端 Python 虚拟环境解释器（如 `/root/venv/bin/python`），所有服务器端脚本均用它执行 |
+| venvs | 服务器端 Python 虚拟环境**字典**（名称 → 解释器路径，如 `{"mooncake-benchmark": "/root/venvs/mooncake-benchmark/bin/python"}`），供 global.json 的 `venv` 按名称选用；旧版字符串形式 `"venv": "路径"` 仍兼容 |
 | nodes | 可用节点列表，每个节点含 `ip`（仅用于 ssh/scp 登录，管理网地址）、`fabric_ip`（内网高性能网卡地址，客户端 local_hostname 使用，可省略则回退到 ip）、`ssh_user`、`ssh_port`、`ssh_key`（空 = 默认密钥，仅支持 ssh 免密登录） |
 
 节点示例：
@@ -331,6 +331,7 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | 字段 | 说明 |
 | --- | --- |
 | master_type | **必填**，选择连接 mooncake master 的方式：`"etcd"`（走 etcd_endpoints）或 `"http"`（走 master_addr） |
+| venv | 选用 cluster.json `venvs` 中的**名称**（如 `"mooncake-benchmark"`）；留空且仅一条时自动取用 |
 | etcd_endpoints | **etcd 模式**：经 etcd 连接 master 的完整 URI，如 `etcd://192.168.84.151:2379;192.168.84.149:2379`（分号分隔多节点）。`master_type="etcd"` 时必须非空；客户端把该 URI 原样传给 `setup` 的 `metadata_server` 与 `master_server_addr` |
 | master_addr | **http 模式**：mooncake_master rpc 地址（必须用内网高性能网卡 IP），如 `192.168.84.151:50051`；`master_type="http"` 时必须非空 |
 | metadata_server | **http 模式**：`setup` 的 metadata_server 参数，如 `http://192.168.84.151:9999/metadata`（master 的 HTTP 元数据端口，必须用内网 IP）；可省略，默认 `http://{master_addr}/metadata` |
