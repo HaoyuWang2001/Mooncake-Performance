@@ -18,3 +18,5 @@ configs/*
 schedule/plan.json
 
 .state
+
+mock/cluster.json

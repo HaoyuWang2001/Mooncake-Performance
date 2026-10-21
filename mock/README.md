@@ -69,3 +69,24 @@ rm -rf /tmp/mooncake_mock_store
   因此**性能数字无参考价值**，仅用于验证流程与指标解析正确性；
 - `setup()` 恒定返回 0，不校验参数；
 - 不模拟 TTL、副本、lease 等真实 store 语义（当前基准也未用到）。
+
+## 冒烟配置（mock/smoke/）
+
+`smoke/` 下提供精简冒烟配置（tcp、20 key、64KB、单组合、3s 预热；pipeline 8s），
+配合 `mock/cluster.json` 可在数秒内完成端到端验证——**不要用 configs/ 下的正式配置
+跑 mock**（正式配置继承全量 22 params × 4 sizes 矩阵，mock 上需 12 分钟以上且受
+/tmp 容量限制）。
+
+```bash
+# 一次性准备（venv 注入方式见上文；cluster.json 已 gitignore）
+cp mock/cluster.example.json mock/cluster.json
+
+# 冒烟（各约 10-20 秒）
+python benchmark.py --scenario basic    --config mock/smoke/put.json     --cluster mock/cluster.json
+python benchmark.py --scenario basic    --config mock/smoke/get.json     --cluster mock/cluster.json
+python benchmark.py --scenario basic    --config mock/smoke/mixed.json   --cluster mock/cluster.json
+python benchmark.py --scenario pipeline --config mock/smoke/pipeline.json --cluster mock/cluster.json
+```
+
+冒烟覆盖点：三阶段流程、duration/预热、多客户端 pids 台账（.state）、CSV、
+remove-keys 触发点、pipeline 双角色与 notify。

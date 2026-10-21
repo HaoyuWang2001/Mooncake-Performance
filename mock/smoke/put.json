@@ -1,0 +1,12 @@
+{
+  "scenario": "basic",
+  "operation": "put",
+  "protocol": "tcp",
+  "client_node": "store1",
+  "key_prefix": "mc_bench",
+  "key_count": 20,
+  "data_size": ["64KB"],
+  "params": [{"num_clients": 1, "num_threads": 2}],
+  "warmup": {"duration": 3},
+  "work_mode": "put"
+}

@@ -1,0 +1,13 @@
+{
+  "_note": "复制本文件为 mock/cluster.json（已 gitignore）并按需修改。venvs.mock 指向注入了 mock/mooncake 假包的 venv 解释器，全部节点指向 127.0.0.1。",
+  "venvs": {
+    "mock": "/tmp/opencode/mockvenv/bin/python"
+  },
+  "nodes": {
+    "store1":       {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "haoyu", "ssh_port": 22, "ssh_key": ""},
+    "node1":        {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "haoyu", "ssh_port": 22, "ssh_key": ""},
+    "writer_node1": {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "haoyu", "ssh_port": 22, "ssh_key": ""},
+    "reader_node1": {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "haoyu", "ssh_port": 22, "ssh_key": ""},
+    "reader_node2": {"ip": "127.0.0.1", "fabric_ip": "127.0.0.1", "ssh_user": "haoyu", "ssh_port": 22, "ssh_key": ""}
+  }
+}
