@@ -909,6 +909,15 @@ def _pipeline_writer(args, store, do_warmup=True):
     from concurrent.futures import ThreadPoolExecutor
     notify_pool = ThreadPoolExecutor(max_workers=notify_threads)
     seq = [0]
+    # optional per-writer key-space cap (MC_KEY_COUNT): the sequence wraps at
+    # key_cap and wrapped batches remove their keys first (delete-before-
+    # write) so puts always create fresh objects — bounding store usage at
+    # writers x key_count x data_size. 0 = unbounded (legacy behaviour).
+    key_cap = int(getattr(args, "key_count", 0) or 0)
+    if key_cap and key_cap < batch_keys:
+        raise SystemExit("[ERROR] key_count {} < batch_size {}".format(key_cap, batch_keys))
+    wrapped_logged = [False]
+    insufficient_streak = [0]
     # measured-phase stats (warmup writes stay out of the metrics)
     stats = {"keys_ok": 0, "keys_fail": 0, "batches_ok": 0, "batches_fail": 0, "lats": []}
     last_flush = [time.time()]
@@ -927,8 +936,21 @@ def _pipeline_writer(args, store, do_warmup=True):
                     burst_remaining = int(burst_budget)
                     burst_budget -= burst_remaining
                     window_start = time.time()
-            keys = ["{}*{}*w{}*{:08d}".format(prefix, scenario, writer_id, seq[0] + i)
+            # key-space wrap: base stays within [0, key_cap); from the second
+            # cycle (seq >= key_cap) every batch is delete-before-write so
+            # the timed put always creates fresh objects
+            base = seq[0] % key_cap if key_cap > 0 else seq[0]
+            if key_cap > 0 and base + batch_keys > key_cap:
+                base = key_cap - batch_keys
+            delete_first = key_cap > 0 and seq[0] >= key_cap
+            keys = ["{}*{}*w{}*{:08d}".format(prefix, scenario, writer_id, base + i)
                     for i in range(batch_keys)]
+            if delete_first:
+                if not wrapped_logged[0]:
+                    log("writer w{} key space wrapped at {} keys: delete-before-write mode".format(
+                        writer_id, key_cap))
+                    wrapped_logged[0] = True
+                store.batch_remove(keys, force=True)  # untimed maintenance
             seq[0] += batch_keys
             # interface dispatch: put_batch = one call per whole batch;
             # put/put_from = one timed call per key (key_count=1 each)
@@ -941,6 +963,19 @@ def _pipeline_writer(args, store, do_warmup=True):
                     lat_ms, status = _run_iface(store, *PUT_IFACE_DEFS[writer_op], [k], value, ctx)
                     write_samples.append((k, lat_ms, status, 1))
             batch_ok = all(s == "OK" for _, _, s, _ in write_samples)
+            # fail-fast: storage exhaustion (put rc=-200 insufficient space)
+            # otherwise degrades into a full-MISS garbage run — abort early
+            # with an actionable message instead
+            if not batch_ok and all("ERR:-200" in s for _, _, s, _ in write_samples):
+                insufficient_streak[0] += 1
+            else:
+                insufficient_streak[0] = 0
+            if insufficient_streak[0] >= 10 and not is_warmup:
+                raise RuntimeError(
+                    "writer w{}: store storage exhausted ({} consecutive batches rc=-200 "
+                    "insufficient space); set pipeline key_count to cap the key space "
+                    "(writers x key_count x data_size must fit the store)".format(
+                        writer_id, insufficient_streak[0]))
             if not is_warmup:
                 for k, lat_ms, status, kc in write_samples:
                     if status == "OK":

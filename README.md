@@ -141,6 +141,7 @@ notify_pipeline 步骤）详见 configs/pipeline/README.md 的「配置总览」
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
 | `batch_size` | writer 每批写入的 key 数（reader 按 notify 批处理） | 1 | 1 |
+| `key_count` | **可选**，每 writer 的 key 空间封顶：序列在 0..key_count-1 内回绕，回绕批**先删后写**（batch_remove 旧 key 后再写，写路径始终真实）。存储上界 = writers × key_count × data_size；缺省不设限（key 序列单调递增，长时间运行会耗尽 store 空间——writer 检测到连续 10 批 rc=-200 insufficient space 即失败并给出调优提示）。须 ≥ batch_size | 按需 | 按需 |
 
 rank 档位矩阵（按 reader 参与节点数归档进同名目录；每档均跑 pulse/balanced × 1x/2x/3x）：
 

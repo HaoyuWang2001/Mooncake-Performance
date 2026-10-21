@@ -52,7 +52,7 @@ PIPELINE_CSV_HEADER = [
     "config_name",
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_threads", "notify_threads",
-    "data_size", "batch_size", "duration", "warmup_duration",
+    "data_size", "key_count", "batch_size", "duration", "warmup_duration",
     "writer_count", "reader_count", "notify_count",
     "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
     "total", "success", "fail", "fail_rate",
@@ -839,6 +839,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     if plan["notify_count"] > len(plan["readers"]):
         raise RuntimeError("notify_count={} exceeds reader count {}".format(
             plan["notify_count"], len(plan["readers"])))
+    # optional per-writer key-space cap: must hold at least one full batch
+    key_count = int(cfg.get("key_count", 0) or 0)
+    if key_count and key_count < int(cfg.get("batch_size", 1)):
+        raise RuntimeError(
+            "key_count={} must be >= batch_size={}".format(
+                key_count, cfg.get("batch_size", 1)))
     # duration is mandatory for pipeline: it is the measurement window for
     # qps/throughput on both writer and reader rows
     cfg_duration = cfg.get("duration", None)
@@ -887,9 +893,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         "MC_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
         "MC_DURATION": str(cfg.get("duration", 30)),
         "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)),
+        # key_count (optional): per-writer key-space cap — when set the writer
+        # wraps its sequence with delete-before-write, bounding store usage at
+        # writers x key_count x data_size; empty = unbounded (legacy behaviour)
+        "MC_KEY_COUNT": str(cfg.get("key_count", "") or ""),
         # clear basic-only vars that are meaningless for pipeline
         "MC_OPERATION": "",
-        "MC_KEY_COUNT": "",
         "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
@@ -1261,6 +1270,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
                 "data_size": ds,
                 "batch_size": cfg.get("batch_size", ""),
+                "key_count": cfg.get("key_count", "") or "",
                 "duration": cfg.get("duration", ""),
                 "warmup_duration": cfg.get("warmup", {}).get("duration", ""),
                 "writer_count": "N*{}".format(w_cpn),
