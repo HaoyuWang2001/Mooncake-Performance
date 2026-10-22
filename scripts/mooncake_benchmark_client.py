@@ -802,6 +802,7 @@ def cmd_benchmark(args, store):
         "avg_ms": (sum(lat_ok) / len(lat_ok)) if lat_ok else 0.0,
         "p99_ms": _percentile(latencies, 0.99),
         "p999_ms": _percentile(latencies, 0.999),
+        "p9999_ms": _percentile(latencies, 0.9999),
         "data_size": data_size,
         "key_count": len(keys),
         "target_qps": args.target_qps or 0,
@@ -1068,6 +1069,7 @@ def _pipeline_writer(args, store, do_warmup=True):
         "avg_ms": (sum(lats) / len(lats)) if lats else 0.0,
         "p99_ms": _percentile(sorted(lats), 0.99),
         "p999_ms": _percentile(sorted(lats), 0.999),
+        "p9999_ms": _percentile(sorted(lats), 0.9999),
         "data_size": len(value),
     })
     sys.stdout.flush()
@@ -1310,6 +1312,7 @@ def _pipeline_reader(args, store):
         "avg_ms": (sum(lat_ok) / len(lat_ok)) if lat_ok else 0.0,
         "p99_ms": _percentile(latencies, 0.99),
         "p999_ms": _percentile(latencies, 0.999),
+        "p9999_ms": _percentile(latencies, 0.9999),
         "queue_wait_avg_ms": (sum(queue_waits) / len(queue_waits)) if queue_waits else 0.0,
         "queue_wait_max_ms": max(queue_waits) if queue_waits else 0.0,
         "max_depth": _PipelineNotifyHandler.qmax,

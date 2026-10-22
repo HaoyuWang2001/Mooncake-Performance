@@ -38,7 +38,11 @@ try:
 except ImportError:
     sys.exit("[ERROR] matplotlib is required: pip install matplotlib")
 
-STAT_HLINES = [("avg", "tab:blue"), ("p99", "tab:orange"), ("max", "tab:red")]
+STAT_HLINES_ALWAYS = [("avg", "tab:blue"), ("max", "tab:red")]
+# gated lines: only drawn when the sample count makes the percentile
+# meaningful (a percentile needs at least its reciprocal sample count)
+STAT_HLINES_GATED = [("p99", "tab:orange", 100), ("p999", "tab:green", 1000),
+                     ("p9999", "tab:purple", 10000)]
 REF_LINES = [(1.0, "1ms"), (2.0, "2ms")]
 TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
 
@@ -146,9 +150,19 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                    s=28, marker="x", color="red", zorder=5,
                    label=f"outliers ({len(outliers)}, >{outlier_ms:g}ms)")
     stat_vals = sorted(vals)
-    for name, color in STAT_HLINES:
-        v = {"avg": sum(stat_vals) / n, "p99": percentile(stat_vals, 0.99),
-             "max": stat_vals[-1]}[name]
+    computed = {"avg": sum(stat_vals) / n, "max": stat_vals[-1],
+                "p99": percentile(stat_vals, 0.99),
+                "p999": percentile(stat_vals, 0.999),
+                "p9999": percentile(stat_vals, 0.9999)}
+    for name, color in STAT_HLINES_ALWAYS:
+        v = computed[name]
+        ax.axhline(v, linestyle="--", linewidth=1.2, color=color)
+        ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
+                    ha="right", va="bottom", fontsize=9, color=color)
+    for name, color, min_n in STAT_HLINES_GATED:
+        if n < min_n:
+            continue  # 样本量不达标：分位数无意义，不加线
+        v = computed[name]
         ax.axhline(v, linestyle="--", linewidth=1.2, color=color)
         ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
                     ha="right", va="bottom", fontsize=9, color=color)

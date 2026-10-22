@@ -46,6 +46,7 @@ BASIC_CSV_HEADER = [
     "total", "total_bytes", "wall_s",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+    "p9999_ms",
     "ok", "fail", "qps", "fail_rate",
 ]
 PIPELINE_CSV_HEADER = [
@@ -59,6 +60,7 @@ PIPELINE_CSV_HEADER = [
     "total_bytes", "wall_s", "qps",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+    "p9999_ms",
     "queue_wait_avg_ms", "queue_wait_max_ms", "max_depth",
 ]
 
@@ -1208,6 +1210,7 @@ def parse_benchmark_log(paths, op_filter=None):
         "max_ms": percentile(latencies, 1.0),
         "p99_ms": percentile(latencies, 0.99),
         "p999_ms": percentile(latencies, 0.999),
+        "p9999_ms": percentile(latencies, 0.9999),
         "lat_sum_ms": lat_sum_ms,
         "ok": ok,
         "fail": fail,
@@ -1317,7 +1320,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 throughput_mb = (row["total_bytes"] / busy_s / 1024.0 ** 2) if busy_s > 0 else 0.0
             row["throughput_mb_s"] = throughput_mb
             row["throughput_gb_s"] = throughput_mb / 1024.0
-            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms"):
+            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms"):
                 row[k] = agg[k]
             if with_queue:
                 row["queue_wait_avg_ms"] = agg["queue_wait_avg_ms"]
@@ -1401,13 +1404,13 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["operation"] = op_label
             row.update({k: agg[k] for k in (
                 "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
-                "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "ok", "fail",
-                "qps", "fail_rate")})
+                "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms",
+                "ok", "fail", "qps", "fail_rate")})
             # throughput recomputed from this row's own bytes/wall so split
             # (mixed) rows never inherit combined SUMMARY bytes
             row["throughput_mb_s"] = (row["total_bytes"] / row["wall_s"] / 1024.0 ** 2) if row["wall_s"] > 0 else 0.0
             row["throughput_gb_s"] = (row["total_bytes"] / row["wall_s"] / 1024.0 ** 3) if row["wall_s"] > 0 else 0.0
-            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "wall_s"):
+            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms", "wall_s"):
                 v = row.get(k)
                 if v is not None and isinstance(v, float):
                     row[k] = round(v, 4)

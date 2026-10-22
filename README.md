@@ -260,7 +260,7 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | qps | 每秒操作数（total / wall_s） | ops/s |
 | total | 总操作数；pipeline 场景按 key 数计（writer 为写入 key 数，reader 为读取 key 数） | ops |
 | success / ok、fail、fail_rate | 成功数 / 失败数 / 失败率（fail / total） | ops、% |
-| avg_ms / min_ms / max_ms / p99_ms / p999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9），仅统计成功样本 | ms |
+| avg_ms / min_ms / max_ms / p99_ms / p999_ms / p9999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9 / P99.99），仅统计成功样本 | ms |
 | queue_wait_avg_ms / queue_wait_max_ms / max_depth | reader 队列积压诊断：notify 到达→出队等待（平均/最大）与最大队列深度 | ms、ops |
 
 - 时延基于全部 client 上报的成功操作样本精确统计（失败样本计入 fail/fail_rate，不计入时延百分位）；
@@ -567,7 +567,7 @@ outputs/<时间戳，如 20261010-1308>/
 ### 10.1 plot_latency.py（时延统计图）
 
 根据客户端日志中的 RESULT 行绘制**点线图**：横轴 = 第 i 个请求，纵轴 = 时延(ms)；
-横向虚线标注 `avg`/`p99`/`max`（不同颜色 + 数值），`1ms`/`2ms` 灰色点划参考线；
+横向虚线标注 `avg`/`max`（恒定）与 `p99`/`p999`/`p9999`（样本量门控：分别需 ≥100/1000/10000 个样本，不足则不加线，不同颜色 + 数值），`1ms`/`2ms` 灰色点划参考线；
 高于离群阈值的样本从主序列剥离并以红色 `x` 单独标注。
 
 ```bash
