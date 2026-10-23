@@ -1,0 +1,12 @@
+{
+  "_note": "复制本文件为 configs/matrix.json（已被 gitignore）启用性能诊断；或通过 --profile <路径> 指定任意位置。enabled: true/false 控制各工具开关；perf/runqlat/offcputime 命令自动加 sudo -n 前缀；bin 可覆盖为绝对路径（本地 stub 验证或特殊安装路径）。nodes=auto 表示本次 run 的全部参与节点。trigger: whole_run=整个场景 | per_stage=仅测量窗。outliers.auto=run 结束自动生成异常值清单与时间窗切片。",
+  "nodes": "auto",
+  "trigger": "whole_run",
+  "tools": {
+    "spdiag":     { "enabled": true },
+    "perf":       { "enabled": false, "freq": 99, "callgraph": "fp", "output": "perf.data" },
+    "runqlat":    { "enabled": false, "interval_s": 10 },
+    "offcputime": { "enabled": false, "min_block_us": 1000 }
+  },
+  "outliers": { "threshold_ms": 1.0, "window_ms": 200, "auto": true }
+}

@@ -16,12 +16,20 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 
 from utils import (get_node, load_json, log, parse_data_size, percentile,
                    run_ssh, scp_pull, scp_push, ssh_args, ssh_check_output)
+
+# profiling matrix core (optional tools: spdiag / perf / bpftrace)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling"))
+try:
+    import prof_core
+except ImportError:  # profiling dir missing -> feature silently off
+    prof_core = None
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
@@ -639,14 +647,16 @@ def reap_state_entries(cluster):
         try:
             marker = ssh_check_output(
                 ip, node,
-                "tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null | grep -c mooncake_benchmark_client || true".format(pid=pid),
+                "tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null | grep -cF {m} || true".format(
+                    pid=pid, m=shlex.quote(e.get("marker") or "mooncake_benchmark_client")),
                 quiet=True)
         except Exception:
             marker = "0"
         if marker.strip() in ("", "0"):
             # pid reuse (or a foreign process): never kill, drop stale row
-            log("[WARN] .state reap: pid {} on {} is not a benchmark client; "
-                "skipping kill, dropping stale record".format(pid, ip))
+            log("[WARN] .state reap: pid {} on {} is not {} ; "
+                "skipping kill, dropping stale record".format(
+                    pid, ip, e.get("marker") or "mooncake_benchmark_client"))
             removed.append(e)
             continue
         port, fab = e.get("port"), e.get("fabric_host")
@@ -696,6 +706,7 @@ def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, 
 
 def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
+    matrix = getattr(args, "_matrix", None)
     scenario = cfg["scenario"]
     cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
     dry = args.dry_run
@@ -751,6 +762,16 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         numa_bind = True if numa_bind is None else bool(numa_bind)
         log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
+        # profiling lifecycle (both triggers wrap the combo loop in basic;
+        # whole_run additionally covers the per-ds setup stages inside it)
+        profile_sess = None
+        if matrix and not dry and prof_core:
+            try:
+                profile_sess = prof_core.start_profiling(
+                    cluster, matrix, involved_nodes, cfg_name,
+                    os.path.join(remote_log_dir, "profiling"))
+            except Exception as exc:
+                log("[WARN] [profile] start failed: {}".format(exc))
         current_ds = None
         for c, t, ds in runs:
             if ds != current_ds:
@@ -811,6 +832,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # profiling: stop sampling + spdiag show + collect (never raises)
+        if profile_sess is not None:
+            prof_core.stop_and_collect(cluster, profile_sess,
+                                       os.path.join(RESULTS_DIR, ts, "profiling"))
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -821,6 +846,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if not dry:
             fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir)
             reap_state_entries(cluster)
+            if profile_sess is not None:
+                prof_core.stop_and_collect(cluster, profile_sess,
+                                           os.path.join(RESULTS_DIR, ts, "profiling"))
         raise
 
 
@@ -830,6 +858,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
 
 def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
+    matrix = getattr(args, "_matrix", None)
     scenario = cfg["scenario"]
     cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
     dry = args.dry_run
@@ -910,6 +939,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     reader_peers = []
     reader_pids = []
     writer_pids = []
+    profile_sess = None  # profiling session (started at Step 1 or Step 3)
     # optional NUMA binding: per node, round-robin the node's client
     # processes (readers launched first, then writers) across its NUMA nodes.
     # Resolution: case/layer explicit value > global.json ("numa_bind",
@@ -980,6 +1010,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             # sizes never share writer/reader logs
             run_name = "benchmark_c1_t{}_{}".format(reader_threads, ds)
             base_noext = remote_log_path(remote_log_dir, cfg_name, run_name).replace(".log", "")
+            # profiling lifecycle: whole_run covers everything from reader
+            # boot; per_stage starts just before the writers (measurement
+            # window) — stop/collect happens after Step 6 / on failure
+            if matrix and not dry and prof_core and profile_sess is None:
+                if matrix.get("trigger", "whole_run") == "whole_run":
+                    try:
+                        profile_sess = prof_core.start_profiling(
+                            cluster, matrix, involved_nodes, cfg_name,
+                            os.path.join(remote_log_dir, "profiling"))
+                    except Exception as exc:
+                        log("[WARN] [profile] start failed: {}".format(exc))
             # Step 1: start all readers (one process per reader, unique port and id)
             for r, peer in zip(plan["readers"], reader_peers):
                 rn = get_node(cluster, r["node"])
@@ -1029,6 +1070,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             # explicit --client-id in EXTRA overrides the per-invocation default
             # and gives each writer a globally unique id). ALL writers run the
             # warmup phase so every writer's store/notify connections are warmed.
+            if matrix and not dry and prof_core and profile_sess is None:
+                # per_stage trigger: profiling starts at the measurement window
+                try:
+                    profile_sess = prof_core.start_profiling(
+                        cluster, matrix, involved_nodes, cfg_name,
+                        os.path.join(remote_log_dir, "profiling"))
+                except Exception as exc:
+                    log("[WARN] [profile] start failed: {}".format(exc))
             for w in plan["writers"]:
                 wn = get_node(cluster, w["node"])
                 merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
@@ -1099,6 +1148,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # All pipeline processes exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
+        # profiling: stop sampling + spdiag show + collect (never raises)
+        if profile_sess is not None:
+            prof_core.stop_and_collect(cluster, profile_sess,
+                                       os.path.join(RESULTS_DIR, ts, "profiling"))
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -1111,6 +1164,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   involved_nodes, remote_log_dir, cfg_name, local_log_dir)
             # 复核台账：已死删行、杀不死的保留待下次 reap
             reap_state_entries(cluster)
+            if profile_sess is not None:
+                prof_core.stop_and_collect(cluster, profile_sess,
+                                           os.path.join(RESULTS_DIR, ts, "profiling"))
         raise
 
 
@@ -1606,6 +1662,9 @@ def parse_arguments(argv=None):
     parser.add_argument("--no-plot", action="store_true",
                         help="skip the automatic latency/queue-wait plotting of "
                              "this run's logs (default: plotted after the sweep)")
+    parser.add_argument("--profile", default=None,
+                        help="profiling matrix json (default: configs/matrix.json "
+                             "when present; no file -> profiling off)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
                         help="override protocol (tcp/rdma/ub); highest priority, "
@@ -1686,10 +1745,65 @@ def parse_arguments(argv=None):
     return args, cfg_paths
 
 
+def _profile_outliers(matrix, ts_dir, cfg_name):
+    """Auto outlier report for one finished config: extract RESULT rows above
+    the matrix threshold, append to <ts>/profiling/outliers.json and (when
+    profiling artifacts were collected) write time-window slices around the
+    top outliers into outliers.slices.txt."""
+    out_cfg = matrix.get("outliers", {})
+    threshold = float(out_cfg.get("threshold_ms", 1.0))
+    window_ms = float(out_cfg.get("window_ms", 200))
+    logs_dir = os.path.join(ts_dir, "logs", cfg_name)
+    outliers = prof_core.extract_outliers(logs_dir, threshold)
+    prof_dir = os.path.join(ts_dir, "profiling")
+    os.makedirs(prof_dir, exist_ok=True)
+    # append per-config entries to the run-level outlier ledger
+    ledger = os.path.join(prof_dir, "outliers.json")
+    entries = []
+    if os.path.isfile(ledger):
+        try:
+            entries = json.load(open(ledger, "r", encoding="utf-8"))
+        except ValueError:
+            entries = []
+    entries.append({"cfg": cfg_name, "threshold_ms": threshold,
+                    "count": len(outliers),
+                    "outliers": [{k: o[k] for k in ("ts", "key", "lat_ms", "status", "file")}
+                                 for o in outliers]})
+    with open(ledger, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False, indent=2)
+    log("[profile] outliers(>{:g}ms) for {}: {}".format(threshold, cfg_name, len(outliers)))
+    # time-window slices around the top outliers (text artifacts only;
+    # perf.data precise slicing is done node-side with perf script --time)
+    if outliers and os.path.isdir(prof_dir):
+        lines = []
+        for o in outliers[:10]:
+            lines.append("===== {} cfg={} lat={:.3f}ms key={} =====".format(
+                o["ts"], cfg_name, o["lat_ms"], o["key"]))
+            slices = prof_core.slice_window(prof_dir, o["seconds"], window_ms)
+            for fname, slines in slices.items():
+                lines.append("  --- {} ({} lines) ---".format(fname, len(slines)))
+                lines.extend("    " + l for l in slines[:20])
+            lines.append("  hint: perf script -i perf.data --time <start>,<end>")
+        with open(os.path.join(prof_dir, "outliers.slices.txt"), "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
     globals_cfg = load_json(args.global_cfg)
     _validate_master_mode(globals_cfg)
+    # profiling matrix: explicit --profile wins (and must exist); otherwise
+    # default configs/matrix.json when present; absent -> profiling off
+    profile_path = args.profile or os.path.join(CONFIGS_DIR, "matrix.json")
+    matrix = None
+    if args.profile and not os.path.isfile(args.profile):
+        sys.exit("[ERROR] --profile matrix not found: {}".format(args.profile))
+    if prof_core is not None:
+        matrix = prof_core.load_matrix(profile_path)
+    args._matrix = matrix
+    if matrix:
+        log("profiling matrix active: {} (trigger={})".format(
+            profile_path, matrix.get("trigger")))
     # .state ledger check: reap any client processes left over from previous
     # runs (crashed/killed orchestrator) BEFORE anything else touches nodes.
     if not args.dry_run:
@@ -1738,6 +1852,13 @@ def main(args, cfg_paths):
                 else:
                     categories.add("basic")
                     all_rows.extend(rows)
+                # profiling outliers: auto-extract RESULT rows above the
+                # matrix threshold and write the per-run outlier report
+                if matrix and matrix.get("outliers", {}).get("auto") and prof_core:
+                    try:
+                        _profile_outliers(matrix, ts_dir, name)
+                    except Exception as exc:
+                        log("[WARN] [profile] outlier extraction: {}".format(exc))
         except Exception as exc:
             log("[FAIL] scenario {}: {}".format(name, exc))
             failed_scenarios.append(name)

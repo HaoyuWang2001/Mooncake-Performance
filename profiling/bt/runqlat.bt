@@ -1,0 +1,35 @@
+#!/usr/bin/env bpftrace
+// runqlat.bt — 调度延迟（run queue latency）直方图，按周期输出。
+// 每 INTERVAL 秒打印一次全局直方图（带时间戳），供异常值时间窗切片。
+// 用法: INTERVAL=10 bpftrace runqlat.bt   （需 root）
+BEGIN
+{
+  printf("runqlat started, interval=%ds\n", INTERVAL);
+}
+
+tracepoint:sched:sched_wakeup,
+tracepoint:sched:sched_wakeup_new
+{
+  @qtime[args->pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+{
+  $us = @qtime[args->next_pid];
+  if ($us) {
+    @usecs = hist((nsecs - $us) / 1000);
+    delete(@qtime[args->next_pid]);
+  }
+}
+
+interval:s:INTERVAL
+{
+  printf("\n===== runqlat histogram @ %s =====\n", strftime("%H:%M:%S", nsecs));
+  print(@usecs);
+  clear(@usecs);
+}
+
+END
+{
+  clear(@qtime);
+}

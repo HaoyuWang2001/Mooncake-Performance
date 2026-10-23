@@ -612,6 +612,17 @@ python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
   `mooncake_benchmark_client`（防 pid 重用误杀）、有端口的 reader 先 HTTP /shutdown 优雅关停，
   再 TERM → KILL。手动终止编排器后再次运行即可自动清场上次残留。
 
+### 10.3 性能诊断矩阵（profiling/）
+
+benchmark 运行期间自动激活诊断工具（spdiag / perf / bpftrace 调度与 off-CPU），结束后
+收集采样并生成异常值追踪。`configs/matrix.json`（模板 `configs/matrix.example.json`，
+已 gitignore）控制各工具 enabled 开关；`--profile <路径>` 显式指定；未配置则完全关闭。
+诊断进程纳入 `.state` 台账，崩溃后可清理；诊断故障仅 `[WARN]` 不影响测试结果。
+产出：`outputs/<ts>/profiling/<节点>/{spdiag.show.txt, perf.data, runqlat.out}` +
+自动异常值清单（RESULT > threshold）与时间窗切片；手动追踪
+`python profiling/profiling.py --trace outputs/<ts> --at HH:MM:SS.micro`。
+详见 `profiling/README.md`。
+
 ## 11. 注意事项与待验证项
 
 - API 语义以 `mooncake_api.md` 为准：`put` 为 create-only（key 存在时 no-op 不覆盖），因此 put

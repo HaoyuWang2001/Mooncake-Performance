@@ -1,0 +1,30 @@
+#!/usr/bin/env bpftrace
+// offcputime.bt — off-CPU 时间聚合（含栈），定位持锁/阻塞等待。
+// 聚焦阻塞超过 MIN_BLOCK_US 微秒的事件；周期输出聚合 + 大事件明细
+// （带时间戳，供异常值切片）；SIGINT（kill -INT）时输出 END 汇总。
+// 用法: MIN_BLOCK_US=1000 bpftrace offcputime.bt   （需 root）
+BEGIN
+{
+  printf("offcputime started, min_block_us=%d\n", MIN_BLOCK_US);
+}
+
+tracepoint:sched:sched_switch
+{
+  if (args->prev_state == TASK_INTERRUPTIBLE || args->prev_state == TASK_UNINTERRUPTIBLE) {
+    @off[args->prev_pid] = nsecs;
+  }
+  $t = @off[args->next_pid];
+  if ($t) {
+    $us = (nsecs - $t) / 1000;
+    if ($us > MIN_BLOCK_US) {
+      printf("%s pid=%d off_cpu_us=%d\n", strftime("%H:%M:%S", nsecs), args->next_pid, $us);
+    }
+    delete(@off[args->next_pid]);
+  }
+}
+
+END
+{
+  clear(@off);
+  printf("offcputime done\n");
+}

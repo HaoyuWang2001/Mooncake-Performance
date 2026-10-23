@@ -10,6 +10,7 @@ scripts/env.sh
 configs/*
 !configs/cluster.example.json
 !configs/global.example.json
+!configs/matrix.example.json
 !configs/basic
 !configs/pipeline
 
