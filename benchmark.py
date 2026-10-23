@@ -412,32 +412,38 @@ def format_duration(seconds):
     return "{}分{}秒".format(m, s)
 
 
-# progress-line cadence for long waits (wait_process_exit / run_ssh_with_progress)
-WAIT_PROGRESS_INTERVAL = 30
+def _fmt_dur_en(seconds):
+    """Seconds -> 'x min x s' / 'x h x min x s' style duration string."""
+    seconds = int(max(0, round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "{} h {} min {} s".format(h, m, s)
+    return "{} min {} s".format(m, s)
 
 
-def _eta_note(t0, expected_s):
+def _wait_suffix(t0, expected_s):
+    """One-shot wait-line suffix: '(Expected: <dur>, ETA <HH:MM:SS>)' when the
+    expected duration is known, empty otherwise (count-based runs have no
+    predictable end)."""
     if not expected_s:
-        return "（无法预估结束时间）"
+        return ""
     from datetime import datetime as _dt
     end = _dt.fromtimestamp(t0 + expected_s)
-    return "/ 预计结束 {}（预期 {}）".format(
-        end.strftime("%H:%M:%S"), format_duration(expected_s))
+    return " (Expected: {}, ETA {})".format(
+        _fmt_dur_en(expected_s), end.strftime("%H:%M:%S"))
 
 
 def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
                       expected_s=None):
     """Poll `kill -0 PID` until the remote process exits or times out.
 
-    Logs a single 'waiting' line up front, a progress line every
-    WAIT_PROGRESS_INTERVAL seconds while running (elapsed x分x秒 plus the
-    estimated end wall time when expected_s is given), and one result line
-    at the end (exited / timeout); per-poll ssh commands are not logged."""
+    Logs ONE 'running...' line at start (with the expected duration and ETA
+    wall time when expected_s is given) and one result line at the end
+    (exited / timeout); per-poll ssh commands are not logged."""
     n = get_node(cluster, node_name)
-    log("waiting {} (pid {}) on {} ...".format(what, pid, node_name))
     t0 = time.time()
-    eta = _eta_note(t0, expected_s)
-    last_progress = t0
+    log("{} (pid {}) running...{}".format(what, pid, _wait_suffix(t0, expected_s)))
     for _ in range(int(timeout_s)):
         alive = ssh_check_output(
             n["ip"], n,
@@ -447,11 +453,6 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
             log("{} exited after {} ({:.0f}s)".format(
                 what, format_duration(time.time() - t0), time.time() - t0))
             return True
-        now = time.time()
-        if now - last_progress >= WAIT_PROGRESS_INTERVAL:
-            log("[wait] {} running... 已等待 {} {}".format(
-                what, format_duration(now - t0), eta))
-            last_progress = now
         time.sleep(1)
     log("[WARN] {} (pid {}) still running after {} ({}s timeout)".format(
         what, pid, format_duration(timeout_s), timeout_s))
@@ -522,9 +523,9 @@ def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_
 def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False,
                           pids_file=None, cfg_name=None, node_name=None):
     """run_ssh variant for long-blocking commands (e.g. the basic benchmark
-    stage): launches the ssh child with Popen and prints a progress line
-    every WAIT_PROGRESS_INTERVAL seconds (elapsed x分x秒 plus the estimated
-    end wall time when expected_s is given). rc!=0 raises like run_ssh.
+    stage): launches the ssh child with Popen and logs ONE 'running...' line
+    (expected duration + ETA when expected_s is given). rc!=0 raises like
+    run_ssh.
 
     pids_file: when given, the first poll reads that remote file (client
     pids written by the runner script) and records every pid into the
@@ -536,11 +537,9 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         return
     proc = subprocess.Popen(ssh_args(node) + [command])
     t0 = time.time()
-    eta = _eta_note(t0, expected_s)
-    last_progress = t0
+    log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
     recorded = False
     while proc.poll() is None:
-        now = time.time()
         if not recorded and pids_file:
             try:
                 raw = ssh_check_output(
@@ -556,10 +555,6 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
                     "label": "{} client".format(label), "cfg": cfg_name,
                     "ts": time.strftime("%Y-%m-%d %H:%M:%S")} for p in pids])
                 recorded = True
-        if now - last_progress >= WAIT_PROGRESS_INTERVAL:
-            log("[wait] {} running... 已等待 {} {}".format(
-                label, format_duration(now - t0), eta))
-            last_progress = now
         time.sleep(1)
     rc = proc.wait()
     if rc != 0:
