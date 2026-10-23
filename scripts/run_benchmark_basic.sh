@@ -53,6 +53,9 @@ source "$ENV_FILE"
 # --numa-bind are consumed here and NOT forwarded to the client).
 NUM_CLIENTS=1
 NUMA_BIND=0
+# per-client core count (NUMA-aware sharding, env from the scenario config);
+# when set it supersedes plain numa round-robin in both launch branches
+CPU_SHARD="${MC_CPU_SHARD:-0}"
 ARGS=()
 while [ $# -gt 0 ]; do
   if [ "$1" = "--num-clients" ] && [ $# -ge 2 ]; then
@@ -99,7 +102,7 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   rm -rf "$LOG_DIR"
   mkdir -p "$LOG_DIR"
   RC=0
-  if [ "$NUMA_BIND" = "1" ]; then
+  if [ "$NUMA_BIND" = "1" ] || [ "$CPU_SHARD" -gt 0 ]; then
     K=$(numa_node_count)
     if [ "$K" -lt 1 ]; then
       echo "[FATAL] --numa-bind: no NUMA topology found on this node" >&2
@@ -114,12 +117,21 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   for i in $(seq 1 "$NUM_CLIENTS"); do
     START=$(( (i - 1) * KEY_COUNT / NUM_CLIENTS ))
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
+    # binding args: shard mode (numa round-robin + per-numa slice ordinal)
+    # or plain numa round-robin, or none
+    if [ "$CPU_SHARD" -gt 0 ]; then
+      BIND_ARGS="--numa-node $(( (i - 1) % K )) --cpu-shard $CPU_SHARD --shard-index $(( (i - 1) / K ))"
+    elif [ "$NUMA_BIND" = "1" ]; then
+      BIND_ARGS="--numa-node $(( (i - 1) % K ))"
+    else
+      BIND_ARGS=""
+    fi
     # per-client ylt easylog file (absolute path; merged below with headers)
     MC_YLT_LOG_PATH="$LOG_DIR/client.$i.ylt.log" \
     "$PYTHON" "$CLIENT" \
       --mode "$MODE" \
       --client-id "$i" --key-start "$START" --key-end "$END" \
-      ${NUMA_BIND:+--numa-node $(( (i - 1) % K ))} \
+      $BIND_ARGS \
       "${ARGS[@]}" \
       > "$LOG_DIR/client.$i.log" 2>&1 &
     echo $! >> "$LOG_FILE.pids"
@@ -145,8 +157,14 @@ else
   # live while the process runs (Python output is line-buffered); ylt
   # easylog -> absolute path next to the log. NUMA binding only applies to
   # benchmark mode (the single benchmark client binds NUMA node 0).
-  if [ "$MODE" = "benchmark" ] && [ "$NUMA_BIND" = "1" ]; then
-    BIND_ARGS="--numa-node 0"
+  if [ "$MODE" = "benchmark" ]; then
+    if [ "$CPU_SHARD" -gt 0 ]; then
+      BIND_ARGS="--numa-node 0 --cpu-shard $CPU_SHARD --shard-index 0"
+    elif [ "$NUMA_BIND" = "1" ]; then
+      BIND_ARGS="--numa-node 0"
+    else
+      BIND_ARGS=""
+    fi
   else
     BIND_ARGS=""
   fi

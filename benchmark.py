@@ -310,10 +310,14 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
         "MC_PUT_RATIO": str(cfg.get("put_ratio", "")) if "/" in str(cfg.get("operation", "")) else "",
         "MC_DURATION": str(cfg.get("duration", 0)),
         "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
+        # per-client core count for NUMA-aware sharding (0/unset = whole
+        # node); the basic runner assigns each client its NUMA + slice index
+        "MC_CPU_SHARD": str(cfg.get("cpu_shard", 0) or 0),
     }
 
 
-def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip):
+def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip,
+                      exclude_cpus=""):
     session = dict(cluster_session)
     session["MC_FABRIC_IP"] = fabric_ip
     # TCP transport bind address: every client process on this node must bind
@@ -321,6 +325,10 @@ def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip):
     # (observed on the real cluster: readers hung unresponsive to /health and
     # /shutdown). Same value for all processes on the node -> per-node env.sh.
     session["MC_TCP_BIND_ADDRESS"] = fabric_ip
+    # reserved cores (system / other users), subtracted from every binding
+    # mode on this node (see client apply_cpu_binding)
+    if exclude_cpus:
+        session["MC_EXCLUDE_CPUS"] = exclude_cpus
     lines = ["#!/usr/bin/env bash", ""]
     lines.append("# scenario params")
     for k, v in sorted(scenario_params.items()):
@@ -350,9 +358,15 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
     for node_name in involved_nodes:
         n = get_node(cluster, node_name)
         fab = n.get("fabric_ip", n.get("ip", ""))
+        # reserved cores (system/other users): node-level override wins over
+        # the cluster-wide exclude_cpus; injected per-node so every client
+        # process on this node subtracts it from its binding
+        exclude = n.get("exclude_cpus", "") or cluster.get("exclude_cpus", "") or ""
         with open(env_sh_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(build_env_content(scenario_params, cluster_session, ld_path, fab))
-        log("env.sh written (node={}, fabric_ip={})".format(node_name, fab))
+            f.write(build_env_content(scenario_params, cluster_session, ld_path, fab,
+                                      exclude_cpus=str(exclude)))
+        log("env.sh written (node={}, fabric_ip={}, exclude_cpus={})".format(
+            node_name, fab, exclude or "-"))
         run_ssh(n["ip"], n, "mkdir -p {} {}".format(
             remote_scripts, remote_log_dir), dry_run=dry_run)
         push_files = [env_sh_path,
@@ -704,6 +718,25 @@ def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, 
 # basic scenario (interface-level benchmark: put/get/batch/mixed sweeps)
 # --------------------------------------------------------------------------
 
+def echo_cpu_bindings(cfg_name, local_log_dir):
+    """Echo each client process's actual cpu binding (from its log's
+    'cpu binding:' line) into the orchestrator output, so every run records
+    exactly which cores each started client used."""
+    import glob as _glob
+    for path in sorted(_glob.glob(os.path.join(local_log_dir, "**", "*.log"),
+                                  recursive=True)):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "cpu binding: " in line:
+                        log("{}: [{}] {}".format(
+                            cfg_name, os.path.basename(path),
+                            line.strip()))
+                        # merged basic logs carry one line per client — no break
+        except OSError:
+            continue
+
+
 def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
     matrix = getattr(args, "_matrix", None)
@@ -832,6 +865,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        echo_cpu_bindings(cfg_name, local_log_dir)
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
@@ -948,8 +982,24 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     if numa_bind is None:
         numa_bind = globals_cfg.get("numa_bind")
     numa_bind = True if numa_bind is None else bool(numa_bind)
+    # per-client core count (NUMA-aware sharding). When set it takes
+    # precedence over plain numa round-robin: each client process gets a
+    # consecutive cpu_shard-core slice of its NUMA node's allowed pool
+    # (exclude_cpus subtracted by the client), wrapping when the pool is
+    # smaller than clients x shard.
+    cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
+    if cpu_shard > 0 and not numa_bind:
+        numa_bind = True  # sharding needs the NUMA topology probes
     numa_node_count = {}
     numa_counter = {}
+    shard_ordinals = {}  # (node, numa) -> next slice ordinal
+
+    def shard_ordinal(node_name, numa):
+        key = (node_name, numa)
+        idx = shard_ordinals.get(key, 0)
+        shard_ordinals[key] = idx + 1
+        return idx
+
     if numa_bind:
         for node_name in involved_nodes:
             n = get_node(cluster, node_name)
@@ -1027,7 +1077,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
                 nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
                 numa_arg = ""
-                if numa_bind:
+                if cpu_shard > 0:
+                    # NUMA-aware sharding: round-robin over NUMA nodes, and
+                    # the per-(node,numa) ordinal picks a consecutive slice
+                    nn = numa_counter[r["node"]] % numa_node_count[r["node"]]
+                    numa_counter[r["node"]] += 1
+                    numa_arg = "--numa-node {} --cpu-shard {} --shard-index {}".format(
+                        nn, cpu_shard, shard_ordinal(r["node"], nn))
+                elif numa_bind:
                     numa_arg = "--numa-node {}".format(
                         numa_counter[r["node"]] % numa_node_count[r["node"]])
                     numa_counter[r["node"]] += 1
@@ -1083,7 +1140,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
                 nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
                 numa_arg = ""
-                if numa_bind:
+                if cpu_shard > 0:
+                    nn = numa_counter[w["node"]] % numa_node_count[w["node"]]
+                    numa_counter[w["node"]] += 1
+                    numa_arg = "--numa-node {} --cpu-shard {} --shard-index {}".format(
+                        nn, cpu_shard, shard_ordinal(w["node"], nn))
+                elif numa_bind:
                     numa_arg = "--numa-node {}".format(
                         numa_counter[w["node"]] % numa_node_count[w["node"]])
                     numa_counter[w["node"]] += 1
@@ -1145,6 +1207,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        echo_cpu_bindings(cfg_name, local_log_dir)
         # All pipeline processes exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)

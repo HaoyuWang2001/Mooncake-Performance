@@ -161,15 +161,37 @@ def numa_node_cpu_list(node):
 
 
 def apply_cpu_binding(args):
-    """Bind this process to a NUMA node (--numa-node) or a direct CPU list
-    (--cpu-bind, takes precedence) via os.sched_setaffinity. Logs the actual
-    bound set. Returns silently when no binding is requested. Binding is
-    applied before any store work so all measurement threads inherit it."""
+    """Bind this process via os.sched_setaffinity. Three modes:
+
+    1. --cpu-bind CPULIST      — explicit cpu list (highest precedence)
+    2. --numa-node N + --cpu-shard S [--shard-index J]
+                                — NUMA-aware sharding: take the J-th
+                                  consecutive S-core slice of node N's
+                                  allowed pool, wrapping around when the
+                                  pool cannot give every client a disjoint
+                                  slice (clients then reuse earlier slices)
+    3. --numa-node N           — all allowed cores of node N
+
+    The exclude set (MC_EXCLUDE_CPUS from cluster.json, per-node) is
+    subtracted from EVERY mode — reserved cores (for the system / other
+    users) are never bound. An empty result is a hard error.
+    Binding is applied before any store work so all threads inherit it."""
+    exclude = set()
+    excl_spec = os.environ.get("MC_EXCLUDE_CPUS", "")
+    if excl_spec:
+        try:
+            exclude = parse_cpu_list(excl_spec)
+        except ValueError as exc:
+            sys.exit("[ERROR] bad MC_EXCLUDE_CPUS {!r}: {}".format(excl_spec, exc))
+    shard = int(getattr(args, "cpu_shard", 0) or 0)
+    shard_index = int(getattr(args, "shard_index", 0) or 0)
+
     if args.cpu_bind:
         try:
             cpus = parse_cpu_list(args.cpu_bind)
         except ValueError as exc:
             sys.exit("[ERROR] invalid --cpu-bind {!r}: {}".format(args.cpu_bind, exc))
+        cpus -= exclude
         source = "cpu_bind={}".format(args.cpu_bind)
     elif args.numa_node is not None and args.numa_node >= 0:
         spec = numa_node_cpu_list(args.numa_node)
@@ -177,19 +199,45 @@ def apply_cpu_binding(args):
             sys.exit("[ERROR] --numa-node {}: NUMA topology not available on this node".format(
                 args.numa_node))
         try:
-            cpus = parse_cpu_list(spec)
+            pool = sorted(parse_cpu_list(spec) - exclude)
         except ValueError as exc:
             sys.exit("[ERROR] bad cpu list for NUMA node {} ({}): {}".format(
                 args.numa_node, spec, exc))
-        source = "numa_node={}".format(args.numa_node)
+        if not pool:
+            sys.exit("[ERROR] NUMA node {} has no cores left after excluding {!r}".format(
+                args.numa_node, excl_spec))
+        if shard > 0:
+            if shard > len(pool):
+                sys.exit("[ERROR] --cpu-shard {} > available cores {} on node {}".format(
+                    shard, len(pool), args.numa_node))
+            # slice J wraps around the pool when it cannot hold all clients
+            start = (shard_index * shard) % len(pool)
+            end = start + shard
+            if end <= len(pool):
+                cpus = set(pool[start:end])
+            else:
+                cpus = set(pool[start:] + pool[:end - len(pool)])
+            source = "numa_node={} cpu_shard={} shard_index={}".format(
+                args.numa_node, shard, shard_index)
+        else:
+            cpus = set(pool)
+            source = "numa_node={}".format(args.numa_node)
     else:
         return
+    if not cpus:
+        sys.exit("[ERROR] cpu binding result is empty (exclude set {!r} removed everything)".format(
+            excl_spec))
     try:
         os.sched_setaffinity(0, sorted(cpus))
     except OSError as exc:
         sys.exit("[ERROR] sched_setaffinity failed ({}): {}".format(source, exc))
     bound = sorted(os.sched_getaffinity(0))
     log("cpu binding: {} bound_cpus={} ({} cpus)".format(source, _fmt_cpu_list(bound), len(bound)))
+    emit("META", {"mode": "cpu_binding", "source": source,
+                  "numa_node": args.numa_node, "shard": shard,
+                  "shard_index": shard_index if shard else None,
+                  "excluded": _fmt_cpu_list(sorted(exclude)) if exclude else "",
+                  "bound_cpus": _fmt_cpu_list(bound), "count": len(bound)})
 
 
 def _fmt_cpu_list(cpus):
@@ -1461,6 +1509,13 @@ def main():
     parser.add_argument("--cpu-bind", default=None,
                         help="bind this process to a direct cpu list (e.g. 0-83,90); "
                              "takes precedence over --numa-node")
+    parser.add_argument("--cpu-shard", type=int, default=None,
+                        help="cores per client (NUMA-aware sharding): take the "
+                             "shard-index-th consecutive slice of --numa-node's "
+                             "allowed pool; 0/unset = whole node")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="slice ordinal within the NUMA node for --cpu-shard "
+                             "(assigned by the runner/orchestrator)")
     args = parser.parse_args()
     # Resolve env.sh fallbacks
     _resolve_env(args)

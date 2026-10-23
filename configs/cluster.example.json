@@ -4,6 +4,8 @@
     "mooncake-benchmark": "~/venvs/mooncake-benchmark/bin/python",
     "dev": "~/venvs/dev/bin/python"
   },
+  "_exclude_cpus_note": "保留核（系统进程/其他用户）：从本节点所有 client 的绑核中剔除，节点级 nodes.<name>.exclude_cpus 覆盖全局；如 \"0-7,64-71\"",
+  "exclude_cpus": "",
   "nodes": {
     "store1": {
       "ip": "127.0.0.1",

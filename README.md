@@ -93,6 +93,11 @@ basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字
 | `numa_bind` | 客户端 NUMA 绑定：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配）。解析优先级：用例/层级显式值 > global.json（默认 true）> 代码缺省 true | `true` |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
+- **核分片（cpu_shard）**：`"cpu_shard": N`（basic/pipeline 根基座或用例，缺省 null 关闭）时每个 client 绑
+  **互不重叠的 N 个连续核**：client 按 NUMA 轮询分配（i→numa (i-1)%K），NUMA 内按启动序取
+  连续 N 核切片（池 = 该 NUMA 核集 − exclude_cpus）；池不足时切片回绕复用（同 NUMA 后到的
+  client 复用前面的片）。设置后优先于 numa_bind 轮询。每个 client 的实际绑定打印到 client 日志
+  `cpu binding:` 行并回显到编排器输出，META 行含结构化 bound_cpus。
 - **NUMA 绑定**：`numa_bind` **默认开启**（解析优先级：用例/层级显式值 > global.json `numa_bind`（默认 true）> 代码缺省 true；仅显式 false 关闭）。开启时basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
@@ -308,6 +313,7 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | 字段 | 说明 |
 | --- | --- |
 | venvs | 服务器端 Python 虚拟环境**字典**（名称 → 解释器路径，如 `{"mooncake-benchmark": "/root/venvs/mooncake-benchmark/bin/python"}`），供 global.json 的 `venv` 按名称选用；旧版字符串形式 `"venv": "路径"` 仍兼容 |
+| exclude_cpus | **保留核**（系统进程/其他用户专用）：从本节点所有 client 的绑核结果中剔除（`--numa-node` 核集与 `--cpu-bind` 列表都生效，空集报错）；per-node 注入 `MC_EXCLUDE_CPUS`，节点级 `nodes.<name>.exclude_cpus` 覆盖全局值；如 `"0-7,64-71"` |
 | nodes | 可用节点列表，每个节点含 `ip`（仅用于 ssh/scp 登录，管理网地址）、`fabric_ip`（内网高性能网卡地址，作为 `MC_FABRIC_IP`（客户端 local_hostname）与 `MC_TCP_BIND_ADDRESS`（TCP transport 绑定地址）注入该节点 env.sh，**必填**——缺省时 transport 绑定错误地址会导致 client 初始化挂死，可省略则回退到 ip）、`ssh_user`、`ssh_port`、`ssh_key`（空 = 默认密钥，仅支持 ssh 免密登录） |
 
 节点示例：

@@ -104,5 +104,6 @@
       "num_clients": 16,
       "num_threads": 8
     }
-  ]
+  ],
+  "cpu_shard": null
 }

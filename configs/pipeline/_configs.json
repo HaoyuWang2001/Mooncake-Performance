@@ -9,5 +9,6 @@
     "duration": 5
   },
   "duration": 30,
-  "batch_size": 1
+  "batch_size": 1,
+  "cpu_shard": null
 }
