@@ -12,6 +12,7 @@ Output (stdout, captured by run_benchmark_*.sh into per-client log files):
 """
 import argparse
 import copy
+import gc
 import json
 import os
 import random
@@ -786,21 +787,28 @@ def cmd_benchmark(args, store):
         run_warmup(args, store, value, ctx)
     end_idx = args.key_end if args.key_end is not None else len(keys)
     chunk = keys[args.key_start:end_idx]
-    deadline = None
-    if duration:
-        deadline = time.time() + duration
-    emit("META", {"mode": "benchmark", "scenario": args.scenario,
-                  "operation": op, "protocol": args.protocol,
-                  "client_id": args.client_id,
-                  "key_start": args.key_start, "key_end": end_idx,
-                  "num_threads": args.num_threads, "warmup": bool(args.warmup == "true"),
-                  "chunk_keys": len(chunk), "target_qps": args.target_qps or 0,
-                  "start_ts": time.time()})
-    log("benchmark start (op={}, chunk_keys={}, threads={}, duration={}, target_qps={})".format(
-        op, len(chunk), args.num_threads, duration or 0, args.target_qps or 0))
-    results = []
-    wall_t0 = time.perf_counter()
+    # Keep CPython's automatic cyclic-GC pauses out of per-operation latency.
+    # Reference counting remains active while cyclic GC is disabled.
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.collect()
+        gc.disable()
+        log("python cyclic GC disabled for measured benchmark")
     try:
+        deadline = None
+        if duration:
+            deadline = time.time() + duration
+        emit("META", {"mode": "benchmark", "scenario": args.scenario,
+                      "operation": op, "protocol": args.protocol,
+                      "client_id": args.client_id,
+                      "key_start": args.key_start, "key_end": end_idx,
+                      "num_threads": args.num_threads, "warmup": bool(args.warmup == "true"),
+                      "chunk_keys": len(chunk), "target_qps": args.target_qps or 0,
+                      "start_ts": time.time()})
+        log("benchmark start (op={}, chunk_keys={}, threads={}, duration={}, target_qps={})".format(
+            op, len(chunk), args.num_threads, duration or 0, args.target_qps or 0))
+        results = []
+        wall_t0 = time.perf_counter()
         if chunk:
             per_thread = []
             for t in range(args.num_threads):
@@ -812,10 +820,15 @@ def cmd_benchmark(args, store):
                            for sub in per_thread]
                 for f in futures:
                     f.result()
+        wall_s = time.perf_counter() - wall_t0
     finally:
-        if ctx is not None:
-            ctx.teardown(store)
-    wall_s = time.perf_counter() - wall_t0
+        try:
+            if ctx is not None:
+                ctx.teardown(store)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+                log("python cyclic GC restored after measured benchmark")
     batch_size = max(1, args.batch_size)
     if op in PUT_BATCH_IFACES or op in GET_BATCH_IFACES:
         bytes_per_op = batch_size * data_size
