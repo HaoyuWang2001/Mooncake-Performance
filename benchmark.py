@@ -402,6 +402,18 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
                  local_log_dir, dry_run=dry_run)
 
 
+def pull_stage_logs(ip, node, remote_files, local_dir, dry_run):
+    """Incremental pull of just-finished stage log(s) so previous stages are
+    locally readable while later (long) stages run; never raises."""
+    if dry_run or not remote_files:
+        return
+    for f in remote_files:
+        try:
+            scp_pull(ip, node, f, local_dir, dry_run=False)
+        except Exception as exc:
+            log("[WARN] stage log pull {}: {}".format(f, exc))
+
+
 def format_duration(seconds):
     """Seconds -> 'x分x秒' / 'x小时x分x秒' style progress string."""
     seconds = int(max(0, round(seconds)))
@@ -701,12 +713,15 @@ def reap_state_entries(cluster):
     return len(removed)
 
 
-def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None, dry_run=False):
+def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
+              dry_run=False, pull_to=None):
     remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
     command = "bash {} {} {}".format(runner, mode, remote_log)
     if extra:
         command += " " + extra
     run_ssh(host, node, command, dry_run=dry_run)
+    if pull_to is not None:
+        pull_stage_logs(host, node, [remote_log], pull_to, dry_run)
 
 
 # --------------------------------------------------------------------------
@@ -771,7 +786,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     # diagnosable evidence. All stages are now covered.
     try:
         run_stage(host, node, remote_runner,
-                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full",
+                  dry_run=dry, pull_to=local_log_dir)
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_remove_before_run = op in PIPELINE_PUT_IFACES or "/" in op
@@ -811,15 +827,18 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 if data_status != "EXISTS":
                     run_stage(host, node, remote_runner,
                               "generate-data", remote_log_dir, cfg_name,
-                              extra="--data-size {}".format(ds), dry_run=dry)
+                              extra="--data-size {}".format(ds), dry_run=dry,
+                              pull_to=local_log_dir)
                 if op in PIPELINE_GET_IFACES:
                     run_stage(host, node, remote_runner,
-                              "prepare-store", remote_log_dir, cfg_name, dry_run=dry)
+                              "prepare-store", remote_log_dir, cfg_name,
+                              dry_run=dry, pull_to=local_log_dir)
                 current_ds = ds
             if need_remove_before_run:
                 run_stage(host, node, remote_runner,
                           "remove-keys", remote_log_dir, cfg_name,
-                          extra="--scope full", dry_run=dry)
+                          extra="--scope full", dry_run=dry,
+                          pull_to=local_log_dir)
             # data_size is always part of the run file name, so different
             # sizes under the same (c, t) never collide
             name = "benchmark_c{}_t{}_{}".format(c, t, ds)
@@ -847,6 +866,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                                   expected_s=expected, dry_run=dry,
                                   pids_file=remote_log + ".pids",
                                   cfg_name=cfg_name, node_name=primary_node_name)
+            pull_stage_logs(host, node,
+                            [remote_log] + ([remote_log + ".pids"] if c > 1 else []),
+                            local_log_dir, dry)
             # clients exited naturally -> drop their ledger rows
             if not dry:
                 state_remove_cfg(cfg_name)
@@ -1032,10 +1054,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     if data_status != "EXISTS":
                         run_stage(n["ip"], n, remote_runner,
                                   "generate-data", remote_log_dir, cfg_name,
-                                  extra="--data-size {}".format(ds), dry_run=dry)
+                                  extra="--data-size {}".format(ds), dry_run=dry,
+                                  pull_to=local_log_dir)
                 current_ds = ds
             run_stage(host, node, remote_runner,
-                      "remove-keys", remote_log_dir, cfg_name, extra="--scope full", dry_run=dry)
+                      "remove-keys", remote_log_dir, cfg_name, extra="--scope full",
+                      dry_run=dry, pull_to=local_log_dir)
             # Reader peers: host resolved from each reader node's fabric_ip so the
             # same config works unchanged on any deployment. Rebuilt per size so
             # the fail-path cleanup only ever sees the current run's processes.
@@ -1164,6 +1188,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "writer w{}".format(w["gid"]),
                                       int(warmup_duration + duration) + 300, dry_run=dry,
                                       expected_s=warmup_duration + duration)
+            for w in plan["writers"]:
+                wn = get_node(cluster, w["node"])
+                pull_stage_logs(wn["ip"], wn,
+                                ["{}.writer{}.log".format(base_noext, w["gid"])],
+                                local_log_dir, dry)
             # Step 5: shutdown readers and wait for their final logs
             for r, peer in zip(plan["readers"], reader_peers):
                 rn = get_node(cluster, r["node"])
@@ -1176,6 +1205,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     wait_process_exit(cluster, r["node"], pid,
                                       "reader r{} (port {})".format(r["index"], r["port"]),
                                       60, dry_run=dry, expected_s=60)
+            for r in plan["readers"]:
+                rn = get_node(cluster, r["node"])
+                pull_stage_logs(rn["ip"], rn,
+                                ["{}.reader_port{}.log".format(base_noext, r["port"])],
+                                local_log_dir, dry)
             # Step 6: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
