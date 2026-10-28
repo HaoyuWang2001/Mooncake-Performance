@@ -62,16 +62,15 @@ def load_plan(path):
 
 
 def wait_until(trigger, label):
+    remain = (trigger - datetime.now()).total_seconds()
+    if remain > 0:
+        log("waiting for [{}] at {} (ETA in {:.0f}s)".format(
+            label, trigger.strftime("%Y-%m-%d %H:%M:%S"), remain))
     while True:
         remain = (trigger - datetime.now()).total_seconds()
         if remain <= 0:
             return
-        if remain > 30:
-            log("waiting for [{}] at {} (ETA in {:.0f}s)".format(
-                label, trigger.strftime("%Y-%m-%d %H:%M:%S"), remain))
-            time.sleep(min(30, remain - 1))
-        else:
-            time.sleep(remain)
+        time.sleep(min(30, remain))
 
 
 def run_task(idx, task, now_str):
