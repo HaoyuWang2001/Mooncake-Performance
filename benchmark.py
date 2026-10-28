@@ -391,6 +391,166 @@ def value_check_cmd(remote_data_dir, scenario, data_size_bytes):
     )
 
 
+# --------------------------------------------------------------------------
+# NUMA binding (numactl cpu+mem): the orchestrator computes every client
+# process's final (numa_node, cpu_list) and the launch sites only prepend
+# `numactl --physcpubind=<list> [--membind|--preferred N]`. The client also
+# receives --cpu-bind <list> so it re-confirms the affinity and logs the
+# `cpu binding:` line (echo_cpu_bindings depends on it).
+# --------------------------------------------------------------------------
+
+def resolve_numa_policy(cfg, globals_cfg):
+    """numa_membind / numa_strict resolution (case explicit > global.json >
+    code default). numa_membind: membind (strict node memory, default) |
+    preferred (soft fallback) | off (cpu affinity only). numa_strict:
+    false (default) -> a node missing numactl degrades to cpu-only binding
+    with a WARN; true -> hard error. Effective only when numa_bind is on."""
+    def pick(key, default):
+        v = cfg.get(key)
+        if v is None:
+            v = globals_cfg.get(key)
+        return default if v is None else str(v).lower()
+    membind = pick("numa_membind", "membind")
+    if membind not in ("membind", "preferred", "off"):
+        raise RuntimeError(
+            "numa_membind must be membind|preferred|off (got {!r})".format(membind))
+    strict = pick("numa_strict", "false")
+    if strict not in ("true", "false"):
+        raise RuntimeError(
+            "numa_strict must be true|false (got {!r})".format(strict))
+    return membind, strict == "true"
+
+
+def node_exclude(cluster, node):
+    """Reserved-core exclusion for a node: node-level override wins over the
+    cluster-wide exclude_cpus (same resolution as deploy_scripts/env.sh)."""
+    return node.get("exclude_cpus", "") or cluster.get("exclude_cpus", "") or ""
+
+
+def _parse_cpu_list(spec):
+    """'0-3,7' -> set of ints (orchestrator-side port of the client parser)."""
+    cpus = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo, hi = int(lo), int(hi)
+            if lo < 0 or hi < lo:
+                raise ValueError("invalid cpu range: {}".format(part))
+            cpus.update(range(lo, hi + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _fmt_cpu_list(cpus):
+    """set of ints -> compact '0-3,7' (accepted by the client --cpu-bind)."""
+    out = []
+    first = prev = None
+    for c in sorted(cpus):
+        if first is None:
+            first = prev = c
+            continue
+        if c == prev + 1:
+            prev = c
+            continue
+        out.append(str(first) if first == prev else "{}-{}".format(first, prev))
+        first = prev = c
+    if first is not None:
+        out.append(str(first) if first == prev else "{}-{}".format(first, prev))
+    return ",".join(out)
+
+
+def probe_numactl(ip, node, dry_run=False):
+    return ssh_check_output(
+        ip, node, "command -v numactl >/dev/null 2>&1 && echo OK || echo MISSING",
+        quiet=True, dry_run=dry_run) == "OK"
+
+
+def probe_numa_topology(ip, node, dry_run=False):
+    """One quiet ssh -> (node_count, {node_idx: 'cpu list str'}). Raises on
+    empty/garbage output (replaces the old count-only probe)."""
+    out = ssh_check_output(
+        ip, node,
+        "for d in /sys/devices/system/node/node[0-9]*; do "
+        "echo \"$(basename \"$d\") $(cat \"$d/cpulist\")\"; done",
+        quiet=True, dry_run=dry_run)
+    node_cpus = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].startswith("node"):
+            continue
+        try:
+            idx = int(parts[0][4:])
+            _parse_cpu_list(parts[1])
+        except ValueError:
+            continue
+        node_cpus[idx] = parts[1].strip()
+    if not node_cpus:
+        raise RuntimeError(
+            "numa_bind: failed to probe NUMA topology on {} (got {!r})".format(ip, out))
+    return len(node_cpus), node_cpus
+
+
+def numa_binding_spec(pool_str, exclude_str, shard, shard_index):
+    """One client's final cpu list on a NUMA node: pool minus exclude, then
+    the shard_index-th consecutive shard-core slice with wraparound when the
+    pool cannot hold every client (shard=0 -> whole pool). Client-side
+    logic, moved here so numactl can bind before exec."""
+    pool = _parse_cpu_list(pool_str)
+    if exclude_str:
+        pool -= _parse_cpu_list(exclude_str)
+    if not pool:
+        raise RuntimeError("cpu binding pool is empty on this NUMA node "
+                           "(exclude_cpus={!r} removed everything)".format(exclude_str))
+    if shard > 0:
+        if shard > len(pool):
+            raise RuntimeError("cpu_shard {} > available cores {} on this NUMA node".format(
+                shard, len(pool)))
+        pool = sorted(pool)
+        start = (shard_index * shard) % len(pool)
+        end = start + shard
+        sel = pool[start:end] if end <= len(pool) else pool[start:] + pool[:end - len(pool)]
+        return _fmt_cpu_list(set(sel))
+    return _fmt_cpu_list(pool)
+
+
+def client_bind_spec(membind_mode, numa_node, cpu_list, numactl):
+    """Encode one client's binding for the basic runner --client-binds flag:
+    m:<node>:<list> membind | p:<node>:<list> preferred | c:<list> cpu-only
+    (all three launch via numactl); bare <list> = degraded cpu-only binding
+    by the client itself (numactl missing on that node)."""
+    if not numactl:
+        return cpu_list
+    if membind_mode == "membind":
+        return "m:{}:{}".format(numa_node, cpu_list)
+    if membind_mode == "preferred":
+        return "p:{}:{}".format(numa_node, cpu_list)
+    return "c:{}".format(cpu_list)
+
+
+def numactl_launch_prefix(membind_mode, numa_node, cpu_list):
+    """numactl prefix for direct launches (pipeline reader/writer)."""
+    prefix = "numactl --physcpubind={}".format(cpu_list)
+    if membind_mode == "membind":
+        return prefix + " --membind={}".format(numa_node)
+    if membind_mode == "preferred":
+        return prefix + " --preferred={}".format(numa_node)
+    return prefix
+
+
+def numa_node_check(node_name, numa_strict):
+    """Per-node numactl gate: degrade with WARN or hard-error per policy."""
+    if not numa_strict:
+        log("[WARN] numactl missing on {} -> cpu-only binding, no membind "
+            "(set numa_strict=true to make this fatal)".format(node_name))
+        return False
+    raise RuntimeError(
+        "numa_bind requires numactl on node {} (numa_strict=true)".format(node_name))
+
+
 def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
     pulled_ips = set()
     for node_name in involved_nodes:
@@ -785,6 +945,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     # the FAIL path never pulled the remote logs — silent failure with no
     # diagnosable evidence. All stages are now covered.
     try:
+        profile_sess = None  # profiling session (set below when matrix is on)
         run_stage(host, node, remote_runner,
                   "remove-keys", remote_log_dir, cfg_name, extra="--scope full",
                   dry_run=dry, pull_to=local_log_dir)
@@ -804,11 +965,27 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if numa_bind is None:
             numa_bind = globals_cfg.get("numa_bind")
         numa_bind = True if numa_bind is None else bool(numa_bind)
+        # per-client core count (NUMA-aware sharding); sharding implies the
+        # NUMA topology probes even when numa_bind was disabled explicitly
+        cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
+        if cpu_shard > 0 and not numa_bind:
+            numa_bind = True
+        # numactl policy: membind (strict, default) | preferred | off, and
+        # strict/auto behavior when numactl is missing on the node
+        membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
+        numa_k = 0
+        numa_topo = {}
+        numactl_ok = False
+        exclude = node_exclude(cluster, node)
+        if numa_bind and not dry:
+            numa_k, numa_topo = probe_numa_topology(host, node)
+            numactl_ok = probe_numactl(host, node)
+            if not numactl_ok:
+                numa_node_check(primary_node_name, numa_strict)
         log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
             cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
         # profiling lifecycle (both triggers wrap the combo loop in basic;
         # whole_run additionally covers the per-ds setup stages inside it)
-        profile_sess = None
         if matrix and not dry and prof_core:
             try:
                 profile_sess = prof_core.start_profiling(
@@ -846,9 +1023,19 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
             if numa_bind:
-                # script-level flag: run_benchmark_basic.sh binds each client
-                # to a NUMA node (round-robin across the node's topology)
-                command += " --numa-bind"
+                # orchestrator-computed per-client bindings; the runner only
+                # prepends numactl (m/p/c spec) or falls back to client-side
+                # --cpu-bind when numactl is missing on the node
+                specs = []
+                for i in range(1, c + 1):
+                    if not dry:
+                        nn = (i - 1) % numa_k
+                        cl = numa_binding_spec(numa_topo[nn], exclude,
+                                               cpu_shard, (i - 1) // numa_k)
+                        specs.append(client_bind_spec(membind_mode, nn, cl, numactl_ok))
+                    else:
+                        specs.append("-")
+                command += " --client-binds '{}'".format(";".join(specs))
             if total_target_qps > 0:
                 # basic target_qps is TOTAL across the scenario; each client
                 # process gets its share (client then divides across threads)
@@ -1002,14 +1189,19 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     # per-client core count (NUMA-aware sharding). When set it takes
     # precedence over plain numa round-robin: each client process gets a
     # consecutive cpu_shard-core slice of its NUMA node's allowed pool
-    # (exclude_cpus subtracted by the client), wrapping when the pool is
-    # smaller than clients x shard.
+    # (exclude_cpus subtracted here), wrapping when the pool is smaller
+    # than clients x shard.
     cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
     if cpu_shard > 0 and not numa_bind:
         numa_bind = True  # sharding needs the NUMA topology probes
+    # numactl policy: membind (strict, default) | preferred | off, and
+    # strict/auto behavior when numactl is missing on a node
+    membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
     numa_node_count = {}
     numa_counter = {}
     shard_ordinals = {}  # (node, numa) -> next slice ordinal
+    numa_topo = {}       # node_name -> {numa_idx: cpulist}
+    numactl_ok = {}      # node_name -> numactl usable
 
     def shard_ordinal(node_name, numa):
         key = (node_name, numa)
@@ -1020,17 +1212,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     if numa_bind:
         for node_name in involved_nodes:
             n = get_node(cluster, node_name)
-            count = ssh_check_output(
-                n["ip"], n,
-                "k=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l); "
-                "[ \"$k\" -gt 0 ] && echo \"$k\" || lscpu 2>/dev/null | "
-                "grep -cE '^NUMA[[:space:]]+node[0-9]+[[:space:]]+CPU\\(s\\):' || echo 0",
-                quiet=True, dry_run=dry)
-            try:
-                numa_node_count[node_name] = max(1, int(count.strip()))
-            except ValueError:
-                raise RuntimeError(
-                    "numa_bind: failed to probe NUMA topology on {}".format(node_name))
+            if not dry:
+                k, topo = probe_numa_topology(n["ip"], n)
+                numa_node_count[node_name] = k
+                numa_topo[node_name] = topo
+                numactl_ok[node_name] = probe_numactl(n["ip"], n)
+                if not numactl_ok[node_name]:
+                    numa_node_check(node_name, numa_strict)
+            else:
+                # dry-run: no ssh probing (the old count-only probe failed
+                # on dry-run's empty result); commands print without
+                # binding args
+                numa_node_count[node_name] = 1
+                numa_topo[node_name] = {0: "0"}
+                numactl_ok[node_name] = False
             numa_counter[node_name] = 0
     try:
         sizes = data_size_list(cfg)
@@ -1096,19 +1291,21 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
                 nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
                 numa_arg = ""
-                if cpu_shard > 0:
-                    # NUMA-aware sharding: round-robin over NUMA nodes, and
-                    # the per-(node,numa) ordinal picks a consecutive slice
+                launch_prefix = ""
+                if (cpu_shard > 0 or numa_bind) and not dry:
+                    # round-robin over NUMA nodes; with cpu_shard the
+                    # per-(node,numa) ordinal picks a consecutive slice
                     nn = numa_counter[r["node"]] % numa_node_count[r["node"]]
                     numa_counter[r["node"]] += 1
-                    numa_arg = "--numa-node {} --cpu-shard {} --shard-index {}".format(
-                        nn, cpu_shard, shard_ordinal(r["node"], nn))
-                elif numa_bind:
-                    numa_arg = "--numa-node {}".format(
-                        numa_counter[r["node"]] % numa_node_count[r["node"]])
-                    numa_counter[r["node"]] += 1
-                rcmd = "nohup bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} {} > {} 2>&1 & echo $!".format(
-                    remote_runner, merged_log, r["index"], reader_threads,
+                    idx = shard_ordinal(r["node"], nn) if cpu_shard > 0 else 0
+                    cl = numa_binding_spec(numa_topo[r["node"]][nn],
+                                           node_exclude(cluster, rn),
+                                           cpu_shard, idx)
+                    numa_arg = "--cpu-bind {}".format(cl)
+                    if numactl_ok.get(r["node"]):
+                        launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
+                rcmd = "nohup {}bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} {} > {} 2>&1 & echo $!".format(
+                    launch_prefix, remote_runner, merged_log, r["index"], reader_threads,
                     r["port"], peers_json, reader_op, numa_arg, nohup_log)
                 pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
                 reader_pids.append((r, pid))
@@ -1159,17 +1356,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
                 nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
                 numa_arg = ""
-                if cpu_shard > 0:
+                launch_prefix = ""
+                if (cpu_shard > 0 or numa_bind) and not dry:
                     nn = numa_counter[w["node"]] % numa_node_count[w["node"]]
                     numa_counter[w["node"]] += 1
-                    numa_arg = "--numa-node {} --cpu-shard {} --shard-index {}".format(
-                        nn, cpu_shard, shard_ordinal(w["node"], nn))
-                elif numa_bind:
-                    numa_arg = "--numa-node {}".format(
-                        numa_counter[w["node"]] % numa_node_count[w["node"]])
-                    numa_counter[w["node"]] += 1
-                wcmd = "nohup bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} {} > {} 2>&1 & echo $!".format(
-                    remote_runner, merged_log, w["gid"], peers_json, warmup, writer_op, numa_arg, nohup_log)
+                    idx = shard_ordinal(w["node"], nn) if cpu_shard > 0 else 0
+                    cl = numa_binding_spec(numa_topo[w["node"]][nn],
+                                           node_exclude(cluster, wn),
+                                           cpu_shard, idx)
+                    numa_arg = "--cpu-bind {}".format(cl)
+                    if numactl_ok.get(w["node"]):
+                        launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
+                wcmd = "nohup {}bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} {} > {} 2>&1 & echo $!".format(
+                    launch_prefix, remote_runner, merged_log, w["gid"], peers_json,
+                    warmup, writer_op, numa_arg, nohup_log)
                 pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
                 writer_pids.append((w, pid))
                 if not dry and pid:

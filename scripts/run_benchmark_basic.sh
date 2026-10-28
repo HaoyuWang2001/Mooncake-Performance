@@ -12,8 +12,9 @@
 #     client). The script reads MC_KEY_COUNT from env.sh, splits the key
 #     range evenly, and spawns N parallel processes, injecting
 #     --client-id i --key-start S --key-end E into each. All other args are
-#     passed through. --numa-bind is also script-level (binds client i to
-#     NUMA node (i-1)%K, K = NUMA node count on this host).
+#     passed through. --client-binds is also script-level: ';'-separated
+#     per-client binding specs computed by the orchestrator (see bind_launch
+#     below); the runner only prepends numactl, never computes bindings.
 #
 # All scenario/cluster configuration comes from env.sh (sourced here), then
 # env.mooncake.sh (hand-editable mooncake store/SDK tuning defaults; same-name
@@ -48,24 +49,21 @@ source "$ENV_FILE"
 # -f guard keeps the script working without the file (local ad-hoc runs).
 # Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
 [ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
-
 # Collect passthrough args; extract script-level flags (--num-clients and
-# --numa-bind are consumed here and NOT forwarded to the client).
+# --client-binds are consumed here and NOT forwarded to the client).
 NUM_CLIENTS=1
-NUMA_BIND=0
-# per-client core count (NUMA-aware sharding, env from the scenario config);
-# when set it supersedes plain numa round-robin in both launch branches
-CPU_SHARD="${MC_CPU_SHARD:-0}"
+CLIENT_BINDS=""
 ARGS=()
+
 while [ $# -gt 0 ]; do
   if [ "$1" = "--num-clients" ] && [ $# -ge 2 ]; then
     NUM_CLIENTS=$2
     shift 2
     continue
   fi
-  if [ "$1" = "--numa-bind" ]; then
-    NUMA_BIND=1
-    shift
+  if [ "$1" = "--client-binds" ] && [ $# -ge 2 ]; then
+    CLIENT_BINDS=$2
+    shift 2
     continue
   fi
   ARGS+=("$1")
@@ -77,20 +75,58 @@ if [ "$MODE" != "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   exit 1
 fi
 
-# NUMA topology: number of NUMA nodes on this host (sysfs first, lscpu fallback)
-numa_node_count() {
-  local k
-  k=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
-  if [ "$k" -gt 0 ]; then
-    echo "$k"
-  else
-    lscpu 2>/dev/null | grep -cE "^NUMA[[:space:]]+node[0-9]+[[:space:]]+CPU\(s\):" || echo 0
-  fi
-}
-
 PYTHON="${MC_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
+
+# resolve the binding spec of client ordinal $1 (1-based) into LAUNCH_CMD
+# (numactl argv prefix, possibly empty) + BIND_ARGS (client --cpu-bind).
+# Spec forms: m:<node>:<list> -> numactl --physcpubind + --membind
+#             p:<node>:<list> -> numactl --physcpubind + --preferred
+#             c:<list>        -> numactl --physcpubind only
+#             <list>          -> client-side --cpu-bind (numactl missing)
+#             -               -> no binding
+# The client also gets --cpu-bind <list> in every numactl form so it
+# re-confirms the affinity and logs its `cpu binding:` line.
+IFS=';' read -r -a BIND_SPECS <<< "$CLIENT_BINDS"
+
+bind_launch() {
+  local spec rest nn list
+  if [ "$1" -ge 1 ] && [ "$1" -le "${#BIND_SPECS[@]}" ]; then
+    spec="${BIND_SPECS[$(($1 - 1))]}"
+  else
+    spec="-"
+  fi
+  LAUNCH_CMD=()
+  BIND_ARGS=""
+  case "$spec" in
+    m:*:*|p:*:*)
+      rest="${spec:2}"
+      nn="${rest%%:*}"
+      list="${rest#*:}"
+      if [ "${spec:0:1}" = "m" ]; then
+        LAUNCH_CMD=(numactl "--physcpubind=$list" "--membind=$nn")
+      else
+        LAUNCH_CMD=(numactl "--physcpubind=$list" "--preferred=$nn")
+      fi
+      BIND_ARGS="--cpu-bind $list"
+      ;;
+    c:*)
+      list="${spec#c:}"
+      LAUNCH_CMD=(numactl "--physcpubind=$list")
+      BIND_ARGS="--cpu-bind $list"
+      ;;
+    -|"")
+      ;;
+    *:*)
+      echo "[FATAL] bad client-binds spec '$spec' (marker missing?)" >&2
+      exit 1
+      ;;
+    *)
+      BIND_ARGS="--cpu-bind $spec"
+      ;;
+  esac
+}
 
 if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   KEY_COUNT="${MC_KEY_COUNT:-0}"
@@ -102,33 +138,16 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   rm -rf "$LOG_DIR"
   mkdir -p "$LOG_DIR"
   RC=0
-  if [ "$NUMA_BIND" = "1" ] || [ "$CPU_SHARD" -gt 0 ]; then
-    K=$(numa_node_count)
-    if [ "$K" -lt 1 ]; then
-      echo "[FATAL] --numa-bind: no NUMA topology found on this node" >&2
-      exit 1
-    fi
-  else
-    K=1
-  fi
   # client pids are exported for the orchestrator's .state ledger (crash
   # recovery: a killed orchestrator can still find and kill these later)
   : > "$LOG_FILE.pids"
   for i in $(seq 1 "$NUM_CLIENTS"); do
     START=$(( (i - 1) * KEY_COUNT / NUM_CLIENTS ))
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
-    # binding args: shard mode (numa round-robin + per-numa slice ordinal)
-    # or plain numa round-robin, or none
-    if [ "$CPU_SHARD" -gt 0 ]; then
-      BIND_ARGS="--numa-node $(( (i - 1) % K )) --cpu-shard $CPU_SHARD --shard-index $(( (i - 1) / K ))"
-    elif [ "$NUMA_BIND" = "1" ]; then
-      BIND_ARGS="--numa-node $(( (i - 1) % K ))"
-    else
-      BIND_ARGS=""
-    fi
+    bind_launch "$i"
     # per-client ylt easylog file (absolute path; merged below with headers)
     MC_YLT_LOG_PATH="$LOG_DIR/client.$i.ylt.log" \
-    "$PYTHON" "$CLIENT" \
+    ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" \
       --mode "$MODE" \
       --client-id "$i" --key-start "$START" --key-end "$END" \
       $BIND_ARGS \
@@ -155,21 +174,16 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
 else
   # single-process/stage mode: write DIRECTLY to LOG_FILE so the output is
   # live while the process runs (Python output is line-buffered); ylt
-  # easylog -> absolute path next to the log. NUMA binding only applies to
-  # benchmark mode (the single benchmark client binds NUMA node 0).
+  # easylog -> absolute path next to the log. Binding only applies to
+  # benchmark mode (the spec list then carries exactly one entry).
   if [ "$MODE" = "benchmark" ]; then
-    if [ "$CPU_SHARD" -gt 0 ]; then
-      BIND_ARGS="--numa-node 0 --cpu-shard $CPU_SHARD --shard-index 0"
-    elif [ "$NUMA_BIND" = "1" ]; then
-      BIND_ARGS="--numa-node 0"
-    else
-      BIND_ARGS=""
-    fi
+    bind_launch 1
   else
+    LAUNCH_CMD=()
     BIND_ARGS=""
   fi
   MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
-  "$PYTHON" "$CLIENT" --mode "$MODE" ${BIND_ARGS} "${ARGS[@]}" \
+  ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" --mode "$MODE" ${BIND_ARGS} "${ARGS[@]}" \
     > "$LOG_FILE" 2>&1
   RC=$?
 fi

@@ -98,7 +98,7 @@ basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字
   连续 N 核切片（池 = 该 NUMA 核集 − exclude_cpus）；池不足时切片回绕复用（同 NUMA 后到的
   client 复用前面的片）。设置后优先于 numa_bind 轮询。每个 client 的实际绑定打印到 client 日志
   `cpu binding:` 行并回显到编排器输出，META 行含结构化 bound_cpus。
-- **NUMA 绑定**：`numa_bind` **默认开启**（解析优先级：用例/层级显式值 > global.json `numa_bind`（默认 true）> 代码缺省 true；仅显式 false 关闭）。开启时basic 的多 client 由 `run_benchmark_basic.sh` 探测本节点 NUMA 节点数 K 并让 client i 绑定 `node (i-1)%K`；pipeline 按节点探测 K，该节点上所有 client 进程（reader 先、writer 后）节点内 round-robin 绑定。客户端内部用 `os.sched_setaffinity`（CPU 亲和，内存为默认本地分配策略）；也可手动传 `--numa-node N` 或 `--cpu-bind CPULIST`（如 `0-83,90`）直接指定。绑定结果在客户端日志输出 `cpu binding: ...` 行。
+- **NUMA 绑定（numactl CPU+内存）**：`numa_bind` **默认开启**（解析优先级：用例/层级显式值 > global.json `numa_bind`（默认 true）> 代码缺省 true；仅显式 false 关闭）。开启时每个 client 进程由**编排器统一计算**最终 (NUMA 节点, CPU 列表)（池 = 节点核集 − exclude_cpus），启动点用 `numactl --physcpubind=<list> --membind=<node>` 包装，**CPU 与内存同时绑定**；basic 多 client 按 `node (i-1)%K` 轮询、pipeline 该节点上所有 client 进程（reader 先、writer 后）round-robin，规格经 `--client-binds` 下发给 runner（runner 不再自行计算）。客户端同时收到 `--cpu-bind <list>` 做二次确认并输出 `cpu binding:` 行（回显到编排器输出，META 行含 bound_cpus）。内存策略 `numa_membind`：`membind`（默认，严格——仅从本节点分配，耗尽即失败）| `preferred`（软回退）| `off`（仅 CPU）；解析优先级同 numa_bind。节点缺失 numactl 时 `numa_strict=false`（默认）降级为仅 CPU 绑定（客户端 `os.sched_setaffinity`）并 `[WARN]`，`numa_strict=true` 则硬失败。手动独立运行客户端仍可用 `--numa-node N` / `--cpu-bind CPULIST`（仅 CPU 亲和）。真机核验：`numastat -p <pid>` 或 `/proc/<pid>/status` 的 `Mems_allowed_list`。
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。
