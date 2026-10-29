@@ -197,6 +197,15 @@ def scenario_paths(globals_cfg, ts, cfg_name):
             remote_runner_basic, remote_runner_pipeline, local_log_dir)
 
 
+def remote_profiling_dir(remote_log_dir):
+    """POSIX join for the remote profiling dir. os.path.join MUST NOT be
+    used on remote paths: running the orchestrator on Windows inserts a
+    backslash (logs\\profiling), which bash escapes into a literal
+    'logsprofiling' while scp (SFTP) looks for a literal backslash name —
+    every artifact then fails to collect."""
+    return "{}/profiling".format(remote_log_dir)
+
+
 def resolve_venv(cluster, globals_cfg):
     """Resolve the server-side Python interpreter for the benchmark client.
 
@@ -990,7 +999,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             try:
                 profile_sess = prof_core.start_profiling(
                     cluster, matrix, involved_nodes, cfg_name,
-                    os.path.join(remote_log_dir, "profiling"))
+                    remote_profiling_dir(remote_log_dir))
             except Exception as exc:
                 log("[WARN] [profile] start failed: {}".format(exc))
         current_ds = None
@@ -1282,7 +1291,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     try:
                         profile_sess = prof_core.start_profiling(
                             cluster, matrix, involved_nodes, cfg_name,
-                            os.path.join(remote_log_dir, "profiling"))
+                            remote_profiling_dir(remote_log_dir))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
             # Step 1: start all readers (one process per reader, unique port and id)
@@ -1348,7 +1357,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 try:
                     profile_sess = prof_core.start_profiling(
                         cluster, matrix, involved_nodes, cfg_name,
-                        os.path.join(remote_log_dir, "profiling"))
+                        remote_profiling_dir(remote_log_dir))
                 except Exception as exc:
                     log("[WARN] [profile] start failed: {}".format(exc))
             for w in plan["writers"]:
