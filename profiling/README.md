@@ -21,11 +21,15 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 | 工具 | 覆盖 | 命令形态 | 权限 |
 | --- | --- | --- | --- |
 | `spdiag` | 侵入式代码段耗时聚合（GetReplicaList 等） | `spdiag restart` → 运行 → `spdiag show > spdiag.show.txt` | 节点级全局 |
-| `perf` | on-CPU 任意函数火焰图（系统级 `-a`） | `sudo -n perf record -F 99 -a -g --call-graph fp -o perf.data`，SIGINT 落盘 | sudo |
-| `runqlat` | 调度延迟直方图（bt/runqlat.bt，周期输出带时间戳） | `sudo -n bpftrace runqlat.bt` | sudo |
-| `offcputime` | off-CPU/持锁等待（bt/offcputime.bt，大事件明细带时间戳） | `sudo -n bpftrace offcputime.bt` | sudo |
+| `perf` | on-CPU 任意函数火焰图（系统级 `-a`） | `sudo -n perf record -F 99 -a -g --call-graph fp -o perf.data`，SIGINT 后轮询落盘再收集；stderr 存 `perf.data.err` 一并收集 | sudo（可关） |
+| `runqlat` | 调度延迟直方图（bt/runqlat.bt，周期输出带时间戳） | `sudo -n env INTERVAL=10 bpftrace runqlat.bt`（.bt 启动时推送到远端 profiling 目录） | sudo（可关） |
+| `offcputime` | off-CPU/持锁等待（bt/offcputime.bt，大事件明细带时间戳） | `sudo -n env MIN_BLOCK_US=1000 bpftrace offcputime.bt`（同上） | sudo（可关） |
 
-工具在节点上不可用（探测失败）→ `[WARN]` 跳过该工具，其余照常。
+工具在节点上不可用（探测失败）→ `[WARN]` 跳过该工具，其余照常。**逐工具故障隔离**：任一
+工具启动失败仅 `[WARN]` 跳过自身，不影响其余工具与场景。sudo 用法（matrix 逐工具
+`"sudo": false` 可关）：带 sudo 的工具启动前先探 `sudo -n true`，无 NOPASSWD 则明确
+`[WARN]` 跳过；sudo 运行产生的 root 属主产物（perf.data）在 scp 前自动
+`chown "$(id -un):$(id -gn)"` 归还 ssh 用户。
 
 ## 生命周期
 

@@ -1,5 +1,5 @@
 {
-  "_note": "复制本文件为 configs/matrix.json（已被 gitignore）启用性能诊断；或通过 --profile <路径> 指定任意位置。enabled: true/false 控制各工具开关；perf/runqlat/offcputime 命令自动加 sudo -n 前缀；bin 可覆盖为绝对路径（本地 stub 验证或特殊安装路径）。nodes=auto 表示本次 run 的全部参与节点。trigger: whole_run=整个场景 | per_stage=仅测量窗。outliers.auto=run 结束自动生成异常值清单与时间窗切片。",
+  "_note": "复制本文件为 configs/matrix.json（已被 gitignore）启用性能诊断；或通过 --profile <路径> 指定任意位置。enabled: true/false 控制各工具开关；perf/runqlat/offcputime 默认加 sudo -n 前缀（普通用户已可直跑 perf 时可逐工具设 \"sudo\": false）；sudo 运行的 root 属主产物（如 perf.data）在收集前自动 chown 回 ssh 用户；bin 可覆盖为绝对路径（本地 stub 验证或特殊安装路径）。nodes=auto 表示本次 run 的全部参与节点。trigger: whole_run=整个场景 | per_stage=仅测量窗。outliers.auto=run 结束自动生成异常值清单与时间窗切片。",
   "nodes": "auto",
   "trigger": "whole_run",
   "tools": {
