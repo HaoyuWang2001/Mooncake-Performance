@@ -1,14 +1,14 @@
 # Mooncake-Performance WebUI — HTTP API
 
-服务启动：`python webui/server.py [--port 8080] [--bind 127.0.0.1]`（`--bind 0.0.0.0` 开放局域网）。
-前端为 vendored **Vue3 + Element Plus**（`webui/static/vendor/`，约 1.8MB，无构建步骤、离线可用），
+服务启动：`python -m webui.backend.main [--port 8080] [--bind 127.0.0.1]`（`--bind 0.0.0.0` 开放局域网）。
+前端为 vendored **Vue3 + Element Plus**（`webui/web/vendor/`，约 1.8MB，无构建步骤、离线可用；URL 前缀 /static/）。后端结构：`backend/{main,paths,common,runmgr}.py + routers/`（按域拆分），测试 `python -m pytest webui/tests`。
 页面与 API 使用同一套后端。
 所有 API 返回 JSON（`Content-Type: application/json`）；错误形如 `{"error": "..."}` 并带恰当 HTTP 状态码
 （400 参数错 / 403 路径越界 / 404 不存在 / 409 槽位占用 / 422 校验失败）。
 
 约定：
 - `path` 参数一律是**相对仓库根**的 POSIX 风格路径（如 `configs/basic/put.json`）
-- 文件读取白名单：`outputs/`、`webui/runs/`；配置读写白名单：`configs/`、`schedule/`
+- 文件读取白名单：`outputs/`、`webui/data/runs/`；配置读写白名单：`configs/`、`schedule/`
 - benchmark 与 scheduler 任务共用单一执行槽：benchmark 运行中（或 scheduler 任务执行中）新 run 请求 → 409
 - scheduler 等待期间发起 benchmark → 允许，响应携带 `warnings`
 
@@ -19,7 +19,7 @@
 ### GET /api/status
 ```json
 {"version":"1.0","platform":"posix","python":"3.12.3","root":"/path/Mooncake-Performance",
- "paths":{"outputs":"outputs","runs":"webui/runs"},
+ "paths":{"outputs":"outputs","runs":"webui/data/runs"},
  "active_run":{"id":"r20261029-223001-001","status":"running",...} | null,
  "scheduler":{"id":"s20261029-223005-002","state":"waiting",...} | null}
 ```
@@ -128,7 +128,7 @@ run meta 字段：`id/kind/cmd/argv/log/status/rc/t0/t1/elapsed/ts_dir/meta`；`
 - 等待触发时刻（状态 `waiting`）；触发时若 benchmark 正在运行 → **等待其结束**（`waiting_slot`）再执行
 - 任务执行期间占用执行槽（此时 POST /api/run → 409）
 - 任务的 stdout/stderr 以与 run_schedule 相同的起止分隔头追加写入计划指定的 output 文件
-- scheduler 自身事件（等待/开始/完成）写入 `webui/runs/s<id>.log`，经 status 轮询可见
+- scheduler 自身事件（等待/开始/完成）写入 `webui/data/runs/s<id>.log`，经 status 轮询可见
 → `{"scheduler":{"id":"s...","state":"waiting",...}}`；已有活跃 scheduler → 409
 
 ### POST /api/schedule/stop

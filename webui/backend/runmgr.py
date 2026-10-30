@@ -1,13 +1,14 @@
-#!/usr/bin/env python3
-"""runmgr — webui 的进程与调度管理器。
+"""webui/backend/runmgr — 进程与调度管理器（无 HTTP 逻辑）。
 
-职责（与 server.py 解耦，不含任何 HTTP 逻辑）：
+职责：
   - 单一 benchmark 槽位：同一时刻只允许一个 benchmark 进程（占用即拒绝）
   - 跨平台停止：Windows taskkill /F /T，POSIX 进程组 TERM->KILL
-  - 运行历史持久化：webui/runs/<id>.json + <id>.log
+  - 运行历史持久化：webui/data/runs/<id>.json + <id>.log
   - scheduler 线程：复用 run_schedule 的计划解析，任务触发时若 benchmark
-    槽位被占则等待其结束后再执行（用户决策）；scheduler 等待期间允许
-    手动 benchmark（由 server 层附 warning），但任务执行期间拒绝新 run
+    槽位被占则等待其结束后再执行；scheduler 等待期间允许手动 benchmark
+    （router 层附 warning），但任务执行期间拒绝新 run
+
+模块级 MGR 单例供各 router 共享。
 """
 import importlib.util
 import json
@@ -18,17 +19,13 @@ import threading
 import time
 from datetime import datetime
 
-WEBUI_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(WEBUI_DIR)
-RUNS_DIR = os.path.join(WEBUI_DIR, "runs")
+from .paths import ROOT, RUNS_DIR
+
 BENCH = os.path.join(ROOT, "benchmark.py")
 IS_WIN = os.name == "nt"
 
 _seq_lock = threading.Lock()
 _seq = [0]
-
-if not os.path.isdir(RUNS_DIR):
-    os.makedirs(RUNS_DIR, exist_ok=True)
 
 
 def _new_id(prefix):
@@ -412,3 +409,6 @@ class RunManager(object):
                     self.run is not None and self.run.status == "running") else None,
                 "scheduler": self.scheduler.to_dict() if self.scheduler else None,
             }
+
+
+MGR = RunManager()

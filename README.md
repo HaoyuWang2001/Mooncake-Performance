@@ -608,20 +608,22 @@ python run_schedule.py --plan plan.json
 python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
 ```
 
-### 10.2.1 WebUI（webui/server.py，本地网页控制台 + HTTP API）
+### 10.2.1 WebUI（webui/backend，本地网页控制台 + HTTP API）
 
 后端纯标准库（stdlib）、双平台（Windows/Linux），在编排机上启动后即可通过网页或
 HTTP API 完成"选配置 → 运行 → 看日志/结果/图 → 改配置 → 管计划"的全流程：
 
 ```bash
-python webui/server.py                       # http://127.0.0.1:8080
-python webui/server.py --port 8080 --bind 0.0.0.0   # 开放局域网（无鉴权，内网用）
+python -m webui.backend.main                       # http://127.0.0.1:8080
+python -m webui.backend.main --port 8080 --bind 0.0.0.0   # 开放局域网（无鉴权，内网用）
+python -m pytest webui/tests -q                     # 测试（亦可 python webui/tests/test_*.py 直跑）
 ```
 
 能力（详见 `webui/API.md`，`GET /api/help` 同样返回）：
 
-前端为 **vendored Vue3 + Element Plus**（`webui/static/vendor/`，约 1.8MB 入库，无构建步骤、
-离线集群可用），侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
+目录结构学习 Services-Deployment：`backend/`（routers 按域拆分）+ `web/`（前端成品，
+vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL 前缀 /static/）+
+`data/`（运行时状态，gitignored）+ `backups/`（编辑备份，gitignored）+ `tests/`，侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
 
 - **配置维护**：运行框（通栏最上方：选中文件展示【目录/文件分开，目录先执行】+ cluster/global/
   profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-plot/protocol 选项 + 运行按钮）；
@@ -639,7 +641,7 @@ python webui/server.py --port 8080 --bind 0.0.0.0   # 开放局域网（无鉴�
 - **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
   再执行（scheduler 等待期允许手动发起 run，响应带 warning）
 - **并发规则**：单一执行槽——benchmark 或 scheduler 任务运行中新 run 请求返回 409
-- 运行历史与日志持久化于 `webui/runs/`（gitignore）
+- 运行历史与日志持久化于 `webui/data/runs/`（gitignore）
 
 触发模型（混合）：任务显式带 `date`+`time` 则睡到该时刻（已过点立即执行）；
 省略时刻则链式（上一条完成 + `wait_seconds`）。失败按 `on_fail`（continue/abort）。
