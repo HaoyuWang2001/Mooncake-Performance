@@ -862,8 +862,12 @@ def reap_state_entries(cluster):
             except Exception:
                 pass
         try:
+            # tree kill: the ledger pid may be the runner-script bash wrapper
+            # whose child is the python client — killing only the parent
+            # would orphan the child (pgrep -P lists the children)
             ssh_check_output(ip, node,
-                             "kill {pid} 2>/dev/null || true".format(pid=pid), quiet=True)
+                             "kill $(pgrep -P {pid} 2>/dev/null) {pid} 2>/dev/null || true".format(pid=pid),
+                             quiet=True)
             time.sleep(2)
             still = ssh_check_output(
                 ip, node,
@@ -871,7 +875,8 @@ def reap_state_entries(cluster):
                 quiet=True)
             if still == "ALIVE":
                 ssh_check_output(ip, node,
-                                 "kill -9 {pid} 2>/dev/null || true".format(pid=pid), quiet=True)
+                                 "kill -9 $(pgrep -P {pid} 2>/dev/null) {pid} 2>/dev/null || true".format(pid=pid),
+                                 quiet=True)
             log(".state reap: killed {} (pid {} on {})".format(label, pid, ip))
         except Exception as exc:
             log("[WARN] .state reap: {} kill failed: {}; kept".format(label, exc))
@@ -1325,6 +1330,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         "ip": rn["ip"], "node": r["node"], "port": r["port"],
                         "fabric_host": peer["host"],
                         "pid": pid.strip(), "label": "reader r{}".format(r["index"]),
+                        # pid 是 run_benchmark_pipeline.sh 的 bash 包装进程（echo $!），
+                        # python client 是其子进程；marker 用于 reap 的防误杀校验
+                        "marker": "run_benchmark_pipeline.sh",
                         "cfg": cfg_name,
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
             # give readers a moment to boot before the health polling starts
@@ -1387,6 +1395,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         "ip": wn["ip"], "node": w["node"], "port": None,
                         "fabric_host": None,
                         "pid": pid.strip(), "label": "writer w{}".format(w["gid"]),
+                        "marker": "run_benchmark_pipeline.sh",
                         "cfg": cfg_name,
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
             # Step 4: wait for all writers to finish (warmup + measured run)

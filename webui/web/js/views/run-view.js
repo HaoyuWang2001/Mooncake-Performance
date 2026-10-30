@@ -27,7 +27,7 @@ const RunView = {
         <el-button v-if="meta.status === 'running'" type="danger" @click="stop" :loading="stopping">停止</el-button>
         <el-button v-if="meta.ts_dir && meta.status && meta.status !== 'running'" type="primary"
                    @click="gotoResults">查看运行结果</el-button>
-        <span class="hint">查看结果为手动跳转；运行完成后自动停止日志轮询</span>
+        <span class="hint">查看结果为手动跳转；停止将终止编排器并自动清理远端残留进程（reader 优雅关停、客户端校验后 kill、清台账）</span>
       </div>
     </el-card>
 

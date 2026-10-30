@@ -649,10 +649,12 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
 计划文件格式详见 `schedule/README.md`。
 
 - **进程台账 `.state`**：所有远端 client 进程（pipeline reader/writer、basic 客户端）启动即记录
-  （ip/节点/端口/pid，仓库根 `.state`，已 gitignore）；正常/失败退出自动清除对应行。编排器每次
-  启动与 `--clean-up` 时自动 **reap** 残留：kill 前校验远端 `/proc/<pid>/cmdline` 含
-  `mooncake_benchmark_client`（防 pid 重用误杀）、有端口的 reader 先 HTTP /shutdown 优雅关停，
-  再 TERM → KILL。手动终止编排器后再次运行即可自动清场上次残留。
+  （ip/节点/端口/pid/marker，仓库根 `.state`，已 gitignore）；正常/失败退出自动清除对应行。编排器每次
+  启动、`--clean-up` 与 **WebUI 停止 run** 时自动 **reap** 残留：kill 前校验远端 `/proc/<pid>/cmdline`
+  含台账 marker（basic 直启客户端 = `mooncake_benchmark_client`；pipeline 的 pid 是
+  `run_benchmark_pipeline.sh` bash 包装进程，python 客户端为其子进程，防 pid 重用误杀）、有端口的
+  reader 先 HTTP /shutdown 优雅关停，再 **树杀**（`pgrep -P` 连同子进程一并 TERM → KILL，
+  防止只杀包装进程孤儿化客户端）。手动终止编排器后再次运行即可自动清场上次残留。
 
 ### 10.3 性能诊断矩阵（profiling/）
 

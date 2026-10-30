@@ -260,7 +260,33 @@ class RunManager(object):
                 return run, None  # already finished; not an error
             run.stopping = True
             _kill(run.proc)
+            self._reap_remote_async(run)
             return run, None
+
+    def _reap_remote_async(self, run):
+        """停止后清理远端残留：按 .state 台账 kill 远端 client 进程
+        （cmdline 校验防 pid 重用误杀、带端口的 reader 先优雅 shutdown）、
+        清空台账。复用 benchmark.reap_state_entries。daemon 线程执行——
+        多节点 SSH 需数秒，不阻塞停止响应。"""
+        def worker():
+            try:
+                import benchmark as bm  # lazy: heavy module
+                cluster_path = "configs/cluster.json"
+                try:
+                    req = (run.meta or {}).get("request") or {}
+                    cluster_path = req.get("flags", {}).get("cluster") or cluster_path
+                except Exception:
+                    pass
+                full = os.path.join(ROOT, cluster_path)
+                if not os.path.isfile(full):
+                    return
+                with open(full, "r", encoding="utf-8") as f:
+                    cluster = json.load(f)
+                bm.reap_state_entries(cluster)
+            except Exception as exc:
+                sys.stderr.write("[webui] remote cleanup for {}: {}\n".format(
+                    run.id, exc))
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------------- scheduler ----------------
 

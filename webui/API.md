@@ -89,7 +89,9 @@ run meta 字段：`id/kind/cmd/argv/log/status/rc/t0/t1/elapsed/ts_dir/meta`；`
 单次最多 512KB；`offset` 为字节偏移（首次传 0，之后传上次返回值）。
 
 ### POST /api/runs/{id}/stop
-跨平台停止（Windows `taskkill /F /T`；POSIX 进程组 TERM→KILL）。
+跨平台停止（Windows `taskkill /F /T`；POSIX 进程组 TERM→KILL）。停止后**后台线程自动
+清理远端残留**：按 `.state` 台账 kill 远端 client 进程（cmdline 校验防 pid 重用误杀、
+带端口的 reader 先 HTTP /shutdown 优雅关停）并清空台账（多节点 SSH 需数秒，异步执行）。
 → `{"ok":true,"run":{...status:"stopped"}}`（已结束的 run 调用也返回 ok）
 
 ---

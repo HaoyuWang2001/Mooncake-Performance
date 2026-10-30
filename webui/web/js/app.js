@@ -63,7 +63,7 @@ const App = {
       </div>
       <el-menu :default-active="store.view" class="menu" @select="go">
         <el-menu-item index="config">配置维护</el-menu-item>
-        <el-menu-item index="run">运行</el-menu-item>
+        <el-menu-item index="run">运行日志</el-menu-item>
         <el-menu-item index="results">运行结果</el-menu-item>
         <el-menu-item index="schedule">Schedule</el-menu-item>
         <el-menu-item index="api">API</el-menu-item>
