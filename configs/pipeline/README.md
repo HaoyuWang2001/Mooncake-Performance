@@ -9,7 +9,7 @@ writer 按 QPS 写入并通知随机 reader 子集，reader 消费读取。配�
 configs/pipeline/
 ├── _configs.json               # 根基座（全部 102 用例共用）
 ├── README.md
-├── demo/                       # 冒烟（--demo，自带全字段）
+├── demo/                       # 冒烟（--config-dir configs/pipeline/demo，自带全字段）
 ├── 1-nodes/                    # reader 侧 1 个节点
 │   ├── _configs.json           # writer/reader 骨架（client_nodes 按层）
 │   ├── rank/_configs.json      # work_mode=rank + base_qps=105 + data_size
@@ -134,8 +134,8 @@ reader 池 = count_per_node × 节点数 ≥ notify_count。每档跑 pulse/bala
 ## 运行方式
 
 ```bash
-python benchmark.py --scenario pipeline --all                      # 递归全部 102
-python benchmark.py --scenario pipeline --config-dir 2-nodes --recursive
-python benchmark.py --scenario pipeline --config-dir 2-nodes/rank  # 单层
-python benchmark.py --scenario pipeline --demo
+python benchmark.py --config-dir configs/pipeline                       # 递归全部（含 demo/）
+python benchmark.py --config-dir configs/pipeline/2-nodes               # 含子目录递归
+python benchmark.py --config-dir configs/pipeline/2-nodes/rank          # rank 层
+python benchmark.py --config-dir configs/pipeline/demo                  # 冒烟
 ```

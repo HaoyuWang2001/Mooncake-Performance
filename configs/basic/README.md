@@ -9,7 +9,7 @@
 configs/basic/
 ├── _configs.json      # 根基座：全部场景共用默认值（本层唯一公共默认）
 ├── README.md
-├── demo/              # 冒烟用例（--demo 运行，自带全字段，不依赖继承）
+├── demo/              # 冒烟用例（--config-dir configs/basic/demo 运行，自带全字段，不依赖继承）
 └── <operation>_<topo>.json ×18   # 正式场景，仅 3-4 字段
 ```
 

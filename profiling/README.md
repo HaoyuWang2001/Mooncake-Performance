@@ -8,7 +8,7 @@ benchmark 运行期间自动激活性能诊断工具（spdiag / perf / bpftrace�
 
 ```bash
 cp configs/matrix.example.json configs/matrix.json   # 编辑工具开关（已 gitignore）
-python benchmark.py --scenario pipeline --demo        # 自动读取 configs/matrix.json
+python benchmark.py --config-dir configs/pipeline/demo   # 自动读取 configs/matrix.json
 python benchmark.py ... --profile /path/to/matrix.json   # 显式指定矩阵
 # 手动异常值追踪（离线）
 python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--threshold-ms 1.0] [--window-ms 200]

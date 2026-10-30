@@ -5,11 +5,11 @@
     {
       "date": "2026-10-21",
       "time": "22:00",
-      "command": "python benchmark.py --scenario pipeline --demo",
+      "command": "python benchmark.py --config-dir configs/pipeline/demo",
       "output": "logs/night/pipeline_demo.log"
     },
     {
-      "command": "python benchmark.py --scenario basic --demo",
+      "command": "python benchmark.py --config-dir configs/basic/demo",
       "output": "logs/night/basic_demo.log"
     }
   ]

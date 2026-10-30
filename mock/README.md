@@ -47,7 +47,7 @@ cp -r mock/mooncake /tmp/opencode/mockvenv/lib/python3.*/site-packages/
 }
 ```
 
-此后 `python benchmark.py --scenario pipeline --demo` 等命令走**真实 ssh/scp + 真实客户端
+此后 `python benchmark.py --config-dir configs/pipeline/demo` 等命令走**真实 ssh/scp + 真实客户端
 代码**，仅 store 层使用本 mock。
 
 > 未来接入真实环境：把 `configs/cluster.json` 的 `venv` 换成安装了 mooncake SDK 的
@@ -82,10 +82,10 @@ rm -rf /tmp/mooncake_mock_store
 cp mock/cluster.example.json mock/cluster.json
 
 # 冒烟（各约 10-20 秒）
-python benchmark.py --scenario basic    --config mock/smoke/put.json     --cluster mock/cluster.json
-python benchmark.py --scenario basic    --config mock/smoke/get.json     --cluster mock/cluster.json
-python benchmark.py --scenario basic    --config mock/smoke/mixed.json   --cluster mock/cluster.json
-python benchmark.py --scenario pipeline --config mock/smoke/pipeline.json --cluster mock/cluster.json
+python benchmark.py --config mock/smoke/put.json      --cluster mock/cluster.json
+python benchmark.py --config mock/smoke/get.json      --cluster mock/cluster.json
+python benchmark.py --config mock/smoke/mixed.json    --cluster mock/cluster.json
+python benchmark.py --config mock/smoke/pipeline.json --cluster mock/cluster.json
 ```
 
 冒烟覆盖点：三阶段流程、duration/预热、多客户端 pids 台账（.state）、CSV、
