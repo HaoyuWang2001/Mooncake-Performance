@@ -1934,13 +1934,16 @@ def parse_arguments(argv=None):
                         help="profiling matrix json (default: configs/matrix.json "
                              "when present; no file -> profiling off)")
     parser.add_argument("--config", "-f", default=None,
-                        help="scenario config json, resolved as given (relative to CWD "
-                             "or absolute; NOT relative to configs/), e.g. "
+                        help="scenario config json(s), comma-separated multi values; "
+                             "resolved as given (relative to CWD or absolute; NOT "
+                             "relative to configs/), e.g. "
                              "configs/pipeline/demo/simple_recall.json or /path/to/cfg.json")
     parser.add_argument("--config-dir", default=None,
                         help="run every scenario config under this directory, "
                              "RECURSIVELY (e.g. configs/basic runs everything under it "
-                             "including demo/; _-prefixed fragments always skipped)")
+                             "including demo/; _-prefixed fragments always skipped); "
+                             "comma-separated multi values; config-dir entries run "
+                             "BEFORE --config files")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-plot", action="store_true",
@@ -1961,29 +1964,29 @@ def parse_arguments(argv=None):
                      args.cluster, example, os.path.join(CONFIGS_DIR, "cluster.json")))
     if not os.path.exists(args.global_cfg):
         sys.exit("[ERROR] global config not found: {}".format(args.global_cfg))
-    # exactly one selector among --config/--config-dir
-    selectors = sum(1 for x in (args.config, args.config_dir) if x)
-    if selectors > 1:
-        sys.exit("[ERROR] --config/--config-dir are mutually exclusive; pick one")
-    if not selectors and not args.clean_up:
-        sys.exit("[ERROR] provide --config or --config-dir, "
-                 "or --clean-up for a standalone cluster cleanup")
+    # selectors accept comma-separated multi values and MAY coexist:
+    # --config-dir entries are expanded (recursively) first, --config files
+    # follow in the given order
     cfg_paths = []
-    if args.config:
-        # --config is resolved verbatim (relative to CWD or absolute); it is
-        # NOT joined with CONFIGS_DIR, so arbitrary external config paths work.
-        if not os.path.exists(args.config):
-            sys.exit("[ERROR] config not found: {}".format(args.config))
-        cfg_paths = [args.config]
-    elif args.config_dir:
+    for d in [x.strip() for x in (args.config_dir or "").split(",") if x.strip()]:
         # --config-dir always scans recursively; "_"-prefixed shared-defaults
         # fragments are the only exclusion (demo/ is a plain directory and
         # is included like any other)
-        if not os.path.isdir(args.config_dir):
-            sys.exit("[ERROR] config dir not found: {}".format(args.config_dir))
-        cfg_paths = collect_config_files(args.config_dir)
-        if not cfg_paths:
-            sys.exit("[ERROR] no config json found under {}".format(args.config_dir))
+        if not os.path.isdir(d):
+            sys.exit("[ERROR] config dir not found: {}".format(d))
+        found = collect_config_files(d)
+        if not found:
+            sys.exit("[ERROR] no config json found under {}".format(d))
+        cfg_paths.extend(found)
+    for p in [x.strip() for x in (args.config or "").split(",") if x.strip()]:
+        # --config values are resolved verbatim (relative to CWD or absolute);
+        # they are NOT joined with CONFIGS_DIR, so external paths work
+        if not os.path.exists(p):
+            sys.exit("[ERROR] config not found: {}".format(p))
+        cfg_paths.append(p)
+    if not cfg_paths and not args.clean_up:
+        sys.exit("[ERROR] provide --config and/or --config-dir (comma-separated "
+                 "multi values allowed), or --clean-up for a standalone cluster cleanup")
     return args, cfg_paths
 
 
