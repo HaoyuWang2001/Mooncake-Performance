@@ -111,5 +111,39 @@ html, body, #app { height: 100%; margin: 0; }
   white-space: pre-wrap; max-height: 78vh; overflow: auto;
 }
 
+/* ---- spdiag 打点树 ---- */
+.sdtree { display: flex; flex-direction: column; height: 100%; min-height: 300px; }
+.sdtree-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.sdtree-meta { font-size: 12.5px; color: var(--el-text-color-secondary); }
+.sdtree-dim { color: var(--el-text-color-secondary); font-size: 12.5px; padding: 2px 0; }
+.sdtree-scroll { flex: 1; overflow: auto; border: 1px solid var(--el-border-color-lighter);
+                 border-radius: var(--el-border-radius-base); }
+.sdtree-canvas { padding: 14px; transform-origin: top left; width: max-content; min-width: 100%; }
+.sdtree-empty { padding: 30px; color: var(--el-text-color-secondary); }
+.sdtree-inv { margin-top: 10px; border-top: 1px dashed var(--el-border-color); }
+.mono { font-family: "Cascadia Mono", Consolas, monospace; }
+
+.sdt-box { border: 1px solid var(--el-border-color); border-radius: 8px;
+           padding: 8px 10px; background: var(--el-bg-color); margin: 4px 0; }
+.sdt-box.nodata { opacity: 0.55; }
+.sdt-title { display: flex; align-items: center; gap: 6px; cursor: pointer;
+             user-select: none; flex-wrap: wrap; }
+.sdt-arrow { width: 14px; color: var(--el-text-color-secondary); flex: none; }
+.sdt-nochild { text-align: center; }
+.sdt-name { font-weight: 600; font-size: 13px; }
+.sdt-order { font-size: 12px; color: var(--el-text-color-secondary); }
+.sdt-stats { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 4px;
+             font-size: 12px; color: var(--el-text-color-regular); }
+.sdt-stats b { color: var(--el-color-primary); font-weight: 600; }
+.sdt-res { margin-top: 4px; font-size: 12px; padding: 2px 8px; border-radius: 4px;
+           background: var(--el-color-success-light-9); color: var(--el-color-success);
+           display: inline-block; }
+.sdt-res.alert { background: var(--el-color-danger-light-9); color: var(--el-color-danger);
+                 font-weight: 600; }
+.sdt-glue { margin-top: 4px; font-size: 11.5px; color: var(--el-text-color-secondary); }
+.sdt-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: stretch; }
+.sdt-row .sdt-box { flex: 1 1 180px; margin: 0; }
+.sdt-stack { margin-top: 8px; }
+
 /* ---- 计划编辑 ---- */
 .plans-table { width: 100%; }

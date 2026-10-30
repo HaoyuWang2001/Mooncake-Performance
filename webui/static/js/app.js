@@ -131,4 +131,6 @@ app.component("run-view", RunView);
 app.component("results-view", ResultsView);
 app.component("schedule-view", ScheduleView);
 app.component("api-view", ApiView);
+app.component("spdiag-tree", SpdiagTree);
+app.component("sdt-node", SdtNode);
 app.mount("#app");

@@ -4,7 +4,8 @@
 
 function _fileGroup(rel) {
   const base = rel.split("/").pop().toLowerCase();
-  if (rel.startsWith("profiling/")) return "profiling";
+  if (/spdiag_tree\.[^.]+\.txt$/.test(base)) return "spdiag树";
+  if (rel.includes("/profiling/") || rel.startsWith("profiling/")) return "profiling";
   if (base.endsWith(".csv")) return "csv";
   if (base.endsWith(".png") || base.endsWith(".jpg") || base.endsWith(".gif")) return "图片";
   if (base.endsWith(".log") || base.endsWith(".txt")) return "日志";
@@ -60,6 +61,18 @@ const ResultsView = {
                 <el-option v-for="o in g.opts" :key="o" :label="o" :value="o"></el-option>
               </el-option-group>
             </el-select>
+            <el-radio-group v-if="kindOf(panes[0]) === 'tree'" v-model="panes[0].rawView" size="small">
+              <el-radio-button :value="false">树状图</el-radio-button>
+              <el-radio-button :value="true">源文件</el-radio-button>
+            </el-radio-group>
+            <el-dropdown v-if="treeShortcut(0).length" @command="f => { panes[0].file = f; }">
+              <el-button size="small" type="primary">查看树状图</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-for="f in treeShortcut(0)" :key="f" :command="f">{{ f }}</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </div>
           <div class="pane-body" v-loading="panes[0].loading">
             <div v-if="!panes[0].file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
@@ -71,6 +84,8 @@ const ResultsView = {
                                :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
             </el-table>
             <pre v-else-if="kindOf(panes[0]) === 'json'" class="json">{{ panes[0].text }}</pre>
+            <spdiag-tree v-else-if="kindOf(panes[0]) === 'tree' && !panes[0].rawView"
+                         :text="panes[0].text"></spdiag-tree>
             <pre v-else class="txt">{{ panes[0].text }}</pre>
           </div>
         </div>
@@ -89,6 +104,18 @@ const ResultsView = {
                 <el-option v-for="o in g.opts" :key="o" :label="o" :value="o"></el-option>
               </el-option-group>
             </el-select>
+            <el-radio-group v-if="kindOf(panes[1]) === 'tree'" v-model="panes[1].rawView" size="small">
+              <el-radio-button :value="false">树状图</el-radio-button>
+              <el-radio-button :value="true">源文件</el-radio-button>
+            </el-radio-group>
+            <el-dropdown v-if="treeShortcut(1).length" @command="f => { panes[1].file = f; }">
+              <el-button size="small" type="primary">查看树状图</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-for="f in treeShortcut(1)" :key="f" :command="f">{{ f }}</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </div>
           <div class="pane-body" v-loading="panes[1].loading">
             <div v-if="!panes[1].file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
@@ -100,6 +127,8 @@ const ResultsView = {
                                :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
             </el-table>
             <pre v-else-if="kindOf(panes[1]) === 'json'" class="json">{{ panes[1].text }}</pre>
+            <spdiag-tree v-else-if="kindOf(panes[1]) === 'tree' && !panes[1].rawView"
+                         :text="panes[1].text"></spdiag-tree>
             <pre v-else class="txt">{{ panes[1].text }}</pre>
           </div>
         </div>
@@ -114,7 +143,7 @@ const ResultsView = {
     const activePane = Vue.ref(0);
 
     function newPane() {
-      return { ts: "", files: [], file: "", loading: false,
+      return { ts: "", files: [], file: "", loading: false, rawView: false,
                rows: [], headers: [], text: "" };
     }
     const panes = Vue.reactive([newPane(), newPane()]);
@@ -131,17 +160,26 @@ const ResultsView = {
         const g = _fileGroup(f);
         (groups[g] = groups[g] || []).push(f);
       }
-      const order = ["csv", "图片", "日志", "json", "profiling", "其他"];
+      const order = ["csv", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
       return order.filter(g => groups[g]).map(g => ({ label: g, opts: groups[g] }));
     }
 
     function kindOf(p) {
       if (!p.file) return "none";
+      const base = p.file.split("/").pop().toLowerCase();
+      if (/spdiag_tree\.[^.]+\.txt$/.test(base)) return "tree";
       const g = _fileGroup(p.file);
       if (g === "图片") return "img";
       if (g === "csv") return "csv";
       if (g === "json") return "json";
       return "txt";
+    }
+
+    function treeShortcut(idx) {
+      // viewing the raw spdiag table -> jump to generated tree files
+      const base = (panes[idx].file || "").split("/").pop();
+      if (base !== "spdiag.show.txt") return [];
+      return panes[idx].files.filter(f => /spdiag_tree\.[^.]+\.txt$/.test(f.split("/").pop()));
     }
 
     function rawUrl(p) {
@@ -203,7 +241,11 @@ const ResultsView = {
           const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
           try { p.text = JSON.stringify(JSON.parse(r.content), null, 2); }
           catch (e) { p.text = r.content; }
-        } else if (kind === "txt") {
+        } else if (kind === "tree") {
+          // full text (tree files are small and the parser needs the whole file)
+          const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
+          p.text = r.content;
+        } else {
           const r = await api("GET", "/api/file?path=" + encodeURIComponent(path) + "&tail=131072");
           p.text = r.content;
         }
@@ -244,6 +286,6 @@ const ResultsView = {
     });
 
     return { runs, loading, compareMode, lockFile, activePane, panes,
-             isActivePaneTs, pickRun, groupedFiles, kindOf, rawUrl, loadRuns };
+             isActivePaneTs, pickRun, groupedFiles, kindOf, rawUrl, treeShortcut, loadRuns };
   },
 };
