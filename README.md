@@ -127,8 +127,9 @@ base_qps、data_size；recall 另含 notify_count/writer.notify_threads/reader.c
 5 字段；recall：traffic_mode/qps_multiple，2 字段）。numa_bind 属全局配置（global.json，
 默认 true，用例/层级可覆盖）。字段语义与可选值（writer/reader.operation、
 notify_pipeline 步骤）详见 configs/pipeline/README.md 的「配置总览」。
-`--config-dir` 指定某目录运行：用例已下沉到 rank|recall 层，指向 x-nodes 层需配 `--recursive`
-（如 `--config-dir 2-nodes --recursive`），或直接指向叶子目录（如 `--config-dir 2-nodes/rank`）。
+`--config-dir` 指定某目录运行（**恒递归**，含 demo/，仅排除 `_` 前缀碎片）：用例已下沉到
+rank|recall 层，直接指向叶子目录最精准（如 `--config-dir configs/pipeline/2-nodes/rank`），
+指向 x-nodes 层则会带上其全部子目录（如 `--config-dir configs/pipeline/2-nodes`）。
 
 **配置命名**：`{work_mode}_{traffic_mode}_1w{notify}r_{倍数}x_n{节点数}.json`
 （单 writer 家族中名字里的 `{notify}r` 即 notify_count 扇出数，非 reader 池大小；池 = cpn×节点数 ≥ notify_count）
@@ -190,11 +191,10 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **运行**：
 
 ```
-python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
-python benchmark.py --scenario pipeline --all     # 递归跑全部 pipeline 场景（跳 demo/ 与 _ 前缀）
-python benchmark.py --scenario pipeline --config-dir 2-nodes          # 跑 2-nodes 目录全部配置
-python benchmark.py --scenario pipeline --config-dir 4-nodes --recursive   # 含子目录递归
-python benchmark.py --scenario pipeline --demo    # 冒烟（demo 目录）
+python benchmark.py --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
+python benchmark.py --config-dir configs/pipeline        # 递归跑全部 pipeline 场景（含 demo/）
+python benchmark.py --config-dir configs/pipeline/2-nodes # 跑 2-nodes 目录全部配置（含子目录）
+python benchmark.py --config-dir configs/pipeline/demo    # 冒烟（demo 目录）
 ```
 
 ### 3.4 数据集
@@ -524,31 +524,29 @@ cp configs/global.example.json configs/global.json
 > `--config` 按给定路径**原样**解析（相对当前目录或绝对路径），不再默认拼接 `configs/` 前缀。
 
 ```
-# 运行 basic 类别下全部场景（自动跳过 _configs.json 公共默认）
-python benchmark.py --scenario basic --all
+# 运行 basic 类别下全部场景（恒递归，含 demo/；仅排除 _ 前缀碎片）
+python benchmark.py --config-dir configs/basic
 # 只运行 basic 类别下指定场景
-python benchmark.py --scenario basic --config configs/basic/get.json
+python benchmark.py --config configs/basic/get.json
 # 运行 demo 冒烟用例
-python benchmark.py --scenario basic --demo
-# 运行 pipeline 场景全部（递归收集 1/2/4-nodes 子目录，跳过 demo/ 与 _ 前缀）
-python benchmark.py --scenario pipeline --all
+python benchmark.py --config-dir configs/basic/demo
+# 运行 pipeline 场景全部（递归收集 1/2/4-nodes 子目录，含 demo/）
+python benchmark.py --config-dir configs/pipeline
 # 运行 pipeline 指定场景
-python benchmark.py --scenario pipeline --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
-# 运行 pipeline 指定目录下全部配置（按 reader 节点数分层的目录）
-python benchmark.py --scenario pipeline --config-dir 2-nodes
-# 目录递归（含其下所有子目录；demo/ 与 _ 前缀始终跳过）
-python benchmark.py --scenario pipeline --config-dir 4-nodes --recursive
+python benchmark.py --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
+# 运行 pipeline 指定目录下全部配置（按 reader 节点数分层的目录，恒递归）
+python benchmark.py --config-dir configs/pipeline/2-nodes
 # 指定集群/全局配置文件
 python benchmark.py --cluster configs/cluster.json --global configs/global.json \
-    --scenario basic --config configs/basic/put.json
+    --config configs/basic/put.json
 # 关闭预热；仅打印命令不执行
-python benchmark.py --scenario basic --config configs/basic/put.json --no-warmup --dry-run
+python benchmark.py --config configs/basic/put.json --no-warmup --dry-run
 # 覆盖传输协议（tcp/rdma/ub，优先级最高，覆盖 JSON 配置值）
-python benchmark.py --scenario basic --config configs/basic/put.json --protocol tcp
+python benchmark.py --config configs/basic/put.json --protocol tcp
 # 独立清理：删除 cluster.json 全部节点的远程测试目录
 python benchmark.py --clean-up
-# 运行并追加清理阶段（与 --all/--demo/--config/--config-dir 共现时）
-python benchmark.py --scenario basic --config configs/basic/get_local.json --clean-up
+# 运行并追加清理阶段（与 --config/--config-dir 共现时）
+python benchmark.py --config configs/basic/get_local.json --clean-up
 ```
 
 ## 9. 结果目录结构
@@ -609,7 +607,7 @@ python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
 
 ### 10.2.1 WebUI（webui/server.py，本地网页控制台 + HTTP API）
 
-零第三方依赖（stdlib）、双平台（Windows/Linux），在编排机上启动后即可通过网页或
+后端纯标准库（stdlib）、双平台（Windows/Linux），在编排机上启动后即可通过网页或
 HTTP API 完成"选配置 → 运行 → 看日志/结果/图 → 改配置 → 管计划"的全流程：
 
 ```bash
@@ -619,13 +617,19 @@ python webui/server.py --port 8080 --bind 0.0.0.0   # 开放局域网（无鉴�
 
 能力（详见 `webui/API.md`，`GET /api/help` 同样返回）：
 
-- **Run**：配置树选取（单文件/目录/类别/Demo）+ 运行参数（dry-run、no-warmup、
-  no-plot、protocol 覆盖、cluster 选择、profiling matrix 自动启用）→ 启动/停止；
-  编排器日志实时滚动（FAIL/ERROR 高亮），运行中即可点开已完成阶段的日志
-- **Results**：`outputs/<ts>` 浏览——benchmark_detail/各配置 CSV 表格、时延/排队
-  PNG 图廊、日志、profiling 产物（spdiag.show.txt 等）
-- **Configs**：在线编辑 configs/ 与 schedule/ 的 JSON（写入前自动校验——复用编排器
-  自身的场景配置校验与计划校验；自动备份到 `webui/backups/`）
+前端为 **vendored Vue3 + Element Plus**（`webui/static/vendor/`，约 1.8MB 入库，无构建步骤、
+离线集群可用），侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
+
+- **配置维护**：cluster/global/matrix 三张快捷卡片 + 全部配置文件的层级树；点击文件直接在线
+  编辑（写入前自动校验——复用编排器自身的场景配置校验；自动备份到 `webui/backups/`）；
+  点击文件或目录出现运行条（运行 N 个配置预览 + 参数面板：dry-run、no-warmup、no-plot、
+  protocol 覆盖、cluster 选择、profiling matrix 自动启用）→ 一键运行并跳转运行页
+- **运行**：仅观察——状态卡（id/状态/耗时/rc/产物目录）+ 停止按钮 + 编排器日志实时滚动
+  （FAIL/ERROR 高亮）+ 历史 runs 表格；运行完毕后手动点击「查看运行结果」跳转结果页
+- **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
+  并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
+  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（matrix 指标占位：
+  profiling/outliers.json）、文本 tail
 - **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
   再执行（scheduler 等待期允许手动发起 run，响应带 warning）
 - **并发规则**：单一执行槽——benchmark 或 scheduler 任务运行中新 run 请求返回 409
@@ -665,4 +669,4 @@ benchmark 运行期间自动激活诊断工具（spdiag / perf / bpftrace 调度
 - `generate-data` 阶段自动检测：每次运行前 ssh 检查 `value.bin` 的文件大小是否匹配当前 `data_size`，
   匹配则跳过 generate-data，避免重复生成浪费。种子变更或数据大小变更时自动触发重新生成；
 - `--clean-up` 参数：删除 cluster.json 中**全部节点**的远程测试目录（`rm -rf $MC_REMOTE_DIR`）。
-  独立使用（不带 --all/--demo/--config/--config-dir）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。
+  独立使用（不带 --config/--config-dir）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。

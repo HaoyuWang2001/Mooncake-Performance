@@ -1,6 +1,8 @@
 # Mooncake-Performance WebUI — HTTP API
 
 服务启动：`python webui/server.py [--port 8080] [--bind 127.0.0.1]`（`--bind 0.0.0.0` 开放局域网）。
+前端为 vendored **Vue3 + Element Plus**（`webui/static/vendor/`，约 1.8MB，无构建步骤、离线可用），
+页面与 API 使用同一套后端。
 所有 API 返回 JSON（`Content-Type: application/json`）；错误形如 `{"error": "..."}` 并带恰当 HTTP 状态码
 （400 参数错 / 403 路径越界 / 404 不存在 / 409 槽位占用 / 422 校验失败）。
 
@@ -55,10 +57,8 @@
 ```json
 {
   "selector": {
-    "type": "file | dir | all | demo",
-    "path": "configs/basic/put.json",     // file/dir 必填
-    "scenario": "basic",                  // dir/all/demo 必填；file 可自动推导
-    "recursive": false                    // 仅 dir
+    "type": "file | dir",
+    "path": "configs/basic/put.json"
   },
   "flags": {
     "dry_run": false, "no_warmup": false, "no_plot": false,
@@ -69,6 +69,8 @@
   }
 }
 ```
+selector 语义：`file` = 单文件（`-f`）；`dir` = 目录（`--config-dir`，**恒递归**，
+含 demo/，`_` 前缀碎片排除）。
 → `201` 意义上返回 `{"run":{"id":"r...","status":"running","cmd":"..."},"warnings":[]}`
 槽位被占 → `409 {"error":"benchmark run r... is still active ..."}`
 

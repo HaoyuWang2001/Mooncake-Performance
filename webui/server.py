@@ -206,18 +206,39 @@ def api_help(handler, query):
         return {"markdown": "API.md not found"}
 
 
+def _config_tree(base_dir, rel_prefix):
+    """Recursive config tree node: {name, path, dirs[], files[]}.
+    '_'-prefixed fragments are excluded (inheritance fragments, not
+    runnable); demo/ is a plain directory like any other."""
+    node = {"name": rel_prefix.rstrip("/").split("/")[-1],
+            "path": rel_prefix, "dirs": [], "files": []}
+    try:
+        entries = sorted(os.listdir(base_dir))
+    except OSError:
+        return node
+    for f in entries:
+        fp = os.path.join(base_dir, f)
+        if os.path.isdir(fp):
+            if f.startswith(".") or f == "__pycache__":
+                continue
+            node["dirs"].append(_config_tree(fp, rel_prefix + f + "/"))
+        elif f.endswith(".json") and not f.startswith("_"):
+            node["files"].append(rel_prefix + f)
+    return node
+
+
+def _tree_count(node):
+    return len(node["files"]) + sum(_tree_count(d) for d in node["dirs"])
+
+
 def api_configs(handler, query):
     out = {"categories": {}, "special": {}, "cluster_candidates": []}
     for cat in ("basic", "pipeline"):
         cdir = os.path.join(bm.CONFIGS_DIR, cat)
-        files = []
-        if os.path.isdir(cdir):
-            for p in bm.collect_config_files(cdir, recursive=True):
-                files.append(os.path.relpath(p, ROOT).replace("\\", "/"))
-        demo_dir = os.path.join(cdir, "demo")
+        tree = _config_tree(cdir, "configs/" + cat + "/") if os.path.isdir(cdir) else None
         out["categories"][cat] = {
-            "configs": files,
-            "has_demo": os.path.isdir(demo_dir),
+            "tree": tree,
+            "config_count": _tree_count(tree) if tree else 0,
         }
     for name in ("cluster.json", "global.json", "matrix.json"):
         p = os.path.join(bm.CONFIGS_DIR, name)
@@ -273,32 +294,21 @@ def _build_run_argv(body):
     sel = body.get("selector") or {}
     flags = body.get("flags") or {}
     typ = sel.get("type", "file")
+    path = sel.get("path", "")
+    full = os.path.join(ROOT, path)
     argv = []
-    scenario = sel.get("scenario")
     if typ == "file":
-        path = sel.get("path", "")
-        full = os.path.join(ROOT, path)
         if not os.path.isfile(full):
             raise ApiError(400, "config file not found: {}".format(path))
-        if not scenario:
-            scenario = path.replace("\\", "/").split("/")[0]
         argv += ["-f", path]
     elif typ == "dir":
-        path = sel.get("path", "")
-        full = os.path.join(ROOT, path)
+        # --config-dir always scans recursively (demo/ included,
+        # _-prefixed fragments skipped)
         if not os.path.isdir(full):
             raise ApiError(400, "config dir not found: {}".format(path))
-        if not scenario:
-            raise ApiError(400, "dir selector requires 'scenario'")
-        argv += ["--config-dir", path, "--scenario", scenario]
-        if sel.get("recursive"):
-            argv.append("--recursive")
-    elif typ in ("all", "demo"):
-        if not scenario:
-            raise ApiError(400, "{} selector requires 'scenario'".format(typ))
-        argv += ["--scenario", scenario, "--" + typ]
+        argv += ["--config-dir", path]
     else:
-        raise ApiError(400, "selector.type must be file|dir|all|demo")
+        raise ApiError(400, "selector.type must be file or dir")
     cluster = flags.get("cluster") or "configs/cluster.json"
     if not os.path.isfile(os.path.join(ROOT, cluster)):
         raise ApiError(400, "cluster config not found: {}".format(cluster))
@@ -612,14 +622,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_static(self, name):
-        full = os.path.join(STATIC_DIR, name)
-        if not os.path.isfile(full) or ".." in name:
+        # normalize: only relative subpaths of webui/static/ are served
+        name = (name or "").replace("\\", "/").lstrip("/")
+        full = os.path.realpath(os.path.join(STATIC_DIR, name))
+        inside = full.startswith(os.path.realpath(STATIC_DIR) + os.sep)
+        if not inside or not os.path.isfile(full):
             self._send_json({"error": "not found: " + name}, 404)
             return
-        ext = os.path.splitext(name)[1].lower()
+        ext = os.path.splitext(full)[1].lower()
         ctype = {".html": "text/html; charset=utf-8",
                  ".js": "application/javascript; charset=utf-8",
-                 ".css": "text/css; charset=utf-8"}.get(ext, "application/octet-stream")
+                 ".mjs": "application/javascript; charset=utf-8",
+                 ".css": "text/css; charset=utf-8",
+                 ".json": "application/json; charset=utf-8",
+                 ".map": "application/json; charset=utf-8",
+                 ".svg": "image/svg+xml",
+                 ".png": "image/png",
+                 ".woff2": "font/woff2"}.get(ext, "application/octet-stream")
         with open(full, "rb") as f:
             self._send_raw(f.read(), ctype)
 
