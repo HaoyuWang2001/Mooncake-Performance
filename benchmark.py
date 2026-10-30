@@ -197,13 +197,14 @@ def scenario_paths(globals_cfg, ts, cfg_name):
             remote_runner_basic, remote_runner_pipeline, local_log_dir)
 
 
-def remote_profiling_dir(remote_log_dir):
-    """POSIX join for the remote profiling dir. os.path.join MUST NOT be
-    used on remote paths: running the orchestrator on Windows inserts a
-    backslash (logs\\profiling), which bash escapes into a literal
-    'logsprofiling' while scp (SFTP) looks for a literal backslash name —
-    every artifact then fails to collect."""
-    return "{}/profiling".format(remote_log_dir)
+def remote_profiling_dir(remote_log_dir, cfg_name):
+    """POSIX join for the remote per-config profiling dir. os.path.join MUST
+    NOT be used on remote paths: running the orchestrator on Windows inserts
+    a backslash, which bash escapes into a literal 'logsprofiling' while scp
+    (SFTP) looks for a literal backslash name. The <cfg_name> subdirectory
+    isolates each config's profiling artifacts so multi-config runs never
+    overwrite each other."""
+    return "{}/profiling/{}".format(remote_log_dir, cfg_name)
 
 
 def resolve_venv(cluster, globals_cfg):
@@ -999,7 +1000,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             try:
                 profile_sess = prof_core.start_profiling(
                     cluster, matrix, involved_nodes, cfg_name,
-                    remote_profiling_dir(remote_log_dir))
+                    remote_profiling_dir(remote_log_dir, cfg_name))
             except Exception as exc:
                 log("[WARN] [profile] start failed: {}".format(exc))
         current_ds = None
@@ -1082,7 +1083,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
-                                       os.path.join(RESULTS_DIR, ts, "profiling"))
+                                       os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -1095,7 +1096,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             reap_state_entries(cluster)
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(RESULTS_DIR, ts, "profiling"))
+                                           os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
         raise
 
 
@@ -1291,7 +1292,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     try:
                         profile_sess = prof_core.start_profiling(
                             cluster, matrix, involved_nodes, cfg_name,
-                            remote_profiling_dir(remote_log_dir))
+                            remote_profiling_dir(remote_log_dir, cfg_name))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
             # Step 1: start all readers (one process per reader, unique port and id)
@@ -1357,7 +1358,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 try:
                     profile_sess = prof_core.start_profiling(
                         cluster, matrix, involved_nodes, cfg_name,
-                        remote_profiling_dir(remote_log_dir))
+                        remote_profiling_dir(remote_log_dir, cfg_name))
                 except Exception as exc:
                     log("[WARN] [profile] start failed: {}".format(exc))
             for w in plan["writers"]:
@@ -1452,7 +1453,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
-                                       os.path.join(RESULTS_DIR, ts, "profiling"))
+                                       os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -1467,7 +1468,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             reap_state_entries(cluster)
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(RESULTS_DIR, ts, "profiling"))
+                                           os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
         raise
 
 
@@ -1996,7 +1997,10 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
     window_ms = float(out_cfg.get("window_ms", 200))
     logs_dir = os.path.join(ts_dir, "logs", cfg_name)
     outliers = prof_core.extract_outliers(logs_dir, threshold)
+    # run-level ledger lives at <ts>/profiling/; the artifacts it slices are
+    # per-config at <ts>/logs/<cfg>/profiling/ (multi-config isolation)
     prof_dir = os.path.join(ts_dir, "profiling")
+    slice_dir = os.path.join(ts_dir, "logs", cfg_name, "profiling")
     os.makedirs(prof_dir, exist_ok=True)
     # append per-config entries to the run-level outlier ledger
     ledger = os.path.join(prof_dir, "outliers.json")
@@ -2015,12 +2019,12 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
     log("[profile] outliers(>{:g}ms) for {}: {}".format(threshold, cfg_name, len(outliers)))
     # time-window slices around the top outliers (text artifacts only;
     # perf.data precise slicing is done node-side with perf script --time)
-    if outliers and os.path.isdir(prof_dir):
+    if outliers and os.path.isdir(slice_dir):
         lines = []
         for o in outliers[:10]:
             lines.append("===== {} cfg={} lat={:.3f}ms key={} =====".format(
                 o["ts"], cfg_name, o["lat_ms"], o["key"]))
-            slices = prof_core.slice_window(prof_dir, o["seconds"], window_ms)
+            slices = prof_core.slice_window(slice_dir, o["seconds"], window_ms)
             for fname, slines in slices.items():
                 lines.append("  --- {} ({} lines) ---".format(fname, len(slines)))
                 lines.extend("    " + l for l in slines[:20])

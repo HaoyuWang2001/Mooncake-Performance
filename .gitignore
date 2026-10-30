@@ -13,6 +13,7 @@ configs/*
 !configs/matrix.example.json
 !configs/basic
 !configs/pipeline
+!configs/_spdiag_trees
 
 示例.xlsx
 

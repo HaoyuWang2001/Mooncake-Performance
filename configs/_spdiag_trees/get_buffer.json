@@ -1,0 +1,139 @@
+{
+  "interface": "get_buffer",
+  "root": {
+    "point": "GetBufferInternal",
+    "module": "real_client.cpp::get_buffer",
+    "level": 2,
+    "kind": "root",
+    "children": [
+      {
+        "point": "Query",
+        "module": "real_client.cpp::get_buffer_internal",
+        "level": 3,
+        "kind": "phase",
+        "order": 1,
+        "children": [
+          {
+            "point": "QueryRpcTotal",
+            "module": "master_client.cpp::Query",
+            "level": 3,
+            "kind": "nested",
+            "children": [
+              {
+                "point": "QueryRouteSwitch",
+                "module": "master_client.cpp::Query",
+                "level": 3,
+                "kind": "leaf",
+                "order": 1,
+                "children": []
+              },
+              {
+                "point": "QueryRpcCall",
+                "module": "master_client.cpp::Query",
+                "level": 3,
+                "kind": "leaf",
+                "order": 2,
+                "children": []
+              }
+            ]
+          }
+        ],
+        "glue_note": "Query ≈ QueryRpcTotal + Client::Query 外层开销(重路由检查/QueryResult构造, 无独立打点)"
+      },
+      {
+        "point": "SelectReplica",
+        "module": "real_client.cpp::get_buffer_internal",
+        "level": 3,
+        "kind": "phase",
+        "order": 2,
+        "children": []
+      },
+      {
+        "point": "AllocBuffer",
+        "module": "real_client.cpp::get_buffer_internal",
+        "level": 3,
+        "kind": "phase",
+        "order": 3,
+        "children": []
+      },
+      {
+        "point": "MemRead",
+        "module": "real_client.cpp::get_buffer_internal",
+        "level": 3,
+        "kind": "phase",
+        "order": 4,
+        "children": [
+          {
+            "point": "TransferGet",
+            "module": "client_service.cpp::Get",
+            "level": 2,
+            "kind": "nested",
+            "children": [
+              {
+                "point": "TransferRead",
+                "module": "client_service.cpp::Get",
+                "level": 2,
+                "kind": "nested",
+                "children": [
+                  {
+                    "point": "TransferData[G]",
+                    "module": "client_service.cpp::TransferData",
+                    "level": 2,
+                    "kind": "nested",
+                    "children": [
+                      {
+                        "point": "Submit[G]",
+                        "module": "client_service.cpp::TransferData",
+                        "level": 3,
+                        "kind": "leaf",
+                        "order": 1,
+                        "children": []
+                      },
+                      {
+                        "point": "Wait[G]",
+                        "module": "client_service.cpp::TransferData",
+                        "level": 3,
+                        "kind": "leaf",
+                        "order": 2,
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "glue_note": "MemRead ≈ TransferGet + 外层glue(~0.2µs)"
+      }
+    ],
+    "glue_note": "GetBufferInternal ≈ Query + SelectReplica + AllocBuffer + MemRead"
+  },
+  "invariants": [
+    "Query.avg_ns ≈ QueryRpcTotal.avg_ns + glue(重路由检查/QueryResult构造)",
+    "QueryRpcTotal.avg_ns ≈ QueryRouteSwitch.avg_ns + QueryRpcCall.avg_ns + glue(重试路径, 稳态≈0)",
+    "MemRead.avg_ns ≈ TransferGet.avg_ns + glue(≈0.2µs)",
+    "TransferGet ≈ TransferRead ≈ TransferData[G] (单链嵌套, 差值为各层glue)",
+    "TransferData[G].avg_ns ≈ Submit[G].avg_ns + Wait[G].avg_ns + glue(≈0.1µs)",
+    "GetBufferInternal.avg_ns ≈ Σ(四个phase).avg_ns"
+  ],
+  "semantics": {
+    "kind": {
+      "root": "接口顶层计时",
+      "phase": "顺序兄弟段(按order在父内依次执行)",
+      "nested": "嵌套容器(子节点时间包含在父计时内)",
+      "leaf": "末端计量段, 无子打点"
+    },
+    "order": "同一父内phase/leaf的执行顺序",
+    "glue_note": "父与子打点之间的未计量代码开销说明(无独立打点, 对账时为差值)"
+  },
+  "cross_reference": {
+    "trace_logs": {
+      "QueryRpcTotal": "query_rpc_breakdown.total_us",
+      "QueryRouteSwitch": "query_rpc_breakdown.switch_us",
+      "QueryRpcCall": "query_rpc_breakdown.rpc_first_us (≈ master_rpc_client_breakdown.rpc_call_us)",
+      "root": "get_breakdown.total_us"
+    },
+    "workflow": "统计树(Avg/P999)异常节点 → 按trace_id检索 query_rpc_breakdown/master_rpc_client_breakdown → 定位单请求通信段"
+  }
+}

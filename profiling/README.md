@@ -38,7 +38,7 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
   → 采样进程 nohup 后台，**pid 记入 `.state` 台账**（崩溃后可清；marker 记录预期
   cmdline 防误杀）
 - **结束**（成功/失败都执行）：SIGINT 停采样（perf 优雅落盘）→ `spdiag show` →
-  scp 收集至 `outputs/<ts>/profiling/<节点>/` → 清台账
+  scp 收集至 `outputs/<ts>/logs/<配置名>/profiling/<节点>/`（spdiag 表同时生成文本打点树）→ 清台账
 - **异常值自动报告**：run 结束提取 RESULT 行 > `outliers.threshold_ms` →
   `profiling/outliers.json`（时刻/key/时延/节点）+ `outliers.slices.txt`
   （每异常 ±`window_ms` 时间窗内各数据源的行切片）
@@ -52,11 +52,19 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 ## 输出结构
 
 ```
-outputs/<ts>/profiling/
-├── outliers.json           # 全 run 异常值台账（按配置分组）
-├── outliers.slices.txt     # top-10 异常的时间窗切片
-└── <节点>/
-    ├── spdiag.show.txt
-    ├── perf.data
-    └── runqlat.out / offcputime.out
+outputs/<ts>/
+├── profiling/                          # run 级异常值台账（跨配置聚合）
+│   ├── outliers.json
+│   └── outliers.slices.txt
+└── logs/<配置名>/profiling/            # 每配置独立（多配置 run 互不覆盖）
+    └── <节点>/
+        ├── spdiag.show.txt
+        ├── spdiag_tree.<接口>.txt      # 自动生成的文本打点树（树定义 configs/_spdiag_trees/）
+        ├── perf.data / perf.data.err
+        └── runqlat.out / offcputime.out
 ```
+
+spdiag_tree.<接口>.txt：按 `configs/_spdiag_trees/*.json` 的 (point, module) 挂载
+Avg/P999/P9999/Max/Ticks，自动计算残差（`|r|>1µs 且 >2%·parent.avg → ALERT`），
+带树形符号可直接阅读；WebUI「运行结果」页渲染为可折叠/缩放树状图。
+手动重生成：`python profiling/spdiag_tree.py --spdiag <表文件> --tree <树定义.json>`。

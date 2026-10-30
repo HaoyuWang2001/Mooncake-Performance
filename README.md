@@ -555,6 +555,9 @@ python benchmark.py --config configs/basic/get_local.json --clean-up
 outputs/<时间戳，如 20261010-1308>/
 ├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 为双 Schema 40 列）
 ├── benchmark_detail.csv        # 全部用例汇总（pipeline 仅 writer/reader TOTAL 行）
+├── profiling/                  # run 级异常值台账（跨配置聚合）
+│   ├── outliers.json
+│   └── outliers.slices.txt
 └── logs/
     ├── final.remove-keys.log   # 场景结束兜底 remove-all 日志（最后一个成功配置节点）
     └── <配置名>/               # 每个配置一个子目录
@@ -562,6 +565,10 @@ outputs/<时间戳，如 20261010-1308>/
         ├── <配置名>.prepare-store.log
         ├── <配置名>.remove-keys.log
         ├── <配置名>.benchmark_c{clients}_t{threads}.log
+        ├── profiling/<节点>/   # 该配置的 profiling 产物（多配置 run 互不覆盖）
+        │   ├── spdiag.show.txt
+        │   ├── spdiag_tree.<接口>.txt   # 自动生成的文本打点树（见 10.4）
+        │   └── perf.data / *.out ...
         └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port}.log / .writer{gid}.log ...
             （脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
 ```
@@ -652,10 +659,23 @@ benchmark 运行期间自动激活诊断工具（spdiag / perf / bpftrace 调度
 收集采样并生成异常值追踪。`configs/matrix.json`（模板 `configs/matrix.example.json`，
 已 gitignore）控制各工具 enabled 开关；`--profile <路径>` 显式指定；未配置则完全关闭。
 诊断进程纳入 `.state` 台账，崩溃后可清理；诊断故障仅 `[WARN]` 不影响测试结果。
-产出：`outputs/<ts>/profiling/<节点>/{spdiag.show.txt, perf.data, runqlat.out}` +
-自动异常值清单（RESULT > threshold）与时间窗切片；手动追踪
+产出：`outputs/<ts>/logs/<配置名>/profiling/<节点>/{spdiag.show.txt, perf.data, runqlat.out}`（**按配置隔离**，多配置 run 互不覆盖）+
+run 级异常值台账 `outputs/<ts>/profiling/outliers.json` 与时间窗切片；手动追踪
 `python profiling/profiling.py --trace outputs/<ts> --at HH:MM:SS.micro`。
 详见 `profiling/README.md`。
+
+### 10.4 spdiag 打点树（profiling/spdiag_tree.py + configs/_spdiag_trees/）
+
+运行结束后自动把收集到的 spdiag 表按**接口打点树定义**（`configs/_spdiag_trees/*.json`，
+如 `get_buffer.json`）挂载统计并生成**文本树**：`outputs/<ts>/logs/<配置名>/profiling/<节点>/spdiag_tree.<接口>.txt`。
+
+- 树定义：`root{point, module, kind(root|phase|nested|leaf), order, children, glue_note}`，
+  以 `(point, module)` 精确匹配 spdiag 输出行；新增接口 = 放一个新 JSON 文件
+- 对账：`residual = parent.avg − Σ(子节点 avg)` 自动计算并附在树内（父与全部子节点
+  有数据才对账）；`|r| > 1µs 且 > 2%·parent.avg → ALERT`（打点缺失/嵌套关系变更信号）
+- 文本树带树形符号（`├─ └─`），可直接 cat 阅读；WebUI「运行结果」页选择该文件即渲染
+  为可折叠/缩放的树状图（nested=包含盒、phase 横向按 order、nodata 半透明、残差 chip）
+- 手动重生成：`python profiling/spdiag_tree.py --spdiag spdiag.show.txt --tree configs/_spdiag_trees/get_buffer.json [-o out.txt]`
 
 ## 11. 注意事项与待验证项
 

@@ -29,7 +29,14 @@ if __package__ in (None, ""):
 
 from utils import get_node, log, scp_pull, scp_push, ssh_check_output  # noqa: E402
 
+try:
+    import spdiag_tree as spdiag_tree_mod
+except ImportError:  # spdiag_tree.py missing -> text-tree generation off
+    spdiag_tree_mod = None
+
 BT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bt")
+SPDIAG_TREES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "configs", "_spdiag_trees")
 
 TOOL_DEFAULTS = {
     "spdiag": {"enabled": False, "bin": "spdiag", "sudo": False},
@@ -255,6 +262,17 @@ def stop_and_collect(cluster, session, local_prof_dir):
                     log("[profile] collected {}/{}".format(node_name, fname))
                 except Exception as exc:
                     log("[WARN] [profile] collect {}/{}: {}".format(node_name, fname, exc))
+            # text-tree generation from the collected spdiag table: every
+            # interface tree under configs/_spdiag_trees/ whose root point
+            # matches gets a spdiag_tree.<interface>.txt next to it
+            if spdiag_tree_mod is not None and "spdiag.show.txt" in collected:
+                try:
+                    for tree_file in spdiag_tree_mod.generate_trees(
+                            os.path.join(node_local, "spdiag.show.txt"),
+                            SPDIAG_TREES_DIR, node_local, node_name):
+                        log("[profile] spdiag tree {}/{}".format(node_name, tree_file))
+                except Exception as exc:
+                    log("[WARN] [profile] spdiag tree on {}: {}".format(node_name, exc))
             bm.state_remove([{"ip": ip, "pid": p} for p in tools.values() if p])
     except Exception as exc:
         log("[WARN] [profile] stop_and_collect: {}".format(exc))
