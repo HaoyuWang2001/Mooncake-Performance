@@ -45,6 +45,49 @@ function toggleDark() {
   applyTheme();
 }
 
+/* ---------------- 高度持久化（拖拽手柄用） ---------------- */
+function loadHeight(key, def) {
+  const v = parseInt(localStorage.getItem(key), 10);
+  return Number.isFinite(v) && v > 0 ? v : def;
+}
+function saveHeight(key, h) {
+  try { localStorage.setItem(key, String(Math.round(h))); } catch (e) { /* ignore */ }
+}
+
+/* ---------------- 通用垂直拖拽手柄 ---------------- */
+const DragHandle = {
+  name: "DragHandle",
+  props: { height: { type: Number, required: true },
+           min: { type: Number, default: 200 },
+           max: { type: Number, default: 1600 },
+           persist: { type: String, default: "" } },
+  emits: ["update:height"],
+  template: `<div class="vdrag" title="拖动调节高度" @mousedown="down"><span></span></div>`,
+  setup(props, { emit }) {
+    const down = (e) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startH = props.height;
+      const move = (ev) => {
+        const h = Math.min(props.max, Math.max(props.min, startH + (ev.clientY - startY)));
+        emit("update:height", h);
+        if (props.persist) saveHeight(props.persist, h);
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      document.body.style.cursor = "row-resize";
+      document.body.style.userSelect = "none";
+    };
+    return { down };
+  },
+};
+
 /* ---------------- 根组件 ---------------- */
 const App = {
   template: `
@@ -134,4 +177,5 @@ app.component("schedule-view", ScheduleView);
 app.component("api-view", ApiView);
 app.component("spdiag-tree", SpdiagTree);
 app.component("sdt-node", SdtNode);
+app.component("drag-handle", DragHandle);
 app.mount("#app");

@@ -74,7 +74,7 @@ const ResultsView = {
               </template>
             </el-dropdown>
           </div>
-          <div class="pane-body" v-loading="panes[0].loading">
+          <div class="pane-body" v-loading="panes[0].loading" :style="{ height: panes[0].h + 'px' }">
             <div v-if="!panes[0].file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
             <img v-else-if="kindOf(panes[0]) === 'img'"
                  :src="rawUrl(panes[0])">
@@ -88,6 +88,7 @@ const ResultsView = {
                          :text="panes[0].text"></spdiag-tree>
             <pre v-else class="txt">{{ panes[0].text }}</pre>
           </div>
+          <drag-handle v-model="panes[0].h" :min="200" :max="1000" persist="mcweb-res-h0"></drag-handle>
         </div>
 
         <div class="pane" v-if="compareMode" :class="{ focus: activePane === 1 }"
@@ -117,7 +118,7 @@ const ResultsView = {
               </template>
             </el-dropdown>
           </div>
-          <div class="pane-body" v-loading="panes[1].loading">
+          <div class="pane-body" v-loading="panes[1].loading" :style="{ height: panes[1].h + 'px' }">
             <div v-if="!panes[1].file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
             <img v-else-if="kindOf(panes[1]) === 'img'"
                  :src="rawUrl(panes[1])">
@@ -131,6 +132,7 @@ const ResultsView = {
                          :text="panes[1].text"></spdiag-tree>
             <pre v-else class="txt">{{ panes[1].text }}</pre>
           </div>
+          <drag-handle v-model="panes[1].h" :min="200" :max="1000" persist="mcweb-res-h1"></drag-handle>
         </div>
       </el-col>
     </el-row>
@@ -142,11 +144,12 @@ const ResultsView = {
     const lockFile = Vue.ref(true);
     const activePane = Vue.ref(0);
 
-    function newPane() {
+    function newPane(idx) {
       return { ts: "", files: [], file: "", loading: false, rawView: false,
-               rows: [], headers: [], text: "" };
+               rows: [], headers: [], text: "",
+               h: loadHeight("mcweb-res-h" + idx, 420) };
     }
-    const panes = Vue.reactive([newPane(), newPane()]);
+    const panes = Vue.reactive([newPane(0), newPane(1)]);
 
     function isActivePaneTs(ts) {
       return panes[activePane.value] && panes[activePane.value].ts === ts;

@@ -33,9 +33,10 @@ const RunView = {
 
     <el-card shadow="never" style="margin-bottom: 14px">
       <template #header><b>日志</b></template>
-      <div class="logview log-lg" ref="logEl">
+      <div class="logview log-lg" ref="logEl" :style="{ height: logH + 'px' }">
         <div v-for="(ln, i) in logLines" :key="i" :class="ln.cls">{{ ln.text }}</div>
       </div>
+      <drag-handle v-model="logH" :min="200" :max="1600" persist="mcweb-log-h"></drag-handle>
     </el-card>
 
     <el-card shadow="never">
@@ -64,6 +65,7 @@ const RunView = {
     const logEl = Vue.ref(null);
     const runs = Vue.ref([]);
     const stopping = Vue.ref(false);
+    const logH = Vue.ref(loadHeight("mcweb-log-h", 460));
 
     function statusType(s) {
       return { running: "primary", done: "success", failed: "danger",
@@ -153,6 +155,6 @@ const RunView = {
     });
     Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
-    return { meta, logLines, logEl, runs, stopping, statusType, stop, gotoResults, onHistoryClick };
+    return { meta, logLines, logEl, runs, stopping, logH, statusType, stop, gotoResults, onHistoryClick };
   },
 };
