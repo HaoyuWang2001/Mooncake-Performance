@@ -21,3 +21,6 @@ schedule/plan.json
 .state
 
 mock/cluster.json
+
+webui/runs/
+webui/backups/

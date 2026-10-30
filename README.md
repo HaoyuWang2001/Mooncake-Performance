@@ -607,6 +607,30 @@ python run_schedule.py --plan plan.json
 python run_schedule.py --plan plan.json --dry-run   # 白天核对执行计划
 ```
 
+### 10.2.1 WebUI（webui/server.py，本地网页控制台 + HTTP API）
+
+零第三方依赖（stdlib）、双平台（Windows/Linux），在编排机上启动后即可通过网页或
+HTTP API 完成"选配置 → 运行 → 看日志/结果/图 → 改配置 → 管计划"的全流程：
+
+```bash
+python webui/server.py                       # http://127.0.0.1:8080
+python webui/server.py --port 8080 --bind 0.0.0.0   # 开放局域网（无鉴权，内网用）
+```
+
+能力（详见 `webui/API.md`，`GET /api/help` 同样返回）：
+
+- **Run**：配置树选取（单文件/目录/类别/Demo）+ 运行参数（dry-run、no-warmup、
+  no-plot、protocol 覆盖、cluster 选择、profiling matrix 自动启用）→ 启动/停止；
+  编排器日志实时滚动（FAIL/ERROR 高亮），运行中即可点开已完成阶段的日志
+- **Results**：`outputs/<ts>` 浏览——benchmark_detail/各配置 CSV 表格、时延/排队
+  PNG 图廊、日志、profiling 产物（spdiag.show.txt 等）
+- **Configs**：在线编辑 configs/ 与 schedule/ 的 JSON（写入前自动校验——复用编排器
+  自身的场景配置校验与计划校验；自动备份到 `webui/backups/`）
+- **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
+  再执行（scheduler 等待期允许手动发起 run，响应带 warning）
+- **并发规则**：单一执行槽——benchmark 或 scheduler 任务运行中新 run 请求返回 409
+- 运行历史与日志持久化于 `webui/runs/`（gitignore）
+
 触发模型（混合）：任务显式带 `date`+`time` 则睡到该时刻（已过点立即执行）；
 省略时刻则链式（上一条完成 + `wait_seconds`）。失败按 `on_fail`（continue/abort）。
 输出文件带 `===== 起止/rc/耗时 =====` 分隔头，多次运行追加不丢历史。

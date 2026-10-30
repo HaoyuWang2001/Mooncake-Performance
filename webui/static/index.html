@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Mooncake-Performance WebUI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">Mooncake<span>-Performance</span></div>
+  <div class="badges">
+    <span id="badge-run" class="badge idle" title="benchmark 槽位">run: idle</span>
+    <span id="badge-sch" class="badge idle" title="scheduler 状态">scheduler: off</span>
+  </div>
+  <nav id="tabs">
+    <button data-tab="run" class="active">Run</button>
+    <button data-tab="results">Results</button>
+    <button data-tab="configs">Configs</button>
+    <button data-tab="schedule">Schedule</button>
+    <button data-tab="api">API</button>
+  </nav>
+</header>
+
+<!-- ================================ RUN ================================ -->
+<section id="tab-run" class="tab active">
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>选择配置</h3>
+        <div class="selmode">
+          <label><input type="radio" name="selmode" value="file" checked> 单文件</label>
+          <label><input type="radio" name="selmode" value="dir"> 目录</label>
+          <label><input type="radio" name="selmode" value="all"> 类别全部</label>
+          <label><input type="radio" name="selmode" value="demo"> Demo</label>
+        </div>
+        <div id="cfg-tree" class="tree"></div>
+      </div>
+      <div class="card">
+        <h3>运行参数</h3>
+        <div class="flags">
+          <label><input type="checkbox" id="f-dry"> dry-run</label>
+          <label><input type="checkbox" id="f-nowarmup"> no-warmup</label>
+          <label><input type="checkbox" id="f-noplot"> no-plot</label>
+        </div>
+        <div class="flagrow">
+          <span>protocol</span>
+          <select id="f-protocol">
+            <option value="">(配置值)</option>
+            <option>tcp</option><option>rdma</option><option>ub</option>
+          </select>
+        </div>
+        <div class="flagrow">
+          <span>cluster</span>
+          <select id="f-cluster"></select>
+        </div>
+        <div class="flagrow">
+          <span>profile</span>
+          <select id="f-profile"><option value="auto">auto</option></select>
+          <em id="matrix-hint" class="hint"></em>
+        </div>
+        <button id="btn-start" class="primary">启动 Run</button>
+        <div id="run-warn" class="warnbox hidden"></div>
+      </div>
+    </div>
+    <div class="col wide">
+      <div class="card">
+        <h3>当前 Run <span id="run-status" class="status"></span></h3>
+        <div class="runbar">
+          <span id="run-meta" class="meta"></span>
+          <span class="spacer"></span>
+          <button id="btn-goto-results" class="hidden">查看产物</button>
+          <button id="btn-stop" class="danger hidden">停止</button>
+        </div>
+        <div id="log-view" class="logview"></div>
+      </div>
+      <div class="card">
+        <h3>历史 Runs</h3>
+        <table id="runs-table" class="tbl">
+          <thead><tr><th>id</th><th>状态</th><th>rc</th><th>耗时</th><th>命令</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== RESULTS ============================== -->
+<section id="tab-results" class="tab">
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>输出 runs</h3>
+        <div id="outputs-list"></div>
+      </div>
+    </div>
+    <div class="col wide">
+      <div class="card">
+        <h3 id="out-title">Run 详情</h3>
+        <div id="out-files" class="filelist"></div>
+      </div>
+      <div class="card">
+        <div id="out-viewer"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== CONFIGS ============================== -->
+<section id="tab-configs" class="tab">
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>配置文件</h3>
+        <div id="cfg-tree2" class="tree"></div>
+      </div>
+    </div>
+    <div class="col wide">
+      <div class="card">
+        <h3 id="cfg-edit-title">编辑器</h3>
+        <textarea id="cfg-editor" spellcheck="false" placeholder="选择左侧配置文件"></textarea>
+        <div class="editbar">
+          <button id="btn-validate">校验</button>
+          <button id="btn-save" class="primary">保存</button>
+          <span id="cfg-msg" class="msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== SCHEDULE ============================= -->
+<section id="tab-schedule" class="tab">
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>计划列表</h3>
+        <div id="plans-list"></div>
+        <div class="editbar">
+          <input id="new-plan-name" placeholder="新计划名 xxx.json">
+          <button id="btn-new-plan">新建</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Scheduler</h3>
+        <div id="sch-state" class="meta">off</div>
+        <div class="editbar">
+          <button id="btn-sch-start" class="primary">启动 Scheduler</button>
+          <button id="btn-sch-stop" class="danger">停止</button>
+        </div>
+        <div id="sch-events" class="logview small"></div>
+      </div>
+    </div>
+    <div class="col wide">
+      <div class="card">
+        <h3 id="plan-edit-title">计划编辑器</h3>
+        <textarea id="plan-editor" spellcheck="false" placeholder="选择或新建计划"></textarea>
+        <div class="editbar">
+          <button id="btn-plan-validate">校验</button>
+          <button id="btn-plan-save" class="primary">保存计划</button>
+          <span id="plan-msg" class="msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================ API ================================ -->
+<section id="tab-api" class="tab">
+  <div class="card">
+    <h3>HTTP API 文档</h3>
+    <pre id="api-doc" class="apidoc"></pre>
+  </div>
+</section>
+
+<footer>Mooncake-Performance WebUI · <span id="foot-info"></span></footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
