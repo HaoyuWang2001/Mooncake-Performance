@@ -530,12 +530,8 @@ python benchmark.py --config-dir configs/basic
 python benchmark.py --config configs/basic/get.json
 # 运行 demo 冒烟用例
 python benchmark.py --config-dir configs/basic/demo
-# 运行 pipeline 场景全部（递归收集 1/2/4-nodes 子目录，含 demo/）
-python benchmark.py --config-dir configs/pipeline
-# 运行 pipeline 指定场景
-python benchmark.py --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
-# 运行 pipeline 指定目录下全部配置（按 reader 节点数分层的目录，恒递归）
-python benchmark.py --config-dir configs/pipeline/2-nodes
+# 多值：逗号分隔多个目录/文件，两者可并存（--config-dir 展开在前，--config 文件在后）
+python benchmark.py --config-dir configs/basic/demo,configs/pipeline/demo --config configs/basic/get.json
 # 指定集群/全局配置文件
 python benchmark.py --cluster configs/cluster.json --global configs/global.json \
     --config configs/basic/put.json
@@ -627,10 +623,13 @@ python webui/server.py --port 8080 --bind 0.0.0.0   # 开放局域网（无鉴�
 前端为 **vendored Vue3 + Element Plus**（`webui/static/vendor/`，约 1.8MB 入库，无构建步骤、
 离线集群可用），侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
 
-- **配置维护**：cluster/global/matrix 三张快捷卡片 + 全部配置文件的层级树；点击文件直接在线
-  编辑（写入前自动校验——复用编排器自身的场景配置校验；自动备份到 `webui/backups/`）；
-  点击文件或目录出现运行条（运行 N 个配置预览 + 参数面板：dry-run、no-warmup、no-plot、
-  protocol 覆盖、cluster 选择、profiling matrix 自动启用）→ 一键运行并跳转运行页
+- **配置维护**：运行框（通栏最上方：选中文件展示【目录/文件分开，目录先执行】+ cluster/global/
+  profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-plot/protocol 选项 + 运行按钮）；
+  左列**通用配置**（configs 根下全部 `*.json`，过滤 `*.example.json` 模板）+ **运行配置**
+  （configs 下所有非 `_` 目录的层级树）；右侧编辑器在线编辑（写入前自动校验——复用编排器自身
+  的场景配置校验；自动备份到 `webui/backups/`）。树用**复选框**选择运行范围：勾目录=整目录
+  收编（子孙不可单独取消）、勾文件=独立选中（父目录半选）、目录选中后其下已独立选中的文件
+  自动去重（取消目录后恢复独立选中）；提交为 `--config-dir a,b` + `-f x,y` 多值形式，目录先执行
 - **运行**：仅观察——状态卡（id/状态/耗时/rc/产物目录）+ 停止按钮 + 编排器日志实时滚动
   （FAIL/ERROR 高亮）+ 历史 runs 表格；运行完毕后手动点击「查看运行结果」跳转结果页
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格

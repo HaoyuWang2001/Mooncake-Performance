@@ -65,13 +65,31 @@ html, body, #app { height: 100%; margin: 0; }
 .log-sm { height: 200px; }
 
 /* ---- 配置维护 ---- */
-.quick-cards { margin-bottom: 14px; }
-.quick-card { cursor: pointer; }
-.quick-card .qc-title {
-  display: flex; align-items: center; gap: 8px; font-weight: 600;
+.runbox .rb-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 5px 0;
 }
-.cfg-tree-card .el-tree { --el-tree-node-content-height: 26px; }
-.runbar-tags { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.runbox .rb-label { width: 56px; flex: none; color: var(--el-text-color-secondary);
+                    font-size: 13px; }
+.runbox .rb-spacer { flex: 1; }
+.runbox .rb-files { flex: 1; display: flex; align-items: center; gap: 14px;
+                    flex-wrap: wrap; font-size: 13px; }
+.runbox .rb-seg { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+.runbox .rb-k { color: var(--el-color-primary); margin-right: 6px; font-weight: 600; }
+.runbox .rb-note { color: var(--el-text-color-secondary); font-size: 12px; }
+.general-item { padding: 3px 8px; border-radius: 5px; cursor: pointer;
+                font-size: 13px; font-family: "Cascadia Mono", Consolas, monospace; }
+.general-item:hover { background: var(--el-fill-color); }
+.cfg-tree { max-height: 560px; overflow: auto; }
+.cfg-row { display: flex; align-items: center; gap: 6px; padding: 2px 0;
+           border-radius: 5px; }
+.cfg-row:hover { background: var(--el-fill-color-light); }
+.cfg-row .cfg-name { cursor: pointer; font-size: 13px; }
+.cfg-row .cfg-name.dir { color: var(--el-color-primary); font-weight: 600; }
+.cfg-row .cfg-count { color: var(--el-text-color-secondary); font-size: 12px; }
+.cfg-row .tgl { display: inline-block; width: 14px; cursor: pointer;
+                color: var(--el-text-color-secondary); flex: none; }
+.cfg-row .tgl-dot::before { content: "·"; }
 .editor textarea { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
 
 /* ---- 运行结果 ---- */

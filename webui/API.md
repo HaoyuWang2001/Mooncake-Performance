@@ -32,8 +32,11 @@
 ## 配置浏览 / 编辑
 
 ### GET /api/configs
-配置树：`categories.basic/pipeline`（可运行配置，遵循 `demo/`、`_` 前缀跳过规则），
-`special`（cluster/global/matrix 存在性），`cluster_candidates`（可选集群配置）。
+配置清单：`general` = configs 根下全部 `*.json`（过滤 `*.example.json` 模板，含
+cluster/global/matrix 及任意其他通用文件）；`categories` = configs 下**每个非 `_`
+开头子目录**的配置树 `{name, path, dirs[], files[]}`（恒含 demo/，`_` 前缀碎片排除）
+与 `config_count`；`cluster_candidates` / `global_candidates` / `matrix_candidates`
+由 general 按文件名前缀推导（运行框下拉数据源）。
 
 ### GET /api/config?path=configs/basic/put.json
 → `{"path":"...","content":"<原文>"}`
@@ -57,8 +60,8 @@
 ```json
 {
   "selector": {
-    "type": "file | dir",
-    "path": "configs/basic/put.json"
+    "dirs": ["configs/basic"],          // 可选；目录数组（恒递归，含 demo/，_ 碎片排除）
+    "files": ["configs/basic/get.json"] // 可选；文件数组
   },
   "flags": {
     "dry_run": false, "no_warmup": false, "no_plot": false,
@@ -69,8 +72,8 @@
   }
 }
 ```
-selector 语义：`file` = 单文件（`-f`）；`dir` = 目录（`--config-dir`，**恒递归**，
-含 demo/，`_` 前缀碎片排除）。
+selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files 后执行**（CLI 映射为
+`--config-dir a,b` + `-f x,y` 多值形式）。旧 `{type, path}` 格式已移除（400）。
 → `201` 意义上返回 `{"run":{"id":"r...","status":"running","cmd":"..."},"warnings":[]}`
 槽位被占 → `409 {"error":"benchmark run r... is still active ..."}`
 

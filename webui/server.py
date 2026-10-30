@@ -232,24 +232,31 @@ def _tree_count(node):
 
 
 def api_configs(handler, query):
-    out = {"categories": {}, "special": {}, "cluster_candidates": []}
-    for cat in ("basic", "pipeline"):
-        cdir = os.path.join(bm.CONFIGS_DIR, cat)
-        tree = _config_tree(cdir, "configs/" + cat + "/") if os.path.isdir(cdir) else None
-        out["categories"][cat] = {
-            "tree": tree,
-            "config_count": _tree_count(tree) if tree else 0,
-        }
-    for name in ("cluster.json", "global.json", "matrix.json"):
-        p = os.path.join(bm.CONFIGS_DIR, name)
-        out["special"][name[:-5]] = {
-            "path": "configs/" + name,
-            "present": os.path.isfile(p),
-        }
-    for cand in ("configs/cluster.json", "configs/cluster.example.json",
-                 "mock/cluster.json"):
-        if os.path.isfile(os.path.join(ROOT, cand)):
-            out["cluster_candidates"].append(cand)
+    """Config inventory: `general` = every configs/*.json except *.example.json
+    templates (cluster/global/matrix and any other shared file); `categories`
+    = a config tree for EVERY non-underscore subdirectory of configs/."""
+    out = {"general": [], "categories": {}, "cluster_candidates": [],
+           "global_candidates": [], "matrix_candidates": []}
+    if not os.path.isdir(bm.CONFIGS_DIR):
+        return out
+    for f in sorted(os.listdir(bm.CONFIGS_DIR)):
+        fp = os.path.join(bm.CONFIGS_DIR, f)
+        if os.path.isfile(fp) and f.endswith(".json") and not f.endswith(".example.json"):
+            out["general"].append("configs/" + f)
+    for name in sorted(os.listdir(bm.CONFIGS_DIR)):
+        dpath = os.path.join(bm.CONFIGS_DIR, name)
+        if not os.path.isdir(dpath) or name.startswith("_") or name.startswith("."):
+            continue
+        tree = _config_tree(dpath, "configs/" + name + "/")
+        out["categories"][name] = {"tree": tree, "config_count": _tree_count(tree)}
+    for p in out["general"]:
+        base = os.path.basename(p)
+        if base.startswith("cluster"):
+            out["cluster_candidates"].append(p)
+        elif base.startswith("global"):
+            out["global_candidates"].append(p)
+        elif base.startswith("matrix"):
+            out["matrix_candidates"].append(p)
     return out
 
 
@@ -293,22 +300,27 @@ def api_config_validate(handler, query):
 def _build_run_argv(body):
     sel = body.get("selector") or {}
     flags = body.get("flags") or {}
-    typ = sel.get("type", "file")
-    path = sel.get("path", "")
-    full = os.path.join(ROOT, path)
+    if sel.get("type") or sel.get("path"):
+        raise ApiError(400, "legacy {type,path} selector removed; "
+                            "use {\"dirs\": [...], \"files\": [...]}")
+    dirs = sel.get("dirs") or []
+    files = sel.get("files") or []
+    if not isinstance(dirs, list) or not isinstance(files, list):
+        raise ApiError(400, "selector.dirs/files must be arrays of paths")
+    if not dirs and not files:
+        raise ApiError(400, "selector needs at least one dir or file")
     argv = []
-    if typ == "file":
-        if not os.path.isfile(full):
-            raise ApiError(400, "config file not found: {}".format(path))
-        argv += ["-f", path]
-    elif typ == "dir":
-        # --config-dir always scans recursively (demo/ included,
-        # _-prefixed fragments skipped)
-        if not os.path.isdir(full):
-            raise ApiError(400, "config dir not found: {}".format(path))
-        argv += ["--config-dir", path]
-    else:
-        raise ApiError(400, "selector.type must be file or dir")
+    # config-dir entries run first, config files follow (benchmark.py order)
+    for d in dirs:
+        if not os.path.isdir(os.path.join(ROOT, d)):
+            raise ApiError(400, "config dir not found: {}".format(d))
+    for f in files:
+        if not os.path.isfile(os.path.join(ROOT, f)):
+            raise ApiError(400, "config file not found: {}".format(f))
+    if dirs:
+        argv += ["--config-dir", ",".join(dirs)]
+    if files:
+        argv += ["-f", ",".join(files)]
     cluster = flags.get("cluster") or "configs/cluster.json"
     if not os.path.isfile(os.path.join(ROOT, cluster)):
         raise ApiError(400, "cluster config not found: {}".format(cluster))

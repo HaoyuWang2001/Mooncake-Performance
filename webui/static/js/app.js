@@ -127,6 +127,7 @@ for (const [iconName, iconComp] of Object.entries(ElementPlusIconsVue || {})) {
   app.component(iconName, iconComp);
 }
 app.component("config-view", ConfigView);
+app.component("cfg-node", CfgNode);
 app.component("run-view", RunView);
 app.component("results-view", ResultsView);
 app.component("schedule-view", ScheduleView);
