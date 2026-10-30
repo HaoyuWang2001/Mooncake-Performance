@@ -42,9 +42,9 @@ const SdtNode = {
       if (props.node.children.length) props.node.open = !props.node.open;
     };
     const rowKids = Vue.computed(() =>
-      props.node.children.filter(c => c.kind === "phase" || c.kind === "leaf"));
+      props.node.children.filter(c => c.kind === "PHASE" || c.kind === "LEAF"));
     const stackKids = Vue.computed(() =>
-      props.node.children.filter(c => c.kind === "nested"));
+      props.node.children.filter(c => c.kind === "NESTED"));
     const kindTag = Vue.computed(() =>
       ({ ROOT: "primary", PHASE: "success", NESTED: "warning", LEAF: "info" }[props.node.kind] || "info"));
     const kindLabel = Vue.computed(() =>
