@@ -78,24 +78,25 @@ const ConfigView = {
           <el-option v-for="g in globalCandidates" :key="g" :label="g" :value="g"></el-select>
         </el-select>
         <span class="rb-label" style="margin-left: 24px">profile</span>
-        <el-select v-model="flags.profile" size="small" style="width: 240px">
-          <el-option label="auto" value="auto"></el-option>
+        <el-select v-model="flags.profile" size="small" style="width: 240px"
+                   placeholder="（无 matrix 候选）" :disabled="!matrixCandidates.length">
           <el-option v-for="m in matrixCandidates" :key="m" :label="m" :value="m"></el-option>
         </el-select>
-        <span class="hint" style="margin-left: 8px">{{ matrixHint }}</span>
       </div>
       <div class="rb-row">
         <span class="rb-label">选项</span>
         <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
         <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
         <el-checkbox v-model="flags.noPlot">no-plot</el-checkbox>
-        <el-select v-model="flags.protocol" size="small" style="width: 110px; margin-left: 12px">
-          <el-option label="(协议=配置值)" value=""></el-option>
+        <span style="font-size: 13px; margin-left: 12px">协议：</span>
+        <el-select v-model="flags.protocol" size="small" style="width: 110px">
+          <el-option label="(配置值)" value=""></el-option>
           <el-option label="tcp" value="tcp"></el-option>
           <el-option label="rdma" value="rdma"></el-option>
           <el-option label="ub" value="ub"></el-option>
         </el-select>
-        <span class="rb-spacer"></span>
+      </div>
+      <div class="rb-row">
         <el-button type="primary" :loading="starting" :disabled="!sel.dirs.length && !sel.files.length"
                    @click="startRun">运行（跳转运行页）</el-button>
       </div>
@@ -114,7 +115,13 @@ const ConfigView = {
         </el-card>
 
         <el-card shadow="never">
-          <template #header><b>运行配置</b><span class="hint" style="margin-left: 8px">复选框选择运行范围；点击文件名可编辑</span></template>
+          <template #header>
+            <div class="header-row" style="margin: 0">
+              <b>运行配置</b><span class="hint" style="margin-left: 8px">复选框选择运行范围；点击文件名可编辑</span>
+              <span class="spacer"></span>
+              <el-button size="small" @click="clearSelection">清空选中</el-button>
+            </div>
+          </template>
           <div class="cfg-tree">
             <cfg-node v-for="root in treeRoots" :key="root.path" :node="root" :depth="0"></cfg-node>
           </div>
@@ -133,7 +140,7 @@ const ConfigView = {
                     :placeholder="editPath ? '' : '点击通用配置或运行配置文件开始编辑'"></el-input>
           <div class="header-row" style="margin: 10px 0 0">
             <el-button size="small" @click="validate" :disabled="!editPath">校验</el-button>
-            <el-button size="small" type="primary" @click="save" :disabled="!editPath" :loading="saving">保存</el-button>
+            <el-button size="small" type="primary" @click="save" :disabled="!dirty" :loading="saving">保存</el-button>
             <span v-if="editMsg.text" :style="{ color: editMsg.ok ? 'var(--el-color-success)' : 'var(--el-color-error)',
                       fontSize: '12.5px' }">{{ editMsg.text }}</span>
             <span class="hint" style="margin-left: auto">保存自动备份到 webui/backups/</span>
@@ -152,22 +159,28 @@ const ConfigView = {
 
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
                                  protocol: "", cluster: "configs/cluster.json",
-                                 global: "configs/global.json", profile: "auto" });
+                                 global: "configs/global.json", profile: "" });
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
 
     const editPath = Vue.ref("");
     const editContent = Vue.ref("");
+    const editSnapshot = Vue.ref("");
     const editMsg = Vue.reactive({ text: "", ok: true });
     const saving = Vue.ref(false);
+    const dirty = Vue.computed(() =>
+      !!editPath.value && editContent.value !== editSnapshot.value);
 
     const sel = Vue.computed(() => {
       const acc = { dirs: [], files: [] };
       for (const r of treeRoots.value) _cfgCollectSel(r, acc);
       return acc;
     });
-    const matrixHint = Vue.computed(() => matrixCandidates.value.length
-      ? "matrix.json 存在 → auto 即启用 profiling" : "无 matrix.json → profiling 关闭");
+
+    function clearSelection() {
+      const walk = n => { n.checked = false; (n.children || []).forEach(walk); };
+      treeRoots.value.forEach(walk);
+    }
 
     function toNode(treeNode) {
       const children = [
@@ -195,9 +208,10 @@ const ConfigView = {
         matrixCandidates.value = cfg.matrix_candidates;
         if (!clusterCandidates.value.includes(flags.cluster)) flags.cluster = clusterCandidates.value[0];
         if (!globalCandidates.value.includes(flags.global)) flags.global = globalCandidates.value[0];
-        if (flags.profile !== "auto" && !matrixCandidates.value.includes(flags.profile)) {
+        if (!matrixCandidates.value.includes(flags.profile)) {
           flags.profile = matrixCandidates.value.includes("configs/matrix.json")
-            ? "configs/matrix.json" : "auto";
+            ? "configs/matrix.json"
+            : (matrixCandidates.value[0] || "");
         }
         treeRoots.value = Object.values(cfg.categories)
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))
@@ -214,6 +228,7 @@ const ConfigView = {
         const r = await api("GET", "/api/config?path=" + encodeURIComponent(path));
         editPath.value = path;
         editContent.value = r.content;
+        editSnapshot.value = r.content;
         editMsg.text = "";
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
@@ -236,6 +251,7 @@ const ConfigView = {
                             { path: editPath.value, content: editContent.value });
         editMsg.ok = true;
         editMsg.text = "已保存" + (r.backup ? "（备份 " + r.backup + "）" : "");
+        editSnapshot.value = editContent.value;
         await loadAll();
       } catch (e) {
         editMsg.ok = false; editMsg.text = e.message;
@@ -253,7 +269,7 @@ const ConfigView = {
           flags: { dry_run: flags.dryRun, no_warmup: flags.noWarmup,
                    no_plot: flags.noPlot, protocol: flags.protocol || null,
                    cluster: flags.cluster, global: flags.global,
-                   profile: flags.profile },
+                   profile: flags.profile || null },
         });
         warnings.value = r.warnings || [];
         store.pendingRunId = r.run.id;
@@ -270,8 +286,8 @@ const ConfigView = {
     Vue.onActivated(() => { if (!store.cfgTree) loadAll(); });
 
     return { loading, treeRoots, general, clusterCandidates, globalCandidates,
-             matrixCandidates, matrixHint, flags, warnings, starting, sel,
-             startRun, openFile, editPath, editContent, editMsg, saving,
+             matrixCandidates, flags, warnings, starting, sel, clearSelection,
+             startRun, openFile, editPath, editContent, editMsg, saving, dirty,
              validate, save, loadAll };
   },
 };

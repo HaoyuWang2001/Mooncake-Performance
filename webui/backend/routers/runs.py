@@ -50,7 +50,7 @@ def _build_run_argv(body):
             raise ApiError(400, "protocol must be tcp|rdma|ub")
         argv += ["--protocol", protocol]
     profile = flags.get("profile")
-    if profile and profile != "auto":
+    if profile:
         if not os.path.isfile(os.path.join(ROOT, profile)):
             raise ApiError(400, "profile matrix not found: {}".format(profile))
         argv += ["--profile", profile]

@@ -68,7 +68,7 @@ cluster/global/matrix 及任意其他通用文件）；`categories` = configs �
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"
     "cluster": "configs/cluster.json",
     "global": "configs/global.json",
-    "profile": "auto"                     // auto=默认行为(matrix.json 存在即启用)；或矩阵路径
+    "profile": "configs/matrix.json"      // matrix 路径；空/缺省 = 不传（benchmark 默认：configs/matrix.json 存在即启用）
   }
 }
 ```

@@ -98,6 +98,10 @@ def test_run_selector_validation():
     assert code == 400
     code, _ = _req("POST", "/api/run", {"selector": {"dirs": ["no/such/dir"]}})
     assert code == 400
+    code, _ = _req("POST", "/api/run", {
+        "selector": {"files": ["mock/smoke/put.json"]},
+        "flags": {"profile": "no/such/matrix.json"}})
+    assert code == 400
 
 
 def test_outputs_and_files():
