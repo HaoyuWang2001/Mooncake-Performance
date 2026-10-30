@@ -30,21 +30,22 @@ const SdtNode = {
     <div v-if="node.glue && (node.open || !node.children.length)" class="sdt-glue">
       glue: {{ node.glue }}
     </div>
-    <div v-if="node.open && rowKids.length" class="sdt-row">
-      <sdt-node v-for="c in rowKids" :key="c.point + c.module" :node="c"></sdt-node>
-    </div>
     <div v-if="node.open && stackKids.length" class="sdt-stack">
       <sdt-node v-for="c in stackKids" :key="c.point + c.module" :node="c"></sdt-node>
+    </div>
+    <div v-if="node.open && rowKids.length" class="sdt-row">
+      <sdt-node v-for="c in rowKids" :key="c.point + c.module" :node="c"></sdt-node>
     </div>
   </div>`,
   setup(props) {
     const toggle = () => {
       if (props.node.children.length) props.node.open = !props.node.open;
     };
+    // 布局：PHASE/NESTED 纵向堆叠；仅末端 LEAF 横向并列（避免多阶段横排过宽）
     const rowKids = Vue.computed(() =>
-      props.node.children.filter(c => c.kind === "PHASE" || c.kind === "LEAF"));
+      props.node.children.filter(c => c.kind === "LEAF"));
     const stackKids = Vue.computed(() =>
-      props.node.children.filter(c => c.kind === "NESTED"));
+      props.node.children.filter(c => c.kind === "PHASE" || c.kind === "NESTED"));
     const kindTag = Vue.computed(() =>
       ({ ROOT: "primary", PHASE: "success", NESTED: "warning", LEAF: "info" }[props.node.kind] || "info"));
     const kindLabel = Vue.computed(() =>
