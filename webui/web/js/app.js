@@ -18,12 +18,26 @@ async function api(method, url, body) {
 }
 
 /* ---------------- 全局共享状态 ---------------- */
+/* ---------------- 视图页签持久化（浏览器刷新后停留在当前页签） ---------------- */
+const VIEW_KEYS = ["config", "run", "results", "schedule", "api"];
+function loadInitialView() {
+  try {
+    const v = localStorage.getItem("mcweb-view");
+    if (VIEW_KEYS.includes(v)) return v;
+  } catch (e) { /* ignore */ }
+  return "config";
+}
+
 const store = reactive({
-  view: "config",               // 当前视图：config | run | results | schedule | api
+  view: loadInitialView(),       // 当前视图：config | run | results | schedule | api
   status: { active_run: null, scheduler: null },   // /api/status 轮询结果
   pendingRunId: null,           // config 视图刚发起的 run id（run 视图接管）
   resultsTarget: null,          // 跳转 results 时聚焦的 outputs/<ts>
   cfgTree: null,                // /api/configs 缓存（config 视图刷新）
+});
+
+watch(() => store.view, v => {
+  try { localStorage.setItem("mcweb-view", v); } catch (e) { /* ignore */ }
 });
 
 /* ---------------- 主题（亮/暗，首次跟随系统，localStorage 持久化） ---------------- */
