@@ -68,23 +68,23 @@ function saveHeight(key, h) {
   try { localStorage.setItem(key, String(Math.round(h))); } catch (e) { /* ignore */ }
 }
 
-/* ---------------- 通用垂直拖拽手柄 ---------------- */
+/* ---------------- 通用垂直拖拽手柄（标准 v-model 契约：modelValue / update:modelValue） ---------------- */
 const DragHandle = {
   name: "DragHandle",
-  props: { height: { type: Number, required: true },
+  props: { modelValue: { type: Number, required: true },
            min: { type: Number, default: 200 },
            max: { type: Number, default: 1600 },
            persist: { type: String, default: "" } },
-  emits: ["update:height"],
+  emits: ["update:modelValue"],
   template: `<div class="vdrag" title="拖动调节高度" @mousedown="down"><span></span></div>`,
   setup(props, { emit }) {
     const down = (e) => {
       e.preventDefault();
       const startY = e.clientY;
-      const startH = props.height;
+      const startH = props.modelValue;
       const move = (ev) => {
         const h = Math.min(props.max, Math.max(props.min, startH + (ev.clientY - startY)));
-        emit("update:height", h);
+        emit("update:modelValue", h);
         if (props.persist) saveHeight(props.persist, h);
       };
       const up = () => {
