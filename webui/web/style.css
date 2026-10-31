@@ -122,6 +122,35 @@ html, body, #app { height: 100%; margin: 0; }
 .pane.focus { border-color: var(--el-color-primary); }
 .pane-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .pane-body { overflow: auto; max-height: 80vh; }
+.pane.focus { border-color: var(--el-color-primary); }
+.pane.focuspane { /* 行内形态：焦点由父级 .focus 类控制 */ }
+.pane-empty { display: flex; align-items: center; justify-content: center; }
+.pane-tools { margin-left: auto; display: inline-flex; align-items: center; }
+
+/* ---- 悬浮操作条（运行日志页） ---- */
+.float-bar {
+  position: sticky; top: 8px; z-index: 60;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 14px; margin-bottom: 14px;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 10px;
+  box-shadow: var(--el-box-shadow-light);
+}
+.float-bar .fb-id { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+.float-bar .fb-elapsed { color: var(--el-text-color-secondary); font-size: 12.5px; }
+.float-bar .fb-spacer { flex: 1; }
+
+/* ---- 结果框全屏（teleport 蒙版 + 居中大框） ---- */
+.fs-mask {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+}
+.fs-box { width: 92%; height: 88vh; display: flex; }
+.fs-box .pane { flex: 1; display: flex; flex-direction: column; margin: 0; }
+.pane-body.fsbody { flex: 1; height: auto !important; max-height: none; }
+.fs-mask .pane-body .txt, .fs-mask .pane-body .json { max-height: none; }
 .pane-body img { max-width: 100%; background: #fff; border-radius: 6px; }
 .pane-body .txt {
   background: var(--el-fill-color-darker); border-radius: 6px; padding: 10px;

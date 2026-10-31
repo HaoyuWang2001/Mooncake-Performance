@@ -1,6 +1,6 @@
 "use strict";
-/* 运行结果视图：runs 列表 + 单窗格查看 / 对比模式（上下双窗格）+ 同文件锁定。
-   支持类型：CSV（表格渲染）、图片（直接显示）、JSON（pretty，matrix 指标占位）、文本（tail）。 */
+/* 运行结果视图（v2）：动态结果框（0..N 竖向排列，独立拖高/全屏/关闭）+ 同文件锁定 +
+   左侧 run 列表分配到焦点框。全屏 = teleport 蒙版 + 居中大框（宽 92% / 高 88vh）。 */
 
 function _fileGroup(rel) {
   const base = rel.split("/").pop().toLowerCase();
@@ -13,18 +13,164 @@ function _fileGroup(rel) {
   return "其他";
 }
 
+/* 模块级 helper：全部以 pane 对象为参（ResPane 与父视图共用） */
+function _kindOf(pane) {
+  if (!pane.file) return "none";
+  const base = pane.file.split("/").pop().toLowerCase();
+  if (/spdiag_tree\.[^.]+\.txt$/.test(base)) return "tree";
+  const g = _fileGroup(pane.file);
+  if (g === "图片") return "img";
+  if (g === "csv") return "csv";
+  if (g === "json") return "json";
+  return "txt";
+}
+
+function _groupedFiles(pane) {
+  const groups = {};
+  for (const f of pane.files) {
+    const g = _fileGroup(f);
+    (groups[g] = groups[g] || []).push(f);
+  }
+  const order = ["csv", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
+  return order.filter(g => groups[g]).map(g => ({ label: g, opts: groups[g] }));
+}
+
+function _treeShortcut(pane) {
+  const base = (pane.file || "").split("/").pop();
+  if (base !== "spdiag.show.txt") return [];
+  return pane.files.filter(f => /spdiag_tree\.[^.]+\.txt$/.test(f.split("/").pop()));
+}
+
+async function _loadFiles(pane) {
+  pane.file = "";
+  pane.rows = []; pane.headers = []; pane.text = "";
+  if (!pane.ts) { pane.files = []; return; }
+  pane.loading = true;
+  try {
+    const r = await api("GET", "/api/outputs/" + encodeURIComponent(pane.ts) + "/tree");
+    pane.files = r.files;
+    const detail = pane.files.find(f => f === "benchmark_detail.csv");
+    if (detail) pane.file = detail;
+  } catch (e) {
+    ElementPlus.ElMessage.error(e.message);
+  } finally {
+    pane.loading = false;
+  }
+}
+
+async function _loadContent(pane) {
+  pane.rows = []; pane.headers = []; pane.text = "";
+  if (!pane.ts || !pane.file) return;
+  const path = "outputs/" + pane.ts + "/" + pane.file;
+  const kind = _kindOf(pane);
+  pane.loading = true;
+  try {
+    if (kind === "csv") {
+      const r = await api("GET", "/api/csv?path=" + encodeURIComponent(path) + "&max_rows=3000");
+      pane.headers = r.headers;
+      pane.rows = r.rows.map(row => {
+        const o = {};
+        r.headers.forEach((h, i) => { o["c" + i] = row[i]; });
+        return o;
+      });
+    } else if (kind === "json") {
+      const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
+      try { pane.text = JSON.stringify(JSON.parse(r.content), null, 2); }
+      catch (e) { pane.text = r.content; }
+    } else if (kind === "tree") {
+      const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
+      pane.text = r.content;
+    } else {
+      const r = await api("GET", "/api/file?path=" + encodeURIComponent(path) + "&tail=131072");
+      pane.text = r.content;
+    }
+  } catch (e) {
+    ElementPlus.ElMessage.error(e.message);
+  } finally {
+    pane.loading = false;
+  }
+}
+
+let _paneUid = 0;
+
+/* 单个结果框（行内 / 全屏两种形态共用） */
+const ResPane = {
+  name: "ResPane",
+  props: { pane: { type: Object, required: true },
+           idx: { type: Number, required: true },
+           runs: { type: Array, default: () => [] },
+           fs: { type: Boolean, default: false } },
+  emits: ["focus", "close", "toggle-fs"],
+  template: `
+  <div class="pane" :class="{ focuspane: !fs }" @click="$emit('focus')">
+    <div class="pane-head">
+      <el-tag size="small" type="info">#{{ idx + 1 }}</el-tag>
+      <el-select v-model="pane.ts" filterable placeholder="选择 run" size="small"
+                 style="width: 190px" @change="loadFiles(pane)">
+        <el-option v-for="r in runs" :key="r.ts" :label="r.ts" :value="r.ts"></el-option>
+      </el-select>
+      <el-select v-model="pane.file" filterable placeholder="选择文件" size="small"
+                 style="flex: 1; min-width: 300px">
+        <el-option-group v-for="g in groupedFiles(pane)" :key="g.label"
+                         :label="g.label + ' (' + g.opts.length + ')'">
+          <el-option v-for="o in g.opts" :key="o" :label="o" :value="o"></el-option>
+        </el-option-group>
+      </el-select>
+      <el-radio-group v-if="kindOf(pane) === 'tree'" v-model="pane.rawView" size="small">
+        <el-radio-button :value="false">树状图</el-radio-button>
+        <el-radio-button :value="true">源文件</el-radio-button>
+      </el-radio-group>
+      <el-dropdown v-if="treeShortcut(pane).length" @command="f => { pane.file = f; }">
+        <el-button size="small" type="primary">查看树状图</el-button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item v-for="f in treeShortcut(pane)" :key="f" :command="f">{{ f }}</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+      <span class="pane-tools">
+        <el-button size="small" text @click.stop="$emit('toggle-fs')"
+                   :title="fs ? '退出全屏' : '全屏查看'">{{ fs ? "退出全屏" : "全屏" }}</el-button>
+        <el-button v-if="!fs" size="small" text type="danger" @click.stop="$emit('close')"
+                   title="关闭此结果框">✕</el-button>
+      </span>
+    </div>
+    <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading"
+         :style="fs ? null : { height: pane.h + 'px' }">
+      <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
+      <img v-else-if="kindOf(pane) === 'img'" :src="rawUrl(pane)">
+      <el-table v-else-if="kindOf(pane) === 'csv'" :data="pane.rows" size="small"
+                border style="width: 100%" :empty-text="pane.loading ? '加载中…' : '无数据'">
+        <el-table-column v-for="(h, i) in pane.headers" :key="i" :label="h"
+                         :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
+      </el-table>
+      <pre v-else-if="kindOf(pane) === 'json'" class="json">{{ pane.text }}</pre>
+      <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
+                   :text="pane.text"></spdiag-tree>
+      <pre v-else class="txt">{{ pane.text }}</pre>
+    </div>
+    <drag-handle v-if="!fs" v-model="pane.h" :min="200" :max="1000"
+                 :persist="'mcweb-res-h' + idx"></drag-handle>
+  </div>`,
+  setup() {
+    return { kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
+             loadFiles: _loadFiles,
+             rawUrl: p => "/api/file?path=" +
+               encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
+  },
+};
+
 const ResultsView = {
   template: `
   <div class="page">
     <div class="header-row">
-      <span class="hint">点击左侧 run 分配到当前焦点窗格；对比模式上下并排查看，同文件锁定自动匹配同名文件</span>
+      <span class="hint">点击左侧 run 分配到焦点框（虚线高亮 = 焦点，点任意框头部切换）；框可任意增删/拖高/全屏</span>
       <span class="spacer"></span>
-      <span style="font-size: 13px">对比模式</span>
-      <el-switch v-model="compareMode"></el-switch>
-      <template v-if="compareMode">
+      <template v-if="panes.length >= 2">
         <span style="font-size: 13px">同文件锁定</span>
         <el-switch v-model="lockFile"></el-switch>
       </template>
+      <el-button size="small" type="primary" plain @click="addPane()">＋ 添加结果框</el-button>
       <el-button size="small" @click="loadRuns" :loading="loading">刷新</el-button>
     </div>
 
@@ -47,146 +193,44 @@ const ResultsView = {
       </el-col>
 
       <el-col :span="18">
-        <div class="pane" :class="{ focus: activePane === 0 }" style="margin-bottom: 14px"
-             @click="activePane = 0">
-          <div class="pane-head">
-            <el-tag size="small" type="info">上</el-tag>
-            <el-select v-model="panes[0].ts" filterable placeholder="选择 run" size="small"
-                       style="width: 190px" @change="loadFiles(0)">
-              <el-option v-for="r in runs" :key="r.ts" :label="r.ts" :value="r.ts"></el-option>
-            </el-select>
-            <el-select v-model="panes[0].file" filterable placeholder="选择文件" size="small"
-                       style="flex: 1; min-width: 320px">
-              <el-option-group v-for="g in groupedFiles(0)" :key="g.label" :label="g.label + ' (' + g.opts.length + ')'">
-                <el-option v-for="o in g.opts" :key="o" :label="o" :value="o"></el-option>
-              </el-option-group>
-            </el-select>
-            <el-radio-group v-if="kindOf(panes[0]) === 'tree'" v-model="panes[0].rawView" size="small">
-              <el-radio-button :value="false">树状图</el-radio-button>
-              <el-radio-button :value="true">源文件</el-radio-button>
-            </el-radio-group>
-            <el-dropdown v-if="treeShortcut(0).length" @command="f => { panes[0].file = f; }">
-              <el-button size="small" type="primary">查看树状图</el-button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item v-for="f in treeShortcut(0)" :key="f" :command="f">{{ f }}</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
+        <div v-if="!panes.length" class="pane pane-empty">
+          <div class="hint" style="padding: 40px; text-align: center">
+            尚无结果框——点击左侧 run 或「＋ 添加结果框」开始查看
           </div>
-          <div class="pane-body" v-loading="panes[0].loading" :style="{ height: panes[0].h + 'px' }">
-            <div v-if="!panes[0].file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
-            <img v-else-if="kindOf(panes[0]) === 'img'"
-                 :src="rawUrl(panes[0])">
-            <el-table v-else-if="kindOf(panes[0]) === 'csv'" :data="panes[0].rows" size="small"
-                      border style="width: 100%" :empty-text="panes[0].loading ? '加载中…' : '无数据'">
-              <el-table-column v-for="(h, i) in panes[0].headers" :key="i" :label="h"
-                               :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
-            </el-table>
-            <pre v-else-if="kindOf(panes[0]) === 'json'" class="json">{{ panes[0].text }}</pre>
-            <spdiag-tree v-else-if="kindOf(panes[0]) === 'tree' && !panes[0].rawView"
-                         :text="panes[0].text"></spdiag-tree>
-            <pre v-else class="txt">{{ panes[0].text }}</pre>
-          </div>
-          <drag-handle v-model="panes[0].h" :min="200" :max="1000" persist="mcweb-res-h0"></drag-handle>
         </div>
-
-        <div class="pane" v-if="compareMode" :class="{ focus: activePane === 1 }"
-             @click="activePane = 1">
-          <div class="pane-head">
-            <el-tag size="small" type="info">下</el-tag>
-            <el-select v-model="panes[1].ts" filterable placeholder="选择 run" size="small"
-                       style="width: 190px" @change="loadFiles(1)">
-              <el-option v-for="r in runs" :key="r.ts" :label="r.ts" :value="r.ts"></el-option>
-            </el-select>
-            <el-select v-model="panes[1].file" filterable placeholder="选择文件" size="small"
-                       style="flex: 1; min-width: 320px">
-              <el-option-group v-for="g in groupedFiles(1)" :key="g.label" :label="g.label + ' (' + g.opts.length + ')'">
-                <el-option v-for="o in g.opts" :key="o" :label="o" :value="o"></el-option>
-              </el-option-group>
-            </el-select>
-            <el-radio-group v-if="kindOf(panes[1]) === 'tree'" v-model="panes[1].rawView" size="small">
-              <el-radio-button :value="false">树状图</el-radio-button>
-              <el-radio-button :value="true">源文件</el-radio-button>
-            </el-radio-group>
-            <el-dropdown v-if="treeShortcut(1).length" @command="f => { panes[1].file = f; }">
-              <el-button size="small" type="primary">查看树状图</el-button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item v-for="f in treeShortcut(1)" :key="f" :command="f">{{ f }}</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
-          </div>
-          <div class="pane-body" v-loading="panes[1].loading" :style="{ height: panes[1].h + 'px' }">
-            <div v-if="!panes[1].file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
-            <img v-else-if="kindOf(panes[1]) === 'img'"
-                 :src="rawUrl(panes[1])">
-            <el-table v-else-if="kindOf(panes[1]) === 'csv'" :data="panes[1].rows" size="small"
-                      border style="width: 100%" :empty-text="panes[1].loading ? '加载中…' : '无数据'">
-              <el-table-column v-for="(h, i) in panes[1].headers" :key="i" :label="h"
-                               :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
-            </el-table>
-            <pre v-else-if="kindOf(panes[1]) === 'json'" class="json">{{ panes[1].text }}</pre>
-            <spdiag-tree v-else-if="kindOf(panes[1]) === 'tree' && !panes[1].rawView"
-                         :text="panes[1].text"></spdiag-tree>
-            <pre v-else class="txt">{{ panes[1].text }}</pre>
-          </div>
-          <drag-handle v-model="panes[1].h" :min="200" :max="1000" persist="mcweb-res-h1"></drag-handle>
-        </div>
+        <res-pane v-for="(p, i) in panes" :key="p.uid"
+                  :class="{ focus: activePane === i }"
+                  :pane="p" :idx="i" :runs="runs"
+                  @focus="activePane = i"
+                  @close="removePane(i)"
+                  @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"
+                  style="margin-bottom: 14px"></res-pane>
       </el-col>
     </el-row>
+
+    <teleport to="body">
+      <div v-if="fullscreenIdx >= 0 && panes[fullscreenIdx]" class="fs-mask"
+           @click.self="fullscreenIdx = -1">
+        <div class="fs-box">
+          <res-pane :pane="panes[fullscreenIdx]" :idx="fullscreenIdx" :runs="runs" :fs="true"
+                    @focus="activePane = fullscreenIdx"
+                    @toggle-fs="fullscreenIdx = -1"></res-pane>
+        </div>
+      </div>
+    </teleport>
   </div>`,
   setup() {
     const loading = Vue.ref(false);
     const runs = Vue.ref([]);
-    const compareMode = Vue.ref(false);
     const lockFile = Vue.ref(true);
     const activePane = Vue.ref(0);
+    const fullscreenIdx = Vue.ref(-1);
+    const panes = Vue.reactive([]);
 
     function newPane(idx) {
-      return { ts: "", files: [], file: "", loading: false, rawView: false,
-               rows: [], headers: [], text: "",
+      return { uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
+               rawView: false, rows: [], headers: [], text: "",
                h: loadHeight("mcweb-res-h" + idx, 420) };
-    }
-    const panes = Vue.reactive([newPane(0), newPane(1)]);
-
-    function isActivePaneTs(ts) {
-      return panes[activePane.value] && panes[activePane.value].ts === ts;
-    }
-
-    function pickRun(ts) { panes[activePane.value].ts = ts; loadFiles(activePane.value); }
-
-    function groupedFiles(idx) {
-      const groups = {};
-      for (const f of panes[idx].files) {
-        const g = _fileGroup(f);
-        (groups[g] = groups[g] || []).push(f);
-      }
-      const order = ["csv", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
-      return order.filter(g => groups[g]).map(g => ({ label: g, opts: groups[g] }));
-    }
-
-    function kindOf(p) {
-      if (!p.file) return "none";
-      const base = p.file.split("/").pop().toLowerCase();
-      if (/spdiag_tree\.[^.]+\.txt$/.test(base)) return "tree";
-      const g = _fileGroup(p.file);
-      if (g === "图片") return "img";
-      if (g === "csv") return "csv";
-      if (g === "json") return "json";
-      return "txt";
-    }
-
-    function treeShortcut(idx) {
-      // viewing the raw spdiag table -> jump to generated tree files
-      const base = (panes[idx].file || "").split("/").pop();
-      if (base !== "spdiag.show.txt") return [];
-      return panes[idx].files.filter(f => /spdiag_tree\.[^.]+\.txt$/.test(f.split("/").pop()));
-    }
-
-    function rawUrl(p) {
-      return "/api/file?path=" + encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw";
     }
 
     async function loadRuns() {
@@ -194,7 +238,9 @@ const ResultsView = {
       try {
         runs.value = (await api("GET", "/api/outputs")).outputs;
         for (const p of panes) {
-          if (p.ts && !runs.value.some(r => r.ts === p.ts)) { p.ts = ""; p.file = ""; p.files = []; }
+          if (p.ts && !runs.value.some(r => r.ts === p.ts)) {
+            p.ts = ""; p.file = ""; p.files = [];
+          }
         }
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
@@ -203,92 +249,77 @@ const ResultsView = {
       }
     }
 
-    async function loadFiles(idx) {
-      const p = panes[idx];
-      p.file = "";
-      p.rows = []; p.headers = []; p.text = "";
-      if (!p.ts) { p.files = []; return; }
-      p.loading = true;
-      try {
-        const r = await api("GET", "/api/outputs/" + encodeURIComponent(p.ts) + "/tree");
-        p.files = r.files;
-        if (idx === 0) {
-          // 默认选 benchmark_detail.csv（若存在）
-          const detail = p.files.find(f => f === "benchmark_detail.csv");
-          if (detail) p.file = detail;
-        }
-      } catch (e) {
-        ElementPlus.ElMessage.error(e.message);
-      } finally {
-        p.loading = false;
-      }
+    function addPane(ts) {
+      const p = newPane(panes.length);
+      p.ts = ts !== undefined ? ts : (runs.value.length ? runs.value[0].ts : "");
+      panes.push(p);
+      activePane.value = panes.length - 1;
+      _loadFiles(p);
+      return p;
     }
 
-    async function loadContent(idx) {
-      const p = panes[idx];
-      p.rows = []; p.headers = []; p.text = "";
-      if (!p.ts || !p.file) return;
-      const path = "outputs/" + p.ts + "/" + p.file;
-      const kind = kindOf(p);
-      p.loading = true;
-      try {
-        if (kind === "csv") {
-          const r = await api("GET", "/api/csv?path=" + encodeURIComponent(path) + "&max_rows=3000");
-          p.headers = r.headers;
-          p.rows = r.rows.map(row => {
-            const o = {};
-            r.headers.forEach((h, i) => { o["c" + i] = row[i]; });
-            return o;
-          });
-        } else if (kind === "json") {
-          const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
-          try { p.text = JSON.stringify(JSON.parse(r.content), null, 2); }
-          catch (e) { p.text = r.content; }
-        } else if (kind === "tree") {
-          // full text (tree files are small and the parser needs the whole file)
-          const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
-          p.text = r.content;
-        } else {
-          const r = await api("GET", "/api/file?path=" + encodeURIComponent(path) + "&tail=131072");
-          p.text = r.content;
-        }
-      } catch (e) {
-        ElementPlus.ElMessage.error(e.message);
-      } finally {
-        p.loading = false;
-      }
+    function removePane(i) {
+      if (fullscreenIdx.value === i) fullscreenIdx.value = -1;
+      else if (fullscreenIdx.value > i) fullscreenIdx.value -= 1;
+      panes.splice(i, 1);
+      if (activePane.value >= panes.length) activePane.value = Math.max(0, panes.length - 1);
     }
 
-    // 同文件锁定：上窗格文件变化 → 下窗格自动匹配同名文件（仅非空选择时）
-    Vue.watch(() => panes[0].file, (f) => {
-      loadContent(0);
-      if (!f || !compareMode.value || !lockFile.value) return;
-      const p1 = panes[1];
-      if (p1.files.includes(f)) {
-        if (p1.file !== f) p1.file = f;   // 触发下窗格 watch 加载
-      } else if (p1.file) {
-        p1.file = "";
-        ElementPlus.ElMessage.warning("下窗格该 run 无同名文件：" + f);
+    function pickRun(ts) {
+      if (!panes.length) { addPane(ts); return; }
+      const p = panes[activePane.value];
+      if (p.ts !== ts) { p.ts = ts; _loadFiles(p); }
+    }
+
+    function isActivePaneTs(ts) {
+      const p = panes[activePane.value];
+      return p && p.ts === ts;
+    }
+
+    // 文件变化：加载内容 + 同文件锁定（任一框换文件，其余框跟随）
+    Vue.watch(() => panes.map(p => p.file), (vals, old) => {
+      let i = -1;
+      for (let k = 0; k < vals.length; k++) {
+        if (old[k] === undefined || vals[k] !== old[k]) { i = k; break; }
+      }
+      if (i < 0) return;
+      _loadContent(panes[i]);
+      if (!vals[i] || !lockFile.value || panes.length < 2) return;
+      for (let j = 0; j < panes.length; j++) {
+        if (j === i) continue;
+        const p = panes[j];
+        if (p.files.includes(vals[i])) {
+          if (p.file !== vals[i]) p.file = vals[i];
+        } else if (p.file) {
+          ElementPlus.ElMessage.warning("窗格 #" + (j + 1) + " 该 run 无同名文件：" + vals[i]);
+        }
       }
     });
-    Vue.watch(() => panes[1].file, () => loadContent(1));
+
+    function onKey(ev) {
+      if (ev.key === "Escape" && fullscreenIdx.value >= 0) fullscreenIdx.value = -1;
+    }
+    Vue.onMounted(() => window.addEventListener("keydown", onKey));
+    Vue.onUnmounted(() => window.removeEventListener("keydown", onKey));
 
     Vue.onActivated(async () => {
       await loadRuns();
       if (store.resultsTarget) {
-        activePane.value = 0;
-        if (panes[0].ts !== store.resultsTarget) {
-          panes[0].ts = store.resultsTarget;
-          await loadFiles(0);
-        }
+        const target = store.resultsTarget;
         store.resultsTarget = null;
-      } else if (!panes[0].ts && runs.value.length) {
-        panes[0].ts = runs.value[0].ts;
-        await loadFiles(0);
+        activePane.value = 0;
+        if (!panes.length) {
+          addPane(target);
+        } else if (panes[0].ts !== target) {
+          panes[0].ts = target;
+          _loadFiles(panes[0]);
+        }
+      } else if (!panes.length && runs.value.length) {
+        addPane();
       }
     });
 
-    return { runs, loading, compareMode, lockFile, activePane, panes,
-             isActivePaneTs, pickRun, groupedFiles, kindOf, rawUrl, treeShortcut, loadRuns };
+    return { runs, loading, lockFile, activePane, fullscreenIdx, panes,
+             loadRuns, addPane, removePane, pickRun, isActivePaneTs };
   },
 };
