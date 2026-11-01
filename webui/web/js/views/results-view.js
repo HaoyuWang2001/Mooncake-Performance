@@ -260,12 +260,15 @@ const ResultsView = {
     const panes = Vue.reactive([]);
 
     function newPane(idx) {
+      // Vue.reactive：pane 必须从创建起即为代理对象——addPane 持有该引用做
+      // 异步写入（_loadFiles），raw 对象的赋值不会触发响应式更新（首个
+      // 结果框曾因此卡在 loading 且文件列表永不刷新）
       let wrap = false;
       try { wrap = localStorage.getItem("mcweb-wrap") === "1"; } catch (e) { /* ignore */ }
-      return { uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
-               rawView: false, wrap: wrap, imgScale: "fit",
-               rows: [], headers: [], text: "",
-               h: loadHeight("mcweb-res-h" + idx, 420) };
+      return Vue.reactive({ uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
+                            rawView: false, wrap: wrap, imgScale: "fit",
+                            rows: [], headers: [], text: "",
+                            h: loadHeight("mcweb-res-h" + idx, 420) });
     }
 
     async function loadRuns() {
