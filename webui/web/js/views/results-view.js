@@ -149,12 +149,15 @@ const ResPane = {
               <el-button @click="imgStep(pane, -0.25)">－</el-button>
               <el-button disabled>{{ pane.imgScale === "fit" ? "适应" : Math.round(pane.imgScale * 100) + "%" }}</el-button>
               <el-button @click="imgStep(pane, 0.25)">＋</el-button>
-              <el-button @click="pane.imgScale = 'fit'">适应</el-button>
+              <el-button @click="imgFit(pane)">适应</el-button>
             </el-button-group>
             <span class="hint">等比缩放，超出可滚动</span>
           </div>
           <div class="imgwrap">
-            <img :src="rawUrl(pane)" :style="imgStyle(pane)">
+            <img :src="rawUrl(pane)" :style="imgStyle(pane)"
+                 :class="dragging ? 'dragging' : (pane.imgScale === 'fit' ? '' : 'can-drag')"
+                 @mousedown.left.prevent="imgDragStart(pane, $event)"
+                 :title="pane.imgScale === 'fit' ? '' : '按住左键拖动查看'">
           </div>
         </div>
         <img v-else :src="rawUrl(pane)">
@@ -180,13 +183,41 @@ const ResPane = {
     function imgStep(pane, d) {
       const cur = pane.imgScale === "fit" ? 1 : pane.imgScale;
       pane.imgScale = Math.min(4, Math.max(0.25, Math.round((cur + d) * 100) / 100));
+      pane.imgX = 0; pane.imgY = 0;   // 缩放后回中
+    }
+    function imgFit(pane) {
+      pane.imgScale = "fit";
+      pane.imgX = 0; pane.imgY = 0;
+    }
+    // 左键拖拽平移：替代滚动条；按 图片-容器 差值钳制，fit 模式（无越界）禁用
+    function imgDragStart(pane, ev) {
+      if (pane.imgScale === "fit") return;
+      const img = ev.target, wrap = img.parentElement;
+      const maxX = Math.max(0, (img.offsetWidth - wrap.clientWidth) / 2);
+      const maxY = Math.max(0, (img.offsetHeight - wrap.clientHeight) / 2);
+      if (maxX === 0 && maxY === 0) return;
+      const sx = ev.clientX, sy = ev.clientY, ox = pane.imgX, oy = pane.imgY;
+      dragging.value = true;
+      const move = e => {
+        pane.imgX = Math.min(maxX, Math.max(-maxX, ox + (e.clientX - sx)));
+        pane.imgY = Math.min(maxY, Math.max(-maxY, oy + (e.clientY - sy)));
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        dragging.value = false;
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
     }
     function imgStyle(pane) {
-      if (pane.imgScale === "fit") return { maxWidth: "100%", maxHeight: "100%" };
-      return { width: (pane.imgScale * 100) + "%", height: "auto" };
+      const t = "translate(calc(-50% + " + (pane.imgX || 0) + "px), calc(-50% + " + (pane.imgY || 0) + "px))";
+      if (pane.imgScale === "fit") return { maxWidth: "100%", maxHeight: "100%", transform: t };
+      return { width: (pane.imgScale * 100) + "%", height: "auto", transform: t };
     }
+    const dragging = Vue.ref(false);
     return { kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
-             loadFiles: _loadFiles, toggleWrap, imgStep, imgStyle,
+             loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              rawUrl: p => "/api/file?path=" +
                encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
   },
@@ -267,6 +298,7 @@ const ResultsView = {
       try { wrap = localStorage.getItem("mcweb-wrap") === "1"; } catch (e) { /* ignore */ }
       return Vue.reactive({ uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
                             rawView: false, wrap: wrap, imgScale: "fit",
+                            imgX: 0, imgY: 0,
                             rows: [], headers: [], text: "",
                             h: loadHeight("mcweb-res-h" + idx, 420) });
     }

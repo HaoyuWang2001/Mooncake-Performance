@@ -156,12 +156,14 @@ html, body, #app { height: 100%; margin: 0; }
 /* TXT/JSON 不换行模式（默认：横向滚动；「换行」按钮切换回 pre-wrap） */
 .pane-body .txt.nw, .pane-body .json.nw { white-space: pre; word-break: normal; }
 
-/* PNG 等比缩放（全屏内） */
+/* PNG 等比缩放 + 拖拽平移（全屏内；绝对定位居中脱离 flex 流，宽度真实越界） */
 .imgfs { height: 100%; display: flex; flex-direction: column; }
 .imgbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.imgwrap { flex: 1; min-height: 0; overflow: auto; display: flex;
-           align-items: center; justify-content: center; }
-.imgwrap img { max-width: none; max-height: none; background: #fff; border-radius: 6px; }
+.imgwrap { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.imgwrap img { position: absolute; left: 50%; top: 50%;
+               max-width: none; max-height: none; background: #fff; border-radius: 6px; }
+.imgwrap img.can-drag { cursor: grab; }
+.imgwrap img.dragging { cursor: grabbing; }
 .pane-body img { max-width: 100%; background: #fff; border-radius: 6px; }
 .pane-body .txt {
   background: var(--el-fill-color-darker); border-radius: 6px; padding: 10px;
