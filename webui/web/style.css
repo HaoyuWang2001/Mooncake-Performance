@@ -144,13 +144,24 @@ html, body, #app { height: 100%; margin: 0; }
 /* ---- 结果框全屏（teleport 蒙版 + 居中大框） ---- */
 .fs-mask {
   position: fixed; inset: 0; z-index: 2000;
-  background: rgba(0, 0, 0, 0.45);
+  background: rgba(0, 0, 0, 0.7);
   display: flex; align-items: center; justify-content: center;
 }
-.fs-box { width: 92%; height: 88vh; display: flex; }
-.fs-box .pane { flex: 1; display: flex; flex-direction: column; margin: 0; }
+.fs-box { width: 92%; height: 88vh; display: flex; overflow: hidden; }
+.fs-box .pane { flex: 1; min-width: 0; display: flex; flex-direction: column;
+                margin: 0; overflow: hidden; }
 .pane-body.fsbody { flex: 1; height: auto !important; max-height: none; }
 .fs-mask .pane-body .txt, .fs-mask .pane-body .json { max-height: none; }
+
+/* TXT/JSON 不换行模式（默认：横向滚动；「换行」按钮切换回 pre-wrap） */
+.pane-body .txt.nw, .pane-body .json.nw { white-space: pre; word-break: normal; }
+
+/* PNG 等比缩放（全屏内） */
+.imgfs { height: 100%; display: flex; flex-direction: column; }
+.imgbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.imgwrap { flex: 1; min-height: 0; overflow: auto; display: flex;
+           align-items: center; justify-content: center; }
+.imgwrap img { max-width: none; max-height: none; background: #fff; border-radius: 6px; }
 .pane-body img { max-width: 100%; background: #fff; border-radius: 6px; }
 .pane-body .txt {
   background: var(--el-fill-color-darker); border-radius: 6px; padding: 10px;

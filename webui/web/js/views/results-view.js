@@ -128,6 +128,10 @@ const ResPane = {
           </el-dropdown-menu>
         </template>
       </el-dropdown>
+      <el-button v-if="kindOf(pane) === 'txt' || kindOf(pane) === 'json'"
+                 size="small" text :type="pane.wrap ? 'primary' : ''"
+                 @click.stop="toggleWrap(pane)"
+                 title="长行换行 / 横向滚动 切换">换行</el-button>
       <span class="pane-tools">
         <el-button size="small" text @click.stop="$emit('toggle-fs')"
                    :title="fs ? '退出全屏' : '全屏查看'">{{ fs ? "退出全屏" : "全屏" }}</el-button>
@@ -138,23 +142,51 @@ const ResPane = {
     <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading"
          :style="fs ? null : { height: pane.h + 'px' }">
       <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
-      <img v-else-if="kindOf(pane) === 'img'" :src="rawUrl(pane)">
+      <template v-else-if="kindOf(pane) === 'img'">
+        <div v-if="fs" class="imgfs">
+          <div class="imgbar">
+            <el-button-group size="small">
+              <el-button @click="imgStep(pane, -0.25)">－</el-button>
+              <el-button disabled>{{ pane.imgScale === "fit" ? "适应" : Math.round(pane.imgScale * 100) + "%" }}</el-button>
+              <el-button @click="imgStep(pane, 0.25)">＋</el-button>
+              <el-button @click="pane.imgScale = 'fit'">适应</el-button>
+            </el-button-group>
+            <span class="hint">等比缩放，超出可滚动</span>
+          </div>
+          <div class="imgwrap">
+            <img :src="rawUrl(pane)" :style="imgStyle(pane)">
+          </div>
+        </div>
+        <img v-else :src="rawUrl(pane)">
+      </template>
       <el-table v-else-if="kindOf(pane) === 'csv'" :data="pane.rows" size="small"
                 border style="width: 100%" :empty-text="pane.loading ? '加载中…' : '无数据'">
         <el-table-column v-for="(h, i) in pane.headers" :key="i" :label="h"
                          :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
       </el-table>
-      <pre v-else-if="kindOf(pane) === 'json'" class="json">{{ pane.text }}</pre>
+      <pre v-else-if="kindOf(pane) === 'json'" class="json" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
       <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
                    :text="pane.text"></spdiag-tree>
-      <pre v-else class="txt">{{ pane.text }}</pre>
+      <pre v-else class="txt" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
     </div>
     <drag-handle v-if="!fs" v-model="pane.h" :min="200" :max="1000"
                  :persist="'mcweb-res-h' + idx"></drag-handle>
   </div>`,
   setup() {
+    function toggleWrap(pane) {
+      pane.wrap = !pane.wrap;
+      try { localStorage.setItem("mcweb-wrap", pane.wrap ? "1" : "0"); } catch (e) { /* ignore */ }
+    }
+    function imgStep(pane, d) {
+      const cur = pane.imgScale === "fit" ? 1 : pane.imgScale;
+      pane.imgScale = Math.min(4, Math.max(0.25, Math.round((cur + d) * 100) / 100));
+    }
+    function imgStyle(pane) {
+      if (pane.imgScale === "fit") return { maxWidth: "100%", maxHeight: "100%" };
+      return { width: (pane.imgScale * 100) + "%", height: "auto" };
+    }
     return { kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
-             loadFiles: _loadFiles,
+             loadFiles: _loadFiles, toggleWrap, imgStep, imgStyle,
              rawUrl: p => "/api/file?path=" +
                encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
   },
@@ -228,8 +260,11 @@ const ResultsView = {
     const panes = Vue.reactive([]);
 
     function newPane(idx) {
+      let wrap = false;
+      try { wrap = localStorage.getItem("mcweb-wrap") === "1"; } catch (e) { /* ignore */ }
       return { uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
-               rawView: false, rows: [], headers: [], text: "",
+               rawView: false, wrap: wrap, imgScale: "fit",
+               rows: [], headers: [], text: "",
                h: loadHeight("mcweb-res-h" + idx, 420) };
     }
 
