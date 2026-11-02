@@ -23,7 +23,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 VALIDATE_BYTES = 64
-PREPARE_BATCH_KEYS = 100
 def parse_size(size_str):
     """Parse 8MB / 1GB / 512KB style strings into byte counts."""
     if isinstance(size_str, (int, float)):
@@ -336,13 +335,16 @@ def cmd_prepare_store(args, store):
     missing = [k for k, ex in zip(keys, existence) if ex == 0]
     existing = len(keys) - len(missing)
     written = 0
-    for i in range(0, len(missing), PREPARE_BATCH_KEYS):
-        chunk = missing[i:i + PREPARE_BATCH_KEYS]
-        ret = store.put_batch(chunk, [value] * len(chunk))
+    for key in missing:
+        ret = store.put(key, value)
         if ret != 0:
-            print("[ERROR] prepare-store failed: put_batch returned {}".format(ret))
+            print("[ERROR] prepare-store failed: put key={} returned {}".format(
+                key, ret))
             sys.exit(1)
-        written += len(chunk)
+        written += 1
+        if written % 100 == 0 or written == len(missing):
+            log("prepare-store progress ({}/{})".format(
+                written, len(missing)))
     emit("META", {"mode": "prepare-store", "scenario": args.scenario,
                   "total": len(keys), "existing": existing, "written": written})
     log("prepare-store done (total={}, existing={}, written={})".format(
@@ -725,7 +727,7 @@ def run_warmup(args, store, value, ctx=None):
     operation until the warmup duration expires (same cycle semantics as
     duration stress: get loops reads, put/mixed write full passes with
     self-clear). Pure get-family operations pre-fill the warmup keys with
-    one untimed batch put first; put and mixed must NOT be pre-filled — put
+    untimed single-key puts first; put and mixed must NOT be pre-filled — put
     is create-only, so pre-written keys would turn warmup puts into no-ops.
     Warmup runs unpaced (target_qps ignored) and its samples are discarded.
     """
@@ -740,9 +742,12 @@ def run_warmup(args, store, value, ctx=None):
         put_iface, get_iface = op.split("/", 1)
     pure_get = op in GET_IFACE_DEFS or (get_iface is not None and put_iface is None)
     if pure_get:
-        ret = store.put_batch(keys, [value] * len(keys))
-        if ret != 0:
-            print("[WARN] warmup prefill put_batch ret={}".format(ret))
+        for key in keys:
+            ret = store.put(key, value)
+            if ret != 0:
+                raise SystemExit(
+                    "[ERROR] warmup prefill put key={} returned {}".format(
+                        key, ret))
     log("warmup start (duration={}s, keys={}, op={})".format(duration, len(keys), op))
     wargs = copy.copy(args)
     wargs.target_qps = 0  # warmup free-runs; pacing is for measured phase
