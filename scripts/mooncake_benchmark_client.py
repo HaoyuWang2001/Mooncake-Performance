@@ -916,8 +916,13 @@ def _pipeline_writer(args, store, do_warmup=True):
     writer_op = args.operation or "put_batch"
     if writer_op not in PUT_IFACE_DEFS:
         raise SystemExit("[ERROR] unsupported writer operation: {}".format(writer_op))
+    effective_writer_op = (
+        "put" if writer_op == "put_batch" and batch_keys == 1 else writer_op
+    )
+    if effective_writer_op != writer_op:
+        log("pipeline writer batch_size=1: using put instead of put_batch")
     ctx = None
-    if writer_op == "put_from":
+    if effective_writer_op == "put_from":
         ctx = _BufferCtx(len(value))
         if not ctx.setup(store):
             raise SystemExit("[ERROR] writer register_buffer failed")
@@ -1022,12 +1027,20 @@ def _pipeline_writer(args, store, do_warmup=True):
             # interface dispatch: put_batch = one call per whole batch;
             # put/put_from = one timed call per key (key_count=1 each)
             write_samples = []
-            if writer_op in PUT_BATCH_IFACES:
-                lat_ms, status = _run_iface(store, *PUT_IFACE_DEFS[writer_op], keys, value, ctx)
+            if effective_writer_op in PUT_BATCH_IFACES:
+                lat_ms, status = _run_iface(
+                    store, *PUT_IFACE_DEFS[effective_writer_op], keys, value, ctx
+                )
                 write_samples.append((keys[0], lat_ms, status, batch_keys))
             else:
                 for k in keys:
-                    lat_ms, status = _run_iface(store, *PUT_IFACE_DEFS[writer_op], [k], value, ctx)
+                    lat_ms, status = _run_iface(
+                        store,
+                        *PUT_IFACE_DEFS[effective_writer_op],
+                        [k],
+                        value,
+                        ctx
+                    )
                     write_samples.append((k, lat_ms, status, 1))
             batch_ok = all(s == "OK" for _, _, s, _ in write_samples)
             # fail-fast: storage exhaustion (put rc=-200 insufficient space)
