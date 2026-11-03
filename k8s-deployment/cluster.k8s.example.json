@@ -1,0 +1,20 @@
+{
+  "_note": "k8s 形态 cluster.json 模板（复制为 configs/cluster.json 使用，已被 gitignore）。节点 kind=k8s-pod 时由编排器自动创建/销毁 pod（每配置 run 一批全新 pod）；image 必填（含 mooncake SDK 的镜像）；namespace 缺省 mooncake；kubecontext 可选（缺省当前 context）；template 可选（缺省 k8s-deployment/templates/benchmark-pod.yaml.tpl，ub 设备段请在模板上自行修改）。venvs 指向容器内 python 解释器路径。free 调度（无 nodeName/亲和性）；容器内不做 numactl 绑核。",
+  "venvs": {
+    "k8s": "python3"
+  },
+  "k8s": {
+    "namespace": "mooncake",
+    "kubecontext": "",
+    "image": "<REPLACE-WITH-YOUR-BENCHMARK-IMAGE>",
+    "template": "k8s-deployment/templates/benchmark-pod.yaml.tpl"
+  },
+  "nodes": {
+    "store1":       { "kind": "k8s-pod" },
+    "node1":        { "kind": "k8s-pod" },
+    "writer_node1": { "kind": "k8s-pod" },
+    "writer_node2": { "kind": "k8s-pod" },
+    "reader_node1": { "kind": "k8s-pod" },
+    "reader_node2": { "kind": "k8s-pod" }
+  }
+}
