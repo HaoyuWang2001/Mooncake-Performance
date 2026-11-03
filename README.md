@@ -314,7 +314,7 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | --- | --- |
 | venvs | 服务器端 Python 虚拟环境**字典**（名称 → 解释器路径，如 `{"mooncake-benchmark": "/root/venvs/mooncake-benchmark/bin/python"}`），供 global.json 的 `venv` 按名称选用；旧版字符串形式 `"venv": "路径"` 仍兼容 |
 | exclude_cpus | **保留核**（系统进程/其他用户专用）：从本节点所有 client 的绑核结果中剔除（`--numa-node` 核集与 `--cpu-bind` 列表都生效，空集报错）；per-node 注入 `MC_EXCLUDE_CPUS`，节点级 `nodes.<name>.exclude_cpus` 覆盖全局值；如 `"0-7,64-71"` |
-| nodes | 可用节点列表，每个节点含 `ip`（仅用于 ssh/scp 登录，管理网地址）、`fabric_ip`（内网高性能网卡地址，作为 `MC_FABRIC_IP`（客户端 local_hostname）与 `MC_TCP_BIND_ADDRESS`（TCP transport 绑定地址）注入该节点 env.sh，**必填**——缺省时 transport 绑定错误地址会导致 client 初始化挂死，可省略则回退到 ip）、`ssh_user`、`ssh_port`、`ssh_key`（空 = 默认密钥，仅支持 ssh 免密登录） |
+| nodes | 可用节点列表，每个节点含 `ip`（仅用于 ssh/scp 登录，管理网地址）、`fabric_ip`（内网高性能网卡地址，作为 `MC_FABRIC_IP`（客户端 local_hostname）与 `MC_TCP_BIND_ADDRESS`（TCP transport 绑定地址）注入该节点 env.sh，**必填**——缺省时 transport 绑定错误地址会导致 client 初始化挂死，可省略则回退到 ip）、`ssh_user`、`ssh_port`、`ssh_key`（空 = 默认密钥）、`passwd`（可选 = SSH 密码认证，需编排机安装 sshpass） |
 
 节点示例：
 
@@ -511,7 +511,10 @@ key 空间，靠 remove-keys 串行隔离）。
 前置条件：
 
 - 集群中 mooncake_master、mooncake_store 已手动启动；
-- 编排机 `ssh` / `scp`（OpenSSH）可用，已配置到服务器的密钥免密登录；
+- 编排机 `ssh` / `scp`（OpenSSH）可用；密钥免密登录（缺省），或节点配 `passwd` 字段走密码认证
+  （经 `sshpass -e`，密码走 `SSHPASS` 环境变量不进命令行/`ps`；需编排机安装
+  `sshpass`：`apt install sshpass` / `yum install sshpass`；缺装即硬失败。密码明文存于
+  cluster.json（已 gitignored），多节点不同密码按节点注入天然支持）；
 - 服务器已安装 mooncake Python 包。
 
 首次使用前，复制集群配置模板并修改：

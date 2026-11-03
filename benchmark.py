@@ -24,9 +24,10 @@ import sys
 import time
 import urllib.parse
 
-from utils import (get_node, is_k8s_node, kubectl_cmd, load_json, log,
-                   parse_data_size, percentile,
-                   run_ssh, scp_pull, scp_push, ssh_args, ssh_check_output)
+from utils import (check_sshpass, get_node, is_k8s_node, kubectl_cmd,
+                   load_json, log, parse_data_size, percentile,
+                   run_ssh, scp_argv, scp_pull, scp_push, ssh_argv,
+                   ssh_check_output)
 
 # profiling matrix core (optional tools: spdiag / perf / bpftrace)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling"))
@@ -858,7 +859,8 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         proc = subprocess.Popen(
             kubectl_cmd(node, "exec", node["_pod"], "--", "bash", "-c", command))
     else:
-        proc = subprocess.Popen(ssh_args(node) + [command])
+        cmd, env = ssh_argv(node)
+        proc = subprocess.Popen(cmd + [command], env=env)
     t0 = time.time()
     log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
     recorded = False
@@ -2324,6 +2326,8 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
     enrich_k8s_nodes(cluster)
+    # passwd 节点需要 sshpass；缺装即硬失败（提示安装命令）
+    check_sshpass(cluster)
     globals_cfg = load_json(args.global_cfg)
     _validate_master_mode(globals_cfg)
     # profiling matrix: explicit --profile wins (and must exist); otherwise

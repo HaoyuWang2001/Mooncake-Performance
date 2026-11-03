@@ -1,5 +1,5 @@
 {
-  "_note": "复制本文件为 cluster.json 并按实际环境修改后使用",
+  "_note": "复制本文件为 cluster.json 并按实际环境修改后使用。passwd 可选：SSH 密码认证（经 sshpass -e，密码走 SSHPASS 环境变量不进命令行；需编排机安装 sshpass：apt install sshpass / yum install sshpass；明文存储，cluster.json 已 gitignored）。缺省 = 密钥免密登录（BatchMode 快失败）",
   "venvs": {
     "mooncake-benchmark": "~/venvs/mooncake-benchmark/bin/python",
     "dev": "~/venvs/dev/bin/python"
@@ -12,56 +12,64 @@
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "node1": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "reader_node1": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "reader_node2": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "reader_node3": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "reader_node4": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "writer_node1": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     },
     "writer_node2": {
       "ip": "127.0.0.1",
       "fabric_ip": "127.0.0.1",
       "ssh_user": "root",
       "ssh_port": 22,
-      "ssh_key": ""
+      "ssh_key": "",
+      "passwd": ""
     }
   }
 }

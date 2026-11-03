@@ -13,6 +13,7 @@ Node transports (cluster.json `kind` field, default "ssh"):
 """
 import json
 import os
+import shutil
 import subprocess
 
 
@@ -41,9 +42,20 @@ def get_node(cluster, name):
     return node
 
 
-def ssh_args(node):
-    args = ["ssh", "-q", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=15"]
+def node_passwd(node):
+    return node.get("passwd") or ""
+
+
+def ssh_argv(node):
+    """ssh invocation for a node -> (argv, env | None). Nodes carrying a
+    `passwd` field authenticate via `sshpass -e` (password travels in the
+    SSHPASS environment variable, never on the command line / ps) and drop
+    BatchMode (it disables password prompts); key nodes keep the fast-fail
+    batch behaviour unchanged."""
+    pw = node_passwd(node)
+    args = ["ssh", "-q", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15"]
+    if not pw:
+        args += ["-o", "BatchMode=yes"]
     port = int(node.get("ssh_port", 22))
     if port != 22:
         args += ["-p", str(port)]
@@ -51,18 +63,40 @@ def ssh_args(node):
     if key:
         args += ["-i", key]
     args.append("{}@{}".format(node.get("ssh_user", "root"), node["ip"]))
-    return args
+    if pw:
+        return ["sshpass", "-e"] + args, dict(os.environ, SSHPASS=pw)
+    return args, None
 
 
-def scp_args(node):
-    args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "LogLevel=QUIET"]
+def scp_argv(node):
+    """scp invocation for a node -> (argv, env | None); passwd semantics as
+    ssh_argv."""
+    pw = node_passwd(node)
+    args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=QUIET"]
+    if not pw:
+        args += ["-o", "BatchMode=yes"]
     port = int(node.get("ssh_port", 22))
     if port != 22:
         args += ["-P", str(port)]
     key = node.get("ssh_key") or ""
     if key:
         args += ["-i", key]
-    return args
+    if pw:
+        return ["sshpass", "-e"] + args, dict(os.environ, SSHPASS=pw)
+    return args, None
+
+
+def check_sshpass(cluster):
+    """Hard-fail early when password nodes need sshpass but it's missing."""
+    pw_nodes = [name for name, n in (cluster.get("nodes") or {}).items()
+                if node_passwd(n) and n.get("kind") != "k8s-pod"]
+    if not pw_nodes:
+        return
+    if shutil.which("sshpass") is None:
+        raise RuntimeError(
+            "nodes {} use passwd auth: install sshpass on the orchestrator "
+            "first (apt install sshpass / yum install sshpass)".format(
+                ", ".join(pw_nodes)))
 
 
 def run_ssh(host, node, command, dry_run=False):
@@ -77,12 +111,13 @@ def run_ssh(host, node, command, dry_run=False):
             raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
                 result.returncode, node["_pod"], command))
         return
-    cmd = ssh_args(node) + [command]
+    cmd, env = ssh_argv(node)
+    cmd += [command]
     log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, env=env)
     if result.returncode != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
             result.returncode, host, command))
@@ -101,13 +136,14 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
             raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
                 result.returncode, node["_pod"], command))
         return result.stdout.strip()
-    cmd = ssh_args(node) + [command]
+    cmd, env = ssh_argv(node)
+    cmd += [command]
     if not quiet:
         log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
         return ""
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
             result.returncode, host, command))
@@ -126,13 +162,14 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
                 continue
             subprocess.run(cmd, check=True)
         return
-    cmd = scp_args(node) + list(local_files) + \
+    cmd, env = scp_argv(node)
+    cmd += list(local_files) + \
         ["{}@{}:{}".format(node.get("ssh_user", "root"), host, remote_path)]
     log("[scp] -> {} : {}".format(host, remote_path))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
@@ -156,14 +193,15 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                 continue
             subprocess.run(cmd, check=True)
         return
-    cmd = scp_args(node) + ["-r"] + \
+    cmd, env = scp_argv(node)
+    cmd += ["-r"] + \
         ["{}@{}:{}".format(node.get("ssh_user", "root"), host, remote_glob),
          local_dir.rstrip("\\/") + os.sep]
     log("[scp] <- {} : {}".format(host, remote_glob))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 def parse_data_size(data_size_str):
