@@ -1,5 +1,5 @@
 {
-  "_note": "复制本文件为 cluster.json 并按实际环境修改后使用。passwd 可选：SSH 密码认证（经 sshpass -e，密码走 SSHPASS 环境变量不进命令行；需编排机安装 sshpass：apt install sshpass / yum install sshpass；明文存储，cluster.json 已 gitignored）。缺省 = 密钥免密登录（BatchMode 快失败）",
+  "_note": "复制本文件为 cluster.json 并按实际环境修改后使用。passwd 可选：SSH 密码认证（paramiko 纯 Python 实现，无需外部 sshpass；Windows 原生编排机可用；明文存储，cluster.json 已 gitignored）。缺省 = 密钥登录（ssh_key 空 = 默认密钥 + ssh-agent）",
   "venvs": {
     "mooncake-benchmark": "~/venvs/mooncake-benchmark/bin/python",
     "dev": "~/venvs/dev/bin/python"

@@ -1,0 +1,6 @@
+# Mooncake-Performance 编排机依赖（Python 3.10+）
+# 安装：pip install -r requirements.txt （Windows / WSL / Linux 通用）
+paramiko>=3.0          # SSH 传输（密码/密钥登录，替代外部 ssh/scp/sshpass 二进制）
+
+# 可选：出图（plot_latency.py / 运行结束自动绘图）
+# matplotlib>=3.5

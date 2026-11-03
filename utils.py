@@ -4,7 +4,11 @@ This module is orchestrator-side only: scripts/mooncake_benchmark_client.py
 stays self-contained because it is uploaded standalone to the test servers.
 
 Node transports (cluster.json `kind` field, default "ssh"):
-  - "ssh":     run/scp against bare-metal nodes (ip/ssh_user/ssh_port/ssh_key)
+  - "ssh":     paramiko SSH/SFTP against bare-metal nodes (pure Python, no
+               external ssh/scp/sshpass binaries -> works on native Windows).
+               Auth: node `passwd` field (password) or ssh_key/agent (keys).
+               One cached connection per node (keepalive 30s), one channel
+               per command.
   - "k8s-pod": kubectl exec/cp against pods. Node dicts are enriched by
                benchmark.py (enrich_k8s_nodes + ensure_pods) with "_pod"
                (pod name), "_ns" (namespace) and "_ctx" (kubecontext) before
@@ -13,8 +17,10 @@ Node transports (cluster.json `kind` field, default "ssh"):
 """
 import json
 import os
-import shutil
 import subprocess
+import sys
+import threading
+import time
 
 
 def log(msg):
@@ -42,61 +48,119 @@ def get_node(cluster, name):
     return node
 
 
+# --- paramiko SSH transport (ssh nodes; k8s-pod nodes use kubectl) --------
+
+_SSH_CLIENTS = {}
+_SSH_LOCK = threading.Lock()
+
+
 def node_passwd(node):
     return node.get("passwd") or ""
 
 
-def ssh_argv(node):
-    """ssh invocation for a node -> (argv, env | None). Nodes carrying a
-    `passwd` field authenticate via `sshpass -e` (password travels in the
-    SSHPASS environment variable, never on the command line / ps) and drop
-    BatchMode (it disables password prompts); key nodes keep the fast-fail
-    batch behaviour unchanged."""
+def _ssh_cache_key(node):
+    return (node.get("ip"), node.get("ssh_port", 22),
+            node.get("ssh_user", "root"), node.get("ssh_key") or "",
+            node_passwd(node))
+
+
+def _ssh_connect(node):
+    try:
+        import paramiko
+    except ImportError:
+        raise RuntimeError("SSH nodes need paramiko: pip install paramiko")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = {
+        "hostname": node["ip"],
+        "port": int(node.get("ssh_port", 22)),
+        "username": node.get("ssh_user", "root"),
+        "timeout": 15,
+        "allow_agent": True,
+        "look_for_keys": True,
+    }
     pw = node_passwd(node)
-    args = ["ssh", "-q", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15"]
-    if not pw:
-        args += ["-o", "BatchMode=yes"]
-    port = int(node.get("ssh_port", 22))
-    if port != 22:
-        args += ["-p", str(port)]
+    if pw:
+        # explicit password auth: do not also try keys/agent
+        kwargs["password"] = pw
+        kwargs["allow_agent"] = False
+        kwargs["look_for_keys"] = False
     key = node.get("ssh_key") or ""
     if key:
-        args += ["-i", key]
-    args.append("{}@{}".format(node.get("ssh_user", "root"), node["ip"]))
-    if pw:
-        return ["sshpass", "-e"] + args, dict(os.environ, SSHPASS=pw)
-    return args, None
-
-
-def scp_argv(node):
-    """scp invocation for a node -> (argv, env | None); passwd semantics as
-    ssh_argv."""
-    pw = node_passwd(node)
-    args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=QUIET"]
-    if not pw:
-        args += ["-o", "BatchMode=yes"]
-    port = int(node.get("ssh_port", 22))
-    if port != 22:
-        args += ["-P", str(port)]
-    key = node.get("ssh_key") or ""
-    if key:
-        args += ["-i", key]
-    if pw:
-        return ["sshpass", "-e"] + args, dict(os.environ, SSHPASS=pw)
-    return args, None
-
-
-def check_sshpass(cluster):
-    """Hard-fail early when password nodes need sshpass but it's missing."""
-    pw_nodes = [name for name, n in (cluster.get("nodes") or {}).items()
-                if node_passwd(n) and n.get("kind") != "k8s-pod"]
-    if not pw_nodes:
-        return
-    if shutil.which("sshpass") is None:
+        kwargs["key_filename"] = os.path.expanduser(key)
+    try:
+        client.connect(**kwargs)
+    except paramiko.AuthenticationException:
         raise RuntimeError(
-            "nodes {} use passwd auth: install sshpass on the orchestrator "
-            "first (apt install sshpass / yum install sshpass)".format(
-                ", ".join(pw_nodes)))
+            "SSH authentication failed for {}@{} (check passwd/ssh_key)"
+            "".format(kwargs["username"], kwargs["hostname"]))
+    client.get_transport().set_keepalive(30)
+    return client
+
+
+def _ssh_client(node):
+    """Cached per-node connection (keepalive 30s); one channel per command."""
+    k = _ssh_cache_key(node)
+    with _SSH_LOCK:
+        client = _SSH_CLIENTS.get(k)
+        if client is None:
+            client = _ssh_connect(node)
+            _SSH_CLIENTS[k] = client
+        return client
+
+
+def _ssh_drop(node):
+    """Drop the cached connection (stale/broken); next call reconnects."""
+    k = _ssh_cache_key(node)
+    with _SSH_LOCK:
+        client = _SSH_CLIENTS.pop(k, None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _drain_chan(chan, relay, out):
+    """Move pending channel output: relay to the console or capture it."""
+    while chan.recv_ready():
+        d = chan.recv(65536)
+        if relay:
+            sys.stdout.write(d.decode("utf-8", "replace"))
+            sys.stdout.flush()
+        else:
+            out.append(d)
+    while chan.recv_stderr_ready():
+        d = chan.recv_stderr(65536)
+        if relay:
+            sys.stdout.write(d.decode("utf-8", "replace"))
+            sys.stdout.flush()
+        # else: discard (parity with the old CLI capture: stdout only)
+
+
+def _ssh_exec(node, command, relay=False):
+    """Execute one command on the cached connection -> (stdout_text, rc).
+    A broken cached connection is dropped so the next call reconnects."""
+    out = []
+    try:
+        client = _ssh_client(node)
+        stdin, stdout, stderr = client.exec_command(command)
+        chan = stdout.channel
+        while not chan.exit_status_ready():
+            _drain_chan(chan, relay, out)
+            time.sleep(0.1)
+        # post-exit drain: sshd delivers EOF after any remaining output
+        grace = time.time() + 5
+        while (chan.recv_ready() or chan.recv_stderr_ready()
+                or not chan.eof_received) and time.time() < grace:
+            _drain_chan(chan, relay, out)
+            time.sleep(0.05)
+        _drain_chan(chan, relay, out)
+        rc = chan.recv_exit_status()
+        return b"".join(out).decode("utf-8", "replace"), rc
+    except Exception:
+        _ssh_drop(node)
+        raise
 
 
 def run_ssh(host, node, command, dry_run=False):
@@ -111,16 +175,14 @@ def run_ssh(host, node, command, dry_run=False):
             raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
                 result.returncode, node["_pod"], command))
         return
-    cmd, env = ssh_argv(node)
-    cmd += [command]
     log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    result = subprocess.run(cmd, env=env)
-    if result.returncode != 0:
+    _, rc = _ssh_exec(node, command, relay=True)
+    if rc != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
-            result.returncode, host, command))
+            rc, host, command))
 
 
 def ssh_check_output(host, node, command, dry_run=False, quiet=False):
@@ -136,18 +198,16 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
             raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
                 result.returncode, node["_pod"], command))
         return result.stdout.strip()
-    cmd, env = ssh_argv(node)
-    cmd += [command]
     if not quiet:
         log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
         return ""
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    if result.returncode != 0:
+    out, rc = _ssh_exec(node, command)
+    if rc != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
-            result.returncode, host, command))
-    return result.stdout.strip()
+            rc, host, command))
+    return out.strip()
 
 
 def scp_push(host, node, local_files, remote_path, dry_run=False):
@@ -162,14 +222,16 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
                 continue
             subprocess.run(cmd, check=True)
         return
-    cmd, env = scp_argv(node)
-    cmd += list(local_files) + \
-        ["{}@{}:{}".format(node.get("ssh_user", "root"), host, remote_path)]
     log("[scp] -> {} : {}".format(host, remote_path))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    subprocess.run(cmd, check=True, env=env)
+    sftp = _ssh_client(node).open_sftp()
+    try:
+        for f in local_files:
+            sftp.put(f, remote_path.rstrip("/") + "/" + os.path.basename(f))
+    finally:
+        sftp.close()
 
 
 def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
@@ -193,15 +255,27 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                 continue
             subprocess.run(cmd, check=True)
         return
-    cmd, env = scp_argv(node)
-    cmd += ["-r"] + \
-        ["{}@{}:{}".format(node.get("ssh_user", "root"), host, remote_glob),
-         local_dir.rstrip("\\/") + os.sep]
+    # SFTP cannot expand remote globs: list matching paths via exec, then
+    # fetch each file (mirrors the k8s branch). A single missing non-glob
+    # path raises (parity with scp failure for guarded collectors).
+    listing = ssh_check_output(host, node,
+                               "ls -1 {} 2>/dev/null || true".format(remote_glob),
+                               quiet=True)
+    files = [l.strip() for l in listing.splitlines() if l.strip()]
+    if not files and not any(c in remote_glob for c in "*?["):
+        raise RuntimeError("scp pull failed: no such file on {}: {}".format(
+            host, remote_glob))
     log("[scp] <- {} : {}".format(host, remote_glob))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    subprocess.run(cmd, check=True, env=env)
+    os.makedirs(local_dir, exist_ok=True)
+    sftp = _ssh_client(node).open_sftp()
+    try:
+        for f in files:
+            sftp.get(f, os.path.join(local_dir, os.path.basename(f)))
+    finally:
+        sftp.close()
 
 
 def parse_data_size(data_size_str):
