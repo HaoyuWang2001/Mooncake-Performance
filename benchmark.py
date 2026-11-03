@@ -13,15 +13,19 @@ Structure:
 import argparse
 import csv
 import glob
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 
-from utils import (get_node, load_json, log, parse_data_size, percentile,
+from utils import (get_node, is_k8s_node, kubectl_cmd, load_json, log,
+                   parse_data_size, percentile,
                    run_ssh, scp_pull, scp_push, ssh_args, ssh_check_output)
 
 # profiling matrix core (optional tools: spdiag / perf / bpftrace)
@@ -257,12 +261,132 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
     if master_type == "etcd":
         # etcd mode: only the etcd URI is exported; the client passes it to
         # both setup params. master_addr/metadata_server (if set) are dormant.
-        session["MC_ETCD_ENDPOINTS"] = globals_cfg.get("etcd_endpoints", "")
+        session["MC_ETCD_ENDPOINTS"] = _resolve_k8s_addr(
+            globals_cfg.get("etcd_endpoints", ""), cluster)
     else:
         # http mode: only rpc master + http metadata are exported
-        session["MC_MASTER_ADDR"] = globals_cfg.get("master_addr", "")
-        session["MC_METADATA_SERVER"] = globals_cfg.get("metadata_server", "")
+        session["MC_MASTER_ADDR"] = _resolve_k8s_addr(
+            globals_cfg.get("master_addr", ""), cluster)
+        session["MC_METADATA_SERVER"] = _resolve_k8s_addr(
+            globals_cfg.get("metadata_server", ""), cluster)
     return session
+
+
+# --------------------------------------------------------------------------
+# k8s support: node enrichment, DNS->IP resolution, pod lifecycle
+# --------------------------------------------------------------------------
+
+def enrich_k8s_nodes(cluster):
+    """Merge cluster-level k8s settings (namespace/kubecontext) into every
+    k8s-pod node (_ns/_ctx), so the utils transports need no cluster arg."""
+    k8s = cluster.get("k8s") or {}
+    ns_default = k8s.get("namespace", "default")
+    ctx_default = k8s.get("kubecontext", "")
+    for node in (cluster.get("nodes") or {}).values():
+        if node.get("kind") == "k8s-pod":
+            node["_ns"] = node.get("namespace") or ns_default
+            node["_ctx"] = node.get("kubecontext") or ctx_default
+
+
+def _resolve_k8s_svc(svc, ns, ctx):
+    """Resolve a k8s Service DNS name to its ClusterIP via kubectl (works
+    even when the orchestrator cannot reach cluster DNS). Headless services
+    (no ClusterIP) fall back to the first endpoint IP. -> ip or None."""
+    base = ["kubectl"]
+    if ctx:
+        base += ["--context", ctx]
+    try:
+        out = subprocess.run(
+            base + ["get", "svc", svc, "-n", ns, "-o",
+                    "jsonpath={.spec.clusterIP}"],
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        if out and out != "None":
+            return out
+        out = subprocess.run(
+            base + ["get", "endpoints", svc, "-n", ns, "-o",
+                    "jsonpath={.subsets[0].addresses[0].ip}"],
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _resolve_host(host, cluster):
+    """Resolve one hostname to an IP. Order: already an IP -> kubectl svc
+    (for k8s Service DNS forms) -> getaddrinfo -> None (keep original)."""
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return host          # already an IP
+    except ValueError:
+        pass
+    # k8s Service DNS forms: <svc>.<ns>.svc.cluster.local / <svc>.<ns>.svc /
+    # <svc>.<ns> (2-part names are tried as svc.ns first, then DNS)
+    parts = host.split(".")
+    svc = ns = None
+    if len(parts) >= 2 and parts[-1] == "local" and len(parts) >= 4 \
+            and parts[-2] == "svc":
+        svc, ns = parts[0], parts[1]
+    elif len(parts) == 3 and parts[2] == "svc":
+        svc, ns = parts[0], parts[1]
+    elif len(parts) == 2:
+        svc, ns = parts[0], parts[1]
+    if svc:
+        k8s = cluster.get("k8s") or {}
+        ip = _resolve_k8s_svc(svc, ns, k8s.get("kubecontext", ""))
+        if ip:
+            log("k8s dns: {} -> {} (kubectl svc {})".format(host, ip, svc))
+            return ip
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET)
+        ip = infos[0][4][0]
+        log("k8s dns: {} -> {} (resolver)".format(host, ip))
+        return ip
+    except Exception:
+        return None
+
+
+def _resolve_k8s_addr(value, cluster):
+    """Resolve every hostname inside an address value to an IP. Accepted
+    forms: bare host / host:port / http://host[:port]/path / comma-separated
+    etcd endpoint list. Unresolvable parts are kept as-is with a [WARN]."""
+    if not value:
+        return value
+
+    def resolve_one(addr):
+        if "://" in addr:
+            p = urllib.parse.urlsplit(addr)
+            host, port = p.hostname, p.port
+            ip = _resolve_host(host, cluster)
+            if not ip:
+                log("[WARN] k8s dns: cannot resolve {}, kept as-is".format(host))
+                return addr
+            netloc = ip if port is None else "{}:{}".format(ip, port)
+            return urllib.parse.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
+        host, _, port = addr.rpartition(":")
+        if not host:          # bare host (no port)
+            ip = _resolve_host(addr, cluster)
+            if not ip:
+                log("[WARN] k8s dns: cannot resolve {}, kept as-is".format(addr))
+                return addr
+            return ip
+        ip = _resolve_host(host, cluster)
+        if not ip:
+            log("[WARN] k8s dns: cannot resolve {}, kept as-is".format(host))
+            return addr
+        return "{}:{}".format(ip, port)
+
+    return ",".join(resolve_one(a.strip()) for a in str(value).split(","))
+
+
+def http_probe(url, method="GET", timeout=5):
+    """Direct HTTP probe from the orchestrator (k8s pods are directly
+    reachable). Returns the body text; raises on connection/HTTP errors."""
+    import urllib.request
+    req = urllib.request.Request(url, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
 
 
 def _validate_master_mode(globals_cfg):
@@ -298,7 +422,10 @@ def resolve_store_node_ips(cluster, store_node_names):
     ips = set()
     for name in store_node_names or []:
         n = get_node(cluster, name)
-        ips.add(n["ip"])
+        # k8s store nodes outside this config's involved set have no pod
+        # (no "ip") — topology is informational only, fall back to the pod
+        # name / node name so detection stays best-effort instead of a crash
+        ips.add(n.get("ip") or n.get("_pod") or name)
     return ips
 
 
@@ -372,8 +499,15 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
         # the cluster-wide exclude_cpus; injected per-node so every client
         # process on this node subtracts it from its binding
         exclude = n.get("exclude_cpus", "") or cluster.get("exclude_cpus", "") or ""
+        # containers do not bind cores: k8s nodes get cpu_shard/exclude zeroed
+        params = scenario_params
+        if is_k8s_node(n) and (params.get("MC_CPU_SHARD", "0") not in ("", "0")
+                               or exclude):
+            params = dict(scenario_params)
+            params["MC_CPU_SHARD"] = "0"
+            exclude = ""
         with open(env_sh_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(build_env_content(scenario_params, cluster_session, ld_path, fab,
+            f.write(build_env_content(params, cluster_session, ld_path, fab,
                                       exclude_cpus=str(exclude)))
         log("env.sh written (node={}, fabric_ip={}, exclude_cpus={})".format(
             node_name, fab, exclude or "-"))
@@ -713,11 +847,18 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     pids written by the runner script) and records every pid into the
     .state ledger under cfg_name — so a crashed orchestrator still leaves a
     killable trail."""
-    log("[ssh] {} : {}".format(host, command))
+    if is_k8s_node(node):
+        log("[exec] {} : {}".format(node["_pod"], command))
+    else:
+        log("[ssh] {} : {}".format(host, command))
     if dry_run:
         log("      (dry-run, skipped)")
         return
-    proc = subprocess.Popen(ssh_args(node) + [command])
+    if is_k8s_node(node):
+        proc = subprocess.Popen(
+            kubectl_cmd(node, "exec", node["_pod"], "--", "bash", "-c", command))
+    else:
+        proc = subprocess.Popen(ssh_args(node) + [command])
     t0 = time.time()
     log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
     recorded = False
@@ -932,6 +1073,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     work_mode = cfg.get("work_mode", cfg.get("mode", ""))
     primary_node_name = cfg["client_node"]
     involved_nodes = [primary_node_name]
+    # k8s-pod nodes: create pods FIRST (pod IPs are needed for topology/host
+    # detection and every transport call below)
+    ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
     # topology: local iff the client node's IP is one of the store nodes' IPs
@@ -985,6 +1129,12 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
         if cpu_shard > 0 and not numa_bind:
             numa_bind = True
+        # containers do not do numactl: k8s primary node forces binding off
+        if is_k8s_node(node) and (numa_bind or cpu_shard > 0):
+            numa_bind = False
+            cpu_shard = 0
+            log("k8s pod node {}: numa/cpu binding disabled (container)"
+                "".format(primary_node_name))
         # numactl policy: membind (strict, default) | preferred | off, and
         # strict/auto behavior when numactl is missing on the node
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
@@ -1089,6 +1239,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
                                        os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+        # k8s pods stay alive past this return: main()'s sweep-end
+        # remove-keys still needs a live pod (store keys are not in the
+        # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -1102,6 +1255,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+            cleanup_pods(cluster, involved_nodes, dry)
         raise
 
 
@@ -1150,6 +1304,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             seen_nodes.add(p["node"])
             involved_nodes.append(p["node"])
     primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
+    # k8s-pod nodes: create pods FIRST (pod IPs are needed for topology/host
+    # detection and every transport call below)
+    ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
     # topology: local iff the primary client node's IP is one of the store
@@ -1307,7 +1464,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
                 numa_arg = ""
                 launch_prefix = ""
-                if (cpu_shard > 0 or numa_bind) and not dry:
+                if (cpu_shard > 0 or numa_bind) and not dry \
+                        and not is_k8s_node(rn):
                     # round-robin over NUMA nodes; with cpu_shard the
                     # per-(node,numa) ordinal picks a consecutive slice
                     nn = numa_counter[r["node"]] % numa_node_count[r["node"]]
@@ -1344,10 +1502,19 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 health_url = "http://{}:{}/health".format(peer["host"], r["port"])
                 HEALTHY = False
                 for attempt in range(10):
-                    health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
-                    result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry, quiet=True) if not dry else "HEALTHY"
-                    if "HEALTHY" in result:
-                        HEALTHY = True
+                    if is_k8s_node(rn):
+                        # pods are directly reachable from the orchestrator
+                        try:
+                            http_probe(health_url, timeout=2)
+                            HEALTHY = True
+                        except Exception:
+                            pass
+                    else:
+                        health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
+                        result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry, quiet=True) if not dry else "HEALTHY"
+                        if "HEALTHY" in result:
+                            HEALTHY = True
+                    if HEALTHY:
                         break
                     time.sleep(1)
                 if not dry:
@@ -1375,7 +1542,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
                 numa_arg = ""
                 launch_prefix = ""
-                if (cpu_shard > 0 or numa_bind) and not dry:
+                if (cpu_shard > 0 or numa_bind) and not dry \
+                        and not is_k8s_node(wn):
                     nn = numa_counter[w["node"]] % numa_node_count[w["node"]]
                     numa_counter[w["node"]] += 1
                     idx = shard_ordinal(w["node"], nn) if cpu_shard > 0 else 0
@@ -1416,9 +1584,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             for r, peer in zip(plan["readers"], reader_peers):
                 rn = get_node(cluster, r["node"])
                 shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
-                curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
                 if not dry:
-                    ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
+                    if is_k8s_node(rn):
+                        try:
+                            http_probe(shutdown_url, method="POST", timeout=5)
+                        except Exception:
+                            pass
+                    else:
+                        curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
+                        ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
             for r, pid in reader_pids:
                 if not dry and pid:
                     wait_process_exit(cluster, r["node"], pid,
@@ -1463,6 +1637,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
                                        os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+        # k8s pods stay alive past this return: main()'s sweep-end
+        # remove-keys still needs a live pod (store keys are not in the
+        # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
@@ -1478,14 +1655,113 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+            cleanup_pods(cluster, involved_nodes, dry)
         raise
 
 
+def _pod_template_path(cluster):
+    k8s = cluster.get("k8s") or {}
+    return k8s.get("template") or os.path.join(
+        ROOT, "k8s-deployment", "templates", "benchmark-pod.yaml.tpl")
+
+
+def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
+    """Create one pod per k8s-pod node involved in this config (per-config
+    lifecycle: fresh pods each config run), wait Ready, resolve Pod IPs and
+    write them into node["ip"]/["fabric_ip"] — after this a k8s node's data
+    shape matches an ssh node. Dry-run logs planned pods with placeholders."""
+    k8s_nodes = [(name, get_node(cluster, name)) for name in involved_nodes
+                 if is_k8s_node(get_node(cluster, name))]
+    if not k8s_nodes:
+        return
+    k8s = cluster.get("k8s") or {}
+    image = k8s.get("image")
+    if not image and not dry_run:
+        raise RuntimeError("cluster.json k8s.image not set (required for "
+                           "k8s-pod nodes)")
+    with open(_pod_template_path(cluster), "r", encoding="utf-8") as f:
+        tpl = f.read()
+    run_label = re.sub(r"[^a-zA-Z0-9._-]", "-", "{}-{}".format(ts, cfg_name))
+    for name, n in k8s_nodes:
+        pod_name = "mc-{}-{}".format(
+            re.sub(r"[^a-z0-9-]", "-", name.lower()),
+            re.sub(r"[^a-zA-Z0-9-]", "-", run_label.lower()))
+        n["_pod"] = pod_name
+        n["_run_label"] = run_label
+        if dry_run:
+            n["ip"] = "10.0.0.0"
+            n["fabric_ip"] = "10.0.0.0"
+            log("[k8s] (dry-run) would create pod {} in ns {} (image {})"
+                "".format(pod_name, n["_ns"], image or "<unset>"))
+            continue
+        yaml_text = (tpl.replace("POD_NAME", pod_name)
+                      .replace("IMAGE", image)
+                      .replace("NAMESPACE", n["_ns"])
+                      .replace("RUN_LABEL", run_label)
+                      .replace("NODE_LABEL", re.sub(r"[^a-z0-9-]", "-", name.lower())))
+        apply_cmd = kubectl_cmd(n, "apply", "-f", "-")
+        res = subprocess.run(apply_cmd, input=yaml_text, text=True,
+                             capture_output=True)
+        if res.returncode != 0:
+            raise RuntimeError("kubectl apply failed for {}: {}".format(
+                pod_name, (res.stderr or res.stdout).strip()[:300]))
+        wait_cmd = kubectl_cmd(n, "wait", "--for=condition=Ready",
+                               "pod/" + pod_name, "--timeout=180s")
+        res = subprocess.run(wait_cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError("pod {} not Ready in 180s: {}".format(
+                pod_name, (res.stderr or res.stdout).strip()[:300]))
+        ip_cmd = kubectl_cmd(n, "get", "pod", pod_name,
+                             "-o", "jsonpath={.status.podIP}")
+        res = subprocess.run(ip_cmd, capture_output=True, text=True)
+        pod_ip = res.stdout.strip()
+        if not pod_ip:
+            raise RuntimeError("cannot resolve Pod IP for {}".format(pod_name))
+        n["ip"] = pod_ip
+        if n.get("fabric_ip", "auto") == "auto" or not n.get("fabric_ip"):
+            n["fabric_ip"] = pod_ip
+        log("[k8s] pod {} ready (ns={}, ip={}, node={})"
+            "".format(pod_name, n["_ns"], pod_ip, name))
+
+
+def cleanup_pods(cluster, involved_nodes, dry_run):
+    """Per-config cleanup: delete every pod carrying this run's label
+    (batch by label selector covers any stragglers)."""
+    seen = set()
+    for name in involved_nodes:
+        n = get_node(cluster, name)
+        if not is_k8s_node(n) or n.get("_ns") in seen:
+            continue
+        seen.add(n["_ns"])
+        label = n.get("_run_label")
+        if not label:
+            continue
+        if dry_run:
+            log("[k8s] (dry-run) would delete pods -l run={}".format(label))
+            continue
+        cmd = kubectl_cmd(n, "delete", "pod", "-l", "run=" + label,
+                          "--ignore-not-found=true")
+        subprocess.run(cmd, capture_output=True)
+        log("[k8s] pods deleted (ns={}, run={})".format(n["_ns"], label))
+
+
 def cleanup_cluster(cluster, globals_cfg, dry_run=False):
-    """Remove the remote test directory on every node in cluster.json."""
+    """Remove the remote test directory on every node in cluster.json.
+    For k8s-pod nodes the pod itself is the workspace: delete every pod
+    carrying the benchmark app label in the node's namespace."""
     remote_dir = globals_cfg["remote_dir"]
     for node_name in sorted(cluster.get("nodes", {})):
         n = get_node(cluster, node_name)
+        if is_k8s_node(n):
+            log("cleanup {} : delete pods (label app=mooncake-benchmark)"
+                "".format(node_name))
+            if dry_run:
+                continue
+            subprocess.run(
+                kubectl_cmd(n, "delete", "pod", "-l", "app=mooncake-benchmark",
+                            "--ignore-not-found=true"),
+                capture_output=True)
+            continue
         log("cleanup {} : {}".format(node_name, remote_dir))
         run_ssh(n["ip"], n, "rm -rf {}".format(remote_dir), dry_run=dry_run)
 
@@ -2047,6 +2323,7 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
 
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
+    enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
     _validate_master_mode(globals_cfg)
     # profiling matrix: explicit --profile wins (and must exist); otherwise
@@ -2141,6 +2418,13 @@ def main(args, cfg_paths):
                 os.path.join(ts_dir, "logs", "final.remove-keys.log")))
         except Exception as exc:
             log("[WARN] sweep-end remove-keys failed: {}".format(exc))
+        finally:
+            # k8s: the sweep-end needed the last config's pods alive —
+            # delete them only now (store-side keys are already cleared)
+            try:
+                cleanup_pods(cluster, [sweep_remove["node"]], False)
+            except Exception as exc:
+                log("[WARN] k8s pod cleanup after sweep-end: {}".format(exc))
     if categories == {"pipeline"}:
         detail_header = PIPELINE_CSV_HEADER
         detail_rows = collapse_config_name(all_rows)
