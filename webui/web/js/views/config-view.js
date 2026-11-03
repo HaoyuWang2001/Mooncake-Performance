@@ -108,6 +108,18 @@ const ConfigView = {
       <el-col :span="8">
         <el-card shadow="never" style="margin-bottom: 14px">
           <template #header><b>通用配置</b><span class="hint" style="margin-left: 8px">configs 根目录</span></template>
+          <div class="newcfg-row">
+            <el-input v-model="newCfgName" placeholder="新文件名，如 cluster.3nodes.json"
+                      size="small" style="width: 220px"></el-input>
+            <el-select v-model="newCfgSource" size="small" style="width: 230px" filterable
+                       title="新文件的初始内容来源">
+              <el-option v-for="t in newCfgSources" :key="t" :label="t" :value="t"></el-option>
+            </el-select>
+            <el-button size="small" type="primary" plain @click="newConfig">新建</el-button>
+          </div>
+          <div class="newcfg-hint">
+            命名前缀约定：<code>cluster*</code> 进运行框 cluster 下拉，<code>global*</code>/<code>matrix*</code> 同理
+          </div>
           <div v-for="p in general" :key="p" class="leaf general-item" @click="openFile(p)">
             {{ p }}
           </div>
@@ -157,6 +169,11 @@ const ConfigView = {
     const globalCandidates = Vue.ref([]);
     const matrixCandidates = Vue.ref([]);
 
+    // 新建配置：默认基于 cluster.example.json 模板；候选 = 三个模板 + 现有通用配置
+    const newCfgName = Vue.ref("");
+    const newCfgSource = Vue.ref("configs/cluster.example.json");
+    const newCfgSources = Vue.ref(["configs/cluster.example.json"]);
+
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
                                  protocol: "", cluster: "configs/cluster.json",
                                  global: "configs/global.json", profile: "" });
@@ -201,6 +218,13 @@ const ConfigView = {
         const cfg = await api("GET", "/api/configs");
         store.cfgTree = cfg;
         general.value = cfg.general;
+        newCfgSources.value = ["configs/cluster.example.json",
+                               "configs/global.example.json",
+                               "configs/matrix.example.json",
+                               ...cfg.general];
+        if (!newCfgSources.value.includes(newCfgSource.value)) {
+          newCfgSource.value = "configs/cluster.example.json";
+        }
         clusterCandidates.value = cfg.cluster_candidates.length
           ? cfg.cluster_candidates : ["configs/cluster.json"];
         globalCandidates.value = cfg.global_candidates.length
@@ -232,6 +256,33 @@ const ConfigView = {
         editMsg.text = "";
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
+      }
+    }
+
+    // 新建配置：拉取复制源内容，以新文件名打开未保存的编辑会话；
+    // 保存走现有 PUT /api/config（新文件 backup=None）
+    async function newConfig() {
+      const name = newCfgName.value.trim();
+      if (!name.endsWith(".json")) {
+        ElementPlus.ElMessage.warning("新文件名必须以 .json 结尾");
+        return;
+      }
+      const path = "configs/" + name;
+      if (general.value.includes(path)) {
+        ElementPlus.ElMessage.warning("文件已存在：" + path);
+        return;
+      }
+      try {
+        const r = await api("GET", "/api/config?path=" +
+                            encodeURIComponent(newCfgSource.value));
+        editPath.value = path;
+        editContent.value = r.content;
+        editSnapshot.value = r.content;
+        editMsg.ok = true;
+        editMsg.text = "新文件（基于 " + newCfgSource.value + "，未保存）";
+        ElementPlus.ElMessage.success("已打开新文件编辑会话，编辑后点击「保存」创建");
+      } catch (e) {
+        ElementPlus.ElMessage.error("读取复制源失败: " + e.message);
       }
     }
 
@@ -282,12 +333,14 @@ const ConfigView = {
     }
 
     Vue.provide("openConfigFile", openFile);
-    Vue.onMounted(() => { if (!store.cfgTree) loadAll(); });
-    Vue.onActivated(() => { if (!store.cfgTree) loadAll(); });
+    Vue.onMounted(loadAll);
+    // 每次切入页签都重新拉取：手动创建/修改的配置文件切回即自动可见
+    Vue.onActivated(loadAll);
 
     return { loading, treeRoots, general, clusterCandidates, globalCandidates,
              matrixCandidates, flags, warnings, starting, sel, clearSelection,
-             startRun, openFile, editPath, editContent, editMsg, saving, dirty,
+             startRun, openFile, newCfgName, newCfgSource, newCfgSources, newConfig,
+             editPath, editContent, editMsg, saving, dirty,
              validate, save, loadAll };
   },
 };
