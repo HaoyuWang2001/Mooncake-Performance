@@ -651,6 +651,18 @@ python benchmark.py --clean-up
 python benchmark.py --config configs/basic/get_local.json --clean-up
 ```
 
+### 8.2 停止与清理
+
+WebUI 点击「停止」或命令行 Ctrl+C 时，benchmark **不会立即被杀**，而是先进入清理阶段：
+
+- **k8s**：删除本次运行的 namespace（级联删除 pods/configmaps）；
+- **SSH**：按 `.state` 台账终止远端 client/stage/profiling 进程（reader 先 HTTP /shutdown）；
+- 默认等待 60s（环境变量 `MCWEB_STOP_GRACE` 可调），超时才强制 kill；后台再做一次兜底清理；
+- 第二次 Ctrl+C 立即强制退出（跳过剩余清理）；
+- 普通停止**保留**远端日志/数据与 controller workspace；只有 `--clean-up` 才删除；
+- 本地 `webui/data/runs/<id>.log` / `outputs/` 保留用于排查；run 状态先 `stopping`，最终 `stopped`；
+- scheduler 执行中的任务同样走优雅停止（stop 文件 + 信号 + grace）。
+
 ## 9. 结果目录结构
 
 ```

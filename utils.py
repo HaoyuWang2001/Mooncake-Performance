@@ -32,6 +32,43 @@ def log(msg):
     print("[benchmark] {}".format(msg), flush=True)
 
 
+# --- cooperative stop (WebUI stop file / Ctrl+C signals) -------------------
+
+class StopRequested(BaseException):
+    """Raised when a stop was requested; BaseException so scenario-level
+    except Exception handlers do NOT swallow it."""
+
+
+_STOP_EVENT = threading.Event()
+_STOP_FILE = None
+_STOP_LOCK = threading.Lock()
+
+
+def set_stop_file(path):
+    global _STOP_FILE
+    with _STOP_LOCK:
+        _STOP_FILE = path
+
+
+def clear_stop():
+    _STOP_EVENT.clear()
+    with _STOP_LOCK:
+        global _STOP_FILE
+        _STOP_FILE = None
+
+
+def request_stop():
+    _STOP_EVENT.set()
+
+
+def stop_requested():
+    if _STOP_EVENT.is_set():
+        return True
+    with _STOP_LOCK:
+        path = _STOP_FILE
+    return bool(path and os.path.exists(path))
+
+
 def is_k8s_node(node):
     return node.get("kind") == "k8s-pod"
 
@@ -80,12 +117,28 @@ def controller_run(controller, args, check=True, timeout=None):
     argv = _controller_kubectl_argv(controller, args)
     if controller_is_local(controller):
         try:
-            r = subprocess.run(argv, capture_output=True, text=True,
-                               env=_controller_env(controller), timeout=timeout)
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True,
+                                    env=_controller_env(controller))
         except FileNotFoundError:
             raise RuntimeError("kubectl not found (controller local)")
-        out = (r.stdout or "") + (r.stderr or "")
-        rc = r.returncode
+        deadline = time.time() + timeout if timeout else None
+        while True:
+            if stop_requested():
+                proc.kill()
+                proc.communicate()
+                raise StopRequested()
+            try:
+                sout, serr = proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if deadline is not None and time.time() > deadline:
+                    proc.kill()
+                    proc.communicate()
+                    raise RuntimeError("kubectl {} timed out".format(
+                        " ".join(str(a) for a in args)))
+        out = (sout or "") + (serr or "")
+        rc = proc.returncode
     else:
         shell = " ".join(shlex.quote(a) for a in argv)
         if controller.get("kubeconfig"):
@@ -142,10 +195,22 @@ def controller_stream(controller, args):
     argv = _controller_kubectl_argv(controller, args)
     if controller_is_local(controller):
         try:
-            r = subprocess.run(argv, env=_controller_env(controller))
+            proc = subprocess.Popen(argv, env=_controller_env(controller))
         except FileNotFoundError:
             raise RuntimeError("kubectl not found (controller local)")
-        return r.returncode
+        while proc.poll() is None:
+            if stop_requested():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise StopRequested()
+            time.sleep(0.1)
+        return proc.returncode
     shell = " ".join(shlex.quote(a) for a in argv) + " 2>&1"
     if controller.get("kubeconfig"):
         shell = "KUBECONFIG={} {}".format(
@@ -336,6 +401,13 @@ def _ssh_exec(node, command, relay=False):
         stdin, stdout, stderr = client.exec_command(command)
         chan = stdout.channel
         while not chan.exit_status_ready():
+            if stop_requested():
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                _ssh_drop(node)
+                raise StopRequested()
             _drain_chan(chan, relay, out)
             time.sleep(0.1)
         # post-exit drain: sshd delivers EOF after any remaining output

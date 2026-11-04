@@ -13,6 +13,7 @@
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -23,6 +24,50 @@ from .paths import ROOT, RUNS_DIR
 
 BENCH = os.path.join(ROOT, "benchmark.py")
 IS_WIN = os.name == "nt"
+STOP_GRACE = float(os.environ.get("MCWEB_STOP_GRACE", "60"))
+
+
+def _write_stop_file(path):
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("stop\n")
+    except OSError:
+        pass
+
+
+def _remove_stop_file(path):
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _send_graceful_stop(proc):
+    """Ask the child to run its cleanup; force kill is a separate fallback."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if IS_WIN:
+            os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+    except Exception:
+        pass
+
+
+def _popen(argv_or_cmd, log_fh, shell=False, env=None):
+    kwargs = {"stdout": log_fh, "stderr": subprocess.STDOUT,
+              "cwd": ROOT, "shell": shell}
+    if env is not None:
+        kwargs["env"] = env
+    if IS_WIN:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(argv_or_cmd, **kwargs)
 
 _seq_lock = threading.Lock()
 _seq = [0]
@@ -34,14 +79,7 @@ def _new_id(prefix):
         return "{}{}-{:03d}".format(prefix, time.strftime("%Y%m%d-%H%M%S"), _seq[0])
 
 
-def _popen(argv_or_cmd, log_fh, shell=False):
-    kwargs = {"stdout": log_fh, "stderr": subprocess.STDOUT,
-              "cwd": ROOT, "shell": shell}
-    if IS_WIN:
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    return subprocess.Popen(argv_or_cmd, **kwargs)
+
 
 
 def _kill(proc):
@@ -80,12 +118,14 @@ def load_run_schedule():
 class Run(object):
     """One managed benchmark process (or scheduler task placeholder)."""
 
-    def __init__(self, rid, kind, cmd, argv, log_path, meta=None):
+    def __init__(self, rid, kind, cmd, argv, log_path, meta=None,
+                 stop_path=None):
         self.id = rid
         self.kind = kind              # benchmark
         self.cmd = cmd                # display string
         self.argv = argv
         self.log_path = log_path
+        self.stop_path = stop_path
         self.meta = meta or {}
         self.proc = None
         self.t0 = time.time()
@@ -99,6 +139,7 @@ class Run(object):
         return {"id": self.id, "kind": self.kind, "cmd": self.cmd,
                 "argv": self.argv, "log": os.path.relpath(self.log_path, ROOT),
                 "status": self.status, "rc": self.rc,
+                "stopping": self.stopping,
                 "t0": self.t0, "t1": self.t1,
                 "elapsed": (self.t1 or time.time()) - self.t0,
                 "ts_dir": self.ts_dir, "meta": self.meta}
@@ -139,6 +180,7 @@ class Scheduler(object):
         self.current_task = None      # 1-based idx while executing
         self.next_trigger = None      # display string
         self.task_proc = None
+        self.task_stop_path = None
         self.stop_event = threading.Event()
         self.events = []              # recent status lines (capped)
         self.t0 = time.time()
@@ -220,9 +262,9 @@ class RunManager(object):
             return "benchmark run {} is still active (started {}, cmd: {})".format(
                 r.id, datetime.fromtimestamp(r.t0).strftime("%H:%M:%S"), r.cmd)
         sch = self.scheduler
-        if sch is not None and sch.state == "executing":
-            return "scheduler task {} is executing (plan {}, stop it first)".format(
-                sch.current_task, sch.plan_path)
+        if sch is not None and sch.state in ("executing", "stopping"):
+            return "scheduler task {} is {} (plan {}, stop it first)".format(
+                sch.current_task, sch.state, sch.plan_path)
         return None
 
     def start_benchmark(self, argv, meta=None):
@@ -232,7 +274,11 @@ class RunManager(object):
                 raise SlotBusy(busy)
             rid = _new_id("r")
             log_path = os.path.join(RUNS_DIR, rid + ".log")
-            run = Run(rid, "benchmark", " ".join(argv), list(argv), log_path, meta)
+            stop_path = os.path.join(RUNS_DIR, rid + ".stop")
+            _remove_stop_file(stop_path)
+            argv = list(argv) + ["--stop-file", stop_path]
+            run = Run(rid, "benchmark", " ".join(argv), list(argv), log_path,
+                      meta, stop_path=stop_path)
             try:
                 fh = open(log_path, "wb")
             except OSError as exc:
@@ -259,9 +305,27 @@ class RunManager(object):
             if run.status != "running" or run.proc is None:
                 return run, None  # already finished; not an error
             run.stopping = True
-            _kill(run.proc)
-            self._reap_remote_async(run)
+            _write_stop_file(run.stop_path)
+            _send_graceful_stop(run.proc)
+            threading.Thread(target=self._stop_watch, args=(run,),
+                             daemon=True).start()
             return run, None
+
+    def _stop_watch(self, run):
+        """Wait up to STOP_GRACE for cooperative cleanup, then force-kill."""
+        proc = run.proc
+        deadline = time.time() + STOP_GRACE
+        while time.time() < deadline and proc is not None \
+                and proc.poll() is None:
+            time.sleep(0.5)
+        if proc is not None and proc.poll() is None:
+            sys.stderr.write("[webui] stop grace {}s expired; force kill {}\n"
+                             "".format(STOP_GRACE, run.id))
+            _kill(proc)
+        try:
+            self._reap_remote_async(run)
+        finally:
+            _remove_stop_file(run.stop_path)
 
     def _reap_remote_async(self, run):
         """停止后清理远端残留：按 .state 台账 kill 远端 client 进程
@@ -282,6 +346,15 @@ class RunManager(object):
                     return
                 with open(full, "r", encoding="utf-8") as f:
                     cluster = json.load(f)
+                if cluster.get("controller"):
+                    cluster["_controller"] = bm.build_controller(cluster)
+                    try:
+                        bm.k8s_settings(cluster)
+                        bm.reap_k8s_namespaces(cluster)
+                        bm.cleanup_k8s_namespace(cluster, dry_run=False)
+                    except Exception as exc:
+                        sys.stderr.write(
+                            "[webui] k8s cleanup for {}: {}\n".format(run.id, exc))
                 bm.reap_state_entries(cluster)
             except Exception as exc:
                 sys.stderr.write("[webui] remote cleanup for {}: {}\n".format(
@@ -293,7 +366,8 @@ class RunManager(object):
     def start_scheduler(self, plan_path):
         with self.lock:
             if self.scheduler is not None and \
-                    self.scheduler.state in ("waiting", "waiting_slot", "executing"):
+                    self.scheduler.state in ("waiting", "waiting_slot",
+                                             "executing", "stopping"):
                 raise SlotBusy("scheduler {} is already active (plan {})".format(
                     self.scheduler.id, self.scheduler.plan_path))
             rs = load_run_schedule()
@@ -312,11 +386,29 @@ class RunManager(object):
             sch = self.scheduler
             if sch is None or sch.state in ("done", "stopped", "aborted"):
                 return None, "no active scheduler"
+            if sch.state == "stopping":
+                return sch, None
             sch.stop_event.set()
             proc = sch.task_proc
             if proc is not None and proc.poll() is None:
-                _kill(proc)
+                sch.state = "stopping"
+                _write_stop_file(sch.task_stop_path)
+                _send_graceful_stop(proc)
+                threading.Thread(
+                    target=self._scheduler_stop_watch,
+                    args=(sch, proc, sch.task_stop_path),
+                    daemon=True).start()
             return sch, None
+
+    def _scheduler_stop_watch(self, sch, proc, stop_path):
+        deadline = time.time() + STOP_GRACE
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.5)
+        if proc.poll() is None:
+            sys.stderr.write("[webui] scheduler stop grace {}s expired; "
+                             "force kill task\n".format(STOP_GRACE))
+            _kill(proc)
+        _remove_stop_file(stop_path)
 
     def _scheduler_loop(self, sch, rs):
         try:
@@ -377,7 +469,13 @@ class RunManager(object):
                     f.write("===== [{}] [task {}] {}\n".format(
                         now_str, idx, task["command"]))
                     f.flush()
-                    proc = _popen(task["command"], f, shell=True)
+                    stop_path = os.path.join(
+                        RUNS_DIR, "{}.task{}.stop".format(sch.id, idx))
+                    _remove_stop_file(stop_path)
+                    env = dict(os.environ)
+                    env["BENCH_STOP_FILE"] = stop_path
+                    proc = _popen(task["command"], f, shell=True, env=env)
+                    sch.task_stop_path = stop_path
                     sch.task_proc = proc
                     proc.wait()
                     rc = proc.returncode
@@ -387,6 +485,8 @@ class RunManager(object):
             finally:
                 sch.task_proc = None
                 sch.current_task = None
+                _remove_stop_file(sch.task_stop_path)
+                sch.task_stop_path = None
             elapsed = time.time() - t0
             end_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
@@ -397,6 +497,10 @@ class RunManager(object):
                 pass
             sch.log("task {} DONE: rc={} elapsed={:.1f}s -> {}".format(
                 idx, rc, elapsed, out_path))
+            if sch.stop_event.is_set():
+                sch.state = "stopped"
+                sch.log("scheduler stopped after task {}".format(idx))
+                return
             prev_end = datetime.now()
             if rc != 0 and sch.plan["on_fail"] == "abort":
                 sch.state = "aborted"

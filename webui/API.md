@@ -79,7 +79,7 @@ selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files
 
 ### GET /api/runs
 历史运行列表（最多 60 条，新→旧）：`{"runs":[<run meta>...]}`。
-run meta 字段：`id/kind/cmd/argv/log/status/rc/t0/t1/elapsed/ts_dir/meta`；`ts_dir` 如 `outputs/20261029-2230`（dry-run 无）。
+run meta 字段：`id/kind/cmd/argv/log/status/stopping/rc/t0/t1/elapsed/ts_dir/meta`；`ts_dir` 如 `outputs/20261029-2230`（dry-run 无）。
 
 ### GET /api/runs/{id}
 单条 run meta。404 若不存在。
@@ -89,10 +89,12 @@ run meta 字段：`id/kind/cmd/argv/log/status/rc/t0/t1/elapsed/ts_dir/meta`；`
 单次最多 512KB；`offset` 为字节偏移（首次传 0，之后传上次返回值）。
 
 ### POST /api/runs/{id}/stop
-跨平台停止（Windows `taskkill /F /T`；POSIX 进程组 TERM→KILL）。停止后**后台线程自动
-清理远端残留**：按 `.state` 台账 kill 远端 client 进程（cmdline 校验防 pid 重用误杀、
-带端口的 reader 先 HTTP /shutdown 优雅关停）并清空台账（多节点 SSH 需数秒，异步执行）。
-→ `{"ok":true,"run":{...status:"stopped"}}`（已结束的 run 调用也返回 ok）
+**优雅停止**：写 `webui/data/runs/<id>.stop` 并向进程组发送 SIGINT/CTRL_BREAK，
+benchmark 先进入清理阶段（k8s 删除 namespace/pods；SSH 按 `.state` 台账 kill
+client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
+（环境变量 `MCWEB_STOP_GRACE` 可调），超时后强制 kill；后台线程再做一次兜底清理。
+停止期间 `status` 仍为 `running` 且 `stopping=true`，完成后变 `stopped`。
+→ `{"ok":true,"run":{...stopping:true}}`（已结束的 run 调用也返回 ok）
 
 ---
 
@@ -149,10 +151,12 @@ run meta 字段：`id/kind/cmd/argv/log/status/rc/t0/t1/elapsed/ts_dir/meta`；`
 → `{"scheduler":{"id":"s...","state":"waiting",...}}`；已有活跃 scheduler → 409
 
 ### POST /api/schedule/stop
-停止 scheduler（等待期直接停；执行期连任务进程一起杀）→ `{"ok":true,"scheduler":{...}}`
+停止 scheduler。等待期直接停；执行期先写 stop 文件 + 发优雅信号，任务（benchmark）
+自行清理，grace 超时后再强制 kill；`state` 先 `stopping`，最终 `stopped`。
+→ `{"ok":true,"scheduler":{...}}`
 
 ### GET /api/schedule/status
-→ `{"scheduler":{"state":"waiting|waiting_slot|executing|done|stopped|aborted",
+→ `{"scheduler":{"state":"waiting|waiting_slot|executing|stopping|done|stopped|aborted",
                   "plan":"schedule/plan.json","next_trigger":"...","current_task":1,
                   "tasks":2,"events":["[22:30:01] task 1 START: ..."]} | null}`
 

@@ -81,7 +81,8 @@ const ScheduleView = {
       const s = sch.value;
       if (!s) return "info";
       return { waiting: "primary", waiting_slot: "warning", executing: "warning",
-               done: "success", stopped: "info", aborted: "danger" }[s.state] || "info";
+               stopping: "warning", done: "success", stopped: "info",
+               aborted: "danger" }[s.state] || "info";
     });
     const schText = Vue.computed(() => {
       const s = sch.value;
@@ -89,6 +90,7 @@ const ScheduleView = {
       let t = s.plan + " · " + s.tasks + " tasks";
       if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state)) t += " · 下一任务 @" + s.next_trigger;
       if (s.current_task) t += " · 执行中 task " + s.current_task;
+      if (s.state === "stopping") t += " · 停止中（清理）";
       return t;
     });
     const schEvents = Vue.computed(() => (sch.value ? sch.value.events : []));

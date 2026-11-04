@@ -78,6 +78,8 @@ fi
 PYTHON="${ORCH_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
+# orchestrator .state ledger: client pids are appended below (all modes).
+: > "$LOG_FILE.pids"
 
 # resolve the binding spec of client ordinal $1 (1-based) into LAUNCH_CMD
 # (numactl argv prefix, possibly empty) + BIND_ARGS (client --cpu-bind).
@@ -138,9 +140,6 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   rm -rf "$LOG_DIR"
   mkdir -p "$LOG_DIR"
   RC=0
-  # client pids are exported for the orchestrator's .state ledger (crash
-  # recovery: a killed orchestrator can still find and kill these later)
-  : > "$LOG_FILE.pids"
   for i in $(seq 1 "$NUM_CLIENTS"); do
     START=$(( (i - 1) * KEY_COUNT / NUM_CLIENTS ))
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
@@ -184,7 +183,10 @@ else
   fi
   MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
   ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" --mode "$MODE" ${BIND_ARGS} "${ARGS[@]}" \
-    > "$LOG_FILE" 2>&1
+    > "$LOG_FILE" 2>&1 &
+  CHILD=$!
+  echo "$CHILD" >> "$LOG_FILE.pids"
+  wait "$CHILD"
   RC=$?
 fi
 exit "$RC"

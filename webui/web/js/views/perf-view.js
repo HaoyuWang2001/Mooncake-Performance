@@ -170,7 +170,9 @@ const PerfView = {
         <div class="header-row" style="margin: 0">
           <b>当前 RUN</b>
           <span class="spacer"></span>
-          <el-button v-if="meta.status === 'running'" size="small" type="danger" @click="stop" :loading="stopping">停止</el-button>
+          <el-button v-if="meta.status === 'running'" size="small" type="danger"
+                     @click="stop" :loading="stopping || meta.stopping"
+                     :disabled="meta.stopping">{{ meta.stopping ? "停止中…" : "停止" }}</el-button>
           <el-button v-if="meta.ts_dir && meta.status !== 'running'" size="small" type="primary"
                      @click="gotoResults">查看运行结果</el-button>
           <el-button size="small" @click="drawerOpen = true">历史</el-button>
@@ -179,7 +181,8 @@ const PerfView = {
       <el-descriptions :column="4" size="small" border style="margin-bottom: 10px">
         <el-descriptions-item label="id">{{ meta.id || "-" }}</el-descriptions-item>
         <el-descriptions-item label="状态">
-          <el-tag v-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
+          <el-tag v-if="meta.stopping && meta.status === 'running'" type="warning" size="small">stopping（清理中）</el-tag>
+          <el-tag v-else-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
           <span v-else>-</span>
         </el-descriptions-item>
         <el-descriptions-item label="耗时">
@@ -428,8 +431,10 @@ const PerfView = {
     async function stop() {
       if (!meta.value.id) return;
       stopping.value = true;
-      try { await api("POST", "/api/runs/" + meta.value.id + "/stop"); }
-      catch (e) { ElementPlus.ElMessage.error(e.message); }
+      try {
+        const r = await api("POST", "/api/runs/" + meta.value.id + "/stop");
+        if (r && r.run) meta.value = r.run;
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
       finally { stopping.value = false; }
     }
 

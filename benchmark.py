@@ -20,6 +20,7 @@ import posixpath
 import re
 import atexit
 import shutil
+import signal
 import shlex
 import socket
 import subprocess
@@ -28,12 +29,13 @@ import threading
 import time
 import urllib.parse
 
-from utils import (_drain_chan, _ssh_client, controller_diagnose,
-                   controller_mkdir,
+from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
+                   clear_stop, controller_diagnose, controller_mkdir,
                    controller_put, controller_remove, controller_run,
                    controller_stream, get_node, is_k8s_node, load_json, log,
-                   parse_data_size, percentile, run_ssh, scp_pull, scp_push,
-                   ssh_check_output)
+                   parse_data_size, percentile, request_stop, run_ssh,
+                   scp_pull, scp_push, set_stop_file, ssh_check_output,
+                   stop_requested)
 
 # profiling matrix core (optional tools: spdiag / perf / bpftrace)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling"))
@@ -44,6 +46,35 @@ except ImportError:  # profiling dir missing -> feature silently off
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
+
+# --- cooperative stop context (WebUI stop file / Ctrl+C) -------------------
+_STOP_CTX = {}
+_STOP_SIGNALS = 0
+
+
+def _install_stop_handlers():
+    def _handler(signum, _frame):
+        global _STOP_SIGNALS
+        _STOP_SIGNALS += 1
+        if _STOP_SIGNALS >= 2:
+            log("[STOP] second signal -> force exit (cleanup skipped)")
+            os._exit(130)
+        log("[STOP] signal {}: entering cleanup "
+            "(press again to force)".format(signum))
+        request_stop()
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
+
+def _check_stop():
+    if stop_requested():
+        raise StopRequested()
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 # RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
@@ -1293,7 +1324,8 @@ def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_
         log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
 
 
-def _record_pids(host, node, pids_file, label, cfg_name, node_name):
+def _record_pids(host, node, pids_file, label, cfg_name, node_name,
+                 marker="mooncake_benchmark_client"):
     """Read the runner's pids file once; returns True when pids were found
     and ledgered into .state (the caller latches this per invocation)."""
     try:
@@ -1308,13 +1340,15 @@ def _record_pids(host, node, pids_file, label, cfg_name, node_name):
             "ip": host, "node": node_name or "", "port": None,
             "fabric_host": None, "pid": p,
             "label": "{} client".format(label), "cfg": cfg_name,
+            "marker": marker,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S")} for p in pids])
         return True
     return False
 
 
 def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False,
-                          pids_file=None, cfg_name=None, node_name=None):
+                          pids_file=None, cfg_name=None, node_name=None,
+                          marker="mooncake_benchmark_client"):
     """run_ssh variant for long-blocking commands (e.g. the basic benchmark
     stage): logs ONE 'running...' line (expected duration + ETA when
     expected_s is given). rc!=0 raises like run_ssh. ssh nodes run over the
@@ -1332,8 +1366,10 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     if dry_run:
         log("      (dry-run, skipped)")
         return
+    if stop_requested():
+        raise StopRequested()
     if is_k8s_node(node):
-        holder = {"rc": 1}
+        holder = {"rc": 1, "stop": False}
 
         def _run():
             try:
@@ -1341,6 +1377,8 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
                     node["_controller"],
                     ["-n", node["_ns"], "exec", node["_pod"],
                      "--", "bash", "-c", command])
+            except StopRequested:
+                holder["stop"] = True
             except Exception as exc:
                 log("[exec] {} failed: {}".format(node["_pod"], exc))
                 holder["rc"] = 1
@@ -1351,11 +1389,16 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
         recorded = False
         while th.is_alive():
+            if stop_requested():
+                holder["stop"] = True
             if not recorded and pids_file:
-                if _record_pids(host, node, pids_file, label, cfg_name, node_name):
+                if _record_pids(host, node, pids_file, label, cfg_name,
+                                node_name, marker):
                     recorded = True
             time.sleep(1)
         th.join()
+        if holder.get("stop") or stop_requested():
+            raise StopRequested()
         rc = holder["rc"]
     else:
         client = _ssh_client(node)
@@ -1365,9 +1408,17 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
         recorded = False
         while not chan.exit_status_ready():
+            if stop_requested():
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                _ssh_drop(node)
+                raise StopRequested()
             _drain_chan(chan, True, [])
             if not recorded and pids_file:
-                if _record_pids(host, node, pids_file, label, cfg_name, node_name):
+                if _record_pids(host, node, pids_file, label, cfg_name,
+                                node_name, marker):
                     recorded = True
             time.sleep(1)
         grace = time.time() + 5
@@ -1536,14 +1587,20 @@ def reap_state_entries(cluster):
 
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
-              dry_run=False, pull_to=None):
+              dry_run=False, pull_to=None, cfg_name=None, node_name=None):
+    _check_stop()
     remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
     command = "bash {} {} {}".format(runner, mode, remote_log)
     if extra:
         command += " " + extra
-    run_ssh(host, node, command, dry_run=dry_run)
+    run_ssh_with_progress(
+        host, node, command, label=log_prefix, dry_run=dry_run,
+        pids_file=remote_log + ".pids", cfg_name=cfg_name or log_prefix,
+        node_name=node_name)
     if pull_to is not None:
         pull_stage_logs(host, node, [remote_log], pull_to, dry_run)
+    if not dry_run:
+        state_remove_cfg(cfg_name or log_prefix)
 
 
 # --------------------------------------------------------------------------
@@ -1623,8 +1680,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     try:
         profile_sess = None  # profiling session (set below when matrix is on)
         run_stage(host, node, remote_runner,
-                  "remove-keys", remote_log_dir, cfg_name, extra="--scope full",
-                  dry_run=dry, pull_to=local_log_dir)
+                  "remove-keys", remote_log_dir, cfg_name,
+                  extra="--scope full", dry_run=dry, pull_to=local_log_dir,
+                  node_name=primary_node_name)
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_remove_before_run = op in PIPELINE_PUT_IFACES or "/" in op
@@ -1677,6 +1735,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 log("[WARN] [profile] start failed: {}".format(exc))
         current_ds = None
         for c, t, ds in runs:
+            _check_stop()
             if ds != current_ds:
                 # data_size changed: (re)build value.bin at this size and
                 # re-prefill the store for get-family combos
@@ -1687,17 +1746,20 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                     run_stage(host, node, remote_runner,
                               "generate-data", remote_log_dir, cfg_name,
                               extra="--data-size {}".format(ds), dry_run=dry,
-                              pull_to=local_log_dir)
+                              pull_to=local_log_dir,
+                              node_name=primary_node_name)
                 if op in PIPELINE_GET_IFACES:
                     run_stage(host, node, remote_runner,
                               "prepare-store", remote_log_dir, cfg_name,
-                              dry_run=dry, pull_to=local_log_dir)
+                              dry_run=dry, pull_to=local_log_dir,
+                              node_name=primary_node_name)
                 current_ds = ds
             if need_remove_before_run:
                 run_stage(host, node, remote_runner,
                           "remove-keys", remote_log_dir, cfg_name,
                           extra="--scope full", dry_run=dry,
-                          pull_to=local_log_dir)
+                          pull_to=local_log_dir,
+                          node_name=primary_node_name)
             # data_size is always part of the run file name, so different
             # sizes under the same (c, t) never collide
             name = "benchmark_c{}_t{}_{}".format(c, t, ds)
@@ -1940,11 +2002,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         run_stage(n["ip"], n, remote_runner,
                                   "generate-data", remote_log_dir, cfg_name,
                                   extra="--data-size {}".format(ds), dry_run=dry,
-                                  pull_to=local_log_dir)
+                                  pull_to=local_log_dir, node_name=node_name)
                 current_ds = ds
             run_stage(host, node, remote_runner,
-                      "remove-keys", remote_log_dir, cfg_name, extra="--scope full",
-                      dry_run=dry, pull_to=local_log_dir)
+                      "remove-keys", remote_log_dir, cfg_name,
+                      extra="--scope full", dry_run=dry, pull_to=local_log_dir,
+                      node_name=primary_node_name)
             # Reader peers: host resolved from each reader node's fabric_ip so the
             # same config works unchanged on any deployment. Rebuilt per size so
             # the fail-path cleanup only ever sees the current run's processes.
@@ -2707,6 +2770,9 @@ def parse_arguments(argv=None):
                              "comma-separated multi values; config-dir entries run "
                              "BEFORE --config files")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--stop-file", default=None,
+                        help="cooperative stop flag file (WebUI stop); a "
+                             "SIGINT/SIGTERM/SIGBREAK also requests stop")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-plot", action="store_true",
                         help="skip the automatic latency/queue-wait plotting of "
@@ -2812,6 +2878,10 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
 
 
 def main(args, cfg_paths):
+    stop_file = args.stop_file or os.environ.get("BENCH_STOP_FILE")
+    if stop_file:
+        args.stop_file = stop_file
+        set_stop_file(stop_file)
     cluster = load_json(args.cluster)
     if args.mode == "k8s":
         cluster["_controller"] = build_controller(cluster)
@@ -2826,6 +2896,8 @@ def main(args, cfg_paths):
     if args.mode == "k8s":
         globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
     _validate_master_mode(globals_cfg)
+    _STOP_CTX.update(cluster=cluster, globals_cfg=globals_cfg, args=args)
+    _check_stop()
     # profile config: parse_arguments already defaulted it to
     # <mode-dir>/profile.json and required it to exist.
     profile_path = args.profile
@@ -2881,6 +2953,7 @@ def main(args, cfg_paths):
     # sweep-end pass is what guarantees the store gets emptied)
     sweep_remove = None
     for cfg_path in cfg_paths:
+        _check_stop()
         cfg = load_scenario_config(cfg_path)
         cfg["__cfg_path__"] = cfg_path
         name = os.path.splitext(os.path.basename(cfg_path))[0]
@@ -2932,7 +3005,8 @@ def main(args, cfg_paths):
             nd = get_node(cluster, sweep_remove["node"])
             run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
                       sweep_remove["remote_log_dir"], "final",
-                      extra="--scope full", dry_run=False)
+                      extra="--scope full", dry_run=False,
+                      cfg_name="final", node_name=sweep_remove["node"])
             scp_pull(sweep_remove["host"], nd,
                      "{}/final.remove-keys.log".format(sweep_remove["remote_log_dir"]),
                      os.path.join(ts_dir, "logs"), dry_run=False)
@@ -3008,9 +3082,66 @@ def main(args, cfg_paths):
         sys.exit(1)
 
 
+def cleanup_on_stop():
+    """Cooperative stop cleanup: k8s delete namespace/pods; SSH reap remote
+    client/stage/profiling processes. Best-effort; never raises."""
+    cluster = _STOP_CTX.get("cluster")
+    globals_cfg = _STOP_CTX.get("globals_cfg")
+    args = _STOP_CTX.get("args")
+    if cluster is None:
+        log("[STOP] no cluster context; nothing to clean")
+        clear_stop()
+        return
+    # allow cleanup SSH/kubectl commands to run (stop file/event would abort them)
+    clear_stop()
+    log("[STOP] cleanup phase started")
+    try:
+        if cluster.get("_controller") is not None:
+            try:
+                cleanup_k8s_namespace(cluster, dry_run=False)
+            except Exception as exc:
+                log("[WARN] [STOP] delete namespace: {}".format(exc))
+            try:
+                reap_state_entries(cluster)
+            except Exception as exc:
+                log("[WARN] [STOP] state reap: {}".format(exc))
+            if args is not None and getattr(args, "clean_up", False):
+                try:
+                    cleanup_k8s_workspace(cluster, dry_run=False)
+                except Exception as exc:
+                    log("[WARN] [STOP] controller workspace: {}".format(exc))
+        else:
+            try:
+                reap_state_entries(cluster)
+            except Exception as exc:
+                log("[WARN] [STOP] state reap: {}".format(exc))
+            if args is not None and getattr(args, "clean_up", False):
+                try:
+                    cleanup_cluster(cluster, globals_cfg, dry_run=False)
+                except Exception as exc:
+                    log("[WARN] [STOP] remote cleanup: {}".format(exc))
+        log("[STOP] cleanup phase done (logs/outputs kept)")
+    finally:
+        if args is not None and getattr(args, "stop_file", None):
+            try:
+                os.remove(args.stop_file)
+            except OSError:
+                pass
+        clear_stop()
+
+
 if __name__ == "__main__":
+    _install_stop_handlers()
     args, cfg_paths = parse_arguments()
     try:
         main(args, cfg_paths)
+    except (StopRequested, KeyboardInterrupt) as exc:
+        log("[STOP] requested ({}); cleaning up ...".format(
+            exc.__class__.__name__))
+        try:
+            cleanup_on_stop()
+        except Exception as ce:
+            log("[WARN] [STOP] cleanup failed: {}".format(ce))
+        sys.exit(130)
     except RuntimeError as exc:
         sys.exit("[ERROR] {}".format(exc))
