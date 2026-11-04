@@ -42,8 +42,6 @@ RESULTS_DIR = os.path.join(ROOT, "outputs")
 # RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
 # legacy rows start with the op name directly (see parse_benchmark_log)
 TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
-DEFAULT_LD_PATH = ("/home/w00921547/stress-cluster-bench/lib/:/usr/local/cuda-12.9/lib64:"
-                   "/usr/local/lib64:${LD_LIBRARY_PATH:-}")
 # store interface families (mirror scripts/mooncake_benchmark_client.py so the
 # orchestrator can validate operation values and choose staging behaviour)
 PIPELINE_PUT_IFACES = ("put", "put_batch", "put_from")
@@ -245,13 +243,13 @@ def resolve_venv(cluster, globals_cfg):
 def build_cluster_session(cluster, globals_cfg, remote_dir):
     master_type = globals_cfg.get("master_type", "") or ""
     session = {
-        "MC_MASTER_TYPE": master_type,
-        "MC_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
-        "MC_VENV": resolve_venv(cluster, globals_cfg),
-        "MC_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
-        "MC_TENANT_ID": globals_cfg.get("tenant_id", "default"),
-        "MC_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
-        "MC_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
+        "SETUP_MASTER_TYPE": master_type,
+        "SETUP_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
+        "ORCH_VENV": resolve_venv(cluster, globals_cfg),
+        "SETUP_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
+        "SETUP_TENANT_ID": globals_cfg.get("tenant_id", "default"),
+        "SETUP_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
+        "BENCH_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
         # NOTE: MC_GLOBAL_SEGMENT_SIZE, MC_YLT_LOG_LEVEL, MC_YLT_LOG_MAX_FILE_SIZE
         # and MC_YLT_LOG_MAX_FILES are intentionally NOT generated here. Their
         # ownership moved to scripts/env.mooncake.sh (hand-editable tuning
@@ -261,13 +259,13 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
     if master_type == "etcd":
         # etcd mode: only the etcd URI is exported; the client passes it to
         # both setup params. master_addr/metadata_server (if set) are dormant.
-        session["MC_ETCD_ENDPOINTS"] = _resolve_k8s_addr(
+        session["SETUP_ETCD_ENDPOINTS"] = _resolve_k8s_addr(
             globals_cfg.get("etcd_endpoints", ""), cluster)
     else:
         # http mode: only rpc master + http metadata are exported
-        session["MC_MASTER_ADDR"] = _resolve_k8s_addr(
+        session["SETUP_MASTER_ADDR"] = _resolve_k8s_addr(
             globals_cfg.get("master_addr", ""), cluster)
-        session["MC_METADATA_SERVER"] = _resolve_k8s_addr(
+        session["SETUP_METADATA_SERVER"] = _resolve_k8s_addr(
             globals_cfg.get("metadata_server", ""), cluster)
     return session
 
@@ -434,29 +432,45 @@ def base_scenario_params(cfg, work_mode, topology, primary_node_name):
     # fallback only — the actual per-run size reaches the client via the
     # generate-data stage's --data-size and the value.bin file length.
     return {
-        "MC_SCENARIO": cfg["scenario"],
-        "MC_WORK_MODE": work_mode,
-        "MC_OPERATION": cfg.get("operation", ""),
-        "MC_PROTOCOL": cfg["protocol"],
-        "MC_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
-        "MC_KEY_COUNT": str(cfg.get("key_count", 1000)),
-        "MC_DATA_SIZE": data_size_list(cfg)[0],
-        "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)) if (
+        "BENCH_SCENARIO": cfg["scenario"],
+        "BENCH_WORK_MODE": work_mode,
+        "BENCH_OPERATION": cfg.get("operation", ""),
+        "SETUP_PROTOCOL": cfg["protocol"],
+        "BENCH_KEY_PREFIX": cfg.get("key_prefix", "mc_bench"),
+        "BENCH_KEY_COUNT": str(cfg.get("key_count", 1000)),
+        "BENCH_DATA_SIZE": data_size_list(cfg)[0],
+        "BENCH_BATCH_SIZE": str(cfg.get("batch_size", 1)) if (
             cfg.get("operation") in ("put_batch", "get_batch")
             or any(s in ("put_batch", "get_batch") for s in str(cfg.get("operation", "")).split("/"))) else "",
-        "MC_PUT_RATIO": str(cfg.get("put_ratio", "")) if "/" in str(cfg.get("operation", "")) else "",
-        "MC_DURATION": str(cfg.get("duration", 0)),
-        "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
+        "BENCH_PUT_RATIO": str(cfg.get("put_ratio", "")) if "/" in str(cfg.get("operation", "")) else "",
+        "BENCH_DURATION": str(cfg.get("duration", 0)),
+        "BENCH_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
         # per-client core count for NUMA-aware sharding (0/unset = whole
         # node); the basic runner assigns each client its NUMA + slice index
-        "MC_CPU_SHARD": str(cfg.get("cpu_shard", 0) or 0),
+        "ORCH_CPU_SHARD": str(cfg.get("cpu_shard", 0) or 0),
     }
 
 
-def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip,
+ENV_GROUPS = [
+    ("MC_", "mooncake runtime: read IN-PROCESS by the C++ SDK (MC_ prefix); "
+             "MC_YLT_LOG_PATH is injected per-client by the runner (inline wins)"),
+    ("SETUP_", "setup params: read by mooncake_benchmark_client.py and passed "
+               "to store.setup() explicitly (SETUP_ prefix)"),
+    ("BENCH_", "benchmark logic: repo-only, NOT read by the Mooncake process "
+               "(BENCH_ prefix)"),
+    ("ORCH_", "orchestrator / runner transport (ORCH_ prefix)"),
+]
+
+
+def build_env_content(scenario_params, cluster_session, fabric_ip,
                       exclude_cpus=""):
+    """Generate the per-node env.sh with variables grouped by consumer (see
+    ENV_GROUPS). Hand-tuning lives in env.mooncake.sh, sourced by the runner
+    AFTER this file — same-name vars there win. LD_LIBRARY_PATH is no longer
+    generated: inject it manually in env.mooncake.sh if a deployment needs
+    it."""
     session = dict(cluster_session)
-    session["MC_FABRIC_IP"] = fabric_ip
+    session["SETUP_FABRIC_IP"] = fabric_ip
     # TCP transport bind address: every client process on this node must bind
     # the node's fabric IP, or store-side connections wedge during setup
     # (observed on the real cluster: readers hung unresponsive to /health and
@@ -465,25 +479,34 @@ def build_env_content(scenario_params, cluster_session, ld_path, fabric_ip,
     # reserved cores (system / other users), subtracted from every binding
     # mode on this node (see client apply_cpu_binding)
     if exclude_cpus:
-        session["MC_EXCLUDE_CPUS"] = exclude_cpus
-    lines = ["#!/usr/bin/env bash", ""]
-    lines.append("# scenario params")
-    for k, v in sorted(scenario_params.items()):
-        if v:
-            lines.append('export {}="{}"'.format(k, v))
-    lines.append("")
-    lines.append("# cluster / session")
-    for k, v in sorted(session.items()):
-        if v:
-            lines.append('export {}="{}"'.format(k, v))
-    lines.append("")
-    lines.append('export LD_LIBRARY_PATH={}'.format(ld_path))
-    lines.append("")
+        session["BENCH_EXCLUDE_CPUS"] = exclude_cpus
+    merged = dict(scenario_params)
+    merged.update(session)
+    lines = ["#!/usr/bin/env bash", "",
+             "# generated by benchmark.py — do not edit; hand-tuning belongs in",
+             "# env.mooncake.sh (sourced after this file; same-name vars win).",
+             ""]
+    consumed = set()
+    for prefix, title in ENV_GROUPS:
+        keys = sorted(k for k in merged if k.startswith(prefix) and merged[k])
+        if not keys:
+            continue
+        consumed.update(keys)
+        lines.append("# ===== {} =====".format(title))
+        for k in keys:
+            lines.append('export {}="{}"'.format(k, merged[k]))
+        lines.append("")
+    rest = sorted(k for k in merged if k not in consumed and merged[k])
+    if rest:
+        lines.append("# ===== unclassified =====")
+        for k in rest:
+            lines.append('export {}="{}"'.format(k, merged[k]))
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
 def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   ld_path, remote_scripts, remote_log_dir, dry_run):
+                   remote_scripts, remote_log_dir, dry_run):
     """Generate a per-node env.sh (node-specific fabric_ip) and push the
     orchestrator scripts (both runner variants + client + the hand-editable
     env.mooncake.sh tuning panel) to every involved node."""
@@ -501,13 +524,13 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
         exclude = n.get("exclude_cpus", "") or cluster.get("exclude_cpus", "") or ""
         # containers do not bind cores: k8s nodes get cpu_shard/exclude zeroed
         params = scenario_params
-        if is_k8s_node(n) and (params.get("MC_CPU_SHARD", "0") not in ("", "0")
+        if is_k8s_node(n) and (params.get("ORCH_CPU_SHARD", "0") not in ("", "0")
                                or exclude):
             params = dict(scenario_params)
-            params["MC_CPU_SHARD"] = "0"
+            params["ORCH_CPU_SHARD"] = "0"
             exclude = ""
         with open(env_sh_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(build_env_content(params, cluster_session, ld_path, fab,
+            f.write(build_env_content(params, cluster_session, fab,
                                       exclude_cpus=str(exclude)))
         log("env.sh written (node={}, fabric_ip={}, exclude_cpus={})".format(
             node_name, fab, exclude or "-"))
@@ -1123,9 +1146,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cfg_name, op, topology, cfg["protocol"], host))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
-    ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   ld_path, remote_scripts, remote_log_dir, dry)
+                   remote_scripts, remote_log_dir, dry)
     # The try MUST start here (before any stage): a failure in generate-data /
     # remove-keys / prepare-store previously raised before the try block, so
     # the FAIL path never pulled the remote logs — silent failure with no
@@ -1191,7 +1213,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 # data_size changed: (re)build value.bin at this size and
                 # re-prefill the store for get-family combos
                 ds_bytes = parse_data_size(ds)
-                check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, ds_bytes)
+                check_cmd = value_check_cmd(cluster_session["BENCH_REMOTE_DATA_DIR"], scenario, ds_bytes)
                 data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
                 if data_status != "EXISTS":
                     run_stage(host, node, remote_runner,
@@ -1252,7 +1274,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             if not dry:
                 state_remove_cfg(cfg_name)
         # Config end: remove only the keys this config wrote (key-prefix
-        # scope, bounded by MC_KEY_COUNT from env.sh). Full scope here would
+        # scope, bounded by BENCH_KEY_COUNT from env.sh). Full scope here would
         # wipe shared store data written by other nodes/scenarios; the full
         # sweep is deferred to the sweep-end remove-all in main(). The log
         # name is distinct (<cfg>.remove-keys-end.log) so it sits next to the
@@ -1352,27 +1374,26 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         cfg_name, op, topology, cfg["protocol"], host))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     scenario_params.update({
-        "MC_WRITER_COUNT": str(len(plan["writers"])),
-        "MC_READER_COUNT": str(len(plan["readers"])),
-        "MC_TARGET_QPS": str(plan["per_writer_qps"]),
-        "MC_NOTIFY_COUNT": str(plan["notify_count"]),
-        "MC_NOTIFY_THREADS": str(plan["notify_threads"]),
-        "MC_NOTIFY_PIPELINE": ",".join(cfg.get("notify_pipeline", [])),
-        "MC_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
-        "MC_DURATION": str(cfg.get("duration", 30)),
-        "MC_BATCH_SIZE": str(cfg.get("batch_size", 1)),
+        "BENCH_WRITER_COUNT": str(len(plan["writers"])),
+        "BENCH_READER_COUNT": str(len(plan["readers"])),
+        "BENCH_TARGET_QPS": str(plan["per_writer_qps"]),
+        "BENCH_NOTIFY_COUNT": str(plan["notify_count"]),
+        "BENCH_NOTIFY_THREADS": str(plan["notify_threads"]),
+        "BENCH_NOTIFY_PIPELINE": ",".join(cfg.get("notify_pipeline", [])),
+        "BENCH_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
+        "BENCH_DURATION": str(cfg.get("duration", 30)),
+        "BENCH_BATCH_SIZE": str(cfg.get("batch_size", 1)),
         # key_count (optional): per-writer key-space cap — when set the writer
         # wraps its sequence with delete-before-write, bounding store usage at
         # writers x key_count x data_size; empty = unbounded (legacy behaviour)
-        "MC_KEY_COUNT": str(cfg.get("key_count", "") or ""),
+        "BENCH_KEY_COUNT": str(cfg.get("key_count", "") or ""),
         # clear basic-only vars that are meaningless for pipeline
-        "MC_OPERATION": "",
-        "MC_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
+        "BENCH_OPERATION": "",
+        "BENCH_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
-    ld_path = cluster.get("ld_library_path", DEFAULT_LD_PATH)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   ld_path, remote_scripts, remote_log_dir, dry)
+                   remote_scripts, remote_log_dir, dry)
     reader_peers = []
     reader_pids = []
     writer_pids = []
@@ -1441,7 +1462,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # data_size changed: (re)build value.bin at this size on every
                 # node that runs a writer or reader
                 ds_bytes = parse_data_size(ds)
-                check_cmd = value_check_cmd(cluster_session["MC_REMOTE_DATA_DIR"], scenario, ds_bytes)
+                check_cmd = value_check_cmd(cluster_session["BENCH_REMOTE_DATA_DIR"], scenario, ds_bytes)
                 for node_name in involved_nodes:
                     n = get_node(cluster, node_name)
                     data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
@@ -1648,7 +1669,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             " ".join(nohup_files))
                         ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
         # Config end: remove-all — clears everything this config's writers
-        # wrote. Pipeline env clears MC_KEY_COUNT, so the key-prefix scope has
+        # wrote. Pipeline env clears BENCH_KEY_COUNT, so the key-prefix scope has
         # no key count to work with; a full sweep here is short and precise
         # enough. The log name is distinct (<cfg>.remove-keys-end.log) so it
         # sits next to the config-start remove-keys log.

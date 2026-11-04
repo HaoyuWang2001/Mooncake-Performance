@@ -45,7 +45,7 @@ source "$ENV_FILE"
 # Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
 [ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
 
-PYTHON="${MC_VENV:-python3}"
+PYTHON="${ORCH_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
 

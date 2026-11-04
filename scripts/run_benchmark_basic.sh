@@ -9,7 +9,7 @@
 #   - stage modes (generate-data / remove-keys / prepare-store): single
 #     foreground process; all extra args are passed through.
 #   - benchmark: --num-clients N is a SCRIPT-level flag (NOT forwarded to the
-#     client). The script reads MC_KEY_COUNT from env.sh, splits the key
+#     client). The script reads BENCH_KEY_COUNT from env.sh, splits the key
 #     range evenly, and spawns N parallel processes, injecting
 #     --client-id i --key-start S --key-end E into each. All other args are
 #     passed through. --client-binds is also script-level: ';'-separated
@@ -75,7 +75,7 @@ if [ "$MODE" != "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   exit 1
 fi
 
-PYTHON="${MC_VENV:-python3}"
+PYTHON="${ORCH_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -129,9 +129,9 @@ bind_launch() {
 }
 
 if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
-  KEY_COUNT="${MC_KEY_COUNT:-0}"
+  KEY_COUNT="${BENCH_KEY_COUNT:-0}"
   if [ "$KEY_COUNT" -lt "$NUM_CLIENTS" ]; then
-    echo "[FATAL] MC_KEY_COUNT=$KEY_COUNT < num-clients=$NUM_CLIENTS" >&2
+    echo "[FATAL] BENCH_KEY_COUNT=$KEY_COUNT < num-clients=$NUM_CLIENTS" >&2
     exit 1
   fi
   LOG_DIR="$LOG_FILE.d"

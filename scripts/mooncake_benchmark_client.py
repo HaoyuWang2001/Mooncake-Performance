@@ -54,7 +54,7 @@ def make_store(args):
     master_type = args.master_type or ""
     if master_type not in ("http", "etcd"):
         print("[ERROR] master_type not specified: pass --master-type http|etcd "
-              "or set MC_MASTER_TYPE")
+              "or set SETUP_MASTER_TYPE")
         sys.exit(1)
     if master_type == "etcd":
         # etcd mode: the same etcd URI serves as both metadata_server and
@@ -172,17 +172,17 @@ def apply_cpu_binding(args):
                                   slice (clients then reuse earlier slices)
     3. --numa-node N           — all allowed cores of node N
 
-    The exclude set (MC_EXCLUDE_CPUS from cluster.json, per-node) is
+    The exclude set (BENCH_EXCLUDE_CPUS from cluster.json, per-node) is
     subtracted from EVERY mode — reserved cores (for the system / other
     users) are never bound. An empty result is a hard error.
     Binding is applied before any store work so all threads inherit it."""
     exclude = set()
-    excl_spec = os.environ.get("MC_EXCLUDE_CPUS", "")
+    excl_spec = os.environ.get("BENCH_EXCLUDE_CPUS", "")
     if excl_spec:
         try:
             exclude = parse_cpu_list(excl_spec)
         except ValueError as exc:
-            sys.exit("[ERROR] bad MC_EXCLUDE_CPUS {!r}: {}".format(excl_spec, exc))
+            sys.exit("[ERROR] bad BENCH_EXCLUDE_CPUS {!r}: {}".format(excl_spec, exc))
     shard = int(getattr(args, "cpu_shard", 0) or 0)
     shard_index = int(getattr(args, "shard_index", 0) or 0)
 
@@ -981,7 +981,7 @@ def _pipeline_writer(args, store, do_warmup=True):
     from concurrent.futures import ThreadPoolExecutor
     notify_pool = ThreadPoolExecutor(max_workers=notify_threads)
     seq = [0]
-    # optional per-writer key-space cap (MC_KEY_COUNT): the sequence wraps at
+    # optional per-writer key-space cap (BENCH_KEY_COUNT): the sequence wraps at
     # key_cap and wrapped batches remove their keys first (delete-before-
     # write) so puts always create fresh objects — bounding store usage at
     # writers x key_count x data_size. 0 = unbounded (legacy behaviour).
@@ -1293,7 +1293,7 @@ def cmd_pipeline(args, store):
 def _pipeline_reader(args, store):
     """Reader process: HTTP server to receive notify, worker threads to read store."""
     lifetime = float(args.timeout)
-    # measurement window = configured duration (MC_DURATION); fall back to
+    # measurement window = configured duration (BENCH_DURATION); fall back to
     # lifetime only if duration was not provided
     meas_duration = float(args.duration or 0) or lifetime
     exit_grace = 5.0
@@ -1408,70 +1408,70 @@ def _pipeline_reader(args, store):
 def _resolve_env(args):
     """After parsing CLI args, fall back to env.sh vars for any unset params."""
     if args.protocol is None:
-        args.protocol = os.environ.get("MC_PROTOCOL", "tcp")
+        args.protocol = os.environ.get("SETUP_PROTOCOL", "tcp")
     if args.scenario is None:
-        args.scenario = os.environ.get("MC_SCENARIO", None)
+        args.scenario = os.environ.get("BENCH_SCENARIO", None)
     if args.work_mode is None:
-        args.work_mode = os.environ.get("MC_WORK_MODE", None)
+        args.work_mode = os.environ.get("BENCH_WORK_MODE", None)
     if args.operation is None:
-        args.operation = os.environ.get("MC_OPERATION", None)
+        args.operation = os.environ.get("BENCH_OPERATION", None)
     if args.key_prefix is None:
-        args.key_prefix = os.environ.get("MC_KEY_PREFIX", "mc_bench")
+        args.key_prefix = os.environ.get("BENCH_KEY_PREFIX", "mc_bench")
     if args.key_count is None:
-        args.key_count = int(os.environ.get("MC_KEY_COUNT", "1000"))
+        args.key_count = int(os.environ.get("BENCH_KEY_COUNT", "1000"))
     if args.data_size is None:
-        args.data_size = os.environ.get("MC_DATA_SIZE", "8MB")
+        args.data_size = os.environ.get("BENCH_DATA_SIZE", "8MB")
     if args.batch_size is None:
-        args.batch_size = int(os.environ.get("MC_BATCH_SIZE", "1"))
+        args.batch_size = int(os.environ.get("BENCH_BATCH_SIZE", "1"))
     if args.put_ratio is None:
-        args.put_ratio = float(os.environ.get("MC_PUT_RATIO", "0.5"))
+        args.put_ratio = float(os.environ.get("BENCH_PUT_RATIO", "0.5"))
     if args.duration is None:
-        dur = os.environ.get("MC_DURATION", None)
+        dur = os.environ.get("BENCH_DURATION", None)
         if dur is not None:
             args.duration = float(dur)
         else:
             args.duration = 0.0
     if args.warmup_duration is None:
-        args.warmup_duration = float(os.environ.get("MC_WARMUP_DURATION", "0"))
+        args.warmup_duration = float(os.environ.get("BENCH_WARMUP_DURATION", "0"))
     if args.master_addr is None:
-        args.master_addr = os.environ.get("MC_MASTER_ADDR", None)
+        args.master_addr = os.environ.get("SETUP_MASTER_ADDR", None)
     if args.metadata_server is None:
-        args.metadata_server = os.environ.get("MC_METADATA_SERVER", None)
+        args.metadata_server = os.environ.get("SETUP_METADATA_SERVER", None)
     if args.etcd_endpoints is None:
-        args.etcd_endpoints = os.environ.get("MC_ETCD_ENDPOINTS", None)
+        args.etcd_endpoints = os.environ.get("SETUP_ETCD_ENDPOINTS", None)
     if args.master_type is None:
-        args.master_type = os.environ.get("MC_MASTER_TYPE", None)
+        args.master_type = os.environ.get("SETUP_MASTER_TYPE", None)
     if args.fabric_ip is None:
-        args.fabric_ip = os.environ.get("MC_FABRIC_IP", None)
+        args.fabric_ip = os.environ.get("SETUP_FABRIC_IP", None)
     if args.ub_device is None or args.ub_device == "":
-        args.ub_device = os.environ.get("MC_UB_DEVICE", "")
+        args.ub_device = os.environ.get("SETUP_UB_DEVICE", "")
     if args.remote_data_dir is None:
-        args.remote_data_dir = os.environ.get("MC_REMOTE_DATA_DIR", "/tmp/mooncake_bench/data")
+        args.remote_data_dir = os.environ.get("BENCH_REMOTE_DATA_DIR", "/tmp/mooncake_bench/data")
     if args.local_buffer_size is None:
-        args.local_buffer_size = int(os.environ.get("MC_LOCAL_BUFFER_SIZE", "1073741824"))
+        args.local_buffer_size = int(os.environ.get("SETUP_LOCAL_BUFFER_SIZE", "1073741824"))
     if args.global_segment_size is None:
         args.global_segment_size = int(os.environ.get("MC_GLOBAL_SEGMENT_SIZE", "0"))
     if args.tenant_id is None:
-        args.tenant_id = os.environ.get("MC_TENANT_ID", "default")
+        args.tenant_id = os.environ.get("SETUP_TENANT_ID", "default")
     if args.data_seed is None:
-        args.data_seed = int(os.environ.get("MC_RANDOM_SEED", "42"))
+        args.data_seed = int(os.environ.get("SETUP_RANDOM_SEED", "42"))
     if args.writer_count is None:
-        args.writer_count = int(os.environ.get("MC_WRITER_COUNT", "1"))
+        args.writer_count = int(os.environ.get("BENCH_WRITER_COUNT", "1"))
     if args.reader_count is None:
-        args.reader_count = int(os.environ.get("MC_READER_COUNT", "1"))
+        args.reader_count = int(os.environ.get("BENCH_READER_COUNT", "1"))
     if args.target_qps is None:
-        args.target_qps = float(os.environ.get("MC_TARGET_QPS", "0"))
+        args.target_qps = float(os.environ.get("BENCH_TARGET_QPS", "0"))
     if args.notify_count is None:
-        args.notify_count = int(os.environ.get("MC_NOTIFY_COUNT", "1"))
+        args.notify_count = int(os.environ.get("BENCH_NOTIFY_COUNT", "1"))
     if args.notify_threads is None:
-        args.notify_threads = int(os.environ.get("MC_NOTIFY_THREADS", "1"))
+        args.notify_threads = int(os.environ.get("BENCH_NOTIFY_THREADS", "1"))
     if args.notify_pipeline is None:
-        raw = os.environ.get("MC_NOTIFY_PIPELINE", "get")
+        raw = os.environ.get("BENCH_NOTIFY_PIPELINE", "get")
         args.notify_pipeline = [s.strip() for s in raw.split(",")]
     if args.traffic_mode is None:
-        args.traffic_mode = os.environ.get("MC_TRAFFIC_MODE", "pulse")
+        args.traffic_mode = os.environ.get("BENCH_TRAFFIC_MODE", "pulse")
     if args.timeout is None:
-        args.timeout = int(os.environ.get("MC_TIMEOUT", "300"))
+        args.timeout = int(os.environ.get("BENCH_TIMEOUT", "300"))
 def main():
     unbuffer_stdio()
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
@@ -1599,7 +1599,7 @@ if __name__ == "__main__":
     # 不需要这些清理，这是 CI 工具的标准做法。唯一代价是 os._exit 不会
     # 自动 flush stdio，所以必须在调用前手动 flush（见下）。
     #
-    # 若 Mooncake 上游修复该 bug：设置环境变量 MC_NORMAL_TEARDOWN=1 即可
+    # 若 Mooncake 上游修复该 bug：设置环境变量 BENCH_NORMAL_TEARDOWN=1 即可
     # 恢复完整的解释器退出流程（含 teardown），无需改代码、无需重新部署；
     # 或在代码审查时删除本 __main__ 块内 os._exit 分支、恢复 sys.exit(code)。
     # ──────────────────────────────────────────────────────────────────────
@@ -1631,6 +1631,6 @@ if __name__ == "__main__":
         # os._exit 不刷 stdio 缓冲，这里手动兜底保全 RESULT/SUMMARY 输出；
         # 刷盘失败（如 broken pipe）也不改变退出码，保码优先。
         pass
-    if os.environ.get("MC_NORMAL_TEARDOWN") != "1":
+    if os.environ.get("BENCH_NORMAL_TEARDOWN") != "1":
         os._exit(code)
     sys.exit(code)
