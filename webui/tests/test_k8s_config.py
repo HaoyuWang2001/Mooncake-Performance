@@ -79,6 +79,62 @@ def test_ub_env_auto_vs_explicit():
     assert 'SETUP_UB_DEVICE="bonding_dev_3"' in explicit
 
 
+def test_resolve_k8s_svc(monkeypatch):
+    c = _cluster()
+    c["_controller"] = bm.build_controller(c)
+    diag = []
+
+    def fake_ok(controller, args, check=True, timeout=None):
+        if "svc" in args:
+            return ("10.109.138.197", 0)
+        return ("192.168.49.60", 0)
+
+    monkeypatch.setattr(bm, "controller_run", fake_ok)
+    monkeypatch.setattr(bm, "controller_diagnose",
+                        lambda ctrl: diag.append(1) or "diag")
+    assert bm._resolve_k8s_svc("mooncake-etcd", "mooncake", "",
+                               c["_controller"]) == "10.109.138.197"
+
+    def fake_headless(controller, args, check=True, timeout=None):
+        if "svc" in args:
+            return ("None", 0)
+        return ("192.168.49.60", 0)
+
+    monkeypatch.setattr(bm, "controller_run", fake_headless)
+    assert bm._resolve_k8s_svc("mooncake-etcd", "mooncake", "",
+                               c["_controller"]) == "192.168.49.60"
+
+    def fake_warn(controller, args, check=True, timeout=None):
+        return ("warning: deprecated\n10.0.0.9", 0)
+
+    monkeypatch.setattr(bm, "controller_run", fake_warn)
+    assert bm._resolve_k8s_svc("mooncake-etcd", "mooncake", "",
+                               c["_controller"]) == "10.0.0.9"
+
+    def fake_fail(controller, args, check=True, timeout=None):
+        return ("command not found", 127)
+
+    monkeypatch.setattr(bm, "controller_run", fake_fail)
+    diag.clear()
+    assert bm._resolve_k8s_svc("mooncake-etcd", "mooncake", "",
+                               c["_controller"]) is None
+    assert diag, "controller diagnostics should be logged on failure"
+
+
+def test_resolve_host_service_fqdn(monkeypatch):
+    c = _cluster()
+    calls = []
+
+    def fake_svc(svc, ns, ctx, controller=None):
+        calls.append((svc, ns))
+        return "10.109.138.197"
+
+    monkeypatch.setattr(bm, "_resolve_k8s_svc", fake_svc)
+    assert bm._resolve_host(
+        "mooncake-etcd.mooncake.svc.cluster.local", c) == "10.109.138.197"
+    assert calls == [("mooncake-etcd", "mooncake")]
+
+
 def test_ssh_env_ub_auto_vs_explicit():
     params = {"BENCH_SCENARIO": "basic", "SETUP_PROTOCOL": "ub"}
     sess = _session()

@@ -98,6 +98,45 @@ def controller_run(controller, args, check=True, timeout=None):
     return out, rc
 
 
+def controller_diagnose(controller):
+    """Human-readable kubectl/kubeconfig/context info for diagnostics."""
+    kubectl = controller.get("_kubectl") or "kubectl"
+    kubeconfig = controller.get("kubeconfig") or ""
+    if controller_is_local(controller):
+        env = _controller_env(controller)
+        kpath = shutil.which(kubectl) or kubectl
+        effective = (kubeconfig or env.get("KUBECONFIG")
+                     or os.path.join(os.path.expanduser("~"), ".kube", "config"))
+        lines = ["kubectl={}".format(kpath),
+                 "kubeconfig={}".format(effective),
+                 "HOME={}".format(os.path.expanduser("~")),
+                 "PATH={}".format(env.get("PATH", ""))]
+        try:
+            r = subprocess.run([kpath, "config", "current-context"],
+                               capture_output=True, text=True, env=env,
+                               timeout=15)
+            lines.append("context={}".format(
+                (r.stdout or r.stderr).strip() or "<empty>"))
+        except Exception as exc:
+            lines.append("context=<error: {}>".format(exc))
+        return "\n".join(lines)
+    prefix = ""
+    if kubeconfig:
+        prefix = "export KUBECONFIG={}; ".format(shlex.quote(kubeconfig))
+    cmd = (
+        prefix +
+        'printf "HOME=%s\\n" "$HOME"; '
+        'printf "KUBECONFIG=%s\\n" "${KUBECONFIG:-}"; '
+        'printf "PATH=%s\\n" "$PATH"; '
+        'K=$(command -v ' + shlex.quote(kubectl) + ' 2>/dev/null || true); '
+        'printf "kubectl=%s\\n" "${K:-NOT_FOUND}"; '
+        'if [ -n "$K" ]; then "$K" config current-context 2>&1 | '
+        'sed "s/^/context=/"; fi'
+    )
+    out, _rc = _ssh_exec(controller, cmd + " 2>&1")
+    return out.strip()
+
+
 def controller_stream(controller, args):
     """Run kubectl and relay output live; return rc."""
     argv = _controller_kubectl_argv(controller, args)

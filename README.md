@@ -361,6 +361,11 @@ k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口
 - `k8s.namespace` 必须由用户固定指定：启动前必须**不存在**，由编排器创建；运行结束/异常/`--clean-up`
   删除；中途被强杀的 namespace 会写入根目录 `.state`，下次启动先回收再创建。
 - `kubecontext` 为空 = controller 当前 context；多集群时填 context 名。
+- **非交互 SSH**：controller 命令不会 source `.bashrc`。若 `kubectl` 不在默认 PATH，
+  把 `controller.kubectl` 填成绝对路径（controller 上 `command -v kubectl`）；
+  `controller.kubeconfig` 留空 = `ssh_user` 的 `$HOME/.kube/config`，非默认位置时填绝对路径
+  （`echo $KUBECONFIG` / `ls $HOME/.kube/config`）。启动时会打印 controller/kubectl/
+  kubeconfig/context 诊断信息。
 - `controller_workspace`（宿主机）与 `pod_workspace`（容器）分离；各自自动建立
   `scripts/ data/ logs/`（宿主机另有 `pods/` 存放渲染后的 YAML）。
 - `venvs` 可留空；`global.venv` 也留空时容器内默认 `python3`。

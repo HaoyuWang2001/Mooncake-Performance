@@ -28,7 +28,8 @@ import threading
 import time
 import urllib.parse
 
-from utils import (_drain_chan, _ssh_client, controller_mkdir,
+from utils import (_drain_chan, _ssh_client, controller_diagnose,
+                   controller_mkdir,
                    controller_put, controller_remove, controller_run,
                    controller_stream, get_node, is_k8s_node, load_json, log,
                    parse_data_size, percentile, run_ssh, scp_pull, scp_push,
@@ -331,31 +332,64 @@ def enrich_k8s_nodes(cluster):
             node["_ctx"] = node.get("kubecontext") or ctx_default
 
 
+def _first_ip(text):
+    """Extract the first valid IP from kubectl output (may contain warnings)."""
+    for cand in re.findall(r"[0-9A-Fa-f:.]+", text or ""):
+        cand = cand.strip(".")
+        try:
+            ipaddress.ip_address(cand)
+            return cand
+        except ValueError:
+            continue
+    return None
+
+
 def _resolve_k8s_svc(svc, ns, ctx, controller=None):
     """Resolve a k8s Service DNS name to its ClusterIP via kubectl (works
     even when the orchestrator cannot reach cluster DNS). Headless services
     (no ClusterIP) fall back to the first endpoint IP. -> ip or None."""
-    def _get(args):
+    def _get(kind, args):
         if controller is not None:
-            out, rc = controller_run(controller, ["-n", ns] + args, check=False)
-            return out.strip() if rc == 0 else ""
-        base = ["kubectl"]
-        if ctx:
-            base += ["--context", ctx]
-        try:
-            return subprocess.run(
-                base + ["-n", ns] + args, capture_output=True, text=True,
-                timeout=15).stdout.strip()
-        except Exception:
-            return ""
+            out, rc = controller_run(controller, ["-n", ns] + args,
+                                     check=False)
+        else:
+            base = ["kubectl"]
+            if ctx:
+                base += ["--context", ctx]
+            try:
+                r = subprocess.run(base + ["-n", ns] + args,
+                                   capture_output=True, text=True, timeout=15)
+                out = (r.stdout or "") + (r.stderr or "")
+                rc = r.returncode
+            except Exception as exc:
+                out, rc = str(exc), 1
+        if rc != 0:
+            log("[WARN] k8s dns: kubectl -n {} get {} {} failed (rc={}): {}"
+                "".format(ns, kind, svc, rc, out.strip()[:400]))
+            return None
+        if out.strip() == "None":
+            return "None"
+        ip = _first_ip(out)
+        if not ip and out.strip():
+            log("[WARN] k8s dns: kubectl -n {} get {} {} returned non-IP "
+                "output: {}".format(ns, kind, svc, out.strip()[:400]))
+        return ip
 
-    out = _get(["get", "svc", svc, "-o", "jsonpath={.spec.clusterIP}"])
+    out = _get("svc", ["get", "svc", svc, "-o",
+                       "jsonpath={.spec.clusterIP}"])
     if out and out != "None":
         return out
-    out = _get(["get", "endpoints", svc, "-o",
-                "jsonpath={.subsets[0].addresses[0].ip}"])
-    return out or None
-
+    out = _get("endpoints", ["get", "endpoints", svc, "-o",
+                             "jsonpath={.subsets[0].addresses[0].ip}"])
+    if out and out != "None":
+        return out
+    if controller is not None:
+        try:
+            log("[k8s] controller diagnostics:\n" +
+                controller_diagnose(controller))
+        except Exception as exc:
+            log("[WARN] k8s controller diagnostics failed: {}".format(exc))
+    return None
 
 def _resolve_host(host, cluster):
     """Resolve one hostname to an IP. Order: already an IP -> kubectl svc
@@ -371,11 +405,14 @@ def _resolve_host(host, cluster):
     # <svc>.<ns> (2-part names are tried as svc.ns first, then DNS)
     parts = host.split(".")
     svc = ns = None
-    if len(parts) >= 2 and parts[-1] == "local" and len(parts) >= 4 \
-            and parts[-2] == "svc":
+    # <svc>.<ns>.svc.cluster.local (standard k8s service FQDN)
+    if len(parts) >= 4 and parts[-1] == "local" \
+            and parts[-2] == "cluster" and parts[-3] == "svc":
         svc, ns = parts[0], parts[1]
-    elif len(parts) == 3 and parts[2] == "svc":
+    # <svc>.<ns>.svc
+    elif len(parts) >= 3 and parts[-1] == "svc":
         svc, ns = parts[0], parts[1]
+    # <svc>.<ns>
     elif len(parts) == 2:
         svc, ns = parts[0], parts[1]
     if svc:
@@ -693,7 +730,11 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
             "_run_label": run_label, "_role": "client-0",
             "ip": ip, "fabric_ip": ip}
     cluster.setdefault("nodes", {})[pod] = node
-    log("[k8s] pod {} ready (ns={}, ip={})".format(pod, ns, ip))
+    if dry_run:
+        log("[k8s] (dry-run) pod {} would be ready "
+            "(ns={}, ip=placeholder)".format(pod, ns))
+    else:
+        log("[k8s] pod {} ready (ns={}, ip={})".format(pod, ns, ip))
     return pod
 
 
@@ -2775,6 +2816,11 @@ def main(args, cfg_paths):
     if args.mode == "k8s":
         cluster["_controller"] = build_controller(cluster)
         k8s_settings(cluster)      # fail fast on missing ns/image/workspaces
+        try:
+            info = controller_diagnose(cluster["_controller"])
+            log("[k8s] controller info: " + " | ".join(info.splitlines()))
+        except Exception as exc:
+            log("[WARN] k8s controller info: {}".format(exc))
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
     if args.mode == "k8s":
