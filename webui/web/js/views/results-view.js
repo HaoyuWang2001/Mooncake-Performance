@@ -139,8 +139,7 @@ const ResPane = {
                    title="关闭此结果框">✕</el-button>
       </span>
     </div>
-    <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading"
-         :style="fs ? null : { height: pane.h + 'px' }">
+    <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading">
       <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
       <template v-else-if="kindOf(pane) === 'img'">
         <div v-if="fs" class="imgfs">
@@ -172,8 +171,6 @@ const ResPane = {
                    :text="pane.text"></spdiag-tree>
       <pre v-else class="txt" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
     </div>
-    <drag-handle v-if="!fs" v-model="pane.h" :min="200" :max="1000"
-                 :persist="'mcweb-res-h' + idx"></drag-handle>
   </div>`,
   setup() {
     function toggleWrap(pane) {
@@ -300,7 +297,7 @@ const ResultsView = {
                             rawView: false, wrap: wrap, imgScale: "fit",
                             imgX: 0, imgY: 0,
                             rows: [], headers: [], text: "",
-                            h: loadHeight("mcweb-res-h" + idx, 420) });
+                            });
     }
 
     async function loadRuns() {

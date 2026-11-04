@@ -48,10 +48,9 @@ const RunView = {
 
     <el-card shadow="never">
       <template #header><b>日志</b></template>
-      <div class="logview log-lg" ref="logEl" :style="{ height: logH + 'px' }">
+      <div class="logview log-lg" ref="logEl">
         <div v-for="(ln, i) in logLines" :key="i" :class="ln.cls">{{ ln.text }}</div>
       </div>
-      <drag-handle v-model="logH" :min="200" :max="1600" persist="mcweb-log-h"></drag-handle>
     </el-card>
 
     <el-drawer v-model="drawerOpen" title="历史 Runs" size="560px" direction="rtl">
@@ -79,7 +78,6 @@ const RunView = {
     const logEl = Vue.ref(null);
     const runs = Vue.ref([]);
     const stopping = Vue.ref(false);
-    const logH = Vue.ref(loadHeight("mcweb-log-h", 460));
     const currentId = Vue.ref(null);      // 本次会话正在跟的 run
     const drawerOpen = Vue.ref(false);
 
@@ -192,7 +190,7 @@ const RunView = {
     });
     Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
-    return { meta, logLines, logEl, runs, stopping, logH, drawerOpen, viewingHistory,
+    return { meta, logLines, logEl, runs, stopping, drawerOpen, viewingHistory,
              statusType, stop, gotoResults, onHistoryClick, backToCurrent };
   },
 };

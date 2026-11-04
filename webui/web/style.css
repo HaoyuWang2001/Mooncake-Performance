@@ -61,20 +61,11 @@ html, body, #app { height: 100%; margin: 0; }
 .logview .ln-warn { color: var(--el-color-warning); }
 .logview .ln-ok { color: var(--el-color-success); }
 .logview .ln-dim { color: var(--el-text-color-secondary); }
-.log-lg { height: 460px; }
+.log-lg {
+  height: auto;
+  min-height: 200px;
+}
 
-/* ---- 垂直拖拽手柄 ---- */
-.vdrag {
-  height: 8px; margin: 2px 0 4px; cursor: row-resize;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 4px;
-}
-.vdrag span {
-  width: 48px; height: 3px; border-radius: 2px;
-  background: var(--el-border-color);
-  transition: background 0.15s;
-}
-.vdrag:hover span, .vdrag:active span { background: var(--el-color-primary); }
 .log-sm { height: 200px; }
 
 /* ---- 配置维护 ---- */
@@ -121,7 +112,12 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .pane.focus { border-color: var(--el-color-primary); }
 .pane-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
-.pane-body { overflow: auto; max-height: 80vh; }
+.pane-body {
+  height: auto;
+  min-height: 200px;
+  max-height: calc(100vh - 180px);
+  overflow-y: auto;
+}
 .pane.focus { border-color: var(--el-color-primary); }
 .pane.focuspane { /* 行内形态：焦点由父级 .focus 类控制 */ }
 .pane-empty { display: flex; align-items: center; justify-content: center; }
