@@ -27,6 +27,36 @@ function _perfModeCandidates(list, mode) {
   });
 }
 
+/* 默认只选精确同名配置（如 cluster.json）；变体（cluster.2node.json）
+   仍保留在候选里，但不自动选中。没有同名文件则返回 ""。 */
+function _perfPickDefault(list, fileName) {
+  const arr = list || [];
+  const hit = arr.find(c => {
+    const p = (c && typeof c === "object") ? c.path : c;
+    return p && p.split("/").pop() === fileName;
+  });
+  return hit ? (hit.path || hit) : "";
+}
+
+/* 配置树勾选状态按 path 跨刷新迁移（页签切换不丢选择）。 */
+function _perfCheckedPaths(roots) {
+  const set = new Set();
+  const walk = (n) => {
+    if (n.checked) set.add(n.path);
+    (n.children || []).forEach(walk);
+  };
+  (roots || []).forEach(walk);
+  return set;
+}
+
+function _perfApplyChecked(roots, set) {
+  const walk = (n) => {
+    if (set.has(n.path)) n.checked = true;
+    (n.children || []).forEach(walk);
+  };
+  (roots || []).forEach(walk);
+}
+
 const SelNode = {
   name: "SelNode",
   props: { node: { type: Object, required: true },
@@ -216,12 +246,18 @@ const PerfView = {
       profile: _perfModeCandidates(candidates.value.profile, mode.value),
     }));
 
-    function onModeChange() {
-      // reset trio to mode-default
+    let servedDefaults = false;
+
+    // 仅首次加载 / 用户显式切换模式时调用；不触碰 mode 与选项开关
+    function applyDefaults() {
       const c = modeCandidates.value;
-      flags.cluster = c.cluster.length ? (c.cluster[0].path || c.cluster[0]) : "";
-      flags.global = c.global.length ? (c.global[0].path || c.global[0]) : "";
-      flags.profile = c.profile.length ? (c.profile[0].path || c.profile[0]) : "";
+      flags.cluster = _perfPickDefault(c.cluster, "cluster.json");
+      flags.global = _perfPickDefault(c.global, "global.json");
+      flags.profile = _perfPickDefault(c.profile, "profile.json");
+    }
+
+    function onModeChange() {
+      applyDefaults();
     }
 
     function _toNode(treeNode) {
@@ -236,16 +272,24 @@ const PerfView = {
 
     async function loadConfigs() {
       try {
+        const checked = _perfCheckedPaths(treeRoots.value);
         const cfg = await api("GET", "/api/configs");
         candidates.value = {
           cluster: cfg.cluster_candidates,
           global: cfg.global_candidates,
           profile: cfg.profile_candidates,
         };
-        treeRoots.value = Object.values(cfg.categories)
+        const roots = Object.values(cfg.categories)
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))
           .map(c => _toNode(c.tree));
-        onModeChange();
+        _perfApplyChecked(roots, checked);
+        treeRoots.value = roots;
+        // 页签切换（onActivated）只刷新候选/树，绝不重置已选项；
+        // 只有首次成功加载才应用精确同名默认值。
+        if (!servedDefaults) {
+          applyDefaults();
+          servedDefaults = true;
+        }
       } catch (e) {
         ElementPlus.ElMessage.error("加载配置失败: " + e.message);
       }

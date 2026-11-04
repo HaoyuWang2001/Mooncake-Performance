@@ -144,5 +144,50 @@ try {
   console.error("[FAIL] _perfModeCandidates: " + e.message);
 }
 
+// 回归：默认仅精确同名；变体不自动选中；勾选按 path 迁移
+try {
+  const cands = [
+    { path: "configs/_k8s/cluster.2node.json", owner: "_k8s" },
+    { path: "configs/_k8s/cluster.json", owner: "_k8s" },
+  ];
+  const pick = vm.runInContext(
+    "_perfPickDefault(" + JSON.stringify(cands) + ',"cluster.json")', ctx);
+  if (pick !== "configs/_k8s/cluster.json") {
+    failed = true;
+    console.error("[FAIL] _perfPickDefault exact: " + pick);
+  }
+  const pickMissing = vm.runInContext(
+    "_perfPickDefault(" + JSON.stringify([cands[0]]) + ',"cluster.json")', ctx);
+  if (pickMissing !== "") {
+    failed = true;
+    console.error("[FAIL] _perfPickDefault missing should be empty: " + pickMissing);
+  }
+  const migrated = vm.runInContext(`(function () {
+    const oldTree = [
+      { path: "configs/basic", checked: true, children: [] },
+      { path: "configs/pipeline", checked: false, children: [
+        { path: "configs/pipeline/a.json", checked: true, children: [] },
+      ] },
+    ];
+    const set = _perfCheckedPaths(oldTree);
+    const fresh = [
+      { path: "configs/basic", checked: false, children: [] },
+      { path: "configs/pipeline", checked: false, children: [
+        { path: "configs/pipeline/a.json", checked: false, children: [] },
+      ] },
+    ];
+    _perfApplyChecked(fresh, set);
+    return fresh[0].checked === true && fresh[1].checked === false &&
+           fresh[1].children[0].checked === true;
+  })()`, ctx);
+  if (!migrated) {
+    failed = true;
+    console.error("[FAIL] _perfCheckedPaths/_perfApplyChecked roundtrip");
+  }
+} catch (e) {
+  failed = true;
+  console.error("[FAIL] default/checked helpers: " + e.message);
+}
+
 if (failed) process.exit(1);
 console.log("FRONTEND_BOOT_OK (" + registered.map(([n]) => n).join(", ") + ")");
