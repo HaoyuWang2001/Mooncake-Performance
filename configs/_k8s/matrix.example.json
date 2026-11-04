@@ -1,0 +1,12 @@
+{
+  "_note": "k8s 通道 profiling 矩阵模板（复制为 configs/_k8s/matrix.json，gitignored）。容器内工具可能不如真机齐全：默认仅启用 spdiag（镜像含 mooncake SDK 即有 spdiag）；perf/bpftrace 取决于镜像（busybox 系基础镜像通常没有）。enabled: true/false 控制各工具开关；sudo 字段 k8s 通道无意义（pod 内即 root）。",
+  "nodes": "auto",
+  "trigger": "whole_run",
+  "tools": {
+    "spdiag":     { "enabled": true },
+    "perf":       { "enabled": false, "freq": 99, "callgraph": "fp", "output": "perf.data" },
+    "runqlat":    { "enabled": false, "interval_s": 10 },
+    "offcputime": { "enabled": false, "min_block_us": 1000 }
+  },
+  "outliers": { "threshold_ms": 1.0, "window_ms": 200, "auto": true }
+}

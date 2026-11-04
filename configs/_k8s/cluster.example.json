@@ -1,0 +1,19 @@
+{
+  "_note": "k8s 通道 cluster 配置模板（复制本文件为 configs/_k8s/cluster.json 使用，gitignored）。节点为逻辑角色名（测试用例引用），全部隐式为 pod（--k8s 模式无需 kind 字段）；编排器按模板创建/销毁 pod。k8s 段：namespace 必填，image 必填（含 mooncake SDK 的镜像），template 可选（缺省 configs/_k8s/templates/benchmark-pod.yaml.tpl，ub 设备段/securityContext/resources 请在模板上维护）。venvs 指向容器内 python 解释器。容器内不做 numactl 绑核。",
+  "venvs": {
+    "mooncake-benchmark": "python3"
+  },
+  "k8s": {
+    "namespace": "mooncake",
+    "kubecontext": "",
+    "image": "<REPLACE-WITH-YOUR-BENCHMARK-IMAGE>",
+    "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl"
+  },
+  "nodes": {
+    "store1":       {},
+    "node1":        {},
+    "writer_node1": {},
+    "reader_node1": {},
+    "reader_node2": {}
+  }
+}

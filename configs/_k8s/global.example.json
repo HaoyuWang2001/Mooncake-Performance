@@ -1,0 +1,24 @@
+{
+  "_k8s_note": "k8s 通道 global 配置模板（复制为 configs/_k8s/global.json，gitignored）。与 _ssh/global.json 的差异：numa_bind 无效（容器不绑核）；protocol.ub.device 无效（每 pod 的 bonding_dev_x 不同，容器内经 urma_admin 自动探测注入 SETUP_UB_DEVICE）；remote_dir 必须与 pod 模板的 workdir 挂载点一致（emptyDir）；域名地址由编排器在生成 env.sh 前解析为 IP（kubectl svc/getaddrinfo）。",
+  "_master_type_comment": "master_type（必填）可选 \"http\" 或 \"etcd\"：etcd 激活 etcd_endpoints；http 激活 master_addr + metadata_server（可省略，默认 http://{master_addr}/metadata）。",
+  "master_type": "http",
+  "etcd_endpoints": "etcd://192.168.49.60:17779",
+  "master_addr": "192.168.49.59:17701",
+  "metadata_server": "",
+  "mooncake_store_nodes": [
+    "store1"
+  ],
+  "venv": "mooncake-benchmark",
+  "numa_bind": false,
+  "protocol": {
+    "ub": {
+      "device": ""
+    }
+  },
+  "local_buffer_size": 1073741824,
+  "tenant_id": "default",
+  "random_seed": 42,
+  "remote_dir": "/tmp/mooncake_bench",
+  "remote_data_dir": "/tmp/mooncake_bench/data",
+  "remote_results_dir": "/tmp/mooncake_bench/results"
+}
