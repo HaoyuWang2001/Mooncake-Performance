@@ -128,12 +128,13 @@ const PerfView = {
           <el-button size="small" @click="drawerOpen = true">历史</el-button>
         </div>
       </template>
-      <div class="logview log-lg" ref="logEl">
+      <div class="logview log-lg" ref="logEl" :style="{ height: logH + 'px' }">
         <div v-for="(ln, i) in logLines" :key="i" :class="ln.cls">{{ ln.text }}</div>
         <div v-if="!logLines.length && !meta.id" class="hint" style="padding: 40px; text-align: center">
           尚未运行——配置完成后点击「运行测试」
         </div>
       </div>
+      <drag-handle v-model="logH" :min="200" :max="1600" persist="mcweb-log-h"></drag-handle>
     </el-card>
 
     <!-- 配置选择弹窗 -->
@@ -264,6 +265,7 @@ const PerfView = {
     const logRem = Vue.ref("");
     const logEof = Vue.ref(true);
     const logEl = Vue.ref(null);
+    const logH = Vue.ref(loadHeight("mcweb-log-h", 460));
     const runs = Vue.ref([]);
     const stopping = Vue.ref(false);
     const drawerOpen = Vue.ref(false);
@@ -278,8 +280,8 @@ const PerfView = {
     }
 
     function classify(ln) {
-      if (/\\bFAIL\\b|\\bERROR\\b/.test(ln)) return "ln-err";
-      if (/\\bWARN\\b/.test(ln)) return "ln-warn";
+      if (/\bFAIL\b|\bERROR\b/.test(ln)) return "ln-err";
+      if (/\bWARN\b/.test(ln)) return "ln-warn";
       if (/SUMMARY: all .* OK|queue finished/.test(ln)) return "ln-ok";
       return "";
     }
@@ -288,14 +290,12 @@ const PerfView = {
       if (!text) return;
       const el = logEl.value;
       const wasBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 60);
-      const lines = (logRem.value + text).split("\\n");
+      const lines = (logRem.value + text).split("\n");
       logRem.value = lines.pop();
       for (const ln of lines) logLines.value.push({ text: ln, cls: classify(ln) });
       if (logLines.value.length > 5000) logLines.value.splice(0, logLines.value.length - 5000);
       if (wasBottom) Vue.nextTick(() => {
-        // page-scroll: scroll the outer el-main, not the log container
-        const main = document.querySelector(".el-main");
-        if (main) main.scrollTop = main.scrollHeight;
+        if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
       });
     }
 
@@ -366,7 +366,7 @@ const PerfView = {
 
     return { mode, cfgDialog, treeRoots, selCount, modeCandidates, onModeChange,
              flags, warnings, starting, clearSel, startRun,
-             meta, logLines, logEl, runs, stopping, drawerOpen, viewingHistory,
+             meta, logLines, logEl, logH, runs, stopping, drawerOpen, viewingHistory,
              statusType, stop, gotoResults, onHistoryClick };
   },
 };

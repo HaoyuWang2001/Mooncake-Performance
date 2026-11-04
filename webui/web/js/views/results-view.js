@@ -121,7 +121,6 @@ const ResPane = {
   <div class="pane" :class="{ focuspane: !fs }" @click="$emit('focus')">
     <div class="pane-head">
       <el-tag size="small" :type="focused && !fs ? 'primary' : 'info'">#{{ idx + 1 }}</el-tag>
-      <span v-if="focused && !fs" class="focus-badge">焦点</span>
       <el-select v-model="pane.ts" filterable placeholder="选择 run" size="small"
                  style="width: 190px" @change="loadFiles(pane, true)">
         <el-option v-for="r in runs" :key="r.ts" :label="r.ts" :value="r.ts"></el-option>
@@ -150,13 +149,14 @@ const ResPane = {
                  @click.stop="toggleWrap(pane)"
                  title="长行换行 / 横向滚动 切换">换行</el-button>
       <span class="pane-tools">
-        <el-button size="small" text @click.stop="$emit('toggle-fs')"
+        <el-button size="small" type="primary" plain @click.stop="$emit('toggle-fs')"
                    :title="fs ? '退出全屏' : '全屏查看'">{{ fs ? "退出全屏" : "全屏" }}</el-button>
         <el-button v-if="!fs" size="small" text type="danger" @click.stop="$emit('close')"
                    title="关闭此结果框">✕</el-button>
       </span>
     </div>
-    <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading">
+    <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading"
+         :style="fs ? null : { height: pane.h + 'px' }">
       <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
       <template v-else-if="kindOf(pane) === 'img'">
         <div v-if="fs" class="imgfs">
@@ -188,6 +188,8 @@ const ResPane = {
                    :text="pane.text"></spdiag-tree>
       <pre v-else class="txt" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
     </div>
+    <drag-handle v-if="!fs" v-model="pane.h" :min="200" :max="1000"
+                 :persist="'mcweb-res-h' + idx"></drag-handle>
   </div>`,
   setup() {
     function toggleWrap(pane) {
@@ -253,7 +255,7 @@ const ResultsView = {
 
     <el-row :gutter="14">
       <el-col :span="6">
-        <el-card shadow="never">
+        <el-card shadow="never" class="run-list-card">
           <template #header>
             <div class="header-row" style="margin: 0">
               <b>运行结果（{{ runs.length }}）</b>
@@ -270,6 +272,7 @@ const ResultsView = {
             <el-button size="small" type="danger" :disabled="!selected.length"
                        @click="deleteSelected">删除选中</el-button>
           </div>
+          <div class="run-list">
           <div v-for="r in runs" :key="r.ts" class="run-item"
                :class="{ active: isActivePaneTs(r.ts), selected: isSelected(r.ts) }"
                @click="pickRun(r.ts)">
@@ -291,6 +294,7 @@ const ResultsView = {
             </div>
           </div>
           <el-empty v-if="!runs.length" description="暂无结果" :image-size="60"></el-empty>
+          </div>
         </el-card>
       </el-col>
 
@@ -339,7 +343,7 @@ const ResultsView = {
                             rawView: false, wrap: wrap, imgScale: "fit",
                             imgX: 0, imgY: 0,
                             rows: [], headers: [], text: "",
-                            });
+                            h: loadHeight("mcweb-res-h" + idx, 420) });
     }
 
     async function loadRuns() {

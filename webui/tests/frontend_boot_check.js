@@ -86,7 +86,7 @@ for (const rel of files) {
 
 const mustHave = ["perf-view", "sel-node", "config-view", "cfg-node",
                   "results-view", "res-pane", "schedule-view",
-                  "spdiag-tree", "sdt-node"];
+                  "spdiag-tree", "sdt-node", "drag-handle"];
 for (const [name, comp] of registered) {
   if (comp === undefined) {
     failed = true;

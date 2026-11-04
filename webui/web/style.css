@@ -62,9 +62,22 @@ html, body, #app { height: 100%; margin: 0; }
 .logview .ln-ok { color: var(--el-color-success); }
 .logview .ln-dim { color: var(--el-text-color-secondary); }
 .log-lg {
-  height: auto;
   min-height: 200px;
+  overflow-y: auto;
 }
+
+/* ---- 垂直拖拽手柄 ---- */
+.vdrag {
+  height: 8px; margin: 2px 0 4px; cursor: row-resize;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 4px;
+}
+.vdrag span {
+  width: 48px; height: 3px; border-radius: 2px;
+  background: var(--el-border-color);
+  transition: background 0.15s;
+}
+.vdrag:hover span, .vdrag:active span { background: var(--el-color-primary); }
 
 .log-sm { height: 200px; }
 
@@ -119,6 +132,9 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .run-item:hover .ri-actions { display: inline-flex; }
 .run-item:hover .ri-tag { visibility: hidden; }
+.run-list-card { display: flex; flex-direction: column; max-height: calc(100vh - 110px); }
+.run-list-card .el-card__body { display: flex; flex-direction: column; min-height: 0; }
+.run-list { flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
 .ms-bar {
   display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
   padding: 6px 8px; background: var(--el-fill-color-light); border-radius: 6px;
@@ -142,14 +158,8 @@ html, body, #app { height: 100%; margin: 0; }
   border-bottom: 1px solid transparent;
 }
 .pane.focus .pane-head { border-bottom-color: var(--el-color-primary-light-7); }
-.focus-badge {
-  font-size: 12px; font-weight: 600; color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9); border-radius: 10px; padding: 1px 8px;
-}
 .pane-body {
-  height: auto;
   min-height: 200px;
-  max-height: calc(100vh - 180px);
   overflow-y: auto;
 }
 .pane-empty { display: flex; align-items: center; justify-content: center; }

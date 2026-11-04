@@ -58,6 +58,72 @@ function toggleDark() {
   applyTheme();
 }
 
+/* ---------------- 高度持久化（拖拽手柄用） ---------------- */
+function loadHeight(key, def) {
+  try {
+    const v = parseInt(localStorage.getItem(key), 10);
+    return Number.isFinite(v) && v > 0 ? v : def;
+  } catch (e) { return def; }
+}
+function saveHeight(key, h) {
+  try { localStorage.setItem(key, String(Math.round(h))); } catch (e) { /* ignore */ }
+}
+
+/* ---------------- 通用垂直拖拽手柄（v-model：modelValue / update:modelValue） ----------------
+   拖动时若指针接近滚动容器上下边缘，容器自动滚动并把实际滚动量补偿进高度，
+   使手柄始终跟随光标（可一直往下拖大）。 */
+const DragHandle = {
+  name: "DragHandle",
+  props: { modelValue: { type: Number, required: true },
+           min: { type: Number, default: 200 },
+           max: { type: Number, default: 1600 },
+           persist: { type: String, default: "" } },
+  emits: ["update:modelValue"],
+  template: `<div class="vdrag" title="拖动调节高度" @mousedown="down"><span></span></div>`,
+  setup(props, { emit }) {
+    const clamp = h => Math.min(props.max, Math.max(props.min, h));
+    const down = (e) => {
+      e.preventDefault();
+      const scroller = document.querySelector(".el-main");
+      const startDocY = e.clientY + (scroller ? scroller.scrollTop : 0);
+      const startH = props.modelValue;
+      let lastY = e.clientY;
+      let raf = 0;
+      const EDGE = 44, STEP = 8;
+      const apply = () => {
+        const docY = lastY + (scroller ? scroller.scrollTop : 0);
+        const h = clamp(startH + (docY - startDocY));
+        emit("update:modelValue", h);
+        if (props.persist) saveHeight(props.persist, h);
+      };
+      const tick = () => {
+        if (scroller) {
+          const r = scroller.getBoundingClientRect();
+          let d = 0;
+          if (lastY > r.bottom - EDGE) d = Math.min(STEP, lastY - (r.bottom - EDGE));
+          else if (lastY < r.top + EDGE) d = -Math.min(STEP, (r.top + EDGE) - lastY);
+          if (d) { scroller.scrollTop += d; apply(); }
+        }
+        raf = requestAnimationFrame(tick);
+      };
+      const move = (ev) => { lastY = ev.clientY; apply(); };
+      const up = () => {
+        cancelAnimationFrame(raf);
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      document.body.style.cursor = "row-resize";
+      document.body.style.userSelect = "none";
+      raf = requestAnimationFrame(tick);
+    };
+    return { down };
+  },
+};
+
 
 /* ---------------- 根组件 ---------------- */
 const App = {
@@ -98,7 +164,13 @@ const App = {
     const VIEWS = { perf: "perf-view", results: "results-view",
                     config: "config-view", schedule: "schedule-view" };
     const viewComp = computed(() => VIEWS[store.view] || "config-view");
-    function go(v) { store.view = v; }
+    function go(v) {
+      store.view = v;
+      nextTick(() => {
+        const m = document.querySelector(".el-main");
+        if (m) m.scrollTop = 0;
+      });
+    }
 
     const runDot = computed(() => store.status.active_run ? "on" : "");
     const runText = computed(() => {
@@ -148,4 +220,5 @@ app.component("res-pane", ResPane);
 app.component("schedule-view", ScheduleView);
 app.component("spdiag-tree", SpdiagTree);
 app.component("sdt-node", SdtNode);
+app.component("drag-handle", DragHandle);
 app.mount("#app");
