@@ -1448,7 +1448,8 @@ def _resolve_env(args):
     if args.remote_data_dir is None:
         args.remote_data_dir = os.environ.get("BENCH_REMOTE_DATA_DIR", "/tmp/mooncake_bench/data")
     if args.local_buffer_size is None:
-        args.local_buffer_size = int(os.environ.get("SETUP_LOCAL_BUFFER_SIZE", "1073741824"))
+        args.local_buffer_size = parse_size(
+            os.environ.get("SETUP_LOCAL_BUFFER_SIZE", "1073741824"))
     if args.global_segment_size is None:
         args.global_segment_size = int(os.environ.get("MC_GLOBAL_SEGMENT_SIZE", "0"))
     if args.tenant_id is None:

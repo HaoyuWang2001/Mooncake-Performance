@@ -17,8 +17,12 @@ Node transports (cluster.json `kind` field, default "ssh"):
 """
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 
@@ -32,13 +36,150 @@ def is_k8s_node(node):
 
 
 def kubectl_cmd(node, *args):
-    """kubectl invocation for a k8s-pod node (context/namespace injected)."""
+    """kubectl invocation for a k8s-pod node (context/namespace injected).
+
+    Kept for backward compatibility with callers that build argv; actual
+    execution now goes through the controller helpers below.
+    """
     cmd = ["kubectl"]
     if node.get("_ctx"):
         cmd += ["--context", node["_ctx"]]
     if node.get("_ns"):
         cmd += ["-n", node["_ns"]]
     return cmd + list(args)
+
+
+# --- controller transport (kubectl host; local or SSH) ---------------------
+
+def controller_is_local(controller):
+    return bool(controller.get("_local"))
+
+
+def _controller_env(controller):
+    env = dict(os.environ)
+    if controller.get("kubeconfig"):
+        env["KUBECONFIG"] = controller["kubeconfig"]
+    return env
+
+
+def _controller_kubectl_argv(controller, args):
+    argv = [controller.get("_kubectl") or "kubectl"]
+    if controller.get("_ctx"):
+        argv += ["--context", controller["_ctx"]]
+    return argv + [str(a) for a in args]
+
+
+def controller_run(controller, args, check=True, timeout=None):
+    """Run kubectl on the controller; return (combined_output, rc)."""
+    argv = _controller_kubectl_argv(controller, args)
+    if controller_is_local(controller):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True,
+                               env=_controller_env(controller), timeout=timeout)
+        except FileNotFoundError:
+            raise RuntimeError("kubectl not found (controller local)")
+        out = (r.stdout or "") + (r.stderr or "")
+        rc = r.returncode
+    else:
+        shell = " ".join(shlex.quote(a) for a in argv)
+        if controller.get("kubeconfig"):
+            shell = "KUBECONFIG={} {}".format(
+                shlex.quote(controller["kubeconfig"]), shell)
+        out, rc = _ssh_exec(controller, shell + " 2>&1")
+    if check and rc != 0:
+        raise RuntimeError("kubectl {} failed (rc={}): {}".format(
+            " ".join(str(a) for a in args), rc, out.strip()[:500]))
+    return out, rc
+
+
+def controller_stream(controller, args):
+    """Run kubectl and relay output live; return rc."""
+    argv = _controller_kubectl_argv(controller, args)
+    if controller_is_local(controller):
+        try:
+            r = subprocess.run(argv, env=_controller_env(controller))
+        except FileNotFoundError:
+            raise RuntimeError("kubectl not found (controller local)")
+        return r.returncode
+    shell = " ".join(shlex.quote(a) for a in argv) + " 2>&1"
+    if controller.get("kubeconfig"):
+        shell = "KUBECONFIG={} {}".format(
+            shlex.quote(controller["kubeconfig"]), shell)
+    _, rc = _ssh_exec(controller, shell, relay=True)
+    return rc
+
+
+def controller_mkdir(controller, path):
+    if controller_is_local(controller):
+        os.makedirs(path, exist_ok=True)
+        return
+    out, rc = _ssh_exec(controller, "mkdir -p " + shlex.quote(path))
+    if rc != 0:
+        raise RuntimeError("controller mkdir {} failed: {}".format(path, out.strip()[:300]))
+
+
+def controller_put(controller, local_files, remote_dir):
+    """Copy local files into a controller directory (local copy or SFTP)."""
+    controller_mkdir(controller, remote_dir)
+    if controller_is_local(controller):
+        for f in local_files:
+            shutil.copy2(f, os.path.join(remote_dir, os.path.basename(f)))
+        return
+    sftp = _ssh_client(controller).open_sftp()
+    try:
+        for f in local_files:
+            sftp.put(f, remote_dir.rstrip("/") + "/" + os.path.basename(f))
+    finally:
+        sftp.close()
+
+
+def controller_get_file(controller, remote_path, local_dir):
+    os.makedirs(local_dir, exist_ok=True)
+    if controller_is_local(controller):
+        shutil.copy2(remote_path, os.path.join(local_dir, os.path.basename(remote_path)))
+        return
+    sftp = _ssh_client(controller).open_sftp()
+    try:
+        sftp.get(remote_path, os.path.join(local_dir, os.path.basename(remote_path)))
+    finally:
+        sftp.close()
+
+
+def controller_get_dir(controller, remote_dir, local_dir):
+    """Recursively copy a controller directory to local (tar over SFTP)."""
+    os.makedirs(local_dir, exist_ok=True)
+    if controller_is_local(controller):
+        if os.path.isdir(remote_dir):
+            shutil.copytree(remote_dir, local_dir, dirs_exist_ok=True)
+        return
+    tmp_remote = "/tmp/mc-pull-{}.tgz".format(int(time.time() * 1000))
+    out, rc = _ssh_exec(controller, "tar -czf {} -C {} .".format(
+        shlex.quote(tmp_remote), shlex.quote(remote_dir)))
+    if rc != 0:
+        raise RuntimeError("controller tar {} failed: {}".format(
+            remote_dir, out.strip()[:300]))
+    tmp_local = tempfile.mktemp(suffix=".tgz")
+    sftp = _ssh_client(controller).open_sftp()
+    try:
+        sftp.get(tmp_remote, tmp_local)
+    finally:
+        sftp.close()
+    try:
+        with tarfile.open(tmp_local, "r:gz") as tf:
+            try:
+                tf.extractall(local_dir, filter="data")
+            except TypeError:       # Python < 3.12
+                tf.extractall(local_dir)
+    finally:
+        os.remove(tmp_local)
+        _ssh_exec(controller, "rm -f " + shlex.quote(tmp_remote))
+
+
+def controller_remove(controller, path):
+    if controller_is_local(controller):
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    _ssh_exec(controller, "rm -rf " + shlex.quote(path))
 
 
 def get_node(cluster, name):
@@ -165,15 +306,16 @@ def _ssh_exec(node, command, relay=False):
 
 def run_ssh(host, node, command, dry_run=False):
     if is_k8s_node(node):
-        cmd = kubectl_cmd(node, "exec", node["_pod"], "--", "bash", "-c", command)
         log("[exec] {} : {}".format(node["_pod"], command))
         if dry_run:
             log("      (dry-run, skipped)")
             return
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
+        rc = controller_stream(node["_controller"],
+                               ["-n", node["_ns"], "exec", node["_pod"],
+                                "--", "bash", "-c", command])
+        if rc != 0:
             raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
-                result.returncode, node["_pod"], command))
+                rc, node["_pod"], command))
         return
     log("[ssh] {} : {}".format(host, command))
     if dry_run:
@@ -187,17 +329,18 @@ def run_ssh(host, node, command, dry_run=False):
 
 def ssh_check_output(host, node, command, dry_run=False, quiet=False):
     if is_k8s_node(node):
-        cmd = kubectl_cmd(node, "exec", node["_pod"], "--", "bash", "-c", command)
         if not quiet:
             log("[exec] {} : {}".format(node["_pod"], command))
         if dry_run:
             log("      (dry-run, skipped)")
             return ""
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
+        out, rc = controller_run(node["_controller"],
+                                 ["-n", node["_ns"], "exec", node["_pod"],
+                                  "--", "bash", "-c", command], check=False)
+        if rc != 0:
             raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
-                result.returncode, node["_pod"], command))
-        return result.stdout.strip()
+                rc, node["_pod"], command))
+        return out.strip()
     if not quiet:
         log("[ssh] {} : {}".format(host, command))
     if dry_run:
@@ -212,15 +355,21 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
 
 def scp_push(host, node, local_files, remote_path, dry_run=False):
     if is_k8s_node(node):
-        # kubectl cp is single-file: loop over the files
+        c = node["_controller"]
+        stage = os.path.join(node.get("_controller_workspace") or "/tmp", "push-tmp")
+        log("[kcp] -> {} : {}".format(node["_pod"], remote_path))
+        if dry_run:
+            log("      (dry-run, skipped)")
+            return
+        controller_put(c, local_files, stage)
         for f in local_files:
-            cmd = kubectl_cmd(node, "cp", f,
-                              "{}:{}".format(node["_pod"], remote_path))
-            log("[kcp] -> {} : {}".format(node["_pod"], remote_path))
-            if dry_run:
-                log("      (dry-run, skipped)")
-                continue
-            subprocess.run(cmd, check=True)
+            out, rc = controller_run(c,
+                                     ["-n", node["_ns"], "cp",
+                                      os.path.join(stage, os.path.basename(f)),
+                                      "{}:{}".format(node["_pod"], remote_path)],
+                                     check=False)
+            if rc != 0:
+                raise RuntimeError("kubectl cp failed for {}: {}".format(f, out.strip()[:300]))
         return
     log("[scp] -> {} : {}".format(host, remote_path))
     if dry_run:
@@ -239,6 +388,10 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         # kubectl cp does NOT expand globs: list matching paths via exec,
         # then copy each file individually. A single missing non-glob path
         # raises (mimics scp failure semantics for guarded collectors).
+        if dry_run:
+            log("[kcp] <- {} : {}".format(node["_pod"], remote_glob))
+            log("      (dry-run, skipped)")
+            return
         listing = ssh_check_output(host, node,
                                    "ls -1 {} 2>/dev/null || true".format(remote_glob),
                                    quiet=True)
@@ -246,14 +399,29 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         if not files and not any(c in remote_glob for c in "*?["):
             raise RuntimeError("kubectl cp pull failed: no such file on {}: {}".format(
                 node["_pod"], remote_glob))
+        c = node["_controller"]
+        stage = os.path.join(node.get("_controller_workspace") or "/tmp", "pull-tmp")
+        if not dry_run:
+            controller_mkdir(c, stage)
         for f in files:
-            cmd = kubectl_cmd(node, "cp", "{}:{}".format(node["_pod"], f),
-                              local_dir.rstrip("\\/") + os.sep)
             log("[kcp] <- {} : {}".format(node["_pod"], f))
             if dry_run:
                 log("      (dry-run, skipped)")
                 continue
-            subprocess.run(cmd, check=True)
+            if controller_is_local(c):
+                out, rc = controller_run(
+                    c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f),
+                        local_dir.rstrip("\\/") + os.sep], check=False)
+            else:
+                base = os.path.basename(f)
+                dst = os.path.join(stage, base)
+                out, rc = controller_run(
+                    c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f), dst],
+                    check=False)
+                if rc == 0:
+                    controller_get_file(c, dst, local_dir)
+            if rc != 0:
+                raise RuntimeError("kubectl cp pull failed for {}: {}".format(f, out.strip()[:300]))
         return
     # SFTP cannot expand remote globs: list matching paths via exec, then
     # fetch each file (mirrors the k8s branch). A single missing non-glob

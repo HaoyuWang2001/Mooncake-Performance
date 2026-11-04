@@ -17,17 +17,21 @@ import ipaddress
 import json
 import os
 import re
+import atexit
 import shutil
 import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
-from utils import (_drain_chan, _ssh_client, get_node, is_k8s_node,
-                   kubectl_cmd, load_json, log, parse_data_size, percentile,
-                   run_ssh, scp_pull, scp_push, ssh_check_output)
+from utils import (_drain_chan, _ssh_client, controller_mkdir,
+                   controller_put, controller_remove, controller_run,
+                   controller_stream, get_node, is_k8s_node, load_json, log,
+                   parse_data_size, percentile, run_ssh, scp_pull, scp_push,
+                   ssh_check_output)
 
 # profiling matrix core (optional tools: spdiag / perf / bpftrace)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling"))
@@ -190,9 +194,16 @@ def apply_cli_overrides(cfg, args):
 
 
 def scenario_paths(globals_cfg, ts, cfg_name):
-    remote_dir = globals_cfg["remote_dir"]
-    remote_scripts = remote_dir + "/scripts"
-    remote_log_dir = "{}/{}/logs".format(globals_cfg["remote_results_dir"], ts)
+    pod_ws = globals_cfg.get("_pod_workspace")
+    if pod_ws:
+        # k8s: paths inside the pod (workspace/scripts, workspace/logs/<ts>)
+        remote_dir = pod_ws
+        remote_scripts = pod_ws + "/scripts"
+        remote_log_dir = "{}/logs/{}".format(pod_ws, ts)
+    else:
+        remote_dir = globals_cfg["remote_dir"]
+        remote_scripts = remote_dir + "/scripts"
+        remote_log_dir = "{}/{}/logs".format(globals_cfg["remote_results_dir"], ts)
     remote_runner_basic = remote_scripts + "/run_benchmark_basic.sh"
     remote_runner_pipeline = remote_scripts + "/run_benchmark_pipeline.sh"
     local_log_dir = os.path.join(RESULTS_DIR, ts, "logs", cfg_name)
@@ -241,13 +252,45 @@ def resolve_venv(cluster, globals_cfg):
     return ""
 
 
+def parse_size_bytes(value):
+    """Parse an int/float byte count or strings like 512KB / 1GB (1024 base)."""
+    if isinstance(value, bool):
+        raise RuntimeError("invalid size (bool): {!r}".format(value))
+    if isinstance(value, (int, float)):
+        n = int(value)
+    else:
+        raw = str(value).strip().upper()
+        units = {"B": 1, "KB": 1024, "MB": 1024 ** 2,
+                 "GB": 1024 ** 3, "TB": 1024 ** 4}
+        n = None
+        for unit in sorted(units, key=len, reverse=True):
+            if raw.endswith(unit):
+                try:
+                    n = int(float(raw[:-len(unit)].strip()) * units[unit])
+                except ValueError:
+                    pass
+                break
+        if n is None:
+            try:
+                n = int(float(raw))
+            except ValueError:
+                raise RuntimeError("invalid size string: {!r}".format(value))
+    if n <= 0:
+        raise RuntimeError("size must be positive: {!r}".format(value))
+    return n
+
+
 def build_cluster_session(cluster, globals_cfg, remote_dir):
     master_type = globals_cfg.get("master_type", "") or ""
+    ub_device = str(globals_cfg.get("protocol", {}).get("ub", {}).get("device", "") or "")
+    if ub_device.strip().lower() == "auto":
+        ub_device = ""
     session = {
         "SETUP_MASTER_TYPE": master_type,
-        "SETUP_UB_DEVICE": globals_cfg.get("protocol", {}).get("ub", {}).get("device", ""),
+        "SETUP_UB_DEVICE": ub_device,
         "ORCH_VENV": resolve_venv(cluster, globals_cfg),
-        "SETUP_LOCAL_BUFFER_SIZE": str(globals_cfg.get("local_buffer_size", 8589934592)),
+        "SETUP_LOCAL_BUFFER_SIZE": str(parse_size_bytes(
+            globals_cfg.get("local_buffer_size", 8589934592))),
         "SETUP_TENANT_ID": globals_cfg.get("tenant_id", "default"),
         "SETUP_RANDOM_SEED": str(globals_cfg.get("random_seed", 42)),
         "BENCH_REMOTE_DATA_DIR": globals_cfg.get("remote_data_dir", remote_dir + "/data"),
@@ -287,27 +330,30 @@ def enrich_k8s_nodes(cluster):
             node["_ctx"] = node.get("kubecontext") or ctx_default
 
 
-def _resolve_k8s_svc(svc, ns, ctx):
+def _resolve_k8s_svc(svc, ns, ctx, controller=None):
     """Resolve a k8s Service DNS name to its ClusterIP via kubectl (works
     even when the orchestrator cannot reach cluster DNS). Headless services
     (no ClusterIP) fall back to the first endpoint IP. -> ip or None."""
-    base = ["kubectl"]
-    if ctx:
-        base += ["--context", ctx]
-    try:
-        out = subprocess.run(
-            base + ["get", "svc", svc, "-n", ns, "-o",
-                    "jsonpath={.spec.clusterIP}"],
-            capture_output=True, text=True, timeout=15).stdout.strip()
-        if out and out != "None":
-            return out
-        out = subprocess.run(
-            base + ["get", "endpoints", svc, "-n", ns, "-o",
-                    "jsonpath={.subsets[0].addresses[0].ip}"],
-            capture_output=True, text=True, timeout=15).stdout.strip()
-        return out or None
-    except Exception:
-        return None
+    def _get(args):
+        if controller is not None:
+            out, rc = controller_run(controller, ["-n", ns] + args, check=False)
+            return out.strip() if rc == 0 else ""
+        base = ["kubectl"]
+        if ctx:
+            base += ["--context", ctx]
+        try:
+            return subprocess.run(
+                base + ["-n", ns] + args, capture_output=True, text=True,
+                timeout=15).stdout.strip()
+        except Exception:
+            return ""
+
+    out = _get(["get", "svc", svc, "-o", "jsonpath={.spec.clusterIP}"])
+    if out and out != "None":
+        return out
+    out = _get(["get", "endpoints", svc, "-o",
+                "jsonpath={.subsets[0].addresses[0].ip}"])
+    return out or None
 
 
 def _resolve_host(host, cluster):
@@ -333,7 +379,8 @@ def _resolve_host(host, cluster):
         svc, ns = parts[0], parts[1]
     if svc:
         k8s = cluster.get("k8s") or {}
-        ip = _resolve_k8s_svc(svc, ns, k8s.get("kubecontext", ""))
+        ip = _resolve_k8s_svc(svc, ns, k8s.get("kubecontext", ""),
+                              cluster.get("_controller"))
         if ip:
             log("k8s dns: {} -> {} (kubectl svc {})".format(host, ip, svc))
             return ip
@@ -428,6 +475,227 @@ def resolve_store_node_ips(cluster, store_node_names):
     return ips
 
 
+# --------------------------------------------------------------------------
+# k8s: controller + namespace/workspace lifecycle
+# --------------------------------------------------------------------------
+
+def build_controller(cluster):
+    c = dict(cluster.get("controller") or {})
+    if not c.get("ip"):
+        raise RuntimeError("cluster.json controller.ip is required for --k8s")
+    k8s = cluster.get("k8s") or {}
+    c["_local"] = (c["ip"] in ("127.0.0.1", "localhost", "::1")
+                   or bool(c.get("local")))
+    c["_kubectl"] = c.get("kubectl") or "kubectl"
+    c["_ctx"] = k8s.get("kubecontext", "") or ""
+    return c
+
+
+def k8s_settings(cluster):
+    k8s = cluster.get("k8s") or {}
+    if not k8s.get("namespace"):
+        raise RuntimeError("cluster.json k8s.namespace is required for --k8s")
+    if not k8s.get("image"):
+        raise RuntimeError("cluster.json k8s.image is required for --k8s")
+    for key in ("controller_workspace", "pod_workspace"):
+        if not k8s.get(key):
+            raise RuntimeError(
+                "cluster.json k8s.{} is required for --k8s".format(key))
+    return k8s
+
+
+def k8s_run_label(ts, cfg_name):
+    return re.sub(r"[^a-zA-Z0-9._-]", "-", "{}-{}".format(ts, cfg_name))
+
+
+def k8s_pod_name(ts, cfg_name):
+    name = "mc-{}-{}".format(ts, cfg_name).lower()
+    name = re.sub(r"[^a-z0-9-]", "-", name).strip("-")
+    return name[:63].strip("-")
+
+
+def k8s_workspace_dirs(cluster, dry_run=False):
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    root = k8s["controller_workspace"]
+    for sub in ("scripts", "data", "logs", "pods", "push-tmp", "pull-tmp"):
+        if dry_run:
+            log("[k8s] (dry-run) would create {}/{}".format(root, sub))
+            continue
+        controller_mkdir(c, os.path.join(root, sub))
+    return root
+
+
+def reap_k8s_namespaces(cluster):
+    """Delete namespaces recorded in .state by a crashed previous run."""
+    c = cluster["_controller"]
+    ctx = c.get("_ctx", "")
+    removed = []
+    for e in state_load():
+        if e.get("type") != "k8s-namespace":
+            continue
+        if e.get("controller") != c.get("ip") or (e.get("context") or "") != ctx:
+            log("[WARN] .state: k8s namespace {} belongs to controller {}/{}; kept"
+                "".format(e.get("namespace"), e.get("controller"),
+                          e.get("context") or "-"))
+            continue
+        ns = e.get("namespace")
+        _, rc = controller_run(c, ["get", "namespace", ns], check=False)
+        if rc != 0:
+            removed.append(e)
+            continue
+        label, _ = controller_run(
+            c, ["get", "namespace", ns, "-o",
+                "jsonpath={.metadata.labels.managed-by}"], check=False)
+        if label.strip() != "mcbench":
+            log("[WARN] .state: namespace {} exists but is not managed by "
+                "mcbench; kept".format(ns))
+            continue
+        log("[k8s] reaping leftover namespace {} from previous run".format(ns))
+        controller_run(c, ["delete", "namespace", ns,
+                           "--wait=true", "--timeout=180s"], check=False)
+        removed.append(e)
+    if removed:
+        keys = {(e.get("controller"), e.get("context") or "", e.get("namespace"))
+                for e in removed}
+        kept = [e for e in state_load()
+                if (e.get("controller"), e.get("context") or "",
+                    e.get("namespace")) not in keys]
+        _state_write(kept)
+
+
+def ensure_k8s_namespace(cluster, ts, dry_run=False):
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    ns = k8s["namespace"]
+    if dry_run:
+        log("[k8s] (dry-run) would create namespace {}".format(ns))
+        return
+    _, rc = controller_run(c, ["get", "namespace", ns], check=False)
+    if rc == 0:
+        raise RuntimeError(
+            "k8s namespace {!r} already exists; refusing to reuse it "
+            "(delete it or run --clean-up)".format(ns))
+    controller_run(c, ["create", "namespace", ns])
+    controller_run(c, ["label", "namespace", ns,
+                       "app=mooncake-benchmark", "managed-by=mcbench",
+                       "--overwrite"])
+    state_append([{"type": "k8s-namespace", "controller": c.get("ip"),
+                   "context": c.get("_ctx", ""), "namespace": ns, "ts": ts,
+                   "controller_workspace": k8s.get("controller_workspace", "")}])
+    log("[k8s] namespace {} created".format(ns))
+
+
+def cleanup_k8s_namespace(cluster, dry_run=False):
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    ns = k8s["namespace"]
+    if dry_run:
+        log("[k8s] (dry-run) would delete namespace {}".format(ns))
+        return
+    _, rc = controller_run(c, ["get", "namespace", ns], check=False)
+    if rc == 0:
+        label, _ = controller_run(
+            c, ["get", "namespace", ns, "-o",
+                "jsonpath={.metadata.labels.managed-by}"], check=False)
+        if label.strip() == "mcbench":
+            controller_run(c, ["delete", "namespace", ns,
+                               "--wait=true", "--timeout=180s"], check=False)
+            log("[k8s] namespace {} deleted".format(ns))
+        else:
+            log("[WARN] namespace {} is not managed by mcbench; not deleted"
+                "".format(ns))
+    keys = {(c.get("ip"), c.get("_ctx", ""), ns)}
+    kept = [e for e in state_load()
+            if (e.get("controller"), e.get("context") or "",
+                e.get("namespace")) not in keys]
+    _state_write(kept)
+
+
+def cleanup_k8s_workspace(cluster, dry_run=False):
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    root = k8s["controller_workspace"]
+    for sub in ("scripts", "data", "logs", "pods", "push-tmp", "pull-tmp"):
+        if dry_run:
+            log("[k8s] (dry-run) would remove {}/{}".format(root, sub))
+            continue
+        controller_remove(c, os.path.join(root, sub))
+    log("[k8s] controller workspace cleaned: {}".format(root))
+
+
+def _render_pod_yaml(cluster, ts, cfg_name):
+    k8s = k8s_settings(cluster)
+    run_label = k8s_run_label(ts, cfg_name)
+    pod = k8s_pod_name(ts, cfg_name)
+    with open(_pod_template_path(cluster), "r", encoding="utf-8") as f:
+        text = f.read()
+    repl = {
+        "{{MC_POD_NAME}}": pod,
+        "{{MC_IMAGE}}": k8s["image"],
+        "{{MC_NAMESPACE}}": k8s["namespace"],
+        "{{MC_RUN_LABEL}}": run_label,
+        "{{MC_ROLE_LABEL}}": "client-0",
+        "{{MC_CONFIGMAP_NAME}}": _configmap_name(run_label),
+        "{{MC_SCRIPTS_MOUNT}}": k8s["pod_workspace"] + "/scripts",
+        "{{MC_WORKDIR_MOUNT}}": k8s["pod_workspace"],
+    }
+    for key, val in repl.items():
+        text = text.replace(key, val)
+    if "{{MC_" in text:
+        raise RuntimeError("pod template has unresolved {{MC_*}} placeholders")
+    return pod, run_label, text
+
+
+def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
+    """Create the per-config client pod and register a runtime node."""
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    ns = k8s["namespace"]
+    pod, run_label, yaml_text = _render_pod_yaml(cluster, ts, cfg_name)
+    if dry_run:
+        log("[k8s] (dry-run) would create pod {} in ns {} (image {})"
+            "".format(pod, ns, k8s["image"]))
+        ip = "10.0.0.0"
+    else:
+        import tempfile
+        local_dir = tempfile.mkdtemp(prefix="mc-pod-")
+        local_yaml = os.path.join(local_dir, pod + ".yaml")
+        try:
+            with open(local_yaml, "w", encoding="utf-8", newline="\n") as f:
+                f.write(yaml_text)
+            yaml_dir = os.path.join(k8s["controller_workspace"], "pods")
+            controller_put(c, [local_yaml], yaml_dir)
+            remote_yaml = os.path.join(yaml_dir, pod + ".yaml")
+            out, rc = controller_run(
+                c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
+            if rc != 0:
+                raise RuntimeError("kubectl apply failed for {}: {}"
+                                   "".format(pod, out.strip()[:400]))
+        finally:
+            shutil.rmtree(local_dir, ignore_errors=True)
+        out, rc = controller_run(
+            c, ["-n", ns, "wait", "--for=condition=Ready", "pod/" + pod,
+                "--timeout=180s"], check=False)
+        if rc != 0:
+            raise RuntimeError("pod {} not Ready in 180s: {}"
+                               "".format(pod, out.strip()[:400]))
+        out, rc = controller_run(
+            c, ["-n", ns, "get", "pod", pod, "-o",
+                "jsonpath={.status.podIP}"], check=False)
+        ip = out.strip()
+        if rc != 0 or not ip:
+            raise RuntimeError("cannot resolve Pod IP for {}".format(pod))
+    node = {"kind": "k8s-pod", "_pod": pod, "_ns": ns,
+            "_ctx": c.get("_ctx", ""), "_controller": c,
+            "_controller_workspace": k8s["controller_workspace"],
+            "_run_label": run_label, "_role": "client-0",
+            "ip": ip, "fabric_ip": ip}
+    cluster.setdefault("nodes", {})[pod] = node
+    log("[k8s] pod {} ready (ns={}, ip={})".format(pod, ns, ip))
+    return pod
+
+
 def base_scenario_params(cfg, work_mode, topology, primary_node_name):
     # data_size is a sweep list; the env var carries the first entry as a
     # fallback only — the actual per-run size reaches the client via the
@@ -461,6 +729,27 @@ ENV_GROUPS = [
                "(BENCH_ prefix)"),
     ("ORCH_", "orchestrator / runner transport (ORCH_ prefix)"),
 ]
+
+
+def _ub_probe_lines():
+    """Shell snippet: resolve SETUP_UB_DEVICE from urma_admin (auto mode)."""
+    return [
+        "# ===== ub device auto-discovery (urma_admin) =====",
+        "if command -v urma_admin >/dev/null 2>&1; then",
+        "    SETUP_UB_DEVICE=$(urma_admin show "
+        "| awk '$1 ~ /^[0-9]+$/ && $2 ~ /^bonding_dev_/ {print $2; exit}')",
+        "    if [ -z \"$SETUP_UB_DEVICE\" ]; then",
+        "        echo \"[ERROR] No bonding_dev_* URMA device found\" >&2",
+        "        exit 1",
+        "    fi",
+        "    export SETUP_UB_DEVICE",
+        "    echo \"[INFO] SETUP_UB_DEVICE=$SETUP_UB_DEVICE\"",
+        "else",
+        "    echo \"[ERROR] urma_admin command not found\" >&2",
+        "    exit 1",
+        "fi",
+        "",
+    ]
 
 
 def build_env_content(scenario_params, cluster_session, fabric_ip,
@@ -503,6 +792,9 @@ def build_env_content(scenario_params, cluster_session, fabric_ip,
         for k in rest:
             lines.append('export {}="{}"'.format(k, merged[k]))
         lines.append("")
+    if str(merged.get("SETUP_PROTOCOL", "")).lower() == "ub" \
+            and not merged.get("SETUP_UB_DEVICE"):
+        lines.extend(_ub_probe_lines())
     return "\n".join(lines) + "\n"
 
 
@@ -547,22 +839,8 @@ def build_k8s_env_content(scenario_params, cluster_session):
         for k in rest:
             lines.append('export {}="{}"'.format(k, merged[k]))
         lines.append("")
-    if protocol == "ub":
-        lines.append("# ===== k8s: per-pod urma device auto-discovery =====")
-        lines.append("if command -v urma_admin >/dev/null 2>&1; then")
-        lines.append("    SETUP_UB_DEVICE=$(urma_admin show "
-                     "| awk '$1 ~ /^[0-9]+$/ && $2 ~ /^bonding_dev_/ {print $2; exit}')")
-        lines.append("    if [ -z \"$SETUP_UB_DEVICE\" ]; then")
-        lines.append("        echo \"[ERROR] No bonding_dev_* URMA device found\" >&2")
-        lines.append("        exit 1")
-        lines.append("    fi")
-        lines.append("    export SETUP_UB_DEVICE")
-        lines.append("    echo \"[INFO] SETUP_UB_DEVICE=$SETUP_UB_DEVICE\"")
-        lines.append("else")
-        lines.append("    echo \"[ERROR] urma_admin command not found\" >&2")
-        lines.append("    exit 1")
-        lines.append("fi")
-        lines.append("")
+    if protocol == "ub" and not merged.get("SETUP_UB_DEVICE"):
+        lines.extend(_ub_probe_lines())
     return "\n".join(lines) + "\n"
 
 
@@ -572,24 +850,22 @@ def _configmap_name(run_label):
 
 def ensure_configmap(cluster, scenario_params, cluster_session,
                     ts, cfg_name, dry_run):
-    """k8s: create one ConfigMap (scripts + shared env.sh) per config run.
-    Pods mount it read-only at the scripts dir; env.sh has no per-pod
-    differences (late binding + urma probe inside the pod)."""
-    # find the first k8s node to get ns/ctx (any involved node works)
-    nodes = cluster.get("nodes") or {}
-    k8s_node = next((n for n in nodes.values() if is_k8s_node(n)), None)
-    if k8s_node is None:
+    """k8s: stage scripts on the controller and create one ConfigMap per
+    config run. Pods mount it read-only at pod_workspace/scripts."""
+    if cluster.get("_controller") is None:
         return None
-    run_label = re.sub(r"[^a-zA-Z0-9._-]", "-", "{}-{}".format(ts, cfg_name))
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    run_label = k8s_run_label(ts, cfg_name)
     cm_name = _configmap_name(run_label)
     if dry_run:
         log("[k8s] (dry-run) would create configmap {} (run={})"
             "".format(cm_name, run_label))
         return cm_name
     env_content = build_k8s_env_content(scenario_params, cluster_session)
-    # stage: 4 static scripts + generated env.sh (+ optional env.mooncake.sh)
+    stage_remote = os.path.join(k8s["controller_workspace"], "scripts", run_label)
     import tempfile
-    stage = tempfile.mkdtemp(prefix="mc-cm-")
+    local_stage = tempfile.mkdtemp(prefix="mc-cm-")
     try:
         files = [("run_benchmark_basic.sh", SCRIPTS_DIR),
                  ("run_benchmark_pipeline.sh", SCRIPTS_DIR),
@@ -600,23 +876,26 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
             files.append(("env.mooncake.sh", SCRIPTS_DIR))
         for fname, src_dir in files:
             if src_dir:
-                shutil.copy(os.path.join(src_dir, fname), os.path.join(stage, fname))
-        with open(os.path.join(stage, "env.sh"), "w",
+                shutil.copy(os.path.join(src_dir, fname),
+                            os.path.join(local_stage, fname))
+        with open(os.path.join(local_stage, "env.sh"), "w",
                   encoding="utf-8", newline="\n") as f:
             f.write(env_content)
-        kubectl_cmd(k8s_node, "delete", "configmap", cm_name,
-                    "--ignore-not-found=true")
-        cmd = kubectl_cmd(k8s_node, "create", "configmap", cm_name,
-                          "--from-file=" + stage)
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError("kubectl create configmap {} failed: {}".format(
-                cm_name, (res.stderr or res.stdout).strip()[:300]))
-        log("[k8s] configmap {} created (run={})".format(cm_name, run_label))
-        return cm_name
+        controller_put(c, [os.path.join(local_stage, f)
+                           for f in os.listdir(local_stage)], stage_remote)
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
-
+        shutil.rmtree(local_stage, ignore_errors=True)
+    ns = k8s["namespace"]
+    controller_run(c, ["-n", ns, "delete", "configmap", cm_name,
+                       "--ignore-not-found=true"], check=False)
+    out, rc = controller_run(
+        c, ["-n", ns, "create", "configmap", cm_name,
+            "--from-file=" + stage_remote], check=False)
+    if rc != 0:
+        raise RuntimeError("kubectl create configmap {} failed: {}"
+                           "".format(cm_name, out.strip()[:400]))
+    log("[k8s] configmap {} created (run={})".format(cm_name, run_label))
+    return cm_name
 
 def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    remote_scripts, remote_log_dir, dry_run):
@@ -1012,17 +1291,30 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         log("      (dry-run, skipped)")
         return
     if is_k8s_node(node):
-        proc = subprocess.Popen(
-            kubectl_cmd(node, "exec", node["_pod"], "--", "bash", "-c", command))
+        holder = {"rc": 1}
+
+        def _run():
+            try:
+                holder["rc"] = controller_stream(
+                    node["_controller"],
+                    ["-n", node["_ns"], "exec", node["_pod"],
+                     "--", "bash", "-c", command])
+            except Exception as exc:
+                log("[exec] {} failed: {}".format(node["_pod"], exc))
+                holder["rc"] = 1
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
         t0 = time.time()
         log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
         recorded = False
-        while proc.poll() is None:
+        while th.is_alive():
             if not recorded and pids_file:
                 if _record_pids(host, node, pids_file, label, cfg_name, node_name):
                     recorded = True
             time.sleep(1)
-        rc = proc.wait()
+        th.join()
+        rc = holder["rc"]
     else:
         client = _ssh_client(node)
         stdin, stdout, stderr = client.exec_command(command)
@@ -1112,6 +1404,15 @@ def reap_state_entries(cluster):
     Every step is best-effort; unreachable nodes keep their records for a
     later reap."""
     entries = state_load()
+    if cluster.get("_controller") is not None:
+        # k8s: namespace deletion (reap_k8s_namespaces) covers pod processes;
+        # keep only namespace ledger rows for later runs.
+        keep = [e for e in entries if e.get("type") == "k8s-namespace"]
+        if len(keep) != len(entries):
+            log(".state: k8s mode, dropping {} stale process record(s)"
+                "".format(len(entries) - len(keep)))
+            _state_write(keep)
+        return 0
     if not entries:
         log(".state: no leftover process records")
         return 0
@@ -1234,8 +1535,11 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     dry = args.dry_run
     op = cfg.get("operation", "")
     work_mode = cfg.get("work_mode", cfg.get("mode", ""))
-    primary_node_name = cfg["client_node"]
-    involved_nodes = [primary_node_name]
+    is_k8s = cluster.get("_controller") is not None
+    # k8s: pod name is generated by ensure_k8s_pod (cluster nodes are no
+    # longer workers); SSH keeps client_node from the scenario config.
+    primary_node_name = None if is_k8s else cfg["client_node"]
+    involved_nodes = [] if is_k8s else [primary_node_name]
     # scenario_params/cluster_session have no pod-IP dependency (topology is
     # a dead param in base_scenario_params) -> build them first so the k8s
     # ConfigMap (scripts + env.sh) can exist before pods mount it
@@ -1245,18 +1549,27 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     remote_runner = remote_runner_basic
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
-    scenario_params = base_scenario_params(cfg, work_mode, "k8s_pod", primary_node_name)
+    scenario_params = base_scenario_params(
+        cfg, work_mode, "k8s_pod" if is_k8s else "ssh",
+        "client" if is_k8s else primary_node_name)
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
-    # k8s: pods are created AFTER the ConfigMap they mount
-    ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+    if is_k8s:
+        # k8s: pods are created AFTER the ConfigMap they mount
+        primary_node_name = ensure_k8s_pod(cluster, ts, cfg_name, dry)
+        involved_nodes = [primary_node_name]
+    else:
+        ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+    cfg["_primary_node"] = primary_node_name
     node = get_node(cluster, primary_node_name)
     host = node["ip"]
-    # topology: local iff the client node's IP is one of the store nodes' IPs
-    # (mooncake_store_nodes from global.json, resolved via cluster.json)
-    store_node_ips = resolve_store_node_ips(
-        cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
-    topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
+    if is_k8s:
+        # master/store are external Services; client pods are always remote
+        topology = "remote_node"
+    else:
+        store_node_ips = resolve_store_node_ips(
+            cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+        topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
     log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
         cfg_name, op, topology, cfg["protocol"], host))
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
@@ -1829,112 +2142,52 @@ def _pod_template_path(cluster):
 
 
 def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
-    """Create one pod per k8s-pod node involved in this config (per-config
-    lifecycle: fresh pods each config run), wait Ready, resolve Pod IPs and
-    write them into node["ip"]/["fabric_ip"] — after this a k8s node's data
-    shape matches an ssh node. Dry-run logs planned pods with placeholders."""
-    k8s_nodes = [(name, get_node(cluster, name)) for name in involved_nodes
-                 if is_k8s_node(get_node(cluster, name))]
-    if not k8s_nodes:
-        return
-    k8s = cluster.get("k8s") or {}
-    image = k8s.get("image")
-    if not image and not dry_run:
-        raise RuntimeError("cluster.json k8s.image not set (required for "
-                           "k8s-pod nodes)")
-    with open(_pod_template_path(cluster), "r", encoding="utf-8") as f:
-        tpl = f.read()
-    run_label = re.sub(r"[^a-zA-Z0-9._-]", "-", "{}-{}".format(ts, cfg_name))
-    for name, n in k8s_nodes:
-        pod_name = "mc-{}-{}".format(
-            re.sub(r"[^a-z0-9-]", "-", name.lower()),
-            re.sub(r"[^a-zA-Z0-9-]", "-", run_label.lower()))
-        n["_pod"] = pod_name
-        n["_run_label"] = run_label
-        if dry_run:
-            n["ip"] = "10.0.0.0"
-            n["fabric_ip"] = "10.0.0.0"
-            log("[k8s] (dry-run) would create pod {} in ns {} (image {})"
-                "".format(pod_name, n["_ns"], image or "<unset>"))
-            continue
-        yaml_text = (tpl.replace("POD_NAME", pod_name)
-                      .replace("IMAGE", image)
-                      .replace("NAMESPACE", n["_ns"])
-                      .replace("RUN_LABEL", run_label)
-                      .replace("NODE_LABEL", re.sub(r"[^a-z0-9-]", "-", name.lower()))
-                      .replace("CM_NAME", _configmap_name(run_label))
-                      .replace("SCRIPTS_MOUNT", n.get("_scripts_mount", "/tmp/mooncake_bench/scripts"))
-                      .replace("WORKDIR_MOUNT", n.get("_workdir_mount", "/tmp/mooncake_bench")))
-        apply_cmd = kubectl_cmd(n, "apply", "-f", "-")
-        res = subprocess.run(apply_cmd, input=yaml_text, text=True,
-                             capture_output=True)
-        if res.returncode != 0:
-            raise RuntimeError("kubectl apply failed for {}: {}".format(
-                pod_name, (res.stderr or res.stdout).strip()[:300]))
-        wait_cmd = kubectl_cmd(n, "wait", "--for=condition=Ready",
-                               "pod/" + pod_name, "--timeout=180s")
-        res = subprocess.run(wait_cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError("pod {} not Ready in 180s: {}".format(
-                pod_name, (res.stderr or res.stdout).strip()[:300]))
-        ip_cmd = kubectl_cmd(n, "get", "pod", pod_name,
-                             "-o", "jsonpath={.status.podIP}")
-        res = subprocess.run(ip_cmd, capture_output=True, text=True)
-        pod_ip = res.stdout.strip()
-        if not pod_ip:
-            raise RuntimeError("cannot resolve Pod IP for {}".format(pod_name))
-        n["ip"] = pod_ip
-        if n.get("fabric_ip", "auto") == "auto" or not n.get("fabric_ip"):
-            n["fabric_ip"] = pod_ip
-        log("[k8s] pod {} ready (ns={}, ip={}, node={})"
-            "".format(pod_name, n["_ns"], pod_ip, name))
+    """Legacy hook for the SSH/pipeline path. k8s basic pods are created by
+    ensure_k8s_pod (one per config); k8s pipeline is rejected earlier."""
+    return
 
 
 def cleanup_pods(cluster, involved_nodes, dry_run):
-    """Per-config cleanup: delete every pod carrying this run's label
-    (batch by label selector covers any stragglers)."""
-    seen = set()
+    """Delete the per-config client pod + ConfigMap (basic, k8s)."""
+    c = cluster.get("_controller")
+    if c is None:
+        return
+    k8s = k8s_settings(cluster)
+    ns = k8s["namespace"]
     for name in involved_nodes:
         n = get_node(cluster, name)
-        if not is_k8s_node(n) or n.get("_ns") in seen:
+        if not is_k8s_node(n):
             continue
-        seen.add(n["_ns"])
+        pod = n.get("_pod")
         label = n.get("_run_label")
-        if not label:
-            continue
         if dry_run:
-            log("[k8s] (dry-run) would delete pods + configmap run={}".format(label))
+            log("[k8s] (dry-run) would delete pod {} + configmap (run={})"
+                "".format(pod, label))
             continue
-        cmd = kubectl_cmd(n, "delete", "pod", "-l", "run=" + label,
-                          "--ignore-not-found=true")
-        subprocess.run(cmd, capture_output=True)
-        cm_cmd = kubectl_cmd(n, "delete", "configmap",
-                              _configmap_name(label),
-                              "--ignore-not-found=true")
-        subprocess.run(cm_cmd, capture_output=True)
-        log("[k8s] pods + configmap deleted (ns={}, run={})".format(n["_ns"], label))
-
+        if pod:
+            controller_run(c, ["-n", ns, "delete", "pod", pod,
+                               "--ignore-not-found=true"], check=False)
+        if label:
+            controller_run(c, ["-n", ns, "delete", "configmap",
+                               _configmap_name(label),
+                               "--ignore-not-found=true"], check=False)
+        log("[k8s] pod + configmap deleted (ns={}, pod={})".format(ns, pod))
+        cluster.get("nodes", {}).pop(name, None)
 
 def cleanup_cluster(cluster, globals_cfg, dry_run=False):
     """Remove the remote test directory on every node in cluster.json.
-    For k8s-pod nodes the pod itself is the workspace: delete every pod
-    carrying the benchmark app label in the node's namespace."""
+    For k8s: delete namespaces recorded/managed by us, then remove the
+    controller-side managed subdirectories (scripts/data/logs/pods)."""
+    if cluster.get("_controller") is not None:
+        reap_k8s_namespaces(cluster)
+        cleanup_k8s_namespace(cluster, dry_run)
+        cleanup_k8s_workspace(cluster, dry_run)
+        return
     remote_dir = globals_cfg["remote_dir"]
     for node_name in sorted(cluster.get("nodes", {})):
         n = get_node(cluster, node_name)
-        if is_k8s_node(n):
-            log("cleanup {} : delete pods (label app=mooncake-benchmark)"
-                "".format(node_name))
-            if dry_run:
-                continue
-            subprocess.run(
-                kubectl_cmd(n, "delete", "pod", "-l", "app=mooncake-benchmark",
-                            "--ignore-not-found=true"),
-                capture_output=True)
-            continue
         log("cleanup {} : {}".format(node_name, remote_dir))
         run_ssh(n["ip"], n, "rm -rf {}".format(remote_dir), dry_run=dry_run)
-
 
 # --------------------------------------------------------------------------
 # metrics aggregation
@@ -2239,8 +2492,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         if "/" in op_label:
             put_iface, get_iface = op_label.split("/", 1)
         is_mixed = bool(put_iface and get_iface)
-        topo = topo_of(cfg["client_node"])
-        node_ip = get_node(cluster, cfg["client_node"])["ip"] if cluster else ""
+        primary = cfg.get("_primary_node") or cfg["client_node"]
+        topo = topo_of(primary)
+        node_ip = get_node(cluster, primary)["ip"] if cluster else ""
         warmup_duration = cfg.get("warmup", {}).get("duration", 0)
         # rows follow run order: outer data_size, inner params order —
         # identical to how run_basic_scenario executes the runs
@@ -2516,11 +2770,12 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
     if args.mode == "k8s":
-        # k8s channel: every node is a pod (roles are logical names)
-        for n in (cluster.get("nodes") or {}).values():
-            n.setdefault("kind", "k8s-pod")
+        cluster["_controller"] = build_controller(cluster)
+        k8s_settings(cluster)      # fail fast on missing ns/image/workspaces
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
+    if args.mode == "k8s":
+        globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
     _validate_master_mode(globals_cfg)
     # profiling matrix: explicit --profile wins (and must exist); otherwise
     # default configs/matrix.json when present; absent -> profiling off
@@ -2534,9 +2789,14 @@ def main(args, cfg_paths):
     if matrix:
         log("profiling matrix active: {} (trigger={})".format(
             profile_path, matrix.get("trigger")))
-    # .state ledger check: reap any client processes left over from previous
-    # runs (crashed/killed orchestrator) BEFORE anything else touches nodes.
+    # .state ledger check: reap any leftovers from previous runs
+    # (crashed/killed orchestrator) BEFORE anything else touches nodes.
     if not args.dry_run:
+        if args.mode == "k8s":
+            try:
+                reap_k8s_namespaces(cluster)
+            except Exception as exc:
+                log("[WARN] .state k8s namespace reap failed: {}".format(exc))
         try:
             reap_state_entries(cluster)
         except Exception as exc:
@@ -2556,6 +2816,16 @@ def main(args, cfg_paths):
     if not args.dry_run:
         os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
         log("results root: {}".format(ts_dir))
+    if args.mode == "k8s":
+        k8s_workspace_dirs(cluster, dry_run=args.dry_run)
+        ensure_k8s_namespace(cluster, ts, dry_run=args.dry_run)
+        if not args.dry_run:
+            def _ns_atexit():
+                try:
+                    cleanup_k8s_namespace(cluster, dry_run=False)
+                except Exception as exc:
+                    log("[WARN] k8s namespace cleanup at exit: {}".format(exc))
+            atexit.register(_ns_atexit)
     all_rows = []
     categories = set()
     failed_scenarios = []
@@ -2578,8 +2848,10 @@ def main(args, cfg_paths):
             else:
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
+                store_nodes = (globals_cfg.get("mooncake_store_nodes", []) or []) \
+                    if args.mode != "k8s" else []
                 rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
-                                          cluster, globals_cfg.get("mooncake_store_nodes", []))
+                                          cluster, store_nodes)
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows
@@ -2650,6 +2922,8 @@ def main(args, cfg_paths):
             ", ".join(failed_scenarios)))
     else:
         log("SUMMARY: all {} scenarios OK".format(len(cfg_paths)))
+    if args.mode == "k8s" and not args.dry_run:
+        cleanup_k8s_namespace(cluster, dry_run=False)
     log("done. results in {}".format(ts_dir))
     # auto-plot: latency/queue-wait figures for every config under this run's
     # logs/ (subprocess isolation — a broken matplotlib must never affect the
@@ -2680,4 +2954,7 @@ def main(args, cfg_paths):
 
 if __name__ == "__main__":
     args, cfg_paths = parse_arguments()
-    main(args, cfg_paths)
+    try:
+        main(args, cfg_paths)
+    except RuntimeError as exc:
+        sys.exit("[ERROR] {}".format(exc))
