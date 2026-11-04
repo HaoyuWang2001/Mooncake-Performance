@@ -76,7 +76,7 @@ const SelNode = {
     </div>
   </div>`,
   setup(props) {
-    const open = Vue.ref(props.depth < 1);
+    const open = Vue.ref(false);   // 选择测试配置弹窗：默认全部折叠
     const hasSel = Vue.computed(() => {
       const walk = (n) => n.checked || (n.children || []).some(walk);
       return walk(props.node);
