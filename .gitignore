@@ -14,6 +14,8 @@ configs/*
 !configs/basic
 !configs/pipeline
 !configs/_spdiag_trees
+!configs/_ssh
+!configs/_k8s
 
 示例.xlsx
 
@@ -25,3 +27,9 @@ mock/cluster.json
 
 webui/data/
 webui/backups/
+configs/_ssh/cluster.json
+configs/_ssh/global.json
+configs/_ssh/matrix.json
+configs/_k8s/cluster.json
+configs/_k8s/global.json
+configs/_k8s/matrix.json
