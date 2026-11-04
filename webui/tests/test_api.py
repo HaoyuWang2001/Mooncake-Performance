@@ -116,6 +116,71 @@ def test_outputs_and_files():
     assert code == 403
 
 
+def test_output_rename_delete():
+    import shutil
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out = os.path.join(root, "outputs")
+    old = "zz-webui-test-" + str(int(time.time() * 1000))
+    new = old + "-renamed"
+    src = os.path.join(out, old)
+    dst = os.path.join(out, new)
+    trash = []
+    os.makedirs(src)
+    try:
+        with open(os.path.join(src, "benchmark_detail.csv"), "w") as f:
+            f.write("a,b\n1,2\n")
+        code, d = _req("GET", "/api/outputs/{}/tree".format(old))
+        assert code == 200 and "benchmark_detail.csv" in d["files"]
+
+        # 非法名 / 重名
+        code, _ = _req("POST", "/api/outputs/{}/rename".format(old), {"name": "../x"})
+        assert code == 400
+        os.makedirs(dst)
+        code, _ = _req("POST", "/api/outputs/{}/rename".format(old), {"name": new})
+        assert code == 409
+        os.rmdir(dst)
+
+        # 正常重命名
+        code, d = _req("POST", "/api/outputs/{}/rename".format(old), {"name": new})
+        assert code == 200 and d["renamed"] is True and d["ts"] == new
+        assert os.path.isdir(dst) and not os.path.isdir(src)
+        code, d = _req("GET", "/api/outputs/{}/tree".format(new))
+        assert code == 200
+
+        # 单删（移入回收站）
+        code, d = _req("DELETE", "/api/outputs/{}".format(new))
+        assert code == 200 and d["trash"].startswith("webui/backups/outputs-trash/")
+        trash.append(os.path.join(root, d["trash"]))
+        assert not os.path.isdir(dst) and os.path.isdir(trash[-1])
+    finally:
+        for p in (src, dst):
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+
+    # 批量删除
+    names = []
+    for i in range(2):
+        ts = "zz-webui-test-batch-{}-{}".format(i, int(time.time() * 1000))
+        os.makedirs(os.path.join(out, ts))
+        names.append(ts)
+    try:
+        code, d = _req("POST", "/api/outputs/delete", {"names": names})
+        assert code == 200 and sorted(d["deleted"]) == sorted(names) and not d["failed"]
+        assert not any(os.path.isdir(os.path.join(out, t)) for t in names)
+    finally:
+        for t in names:
+            shutil.rmtree(os.path.join(out, t), ignore_errors=True)
+        trash_dir = os.path.join(root, "webui/backups/outputs-trash")
+        for p in trash:
+            shutil.rmtree(p, ignore_errors=True)
+        if os.path.isdir(trash_dir):
+            for name in os.listdir(trash_dir):
+                if any(name == t or name.startswith(t + ".") for t in names):
+                    shutil.rmtree(os.path.join(trash_dir, name), ignore_errors=True)
+    code, _ = _req("POST", "/api/outputs/delete", {"names": []})
+    assert code == 400
+
+
 def test_schedule_plans():
     code, d = _req("GET", "/api/schedule/plans")
     assert code == 200

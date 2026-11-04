@@ -24,8 +24,11 @@ STATIC_DIR = os.path.join(WEBUI_DIR, "web")        # 磁盘目录 web/，URL 前
 SCHED_DIR = os.path.join(ROOT, "schedule")
 API_MD = os.path.join(WEBUI_DIR, "API.md")
 
+OUTPUTS_DIR = os.path.join(ROOT, "outputs")
 # 文件读取白名单（/api/file、/api/csv）
-READ_ROOTS = [os.path.join(ROOT, "outputs"), RUNS_DIR]
+READ_ROOTS = [OUTPUTS_DIR, RUNS_DIR]
+# 运行结果删除后的回收站（位于已 gitignore 的 backups/ 下）
+OUTPUTS_TRASH_DIR = os.path.join(BACKUP_DIR, "outputs-trash")
 # 配置读写白名单（/api/config*、schedule 计划）
 CONF_ROOTS = [os.path.join(ROOT, "configs"), SCHED_DIR]
 

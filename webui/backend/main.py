@@ -122,6 +122,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         self._dispatch("PUT")
 
+    def do_DELETE(self):
+        self._dispatch("DELETE")
+
 
 def _generate_openapi():
     """Static OpenAPI 3.0 spec for the HTTP API endpoints."""
@@ -142,6 +145,9 @@ def _generate_openapi():
                         "requestBody": {"required": True,
                                         "content": {"application/json": {"schema": {"type": "object"}}}},
                         "responses": {"200": {"description": "OK"}}}}
+    def _delete(summary):
+        return {"delete": {"summary": summary,
+                           "responses": {"200": {"description": "OK"}}}}
 
     paths = {}
     paths["/api/status"] = _p("System status + active run/scheduler")
@@ -160,6 +166,9 @@ def _generate_openapi():
     paths["/api/runs/{id}/stop"] = _post("Stop a run (cross-platform kill + remote reap)")
     paths["/api/outputs"] = _p("List output runs")
     paths["/api/outputs/{ts}/tree"] = _p("File tree of one output run")
+    paths["/api/outputs/{ts}"] = _delete("Delete run result (moved to trash)")
+    paths["/api/outputs/{ts}/rename"] = _post("Rename run result directory")
+    paths["/api/outputs/delete"] = _post("Batch delete run results (moved to trash)")
     paths["/api/file"] = _p("Read file (text/raw/tail)")
     paths["/api/file"]["get"]["parameters"] = [
         _q("path", required=True), _q("mode", default="text"),

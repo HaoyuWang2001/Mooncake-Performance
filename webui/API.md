@@ -104,6 +104,21 @@ run meta 字段：`id/kind/cmd/argv/log/status/rc/t0/t1/elapsed/ts_dir/meta`；`
 ### GET /api/outputs/{ts}/tree
 `{"ts":"...","files":["benchmark_detail.csv","logs/put/put.benchmark_c1_t2_64KB.log",...]}`
 
+### POST /api/outputs/{ts}/rename
+请求体：`{"name":"put-3nodes"}`
+- 新名需匹配 `[0-9A-Za-z._-]+`，不得以 `.` 开头、不得与已有结果重名（409）
+- 直接重命名 `outputs/<旧名>` → `outputs/<新名>`，并同步更新 run 历史里的 `ts_dir`
+- → `{"ok":true,"ts":"新名","from":"旧名","renamed":true}`（同名时 `renamed:false`）
+
+### DELETE /api/outputs/{ts}
+把结果目录**移入回收站** `webui/backups/outputs-trash/<ts>`（重名自动追加时间戳），
+并把指向它的 run 历史 `ts_dir` 置空。
+→ `{"ok":true,"ts":"...","trash":"webui/backups/outputs-trash/..."}`
+
+### POST /api/outputs/delete
+请求体：`{"names":["20261029-2230","..."]}`（批量删除，同样移入回收站）
+→ `{"deleted":["..."],"failed":[{"ts":"...","error":"..."}]}`
+
 ### GET /api/file?path=outputs/.../xxx.log&mode=text&offset=0
 - `mode=text`（默认）：`{"content":"...","offset":N,"size":M,"eof":bool}`；可用 `tail=65536` 直接取尾部 N 字节
 - `mode=raw`：原始字节流（PNG 等），`Content-Type` 按扩展名
