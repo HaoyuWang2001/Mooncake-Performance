@@ -16,6 +16,7 @@ import glob
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import atexit
 import shutil
@@ -522,7 +523,7 @@ def k8s_workspace_dirs(cluster, dry_run=False):
         if dry_run:
             log("[k8s] (dry-run) would create {}/{}".format(root, sub))
             continue
-        controller_mkdir(c, os.path.join(root, sub))
+        controller_mkdir(c, posixpath.join(root, sub))
     return root
 
 
@@ -620,7 +621,7 @@ def cleanup_k8s_workspace(cluster, dry_run=False):
         if dry_run:
             log("[k8s] (dry-run) would remove {}/{}".format(root, sub))
             continue
-        controller_remove(c, os.path.join(root, sub))
+        controller_remove(c, posixpath.join(root, sub))
     log("[k8s] controller workspace cleaned: {}".format(root))
 
 
@@ -664,9 +665,9 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         try:
             with open(local_yaml, "w", encoding="utf-8", newline="\n") as f:
                 f.write(yaml_text)
-            yaml_dir = os.path.join(k8s["controller_workspace"], "pods")
+            yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
             controller_put(c, [local_yaml], yaml_dir)
-            remote_yaml = os.path.join(yaml_dir, pod + ".yaml")
+            remote_yaml = posixpath.join(yaml_dir, pod + ".yaml")
             out, rc = controller_run(
                 c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
             if rc != 0:
@@ -863,7 +864,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
             "".format(cm_name, run_label))
         return cm_name
     env_content = build_k8s_env_content(scenario_params, cluster_session)
-    stage_remote = os.path.join(k8s["controller_workspace"], "scripts", run_label)
+    stage_remote = posixpath.join(k8s["controller_workspace"], "scripts", run_label)
     import tempfile
     local_stage = tempfile.mkdtemp(prefix="mc-cm-")
     try:
@@ -2871,6 +2872,8 @@ def main(args, cfg_paths):
             failed_scenarios.append(name)
     if args.dry_run:
         log("dry-run complete, no artifacts written")
+        if failed_scenarios:
+            sys.exit(1)
         return
     # Sweep end: remove-all on the last successful config's primary node.
     # Failed configs never reach their own end-remove, so this final pass is
@@ -2925,22 +2928,26 @@ def main(args, cfg_paths):
     if args.mode == "k8s" and not args.dry_run:
         cleanup_k8s_namespace(cluster, dry_run=False)
     log("done. results in {}".format(ts_dir))
-    # auto-plot: latency/queue-wait figures for every config under this run's
-    # logs/ (subprocess isolation — a broken matplotlib must never affect the
-    # benchmark result or exit code). Opt out with --no-plot.
+    # auto-plot runs on the ORCHESTRATOR (local sys.executable, local logs dir);
+    # it must never run on remote nodes. Skip when a failed run produced no logs.
     if not args.no_plot:
-        plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
-        try:
-            proc = subprocess.run(
-                [sys.executable, plot_script,
-                 "--log", os.path.join(ts_dir, "logs")],
-                check=False)
-            if proc.returncode != 0:
-                log("[WARN] auto-plot failed (rc={}); figures skipped. "
-                    "Is matplotlib installed? (pip install matplotlib)".format(
-                        proc.returncode))
-        except Exception as exc:
-            log("[WARN] auto-plot failed: {}".format(exc))
+        log_dir = os.path.join(ts_dir, "logs")
+        has_logs = bool(glob.glob(os.path.join(log_dir, "**", "*.log"),
+                                  recursive=True))
+        if not has_logs:
+            log("[WARN] auto-plot skipped (no *.log under {})".format(log_dir))
+        else:
+            plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
+            try:
+                proc = subprocess.run(
+                    [sys.executable, plot_script, "--log", log_dir],
+                    check=False)
+                if proc.returncode != 0:
+                    log("[WARN] auto-plot failed (rc={}); figures skipped. "
+                        "Is matplotlib installed? (pip install matplotlib)".format(
+                            proc.returncode))
+            except Exception as exc:
+                log("[WARN] auto-plot failed: {}".format(exc))
     if args.clean_up:
         # reap first: recorded processes must be killed before their
         # scripts/binaries vanish with the remote directory
@@ -2950,6 +2957,9 @@ def main(args, cfg_paths):
             log("[WARN] .state reap failed: {}".format(exc))
         cleanup_cluster(cluster, globals_cfg, dry_run=False)
         log("cleanup done")
+    if failed_scenarios:
+        # non-zero exit so runmgr/WebUI marks the run "failed"
+        sys.exit(1)
 
 
 if __name__ == "__main__":

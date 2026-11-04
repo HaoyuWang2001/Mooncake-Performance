@@ -17,6 +17,7 @@ Node transports (cluster.json `kind` field, default "ssh"):
 """
 import json
 import os
+import posixpath
 import shlex
 import shutil
 import subprocess
@@ -53,6 +54,11 @@ def kubectl_cmd(node, *args):
 
 def controller_is_local(controller):
     return bool(controller.get("_local"))
+
+
+def _remote_path(path):
+    """Controller/pod paths are POSIX; Windows orchestrators must not emit '\\'."""
+    return str(path).replace("\\", "/")
 
 
 def _controller_env(controller):
@@ -113,6 +119,7 @@ def controller_mkdir(controller, path):
     if controller_is_local(controller):
         os.makedirs(path, exist_ok=True)
         return
+    path = _remote_path(path)
     out, rc = _ssh_exec(controller, "mkdir -p " + shlex.quote(path))
     if rc != 0:
         raise RuntimeError("controller mkdir {} failed: {}".format(path, out.strip()[:300]))
@@ -125,6 +132,7 @@ def controller_put(controller, local_files, remote_dir):
         for f in local_files:
             shutil.copy2(f, os.path.join(remote_dir, os.path.basename(f)))
         return
+    remote_dir = _remote_path(remote_dir)
     sftp = _ssh_client(controller).open_sftp()
     try:
         for f in local_files:
@@ -138,6 +146,7 @@ def controller_get_file(controller, remote_path, local_dir):
     if controller_is_local(controller):
         shutil.copy2(remote_path, os.path.join(local_dir, os.path.basename(remote_path)))
         return
+    remote_path = _remote_path(remote_path)
     sftp = _ssh_client(controller).open_sftp()
     try:
         sftp.get(remote_path, os.path.join(local_dir, os.path.basename(remote_path)))
@@ -179,7 +188,7 @@ def controller_remove(controller, path):
     if controller_is_local(controller):
         shutil.rmtree(path, ignore_errors=True)
         return
-    _ssh_exec(controller, "rm -rf " + shlex.quote(path))
+    _ssh_exec(controller, "rm -rf " + shlex.quote(_remote_path(path)))
 
 
 def get_node(cluster, name):
@@ -356,7 +365,7 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
 def scp_push(host, node, local_files, remote_path, dry_run=False):
     if is_k8s_node(node):
         c = node["_controller"]
-        stage = os.path.join(node.get("_controller_workspace") or "/tmp", "push-tmp")
+        stage = posixpath.join(node.get("_controller_workspace") or "/tmp", "push-tmp")
         log("[kcp] -> {} : {}".format(node["_pod"], remote_path))
         if dry_run:
             log("      (dry-run, skipped)")
@@ -365,7 +374,7 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
         for f in local_files:
             out, rc = controller_run(c,
                                      ["-n", node["_ns"], "cp",
-                                      os.path.join(stage, os.path.basename(f)),
+                                      posixpath.join(stage, os.path.basename(f)),
                                       "{}:{}".format(node["_pod"], remote_path)],
                                      check=False)
             if rc != 0:
@@ -400,7 +409,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
             raise RuntimeError("kubectl cp pull failed: no such file on {}: {}".format(
                 node["_pod"], remote_glob))
         c = node["_controller"]
-        stage = os.path.join(node.get("_controller_workspace") or "/tmp", "pull-tmp")
+        stage = posixpath.join(node.get("_controller_workspace") or "/tmp", "pull-tmp")
         if not dry_run:
             controller_mkdir(c, stage)
         for f in files:
@@ -414,7 +423,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                         local_dir.rstrip("\\/") + os.sep], check=False)
             else:
                 base = os.path.basename(f)
-                dst = os.path.join(stage, base)
+                dst = posixpath.join(stage, base)
                 out, rc = controller_run(
                     c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f), dst],
                     check=False)

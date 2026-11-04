@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import benchmark as bm
+import utils as u
 
 
 def _cluster():
@@ -18,6 +19,13 @@ def _cluster():
                 "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl",
                 "controller_workspace": "/tmp/cw", "pod_workspace": "/tmp/pw"},
     }
+
+
+def test_remote_paths_use_posix_separators():
+    # Windows orchestrators must not leak '\\' into controller/pod paths
+    assert u._remote_path("/tmp/a\\b\\c") == "/tmp/a/b/c"
+    assert u._remote_path("/tmp/Mooncake-Performance/pods/x.yaml") == \
+        "/tmp/Mooncake-Performance/pods/x.yaml"
 
 
 def test_parse_size_bytes():
