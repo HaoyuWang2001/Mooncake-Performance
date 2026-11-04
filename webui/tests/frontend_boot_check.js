@@ -115,5 +115,34 @@ try {
   console.error("[FAIL] selection tree helpers: " + e.message);
 }
 
+// 回归：模式候选过滤（backend owner=_ssh/_k8s, mode=ssh/k8s）
+try {
+  const cands = [
+    { path: "configs/cluster.json", owner: "root" },
+    { path: "configs/_ssh/cluster.json", owner: "_ssh" },
+    { path: "configs/_k8s/cluster.json", owner: "_k8s" },
+    "legacy/path.json",
+  ];
+  const ssh = vm.runInContext(
+    "_perfModeCandidates(" + JSON.stringify(cands) + ',"ssh")', ctx);
+  const k8s = vm.runInContext(
+    "_perfModeCandidates(" + JSON.stringify(cands) + ',"k8s")', ctx);
+  const sshPaths = ssh.map(c => c.path || c).sort();
+  const k8sPaths = k8s.map(c => c.path || c).sort();
+  if (JSON.stringify(sshPaths) !== JSON.stringify([
+      "configs/_ssh/cluster.json", "configs/cluster.json", "legacy/path.json"])) {
+    failed = true;
+    console.error("[FAIL] ssh candidates: " + JSON.stringify(sshPaths));
+  }
+  if (JSON.stringify(k8sPaths) !== JSON.stringify([
+      "configs/_k8s/cluster.json", "legacy/path.json"])) {
+    failed = true;
+    console.error("[FAIL] k8s candidates: " + JSON.stringify(k8sPaths));
+  }
+} catch (e) {
+  failed = true;
+  console.error("[FAIL] _perfModeCandidates: " + e.message);
+}
+
 if (failed) process.exit(1);
 console.log("FRONTEND_BOOT_OK (" + registered.map(([n]) => n).join(", ") + ")");

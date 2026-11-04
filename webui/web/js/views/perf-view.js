@@ -16,6 +16,17 @@ function _perfTreeCount(node) {
   return node.files.length + node.dirs.reduce((a, d) => a + _perfTreeCount(d), 0);
 }
 
+/* 按运行模式过滤配置候选。owner 由后端给出（_ssh/_k8s/root），
+   注意 mode 值是 "ssh"/"k8s"（无下划线）。字符串候选兼容旧后端。 */
+function _perfModeCandidates(list, mode) {
+  return (list || []).filter(c => {
+    const owner = (c && typeof c === "object") ? c.owner : null;
+    if (!owner) return true;
+    if (mode === "ssh") return owner === "_ssh" || owner === "root";
+    return owner === "_k8s";
+  });
+}
+
 const SelNode = {
   name: "SelNode",
   props: { node: { type: Object, required: true },
@@ -79,21 +90,21 @@ const PerfView = {
         <span class="rb-label">cluster</span>
         <el-select v-model="flags.cluster" size="small" style="width: 280px" filterable
                    placeholder="选择 cluster 配置">
-          <el-option v-for="c in modeCandidates.cluster" :key="c.path"
-                     :label="c.path" :value="c.path"></el-option>
+          <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
+                     :label="c.path || c" :value="c.path || c"></el-option>
         </el-select>
         <span class="rb-label" style="margin-left: 16px">global</span>
         <el-select v-model="flags.global" size="small" style="width: 280px" filterable
                    placeholder="选择 global 配置">
-          <el-option v-for="g in modeCandidates.global" :key="g.path"
-                     :label="g.path" :value="g.path"></el-option>
+          <el-option v-for="g in modeCandidates.global" :key="g.path || g"
+                     :label="g.path || g" :value="g.path || g"></el-option>
         </el-select>
         <span class="rb-label" style="margin-left: 16px">matrix</span>
         <el-select v-model="flags.profile" size="small" style="width: 240px"
                    placeholder="profiling matrix">
           <el-option label="auto" value="auto"></el-option>
-          <el-option v-for="m in modeCandidates.matrix" :key="m.path"
-                     :label="m.path" :value="m.path"></el-option>
+          <el-option v-for="m in modeCandidates.matrix" :key="m.path || m"
+                     :label="m.path || m" :value="m.path || m"></el-option>
         </el-select>
       </div>
       <div class="rb-row">
@@ -200,19 +211,17 @@ const PerfView = {
     const starting = Vue.ref(false);
 
     const selCount = Vue.computed(() => _perfCountSel(treeRoots.value));
-    const modeCandidates = Vue.computed(() => {
-      const f = (list) => list.filter(c => c.owner === mode.value ||
-        c.owner === "root" && mode.value === "ssh");
-      return { cluster: f(candidates.value.cluster),
-               global: f(candidates.value.global),
-               matrix: f(candidates.value.matrix) };
-    });
+    const modeCandidates = Vue.computed(() => ({
+      cluster: _perfModeCandidates(candidates.value.cluster, mode.value),
+      global: _perfModeCandidates(candidates.value.global, mode.value),
+      matrix: _perfModeCandidates(candidates.value.matrix, mode.value),
+    }));
 
     function onModeChange() {
       // reset trio to mode-default
       const c = modeCandidates.value;
-      flags.cluster = c.cluster.length ? c.cluster[0].path : "";
-      flags.global = c.global.length ? c.global[0].path : "";
+      flags.cluster = c.cluster.length ? (c.cluster[0].path || c.cluster[0]) : "";
+      flags.global = c.global.length ? (c.global[0].path || c.global[0]) : "";
       flags.profile = "auto";
     }
 
