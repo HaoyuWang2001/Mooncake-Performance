@@ -86,7 +86,10 @@ const DragHandle = {
       e.preventDefault();
       const scroller = document.querySelector(".el-main");
       const startDocY = e.clientY + (scroller ? scroller.scrollTop : 0);
-      const startH = props.modelValue;
+      const prev = e.currentTarget && e.currentTarget.previousElementSibling;
+      const startH = props.modelValue > 0
+        ? props.modelValue
+        : (prev ? prev.offsetHeight : 420);
       let lastY = e.clientY;
       let raf = 0;
       const EDGE = 44, STEP = 8;

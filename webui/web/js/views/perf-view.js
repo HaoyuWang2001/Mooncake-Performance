@@ -5,11 +5,15 @@
 function _perfCountSel(sel) {
   let total = 0;
   const count = (node) => {
-    if (node.checked) { total += node.children ? node.count : 1; return; }
-    node.children.forEach(count);
+    if (node.checked) { total += node.isDir ? node.count : 1; return; }
+    (node.children || []).forEach(count);
   };
   sel.forEach(count);
   return total;
+}
+
+function _perfTreeCount(node) {
+  return node.files.length + node.dirs.reduce((a, d) => a + _perfTreeCount(d), 0);
 }
 
 const SelNode = {
@@ -43,7 +47,7 @@ const SelNode = {
   setup(props) {
     const open = Vue.ref(props.depth < 1);
     const hasSel = Vue.computed(() => {
-      const walk = (n) => n.checked || n.children.some(walk);
+      const walk = (n) => n.checked || (n.children || []).some(walk);
       return walk(props.node);
     });
     return { open, hasSel };
@@ -200,12 +204,10 @@ const PerfView = {
       const children = [
         ...treeNode.dirs.map(_toNode),
         ...treeNode.files.map(f => ({ name: f.split("/").pop(), path: f,
-                                      isDir: false, checked: false })),
+                                      isDir: false, checked: false, children: [] })),
       ];
       return { name: treeNode.name, path: treeNode.path, isDir: true,
-               checked: false, count: treeNode.files.length +
-               treeNode.dirs.reduce((a, d) => a + d.files.length, 0),
-               children };
+               checked: false, count: _perfTreeCount(treeNode), children };
     }
 
     async function loadConfigs() {

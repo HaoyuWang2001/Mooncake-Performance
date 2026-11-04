@@ -100,5 +100,20 @@ for (const name of mustHave) {
   }
 }
 
+// 回归：选择树计数需正确处理叶子节点（曾有 children 缺失导致整页渲染崩溃）
+try {
+  const sample = [{ isDir: true, checked: false, count: 3, children: [
+    { isDir: false, checked: false, children: [] },
+    { isDir: false, checked: true, children: [] },
+  ] }];
+  const n = vm.runInContext("_perfCountSel(" + JSON.stringify(sample) + ")", ctx);
+  if (n !== 1) { failed = true; console.error("[FAIL] _perfCountSel expected 1, got " + n); }
+  const c = vm.runInContext("_perfTreeCount({files:['a'],dirs:[{files:['b','c'],dirs:[]}]})", ctx);
+  if (c !== 3) { failed = true; console.error("[FAIL] _perfTreeCount expected 3, got " + c); }
+} catch (e) {
+  failed = true;
+  console.error("[FAIL] selection tree helpers: " + e.message);
+}
+
 if (failed) process.exit(1);
 console.log("FRONTEND_BOOT_OK (" + registered.map(([n]) => n).join(", ") + ")");

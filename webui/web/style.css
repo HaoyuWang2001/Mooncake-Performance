@@ -132,7 +132,7 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .run-item:hover .ri-actions { display: inline-flex; }
 .run-item:hover .ri-tag { visibility: hidden; }
-.run-list-card { display: flex; flex-direction: column; max-height: calc(100vh - 110px); }
+.run-list-card { display: flex; flex-direction: column; max-height: calc(100vh - 90px); }
 .run-list-card .el-card__body { display: flex; flex-direction: column; min-height: 0; }
 .run-list { flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
 .ms-bar {
@@ -161,6 +161,12 @@ html, body, #app { height: 100%; margin: 0; }
 .pane-body {
   min-height: 200px;
   overflow-y: auto;
+  box-sizing: border-box;
+}
+/* 自动高度：内容少则自然高度（不小于 200），内容多则封顶 AUTO_MAX（< 手动最大值） */
+.pane-body.auto {
+  height: auto;
+  max-height: 600px;
 }
 .pane-empty { display: flex; align-items: center; justify-content: center; }
 .pane-tools { margin-left: auto; display: inline-flex; align-items: center; }

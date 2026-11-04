@@ -149,14 +149,16 @@ const ResPane = {
                  @click.stop="toggleWrap(pane)"
                  title="长行换行 / 横向滚动 切换">换行</el-button>
       <span class="pane-tools">
+        <el-button size="small" text :type="pane.auto ? 'primary' : ''"
+                   @click.stop="setAuto(pane)" title="根据内容自适应高度">高度自适应</el-button>
         <el-button size="small" type="primary" plain @click.stop="$emit('toggle-fs')"
                    :title="fs ? '退出全屏' : '全屏查看'">{{ fs ? "退出全屏" : "全屏" }}</el-button>
         <el-button v-if="!fs" size="small" text type="danger" @click.stop="$emit('close')"
                    title="关闭此结果框">✕</el-button>
       </span>
     </div>
-    <div class="pane-body" :class="{ fsbody: fs }" v-loading="pane.loading"
-         :style="fs ? null : { height: pane.h + 'px' }">
+    <div class="pane-body" :class="{ fsbody: fs, auto: pane.auto }" v-loading="pane.loading"
+         :style="(fs || pane.auto) ? null : { height: pane.h + 'px' }">
       <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
       <template v-else-if="kindOf(pane) === 'img'">
         <div v-if="fs" class="imgfs">
@@ -188,10 +190,12 @@ const ResPane = {
                    :text="pane.text"></spdiag-tree>
       <pre v-else class="txt" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
     </div>
-    <drag-handle v-if="!fs" v-model="pane.h" :min="200" :max="1000"
-                 :persist="'mcweb-res-h' + idx"></drag-handle>
+    <drag-handle v-if="!fs" :model-value="pane.auto ? 0 : (pane.h || 0)"
+                 :min="200" :max="1000"
+                 @update:model-value="v => { pane.h = v; pane.auto = false; }"></drag-handle>
   </div>`,
   setup() {
+    function setAuto(pane) { pane.auto = true; }
     function toggleWrap(pane) {
       pane.wrap = !pane.wrap;
       try { localStorage.setItem("mcweb-wrap", pane.wrap ? "1" : "0"); } catch (e) { /* ignore */ }
@@ -232,7 +236,7 @@ const ResPane = {
       return { width: (pane.imgScale * 100) + "%", height: "auto", transform: t };
     }
     const dragging = Vue.ref(false);
-    return { kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
+    return { setAuto, kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              rawUrl: p => "/api/file?path=" +
                encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
@@ -333,6 +337,20 @@ const ResultsView = {
     const fullscreenIdx = Vue.ref(-1);
     const panes = Vue.reactive([]);
 
+    // 左侧结果列表精确贴合可用高度（不依赖固定 magic number）
+    function fitRunList() {
+      Vue.nextTick(() => {
+        const main = document.querySelector(".el-main");
+        const card = document.querySelector(".run-list-card");
+        if (!main || !card) return;
+        const mr = main.getBoundingClientRect();
+        const cr = card.getBoundingClientRect();
+        const pad = parseFloat(getComputedStyle(main).paddingBottom) || 20;
+        const avail = mr.height - (cr.top - mr.top) - pad;
+        card.style.maxHeight = Math.max(240, avail) + "px";
+      });
+    }
+
     function newPane(idx) {
       // Vue.reactive：pane 必须从创建起即为代理对象——addPane 持有该引用做
       // 异步写入（_loadFiles），raw 对象的赋值不会触发响应式更新（首个
@@ -343,7 +361,7 @@ const ResultsView = {
                             rawView: false, wrap: wrap, imgScale: "fit",
                             imgX: 0, imgY: 0,
                             rows: [], headers: [], text: "",
-                            h: loadHeight("mcweb-res-h" + idx, 420) });
+                            auto: true, h: null });
     }
 
     async function loadRuns() {
@@ -496,8 +514,15 @@ const ResultsView = {
     function onKey(ev) {
       if (ev.key === "Escape" && fullscreenIdx.value >= 0) fullscreenIdx.value = -1;
     }
-    Vue.onMounted(() => window.addEventListener("keydown", onKey));
-    Vue.onUnmounted(() => window.removeEventListener("keydown", onKey));
+    Vue.onMounted(() => {
+      window.addEventListener("keydown", onKey);
+      window.addEventListener("resize", fitRunList);
+      fitRunList();
+    });
+    Vue.onUnmounted(() => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", fitRunList);
+    });
 
     Vue.onActivated(async () => {
       await loadRuns();
@@ -514,6 +539,7 @@ const ResultsView = {
       } else if (!panes.length && runs.value.length) {
         addPane();
       }
+      fitRunList();
     });
 
     return { runs, loading, lockFile, activePane, fullscreenIdx, panes,
