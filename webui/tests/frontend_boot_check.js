@@ -100,14 +100,26 @@ for (const name of mustHave) {
   }
 }
 
-// 回归：选择树计数需正确处理叶子节点（曾有 children 缺失导致整页渲染崩溃）
+// 回归：目录收编 + 文件去重（运行框展示与提交使用同一份结果）
 try {
-  const sample = [{ isDir: true, checked: false, count: 3, children: [
-    { isDir: false, checked: false, children: [] },
-    { isDir: false, checked: true, children: [] },
-  ] }];
-  const n = vm.runInContext("_perfCountSel(" + JSON.stringify(sample) + ")", ctx);
-  if (n !== 1) { failed = true; console.error("[FAIL] _perfCountSel expected 1, got " + n); }
+  const merged = vm.runInContext(`(function () {
+    const tree = [
+      { isDir: true, checked: true, path: "configs/basic", children: [
+        { isDir: false, checked: true, path: "configs/basic/a.json", children: [] },
+        { isDir: false, checked: false, path: "configs/basic/b.json", children: [] },
+      ] },
+      { isDir: false, checked: true, path: "configs/extra.json", children: [] },
+    ];
+    const acc = { dirs: [], files: [] };
+    tree.forEach(n => _perfCollectSel(n, acc));
+    return JSON.stringify(acc);
+  })()`, ctx);
+  const parsed = JSON.parse(merged);
+  if (parsed.dirs.length !== 1 || parsed.dirs[0] !== "configs/basic" ||
+      parsed.files.length !== 1 || parsed.files[0] !== "configs/extra.json") {
+    failed = true;
+    console.error("[FAIL] _perfCollectSel merge: " + merged);
+  }
   const c = vm.runInContext("_perfTreeCount({files:['a'],dirs:[{files:['b','c'],dirs:[]}]})", ctx);
   if (c !== 3) { failed = true; console.error("[FAIL] _perfTreeCount expected 3, got " + c); }
 } catch (e) {

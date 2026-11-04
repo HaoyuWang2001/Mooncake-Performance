@@ -2,16 +2,6 @@
 /* 性能测试视图：运行框（模式/配置选择/三件套/选项）+ 日志查看（自适应高度）。
    运行发起与日志查看在同一组件内直调（消除跨组件 pendingRunId 时序 bug）。 */
 
-function _perfCountSel(sel) {
-  let total = 0;
-  const count = (node) => {
-    if (node.checked) { total += node.isDir ? node.count : 1; return; }
-    (node.children || []).forEach(count);
-  };
-  sel.forEach(count);
-  return total;
-}
-
 function _perfTreeCount(node) {
   return node.files.length + node.dirs.reduce((a, d) => a + _perfTreeCount(d), 0);
 }
@@ -111,10 +101,21 @@ const PerfView = {
           <el-radio-button value="ssh">真机</el-radio-button>
           <el-radio-button value="k8s">k8s</el-radio-button>
         </el-radio-group>
-        <el-button size="small" @click="cfgDialog = true">
-          配置选择（已选 {{ selCount }} 个）
-        </el-button>
+        <el-button size="small" @click="cfgDialog = true">配置选择</el-button>
         <el-button size="small" @click="clearSel">清空</el-button>
+      </div>
+      <div class="rb-selected">
+        <div class="rb-sel-col">
+          <div class="rb-sel-title">目录 <span class="rb-sel-count">{{ selected.dirs.length }}</span></div>
+          <div v-if="!selected.dirs.length" class="rb-sel-empty">—</div>
+          <div v-for="d in selected.dirs" :key="d" class="rb-sel-path" :title="d">{{ d }}</div>
+        </div>
+        <div class="rb-sel-col">
+          <div class="rb-sel-title">文件 <span class="rb-sel-count">{{ selected.files.length }}</span></div>
+          <div v-if="!selected.files.length" class="rb-sel-empty">—</div>
+          <div v-for="f in selected.files" :key="f" class="rb-sel-path" :title="f">{{ f }}</div>
+        </div>
+        <div class="rb-sel-note">目录先执行、文件后执行；已被目录收编的文件不重复列出</div>
       </div>
       <div class="rb-row">
         <span class="rb-label">cluster</span>
@@ -150,7 +151,7 @@ const PerfView = {
       </div>
       <div class="rb-row">
         <el-button type="primary" size="large" style="width: 160px" :loading="starting"
-                   :disabled="selCount === 0"
+                   :disabled="!hasSelection"
                    @click="startRun">运行测试</el-button>
       </div>
       <el-alert v-if="warnings.length" type="warning" :closable="false" style="margin-top: 8px"
@@ -207,7 +208,7 @@ const PerfView = {
       <template #footer>
         <el-button size="small" @click="clearSel">清空选择</el-button>
         <el-button size="small" type="primary" @click="cfgDialog = false">
-          确定（{{ selCount }} 个）
+          确定（目录 {{ selected.dirs.length }} / 文件 {{ selected.files.length }}）
         </el-button>
       </template>
     </el-dialog>
@@ -239,7 +240,14 @@ const PerfView = {
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
 
-    const selCount = Vue.computed(() => _perfCountSel(treeRoots.value));
+    // 最终选择（与 startRun 提交内容一致）：勾目录=收编该目录并停止下钻
+    const selected = Vue.computed(() => {
+      const acc = { dirs: [], files: [] };
+      treeRoots.value.forEach(r => _perfCollectSel(r, acc));
+      return acc;
+    });
+    const hasSelection = Vue.computed(() =>
+      selected.value.dirs.length > 0 || selected.value.files.length > 0);
     const modeCandidates = Vue.computed(() => ({
       cluster: _perfModeCandidates(candidates.value.cluster, mode.value),
       global: _perfModeCandidates(candidates.value.global, mode.value),
@@ -301,8 +309,8 @@ const PerfView = {
     }
 
     async function startRun() {
-      const acc = { dirs: [], files: [] };
-      treeRoots.value.forEach(r => _perfCollectSel(r, acc));
+      const acc = { dirs: selected.value.dirs.slice(),
+                    files: selected.value.files.slice() };
       if (!acc.dirs.length && !acc.files.length) {
         ElementPlus.ElMessage.warning("先选择配置文件或目录");
         return;
@@ -434,7 +442,7 @@ const PerfView = {
     });
     Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
-    return { mode, cfgDialog, treeRoots, selCount, modeCandidates, onModeChange,
+    return { mode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
              flags, warnings, starting, clearSel, startRun,
              meta, logLines, logEl, logH, runs, stopping, drawerOpen, viewingHistory,
              statusType, stop, gotoResults, onHistoryClick };

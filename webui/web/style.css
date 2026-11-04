@@ -94,6 +94,32 @@ html, body, #app { height: 100%; margin: 0; }
 .runbox .rb-seg { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
 .runbox .rb-k { color: var(--el-color-primary); margin-right: 6px; font-weight: 600; }
 .runbox .rb-note { color: var(--el-text-color-secondary); font-size: 12px; }
+
+/* 运行框：已选配置（目录/文件分开展示，过滤合并后） */
+.runbox .rb-selected {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  margin: 4px 0 8px; padding: 8px 10px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px; background: var(--el-fill-color-lighter);
+  max-height: 160px; overflow-y: auto;
+}
+.runbox .rb-sel-col { min-width: 0; }
+.runbox .rb-sel-title {
+  font-size: 12.5px; font-weight: 600; color: var(--el-text-color-secondary);
+  margin-bottom: 4px;
+}
+.runbox .rb-sel-count { color: var(--el-color-primary); }
+.runbox .rb-sel-path {
+  font: 12px/1.6 "Cascadia Mono", Consolas, monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.runbox .rb-sel-empty { font-size: 12px; color: var(--el-text-color-placeholder); }
+.runbox .rb-sel-note {
+  grid-column: 1 / -1; font-size: 11.5px; color: var(--el-text-color-secondary);
+}
+@media (max-width: 900px) {
+  .runbox .rb-selected { grid-template-columns: 1fr; }
+}
 .general-item { padding: 3px 8px; border-radius: 5px; cursor: pointer;
                 font-size: 13px; font-family: "Cascadia Mono", Consolas, monospace; }
 .general-item:hover { background: var(--el-fill-color); }
