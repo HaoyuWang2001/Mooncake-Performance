@@ -109,7 +109,7 @@ const PerfView = {
         </el-select>
       </div>
       <div class="rb-row">
-        <el-button type="primary" size="large" style="width: 100%" :loading="starting"
+        <el-button type="primary" size="large" style="width: 160px" :loading="starting"
                    :disabled="selCount === 0"
                    @click="startRun">运行测试</el-button>
       </div>
@@ -121,10 +121,6 @@ const PerfView = {
       <template #header>
         <div class="header-row" style="margin: 0">
           <b>当前 RUN</b>
-          <span v-if="meta.status" class="status" :class="statusType(meta.status)">{{ meta.status }}</span>
-          <span v-if="meta.id" style="margin-left: 10px; color: var(--el-text-color-secondary); font-size: 12.5px">
-            {{ Math.round(meta.elapsed) }}s · rc={{ meta.rc === null ? '-' : meta.rc }}
-          </span>
           <span class="spacer"></span>
           <el-button v-if="meta.status === 'running'" size="small" type="danger" @click="stop" :loading="stopping">停止</el-button>
           <el-button v-if="meta.ts_dir && meta.status !== 'running'" size="small" type="primary"
@@ -132,6 +128,26 @@ const PerfView = {
           <el-button size="small" @click="drawerOpen = true">历史</el-button>
         </div>
       </template>
+      <el-descriptions :column="4" size="small" border style="margin-bottom: 10px">
+        <el-descriptions-item label="id">{{ meta.id || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="状态">
+          <el-tag v-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
+          <span v-else>-</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="耗时">
+          {{ meta.id && meta.elapsed !== undefined ? Math.round(meta.elapsed) + "s" : "-" }}
+        </el-descriptions-item>
+        <el-descriptions-item label="rc">
+          {{ (meta.rc === null || meta.rc === undefined) ? "-" : meta.rc }}
+        </el-descriptions-item>
+        <el-descriptions-item label="命令" :span="3">
+          <span style="font-family: monospace; font-size: 12px">{{ meta.cmd || "-" }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="产物">
+          <span v-if="meta.ts_dir" style="font-family: monospace; font-size: 12px">{{ meta.ts_dir }}</span>
+          <span v-else>-</span>
+        </el-descriptions-item>
+      </el-descriptions>
       <div class="logview log-lg" ref="logEl" :style="{ height: logH + 'px' }">
         <div v-for="(ln, i) in logLines" :key="i" :class="ln.cls">{{ ln.text }}</div>
         <div v-if="!logLines.length && !meta.id" class="hint" style="padding: 40px; text-align: center">
