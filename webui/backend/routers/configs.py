@@ -157,12 +157,21 @@ def api_configs(handler, query):
         out["categories"][name] = {"tree": tree, "config_count": _tree_count(tree)}
     for p in out["general"]:
         base = os.path.basename(p)
+        # tag the owning mode dir (_ssh / _k8s / root) so the run box can
+        # filter candidates by mode
+        if "/_ssh/" in p:
+            owner = "_ssh"
+        elif "/_k8s/" in p:
+            owner = "_k8s"
+        else:
+            owner = "root"
+        tagged = {"path": p, "owner": owner}
         if base.startswith("cluster"):
-            out["cluster_candidates"].append(p)
+            out["cluster_candidates"].append(tagged)
         elif base.startswith("global"):
-            out["global_candidates"].append(p)
+            out["global_candidates"].append(tagged)
         elif base.startswith("matrix"):
-            out["matrix_candidates"].append(p)
+            out["matrix_candidates"].append(tagged)
     return out
 
 

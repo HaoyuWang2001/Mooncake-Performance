@@ -34,13 +34,19 @@ def _build_run_argv(body):
         argv += ["--config-dir", ",".join(dirs)]
     if files:
         argv += ["-f", ",".join(files)]
+    # mode: "ssh" (default) or "k8s" -> adds --ssh / --k8s to the benchmark argv
+    mode = flags.get("mode") or "ssh"
+    if mode not in ("ssh", "k8s"):
+        raise ApiError(400, "flags.mode must be 'ssh' or 'k8s'")
     cluster = flags.get("cluster") or "configs/_ssh/cluster.json"
+    if mode == "k8s":
+        cluster = flags.get("cluster") or "configs/_k8s/cluster.json"
     if not os.path.isfile(os.path.join(ROOT, cluster)):
         raise ApiError(400, "cluster config not found: {}".format(cluster))
-    global_cfg = flags.get("global") or "configs/_ssh/global.json"
+    global_cfg = flags.get("global") or ("configs/_k8s/global.json" if mode == "k8s" else "configs/_ssh/global.json")
     if not os.path.isfile(os.path.join(ROOT, global_cfg)):
         raise ApiError(400, "global config not found: {}".format(global_cfg))
-    argv += ["--cluster", cluster, "--global", global_cfg]
+    argv += ["--" + mode, "--cluster", cluster, "--global", global_cfg]
     for flag in ("dry_run", "no_warmup", "no_plot"):
         if flags.get(flag):
             argv.append("--" + flag.replace("_", "-"))

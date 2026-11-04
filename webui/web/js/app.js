@@ -19,7 +19,7 @@ async function api(method, url, body) {
 
 /* ---------------- 全局共享状态 ---------------- */
 /* ---------------- 视图页签持久化（浏览器刷新后停留在当前页签） ---------------- */
-const VIEW_KEYS = ["config", "run", "results", "schedule", "api"];
+const VIEW_KEYS = ["perf", "results", "config", "schedule"];
 function loadInitialView() {
   try {
     const v = localStorage.getItem("mcweb-view");
@@ -31,7 +31,6 @@ function loadInitialView() {
 const store = reactive({
   view: loadInitialView(),       // 当前视图：config | run | results | schedule | api
   status: { active_run: null, scheduler: null },   // /api/status 轮询结果
-  pendingRunId: null,           // config 视图刚发起的 run id（run 视图接管）
   resultsTarget: null,          // 跳转 results 时聚焦的 outputs/<ts>
   cfgTree: null,                // /api/configs 缓存（config 视图刷新）
 });
@@ -77,17 +76,16 @@ const App = {
         </div>
       </div>
       <el-menu :default-active="store.view" class="menu" @select="go">
+        <el-menu-item index="perf">性能测试</el-menu-item>
+        <el-menu-item index="results">统计结果</el-menu-item>
         <el-menu-item index="config">配置维护</el-menu-item>
-        <el-menu-item index="run">运行日志</el-menu-item>
-        <el-menu-item index="results">运行结果</el-menu-item>
-        <el-menu-item index="schedule">Schedule</el-menu-item>
-        <el-menu-item index="api">API</el-menu-item>
+        <el-menu-item index="schedule">定时任务</el-menu-item>
       </el-menu>
       <div class="aside-footer">
         <el-button size="small" circle @click="toggleDark" :title="theme.dark ? '切换到亮色' : '切换到暗色'">
           <el-icon><component :is="theme.dark ? 'Sunny' : 'Moon'"/></el-icon>
         </el-button>
-        <el-link type="primary" :underline="false" @click="go('api')">API 文档</el-link>
+        <el-link type="primary" :underline="false" href="/docs" target="_blank">API 文档</el-link>
       </div>
     </el-aside>
     <el-main class="main">
@@ -97,8 +95,8 @@ const App = {
     </el-main>
   </el-container>`,
   setup() {
-    const VIEWS = { config: "config-view", run: "run-view", results: "results-view",
-                    schedule: "schedule-view", api: "api-view" };
+    const VIEWS = { perf: "perf-view", results: "results-view",
+                    config: "config-view", schedule: "schedule-view" };
     const viewComp = computed(() => VIEWS[store.view] || "config-view");
     function go(v) { store.view = v; }
 
@@ -141,13 +139,13 @@ app.use(ElementPlus, { locale: ElementPlusLocaleZhCn });
 for (const [iconName, iconComp] of Object.entries(ElementPlusIconsVue || {})) {
   app.component(iconName, iconComp);
 }
+app.component("perf-view", PerfView);
+app.component("sel-node", SelNode);
 app.component("config-view", ConfigView);
 app.component("cfg-node", CfgNode);
-app.component("run-view", RunView);
 app.component("results-view", ResultsView);
 app.component("res-pane", ResPane);
 app.component("schedule-view", ScheduleView);
-app.component("api-view", ApiView);
 app.component("spdiag-tree", SpdiagTree);
 app.component("sdt-node", SdtNode);
 app.mount("#app");

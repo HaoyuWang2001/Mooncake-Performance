@@ -224,3 +224,10 @@ html, body, #app { height: 100%; margin: 0; }
   background: var(--el-fill-color); padding: 0 4px; border-radius: 3px;
   font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px;
 }
+
+/* ---- 性能测试页 ---- */
+.perf-empty { display: flex; align-items: center; justify-content: center; }
+.status { font-weight: 600; }
+.status.running { color: var(--el-color-primary); }
+.status.done { color: var(--el-color-success); }
+.status.failed, .status.stopped, .status.aborted { color: var(--el-color-error); }

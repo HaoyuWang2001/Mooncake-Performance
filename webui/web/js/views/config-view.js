@@ -24,90 +24,12 @@ const CfgNode = {
            parentSel: { type: Boolean, default: false },
            depth: { type: Number, default: 0 } },
   template: `
-  <div>
-    <div class="cfg-row" :style="{ paddingLeft: (depth * 14 + 4) + 'px' }">
-      <span v-if="node.isDir" class="tgl" @click="open = !open">{{ open ? "▾" : "▸" }}</span>
-      <span v-else class="tgl tgl-dot"></span>
-      <el-checkbox v-if="node.isDir"
-                   :model-value="node.checked"
-                   :indeterminate="!node.checked && hasSel"
-                   @update:model-value="v => { node.checked = v; }" />
-      <el-checkbox v-else
-                   :model-value="node.checked || parentSel"
-                   :disabled="parentSel"
-                   @update:model-value="v => { node.checked = v; }" />
-      <span class="cfg-name" :class="{ dir: node.isDir }" :title="node.path"
-            @click="onName">{{ node.name }}</span>
-      <span v-if="node.isDir" class="cfg-count">({{ node.count }})</span>
-    </div>
-    <div v-if="node.isDir" v-show="open">
-      <cfg-node v-for="c in node.children" :key="c.path" :node="c"
-                :parent-sel="parentSel || node.checked"
-                :depth="depth + 1"></cfg-node>
-    </div>
-  </div>`,
-  setup(props) {
-    const open = Vue.ref(props.depth < 1);
-    const hasSel = Vue.computed(() => _cfgHasSel(props.node));
-    const openFile = Vue.inject("openConfigFile", () => {});
-    const onName = () => { if (!props.node.isDir) openFile(props.node.path); };
-    return { open, hasSel, onName };
-  },
-};
-
-const ConfigView = {
-  template: `
   <div class="page">
-    <el-card shadow="never" class="runbox">
-      <template #header><b>运行</b></template>
-      <div class="rb-row">
-        <span class="rb-label">文件</span>
-        <div class="rb-files">
-          <span class="rb-seg"><span class="rb-k">目录</span>{{ sel.dirs.length ? sel.dirs.join("，") : "—" }}</span>
-          <span class="rb-seg"><span class="rb-k">文件</span>{{ sel.files.length ? sel.files.join("，") : "—" }}</span>
-          <span class="rb-note">（目录先执行，文件后执行）</span>
-        </div>
-      </div>
-      <div class="rb-row">
-        <span class="rb-label">cluster</span>
-        <el-select v-model="flags.cluster" size="small" style="width: 280px" filterable>
-          <el-option v-for="c in clusterCandidates" :key="c" :label="c" :value="c"></el-option>
-        </el-select>
-        <span class="rb-label" style="margin-left: 24px">global</span>
-        <el-select v-model="flags.global" size="small" style="width: 280px" filterable>
-          <el-option v-for="g in globalCandidates" :key="g" :label="g" :value="g"></el-select>
-        </el-select>
-        <span class="rb-label" style="margin-left: 24px">profile</span>
-        <el-select v-model="flags.profile" size="small" style="width: 240px"
-                   placeholder="（无 matrix 候选）" :disabled="!matrixCandidates.length">
-          <el-option v-for="m in matrixCandidates" :key="m" :label="m" :value="m"></el-option>
-        </el-select>
-      </div>
-      <div class="rb-row">
-        <span class="rb-label">选项</span>
-        <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
-        <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
-        <el-checkbox v-model="flags.noPlot">no-plot</el-checkbox>
-        <span style="font-size: 13px; margin-left: 12px">协议：</span>
-        <el-select v-model="flags.protocol" size="small" style="width: 110px">
-          <el-option label="(配置值)" value=""></el-option>
-          <el-option label="tcp" value="tcp"></el-option>
-          <el-option label="rdma" value="rdma"></el-option>
-          <el-option label="ub" value="ub"></el-option>
-        </el-select>
-      </div>
-      <div class="rb-row">
-        <el-button type="primary" :loading="starting" :disabled="!sel.dirs.length && !sel.files.length"
-                   @click="startRun">运行（跳转运行页）</el-button>
-      </div>
-      <el-alert v-if="warnings.length" type="warning" :closable="false" style="margin-top: 8px"
-                :title="warnings.join('；')"></el-alert>
-    </el-card>
-
-    <el-row :gutter="14" style="margin-top: 14px">
+    <el-row :gutter="14">
       <el-col :span="8">
         <el-card shadow="never" style="margin-bottom: 14px">
-          <template #header><b>通用配置</b><span class="hint" style="margin-left: 8px">configs 根目录</span></template>
+          <template #header><b>通用配置</b>
+            <span class="hint" style="margin-left: 8px">configs/_ssh、_k8s 及根目录</span></template>
           <div class="newcfg-row">
             <el-input v-model="newCfgName" placeholder="新文件名，如 cluster.3nodes.json"
                       size="small" style="width: 220px"></el-input>
@@ -129,7 +51,8 @@ const ConfigView = {
         <el-card shadow="never">
           <template #header>
             <div class="header-row" style="margin: 0">
-              <b>运行配置</b><span class="hint" style="margin-left: 8px">复选框选择运行范围；点击文件名可编辑</span>
+              <b>运行配置</b>
+              <span class="hint" style="margin-left: 8px">点击文件名可编辑</span>
               <span class="spacer"></span>
               <el-button size="small" @click="clearSelection">清空选中</el-button>
             </div>
@@ -139,7 +62,6 @@ const ConfigView = {
           </div>
         </el-card>
       </el-col>
-
       <el-col :span="16">
         <el-card shadow="never">
           <template #header>
@@ -148,19 +70,19 @@ const ConfigView = {
               {{ editPath }}
             </span>
           </template>
-          <el-input type="textarea" :rows="20" v-model="editContent" class="editor"
+          <el-input type="textarea" :rows="24" v-model="editContent" class="editor"
                     :placeholder="editPath ? '' : '点击通用配置或运行配置文件开始编辑'"></el-input>
           <div class="header-row" style="margin: 10px 0 0">
             <el-button size="small" @click="validate" :disabled="!editPath">校验</el-button>
             <el-button size="small" type="primary" @click="save" :disabled="!dirty" :loading="saving">保存</el-button>
             <span v-if="editMsg.text" :style="{ color: editMsg.ok ? 'var(--el-color-success)' : 'var(--el-color-error)',
                       fontSize: '12.5px' }">{{ editMsg.text }}</span>
-            <span class="hint" style="margin-left: auto">保存自动备份到 webui/backups/</span>
           </div>
         </el-card>
       </el-col>
     </el-row>
-  </div>`,
+  </div>
+`,
   setup() {
     const loading = Vue.ref(false);
     const treeRoots = Vue.ref([]);
@@ -188,11 +110,6 @@ const ConfigView = {
     const dirty = Vue.computed(() =>
       !!editPath.value && editContent.value !== editSnapshot.value);
 
-    const sel = Vue.computed(() => {
-      const acc = { dirs: [], files: [] };
-      for (const r of treeRoots.value) _cfgCollectSel(r, acc);
-      return acc;
-    });
 
     function clearSelection() {
       const walk = n => { n.checked = false; (n.children || []).forEach(walk); };
@@ -311,26 +228,6 @@ const ConfigView = {
       }
     }
 
-    async function startRun() {
-      starting.value = true;
-      warnings.value = [];
-      try {
-        const r = await api("POST", "/api/run", {
-          selector: { dirs: sel.value.dirs, files: sel.value.files },
-          flags: { dry_run: flags.dryRun, no_warmup: flags.noWarmup,
-                   no_plot: flags.noPlot, protocol: flags.protocol || null,
-                   cluster: flags.cluster, global: flags.global,
-                   profile: flags.profile || null },
-        });
-        warnings.value = r.warnings || [];
-        store.pendingRunId = r.run.id;
-        store.view = "run";
-      } catch (e) {
-        ElementPlus.ElMessage.error("启动失败: " + e.message);
-      } finally {
-        starting.value = false;
-      }
-    }
 
     Vue.provide("openConfigFile", openFile);
     Vue.onMounted(loadAll);
@@ -338,8 +235,8 @@ const ConfigView = {
     Vue.onActivated(loadAll);
 
     return { loading, treeRoots, general, clusterCandidates, globalCandidates,
-             matrixCandidates, flags, warnings, starting, sel, clearSelection,
-             startRun, openFile, newCfgName, newCfgSource, newCfgSources, newConfig,
+             matrixCandidates, clearSelection,
+             openFile, newCfgName, newCfgSource, newCfgSources, newConfig,
              editPath, editContent, editMsg, saving, dirty,
              validate, save, loadAll };
   },
