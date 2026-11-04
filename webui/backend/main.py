@@ -86,6 +86,13 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/static/"):
             if method == "GET":
                 return self._send_static(path[len("/static/"):])
+        if path == "/docs":
+            if method == "GET":
+                self._send_raw(DOCS_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/api/openapi.json":
+            if method == "GET":
+                return self._send_json(_generate_openapi())
         if path.startswith("/api/"):
             for m, pattern, fn in ROUTES:
                 if m != method:
@@ -114,6 +121,86 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self._dispatch("PUT")
+
+
+def _generate_openapi():
+    """Static OpenAPI 3.0 spec for the HTTP API endpoints."""
+    def _p(summary, method="get"):
+        return {method: {"summary": summary, "responses": {"200": {"description": "OK"}}}}
+    def _q(name, typ="string", required=False, default=None):
+        d = {"name": name, "in": "query", "required": required, "schema": {"type": typ}}
+        if default is not None:
+            d["schema"]["default"] = default
+        return d
+    def _post(summary):
+        return {"post": {"summary": summary,
+                         "requestBody": {"required": True,
+                                         "content": {"application/json": {"schema": {"type": "object"}}}},
+                         "responses": {"200": {"description": "OK"}}}}
+    def _put(summary):
+        return {"put": {"summary": summary,
+                        "requestBody": {"required": True,
+                                        "content": {"application/json": {"schema": {"type": "object"}}}},
+                        "responses": {"200": {"description": "OK"}}}}
+
+    paths = {}
+    paths["/api/status"] = _p("System status + active run/scheduler")
+    paths["/api/help"] = _p("API.md content as markdown")
+    paths["/api/configs"] = _p("Config inventory (general + trees + candidates)")
+    paths["/api/config"] = _p("Read a config file")
+    paths["/api/config"]["get"]["parameters"] = [_q("path", required=True)]
+    paths["/api/config"].update(_put("Save config (backup + validate)"))
+    paths["/api/config/validate"] = _post("Validate config content without saving")
+    paths["/api/run"] = _post("Launch benchmark run (mode: ssh/k8s)")
+    paths["/api/run"]["post"]["responses"]["409"] = {"description": "Slot busy"}
+    paths["/api/runs"] = _p("Run history (max 60)")
+    paths["/api/runs/{id}"] = _p("Run metadata by id")
+    paths["/api/runs/{id}/log"] = _p("Incremental log fetch by byte offset")
+    paths["/api/runs/{id}/log"]["get"]["parameters"] = [_q("offset", "integer", False, 0)]
+    paths["/api/runs/{id}/stop"] = _post("Stop a run (cross-platform kill + remote reap)")
+    paths["/api/outputs"] = _p("List output runs")
+    paths["/api/outputs/{ts}/tree"] = _p("File tree of one output run")
+    paths["/api/file"] = _p("Read file (text/raw/tail)")
+    paths["/api/file"]["get"]["parameters"] = [
+        _q("path", required=True), _q("mode", default="text"),
+        _q("offset", "integer", False, 0), _q("tail", "integer")]
+    paths["/api/csv"] = _p("CSV to JSON table")
+    paths["/api/csv"]["get"]["parameters"] = [_q("path", required=True), _q("max_rows", "integer", False, 5000)]
+    paths["/api/schedule/plans"] = _p("List schedule plans")
+    paths["/api/schedule/plan/{name}"] = _p("Read one schedule plan")
+    paths["/api/schedule/plan/{name}"].update(_put("Create/overwrite plan (validate + backup)"))
+    paths["/api/schedule/start"] = _post("Start scheduler")
+    paths["/api/schedule/stop"] = _post("Stop scheduler")
+    paths["/api/schedule/status"] = _p("Scheduler status")
+
+    return {
+        "openapi": "3.0.0",
+        "info": {"title": "Mooncake-Performance WebUI API", "version": "1.0",
+                 "description": "HTTP API for benchmark orchestration, results, config and scheduling"},
+        "paths": paths,
+    }
+
+
+DOCS_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <title>Mooncake-Performance API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.onload = () => SwaggerUIBundle({
+      url: '/api/openapi.json',
+      dom_id: '#swagger-ui',
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+      layout: 'BaseLayout',
+      tryItOutEnabled: true,
+    });
+  </script>
+</body>
+</html>"""
 
 
 def create_server(bind="127.0.0.1", port=0):
