@@ -100,7 +100,7 @@ def test_run_selector_validation():
     assert code == 400
     code, _ = _req("POST", "/api/run", {
         "selector": {"files": ["mock/smoke/put.json"]},
-        "flags": {"profile": "no/such/matrix.json"}})
+        "flags": {"profile": "no/such/profile.json"}})
     assert code == 400
 
 
@@ -197,20 +197,28 @@ def test_dry_run_via_api():
     if not _mock_ready():
         print("  [skip] mock cluster not present")
         return
-    code, d = _req("POST", "/api/run", {
-        "selector": {"files": ["mock/smoke/put.json"]},
-        "flags": {"cluster": "mock/cluster.json", "dry_run": True}})
-    assert code == 200, d
-    rid = d["run"]["id"]
-    for _ in range(120):
-        code, d = _req("GET", "/api/runs/" + rid)
-        if d.get("status") != "running":
-            break
-        time.sleep(0.5)
-    assert d["status"] == "done" and d["rc"] == 0, d
-    # 日志端点可读（webui/data/runs 白名单）
-    code, d = _req("GET", "/api/runs/{}/log?offset=0".format(rid))
-    assert code == 200 and len(d["content"]) > 0
+    prof = "configs/zz-webui-test-profile.json"
+    with open(prof, "w", encoding="utf-8") as f:
+        json.dump({"tools": {"spdiag": {"enabled": False}}}, f)
+    try:
+        code, d = _req("POST", "/api/run", {
+            "selector": {"files": ["mock/smoke/put.json"]},
+            "flags": {"cluster": "mock/cluster.json",
+                      "profile": prof, "dry_run": True}})
+        assert code == 200, d
+        rid = d["run"]["id"]
+        for _ in range(120):
+            code, d = _req("GET", "/api/runs/" + rid)
+            if d.get("status") != "running":
+                break
+            time.sleep(0.5)
+        assert d["status"] == "done" and d["rc"] == 0, d
+        # 日志端点可读（webui/data/runs 白名单）
+        code, d = _req("GET", "/api/runs/{}/log?offset=0".format(rid))
+        assert code == 200 and len(d["content"]) > 0
+    finally:
+        if os.path.isfile(prof):
+            os.remove(prof)
 
 
 if __name__ == "__main__":

@@ -580,7 +580,7 @@ key 空间，靠 remove-keys 串行隔离）。
 
 ```
 configs/
-├── _ssh/     # 真机三件套（cluster/global/matrix，example 已提供）
+├── _ssh/     # 真机三件套（cluster/global/profile，example 已提供）
 ├── _k8s/     # k8s 三件套（同上 + templates/benchmark-pod.yaml.tpl）
 ├── basic/ pipeline/ …  # 测试用例：两种形态同一套
 └── _spdiag_trees/
@@ -612,14 +612,14 @@ python benchmark.py --k8s -f configs/basic/put.json
 首次使用前，按部署形态复制模板并修改（三件套都在 `_ssh/` 与 `_k8s/` 下）：
 
 ```
-# 真机
+# 真机三件套（必须同时存在）
 cp configs/_ssh/cluster.example.json configs/_ssh/cluster.json
 cp configs/_ssh/global.example.json  configs/_ssh/global.json
-# k8s
+cp configs/_ssh/profile.example.json configs/_ssh/profile.json
+# k8s 三件套（必须同时存在）
 cp configs/_k8s/cluster.example.json configs/_k8s/cluster.json
 cp configs/_k8s/global.example.json  configs/_k8s/global.json
-# 需要 profiling 时
-cp configs/_k8s/matrix.example.json  configs/_k8s/matrix.json
+cp configs/_k8s/profile.example.json configs/_k8s/profile.json
 ```
 
 > `--config` 按给定路径**原样**解析（相对当前目录或绝对路径），不再默认拼接 `configs/` 前缀。
@@ -737,7 +737,7 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   （FAIL/ERROR 高亮）+ 历史 runs 表格；运行完毕后手动点击「查看运行结果」跳转结果页
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
   并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
-  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（matrix 指标占位：
+  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（profiling 指标占位：
   profiling/outliers.json）、文本 tail
 - **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
   再执行（scheduler 等待期允许手动发起 run，响应带 warning）
@@ -757,11 +757,12 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   reader 先 HTTP /shutdown 优雅关停，再 **树杀**（`pgrep -P` 连同子进程一并 TERM → KILL，
   防止只杀包装进程孤儿化客户端）。手动终止编排器后再次运行即可自动清场上次残留。
 
-### 10.3 性能诊断矩阵（profiling/）
+### 10.3 性能诊断配置（profiling/）
 
 benchmark 运行期间自动激活诊断工具（spdiag / perf / bpftrace 调度与 off-CPU），结束后
-收集采样并生成异常值追踪。`configs/matrix.json`（模板 `configs/matrix.example.json`，
-已 gitignore）控制各工具 enabled 开关；`--profile <路径>` 显式指定；未配置则完全关闭。
+收集采样并生成异常值追踪。`configs/_ssh/profile.json` / `configs/_k8s/profile.json`
+（模板 `profile.example.json`，已 gitignore）控制各工具 enabled 开关；`--profile <路径>`
+显式指定。cluster/global/profile 三者必须同时存在，缺失时报错并提示从 example 复制。
 诊断进程纳入 `.state` 台账，崩溃后可清理；诊断故障仅 `[WARN]` 不影响测试结果。
 产出：`outputs/<ts>/logs/<配置名>/profiling/<节点>/{spdiag.show.txt, perf.data, runqlat.out}`（**按配置隔离**，多配置 run 互不覆盖）+
 run 级异常值台账 `outputs/<ts>/profiling/outliers.json` 与时间窗切片；手动追踪

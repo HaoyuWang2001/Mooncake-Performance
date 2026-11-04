@@ -99,11 +99,10 @@ const PerfView = {
           <el-option v-for="g in modeCandidates.global" :key="g.path || g"
                      :label="g.path || g" :value="g.path || g"></el-option>
         </el-select>
-        <span class="rb-label" style="margin-left: 16px">matrix</span>
+        <span class="rb-label" style="margin-left: 16px">profile</span>
         <el-select v-model="flags.profile" size="small" style="width: 240px"
-                   placeholder="profiling matrix">
-          <el-option label="auto" value="auto"></el-option>
-          <el-option v-for="m in modeCandidates.matrix" :key="m.path || m"
+                   placeholder="选择 profile 配置">
+          <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
                      :label="m.path || m" :value="m.path || m"></el-option>
         </el-select>
       </div>
@@ -204,9 +203,9 @@ const PerfView = {
     const mode = Vue.ref("ssh");
     const cfgDialog = Vue.ref(false);
     const treeRoots = Vue.ref([]);
-    const candidates = Vue.ref({ cluster: [], global: [], matrix: [] });
+    const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
-                                 protocol: "", cluster: "", global: "", profile: "auto" });
+                                 protocol: "", cluster: "", global: "", profile: "" });
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
 
@@ -214,7 +213,7 @@ const PerfView = {
     const modeCandidates = Vue.computed(() => ({
       cluster: _perfModeCandidates(candidates.value.cluster, mode.value),
       global: _perfModeCandidates(candidates.value.global, mode.value),
-      matrix: _perfModeCandidates(candidates.value.matrix, mode.value),
+      profile: _perfModeCandidates(candidates.value.profile, mode.value),
     }));
 
     function onModeChange() {
@@ -222,7 +221,7 @@ const PerfView = {
       const c = modeCandidates.value;
       flags.cluster = c.cluster.length ? (c.cluster[0].path || c.cluster[0]) : "";
       flags.global = c.global.length ? (c.global[0].path || c.global[0]) : "";
-      flags.profile = "auto";
+      flags.profile = c.profile.length ? (c.profile[0].path || c.profile[0]) : "";
     }
 
     function _toNode(treeNode) {
@@ -241,7 +240,7 @@ const PerfView = {
         candidates.value = {
           cluster: cfg.cluster_candidates,
           global: cfg.global_candidates,
-          matrix: cfg.matrix_candidates,
+          profile: cfg.profile_candidates,
         };
         treeRoots.value = Object.values(cfg.categories)
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))

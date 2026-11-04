@@ -1,4 +1,4 @@
-# profiling/ — 性能诊断矩阵（matrix.json）
+# profiling/ — 性能诊断配置（profile.json）
 
 benchmark 运行期间自动激活性能诊断工具（spdiag / perf / bpftrace），结束后收集采样数据
 并生成异常值追踪报告。**编排层零侵入测量路径**：所有诊断故障仅 `[WARN]`，绝不影响
@@ -7,14 +7,15 @@ benchmark 运行期间自动激活性能诊断工具（spdiag / perf / bpftrace�
 ## 用法
 
 ```bash
-cp configs/matrix.example.json configs/matrix.json   # 编辑工具开关（已 gitignore）
-python benchmark.py --config-dir configs/pipeline/demo   # 自动读取 configs/matrix.json
-python benchmark.py ... --profile /path/to/matrix.json   # 显式指定矩阵
+cp configs/_ssh/profile.example.json configs/_ssh/profile.json   # 编辑工具开关（已 gitignore）
+# k8s: cp configs/_k8s/profile.example.json configs/_k8s/profile.json
+python benchmark.py --config-dir configs/pipeline/demo   # 自动读取 <mode-dir>/profile.json
+python benchmark.py ... --profile /path/to/profile.json   # 显式指定
 # 手动异常值追踪（离线）
 python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--threshold-ms 1.0] [--window-ms 200]
 ```
 
-未传 `--profile` 且 `configs/matrix.json` 不存在 → 诊断完全关闭（主路径零变化）。
+未显式指定 `--profile` 时使用 `<mode-dir>/profile.json`；该文件必须存在（缺失报错并提示从 example 复制）。文件内工具全关 → 诊断关闭（主路径零变化）。
 
 ## 工具矩阵
 
@@ -26,7 +27,7 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 | `offcputime` | off-CPU/持锁等待（bt/offcputime.bt，大事件明细带时间戳） | `sudo -n env MIN_BLOCK_US=1000 bpftrace offcputime.bt`（同上） | sudo（可关） |
 
 工具在节点上不可用（探测失败）→ `[WARN]` 跳过该工具，其余照常。**逐工具故障隔离**：任一
-工具启动失败仅 `[WARN]` 跳过自身，不影响其余工具与场景。sudo 用法（matrix 逐工具
+工具启动失败仅 `[WARN]` 跳过自身，不影响其余工具与场景。sudo 用法（profile 逐工具
 `"sudo": false` 可关）：带 sudo 的工具启动前先探 `sudo -n true`，无 NOPASSWD 则明确
 `[WARN]` 跳过；sudo 运行产生的 root 属主产物（perf.data）在 scp 前自动
 `chown "$(id -un):$(id -gn)"` 归还 ssh 用户。

@@ -33,9 +33,9 @@
 
 ### GET /api/configs
 配置清单：`general` = configs 根下全部 `*.json`（过滤 `*.example.json` 模板，含
-cluster/global/matrix 及任意其他通用文件）；`categories` = configs 下**每个非 `_`
+cluster/global/profile 及任意其他通用文件）；`categories` = configs 下**每个非 `_`
 开头子目录**的配置树 `{name, path, dirs[], files[]}`（恒含 demo/，`_` 前缀碎片排除）
-与 `config_count`；`cluster_candidates` / `global_candidates` / `matrix_candidates`
+与 `config_count`；`cluster_candidates` / `global_candidates` / `profile_candidates`
 由 general 按文件名前缀推导（运行框下拉数据源）。
 
 ### GET /api/config?path=configs/basic/put.json
@@ -66,9 +66,9 @@ cluster/global/matrix 及任意其他通用文件）；`categories` = configs �
   "flags": {
     "dry_run": false, "no_warmup": false, "no_plot": false,
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"
-    "cluster": "configs/cluster.json",
-    "global": "configs/global.json",
-    "profile": "configs/matrix.json"      // matrix 路径；空/缺省 = 不传（benchmark 默认：configs/matrix.json 存在即启用）
+    "cluster": "configs/_ssh/cluster.json",
+    "global": "configs/_ssh/global.json",
+    "profile": "configs/_ssh/profile.json"  // 空/缺省 = <mode-dir>/profile.json；三者都必须存在
   }
 }
 ```

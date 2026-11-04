@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """prof_core — 性能诊断矩阵核心（编排层，不采样）。
 
-由 benchmark.py 调用（--profile / 默认 configs/matrix.json）：
+由 benchmark.py 调用（--profile / 默认 <mode-dir>/profile.json）：
   load_matrix()          解析矩阵（enabled 过滤 + 默认值合并）
   start_profiling()      场景启动：逐节点探测工具 -> spdiag restart ->
                          perf/bpftrace nohup 后台（pid 记入 .state 台账，
@@ -15,7 +15,7 @@
                          `perf script --time` 原生切片）
 
 手动 CLI 见 profiling/profiling.py。所有故障仅 [WARN]，绝不影响测试主路径。
-采样命令（perf/bpftrace）默认加 `sudo -n` 前缀（matrix 逐工具可关，"sudo": false）；
+采样命令（perf/bpftrace）默认加 `sudo -n` 前缀（profile 逐工具可关，"sudo": false）；
 sudo 运行产生的 root 属主产物在收集前自动 chown 回 ssh 用户；spdiag 节点级全局生效。
 """
 import json
@@ -132,7 +132,7 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                     # instantly (stderr is only visible in perf.data.err)
                     if _run(ip, n, "sudo -n true 2>/dev/null && echo OK || echo FAIL") != "OK":
                         log("[WARN] [profile] {} on {}: sudo -n unavailable -> skipped "
-                            "(grant NOPASSWD or set \"sudo\": false in the matrix)".format(
+                            "(grant NOPASSWD or set \"sudo\": false in the profile)".format(
                                 tool, node_name))
                         continue
                 if tool == "spdiag":

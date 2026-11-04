@@ -2651,8 +2651,8 @@ def parse_arguments(argv=None):
                         help="path to global hyper json (default: configs/_ssh/global.json "
                              "or configs/_k8s/global.json per mode)")
     parser.add_argument("--profile", default=None,
-                        help="profiling matrix json (default: <mode-dir>/matrix.json "
-                             "when present; no file -> profiling off)")
+                        help="profile json (default: <mode-dir>/profile.json; "
+                             "must exist together with cluster/global)")
     parser.add_argument("--config", "-f", default=None,
                         help="scenario config json(s), comma-separated multi values; "
                              "resolved as given (relative to CWD or absolute; NOT "
@@ -2687,14 +2687,16 @@ def parse_arguments(argv=None):
         args.cluster = os.path.join(args.mode_dir, "cluster.json")
     if args.global_cfg is None:
         args.global_cfg = os.path.join(args.mode_dir, "global.json")
-    if not os.path.exists(args.cluster):
-        example = os.path.join(args.mode_dir, "cluster.example.json")
-        sys.exit("[ERROR] cluster config not found: {}\n"
-                 "       copy {} to {} and edit it first.".format(
-                     args.cluster, example,
-                     os.path.join(args.mode_dir, "cluster.json")))
-    if not os.path.exists(args.global_cfg):
-        sys.exit("[ERROR] global config not found: {}".format(args.global_cfg))
+    if args.profile is None:
+        args.profile = os.path.join(args.mode_dir, "profile.json")
+    for name, path in (("cluster", args.cluster), ("global", args.global_cfg),
+                       ("profile", args.profile)):
+        if not os.path.exists(path):
+            example = os.path.join(args.mode_dir, name + ".example.json")
+            target = os.path.join(args.mode_dir, name + ".json")
+            sys.exit("[ERROR] {} config not found: {}\n"
+                     "       copy {} to {} and edit it first.".format(
+                         name, path, example, target))
     # selectors accept comma-separated multi values and MAY coexist:
     # --config-dir entries are expanded (recursively) first, --config files
     # follow in the given order
@@ -2777,17 +2779,15 @@ def main(args, cfg_paths):
     if args.mode == "k8s":
         globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
     _validate_master_mode(globals_cfg)
-    # profiling matrix: explicit --profile wins (and must exist); otherwise
-    # default configs/matrix.json when present; absent -> profiling off
-    profile_path = args.profile or os.path.join(args.mode_dir, "matrix.json")
+    # profile config: parse_arguments already defaulted it to
+    # <mode-dir>/profile.json and required it to exist.
+    profile_path = args.profile
     matrix = None
-    if args.profile and not os.path.isfile(args.profile):
-        sys.exit("[ERROR] --profile matrix not found: {}".format(args.profile))
     if prof_core is not None:
         matrix = prof_core.load_matrix(profile_path)
     args._matrix = matrix
     if matrix:
-        log("profiling matrix active: {} (trigger={})".format(
+        log("profiling profile active: {} (trigger={})".format(
             profile_path, matrix.get("trigger")))
     # .state ledger check: reap any leftovers from previous runs
     # (crashed/killed orchestrator) BEFORE anything else touches nodes.

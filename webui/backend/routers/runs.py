@@ -38,15 +38,20 @@ def _build_run_argv(body):
     mode = flags.get("mode") or "ssh"
     if mode not in ("ssh", "k8s"):
         raise ApiError(400, "flags.mode must be 'ssh' or 'k8s'")
-    cluster = flags.get("cluster") or "configs/_ssh/cluster.json"
-    if mode == "k8s":
-        cluster = flags.get("cluster") or "configs/_k8s/cluster.json"
-    if not os.path.isfile(os.path.join(ROOT, cluster)):
-        raise ApiError(400, "cluster config not found: {}".format(cluster))
-    global_cfg = flags.get("global") or ("configs/_k8s/global.json" if mode == "k8s" else "configs/_ssh/global.json")
-    if not os.path.isfile(os.path.join(ROOT, global_cfg)):
-        raise ApiError(400, "global config not found: {}".format(global_cfg))
-    argv += ["--" + mode, "--cluster", cluster, "--global", global_cfg]
+    mode_dir = "configs/_k8s" if mode == "k8s" else "configs/_ssh"
+    cluster = flags.get("cluster") or (mode_dir + "/cluster.json")
+    global_cfg = flags.get("global") or (mode_dir + "/global.json")
+    profile = flags.get("profile") or (mode_dir + "/profile.json")
+    for name, path in (("cluster", cluster), ("global", global_cfg),
+                       ("profile", profile)):
+        if not os.path.isfile(os.path.join(ROOT, path)):
+            example = mode_dir + "/" + name + ".example.json"
+            target = mode_dir + "/" + name + ".json"
+            raise ApiError(
+                400, "{} config not found: {}. copy {} to {} and edit it "
+                     "first".format(name, path, example, target))
+    argv += ["--" + mode, "--cluster", cluster, "--global", global_cfg,
+             "--profile", profile]
     for flag in ("dry_run", "no_warmup", "no_plot"):
         if flags.get(flag):
             argv.append("--" + flag.replace("_", "-"))
@@ -55,11 +60,6 @@ def _build_run_argv(body):
         if protocol not in ("tcp", "rdma", "ub"):
             raise ApiError(400, "protocol must be tcp|rdma|ub")
         argv += ["--protocol", protocol]
-    profile = flags.get("profile")
-    if profile:
-        if not os.path.isfile(os.path.join(ROOT, profile)):
-            raise ApiError(400, "profile matrix not found: {}".format(profile))
-        argv += ["--profile", profile]
     return [sys.executable, runmgr.BENCH] + argv
 
 

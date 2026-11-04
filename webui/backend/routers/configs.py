@@ -39,7 +39,7 @@ def validate_config_content(path, content):
             scenario_dir = cat
             break
     if scenario_dir is None:
-        return errors  # cluster/global/matrix/external: syntax only
+        return errors  # cluster/global/profile/external: syntax only
     # inheritance: _configs.json chain merged under the new content
     merged = {}
     cfg_dir = os.path.dirname(rp)
@@ -135,7 +135,7 @@ def api_configs(handler, query):
     _ssh/ + _k8s/ dirs) except *.example.json templates; `categories` = a
     config tree for EVERY non-underscore subdirectory of configs/."""
     out = {"general": [], "categories": {}, "cluster_candidates": [],
-           "global_candidates": [], "matrix_candidates": []}
+           "global_candidates": [], "profile_candidates": []}
     if not os.path.isdir(bm.CONFIGS_DIR):
         return out
     general_dirs = ["", "_ssh", "_k8s"]
@@ -170,8 +170,8 @@ def api_configs(handler, query):
             out["cluster_candidates"].append(tagged)
         elif base.startswith("global"):
             out["global_candidates"].append(tagged)
-        elif base.startswith("matrix"):
-            out["matrix_candidates"].append(tagged)
+        elif base.startswith("profile"):
+            out["profile_candidates"].append(tagged)
     return out
 
 

@@ -51,7 +51,7 @@ const ConfigView = {
             <el-button size="small" type="primary" plain @click="newConfig">新建</el-button>
           </div>
           <div class="newcfg-hint">
-            命名前缀约定：<code>cluster*</code> 进运行框 cluster 下拉，<code>global*</code>/<code>matrix*</code> 同理
+            命名前缀约定：<code>cluster*</code> 进运行框 cluster 下拉，<code>global*</code>/<code>profile*</code> 同理
           </div>
           <div v-for="p in general" :key="p" class="leaf general-item" @click="openFile(p)">
             {{ p }}
@@ -98,8 +98,8 @@ const ConfigView = {
 
     // 新建配置：默认基于 cluster.example.json 模板；候选 = 三个模板 + 现有通用配置
     const newCfgName = Vue.ref("");
-    const newCfgSource = Vue.ref("configs/cluster.example.json");
-    const newCfgSources = Vue.ref(["configs/cluster.example.json"]);
+    const newCfgSource = Vue.ref("configs/_ssh/cluster.example.json");
+    const newCfgSources = Vue.ref(["configs/_ssh/cluster.example.json"]);
 
     const editPath = Vue.ref("");
     const editContent = Vue.ref("");
@@ -126,12 +126,15 @@ const ConfigView = {
         const cfg = await api("GET", "/api/configs");
         store.cfgTree = cfg;
         general.value = cfg.general;
-        newCfgSources.value = ["configs/cluster.example.json",
-                               "configs/global.example.json",
-                               "configs/matrix.example.json",
+        newCfgSources.value = ["configs/_ssh/cluster.example.json",
+                               "configs/_ssh/global.example.json",
+                               "configs/_ssh/profile.example.json",
+                               "configs/_k8s/cluster.example.json",
+                               "configs/_k8s/global.example.json",
+                               "configs/_k8s/profile.example.json",
                                ...cfg.general];
         if (!newCfgSources.value.includes(newCfgSource.value)) {
-          newCfgSource.value = "configs/cluster.example.json";
+          newCfgSource.value = "configs/_ssh/cluster.example.json";
         }
         treeRoots.value = Object.values(cfg.categories)
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))
