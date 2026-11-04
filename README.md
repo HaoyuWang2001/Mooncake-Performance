@@ -332,6 +332,49 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 节点命名约定：`store1`（store 节点，basic `_local` 场景客户端）、`node1`（非 store 客户端，basic
 `_remote`）、`writer_nodeX` / `reader_nodeX`（pipeline 角色节点，n{N} 即 reader_node1..N）。
 
+#### k8s 通道的 cluster.json（`configs/_k8s/cluster.json`）
+
+k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口），不再列举工作节点；
+工作 pod 由编排器按场景自动创建（basic：一配置一 pod，名 `mc-<ts>-<cfg>`）。
+
+```json
+{
+  "venvs": {},
+  "controller": {
+    "ip": "127.0.0.1",
+    "ssh_user": "root", "ssh_port": 22, "ssh_key": "", "passwd": "",
+    "kubectl": "kubectl", "kubeconfig": ""
+  },
+  "k8s": {
+    "namespace": "mooncake-bench",
+    "kubecontext": "",
+    "image": "<含 mooncake SDK 的镜像>",
+    "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl",
+    "controller_workspace": "/tmp/Mooncake-Performance",
+    "pod_workspace": "/tmp/Mooncake-Performance"
+  }
+}
+```
+
+- `controller.ip=127.0.0.1`（或 `localhost`）→ 本地直接跑 kubectl（便于 minikube/单机测试）；
+  其他 IP → 经 SSH 到 controller 执行 kubectl。
+- `k8s.namespace` 必须由用户固定指定：启动前必须**不存在**，由编排器创建；运行结束/异常/`--clean-up`
+  删除；中途被强杀的 namespace 会写入根目录 `.state`，下次启动先回收再创建。
+- `kubecontext` 为空 = controller 当前 context；多集群时填 context 名。
+- `controller_workspace`（宿主机）与 `pod_workspace`（容器）分离；各自自动建立
+  `scripts/ data/ logs/`（宿主机另有 `pods/` 存放渲染后的 YAML）。
+- `venvs` 可留空；`global.venv` 也留空时容器内默认 `python3`。
+
+**pod 模板**：`configs/_k8s/templates/benchmark-pod.yaml.tpl` 由编排器渲染后 `kubectl apply`。
+占位符必须原样保留（渲染后残留 `{{MC_` 会直接报错）：
+`{{MC_POD_NAME}}`、`{{MC_IMAGE}}`、`{{MC_NAMESPACE}}`、`{{MC_RUN_LABEL}}`、
+`{{MC_ROLE_LABEL}}`、`{{MC_CONFIGMAP_NAME}}`、`{{MC_SCRIPTS_MOUNT}}`、`{{MC_WORKDIR_MOUNT}}`。
+模板硬性要求：容器常驻（`sleep infinity`）、downward API 提供 `POD_IP`、
+`scripts` ConfigMap 卷 + `workdir` emptyDir 卷、labels（`app/run/role`）、
+`nodeSelector`/`imagePullPolicy`/UB device plugin 按集群自行维护。
+`RUN_LABEL` = `<ts>-<cfg>`（写 `labels.run`，用于清理）；`ROLE_LABEL` 是 pod 的逻辑角色
+（如 `client-0`），**不是** k8s 节点名。
+
 ### 7.2 configs/global.json（业务无关全局超参）
 
 与业务无关的全局超参数与服务器端路径独立放在 `configs/global.json`，由 `--global` 指定
@@ -344,13 +387,17 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 | etcd_endpoints | **etcd 模式**：经 etcd 连接 master 的完整 URI，如 `etcd://192.168.84.151:2379;192.168.84.149:2379`（分号分隔多节点）。`master_type="etcd"` 时必须非空；客户端把该 URI 原样传给 `setup` 的 `metadata_server` 与 `master_server_addr` |
 | master_addr | **http 模式**：mooncake_master rpc 地址（必须用内网高性能网卡 IP），如 `192.168.84.151:50051`；`master_type="http"` 时必须非空 |
 | metadata_server | **http 模式**：`setup` 的 metadata_server 参数，如 `http://192.168.84.151:9999/metadata`（master 的 HTTP 元数据端口，必须用内网 IP）；可省略，默认 `http://{master_addr}/metadata` |
-| protocol.ub.device | ub 传输使用的设备名（如 `bonding_dev_0`）；tcp 场景不使用 |
+| protocol.ub.device | ub 设备名；`"auto"`（或空）= 运行期 `urma_admin` 自动探测首个 `bonding_dev_*`；也可显式指定（如 `bonding_dev_0`），显式时不再探测 |
 | mooncake_store_nodes | store 节点名列表（取自 cluster.json 的 nodes），可多个；仅用于指标行 local/remote 拓扑标注 |
-| local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size |
+| local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size；支持字节数（number）或字符串（如 `"1GB"`，1024 进制） |
 | tenant_id | 租户标识，默认 "default" |
 | data_seed | 数据生成固定随机种子 |
-| remote_dir | 服务器端脚本/配置根目录 |
-| remote_data_dir / remote_results_dir | 服务器端数据 / 结果目录 |
+| remote_dir | **仅 SSH 通道**：服务器端脚本/配置根目录 |
+| remote_data_dir / remote_results_dir | **仅 SSH 通道**：服务器端数据 / 结果目录 |
+
+> k8s 通道不读这三个字段：数据/日志由 `cluster.k8s.pod_workspace` 派生
+> （`pod_workspace/data`、`pod_workspace/logs/<ts>`）；脚本 staging 在 controller 的
+> `controller_workspace/scripts/<run_label>`，ConfigMap 挂载到 `pod_workspace/scripts`。
 
 > 已迁移至 `env.mooncake.sh` 手工调优面板（global.json 同名字段已删除）：`ylt_log_level`、
 > `global_segment_size`（更早还有 `mc_hifreq_log_sample_rate`）。SDK 调优旋钮统一由面板管理，
@@ -553,16 +600,26 @@ python benchmark.py --k8s -f configs/basic/put.json
   实现，密码/密钥登录，无需外部 ssh/scp/sshpass 二进制，Windows 原生可用）；节点缺省走密钥
   登录（`ssh_key` 空 = 默认密钥 + ssh-agent），配 `passwd` 字段走密码登录（每节点独立，明文
   存于 cluster.json，已 gitignored）；
-- **k8s 通道额外前置**：编排机 kubectl + kubeconfig（可创建/删除 pod/configmap 的 RBAC）；
-  镜像含 mooncake SDK + python3 + bash；`configs/_k8s/cluster.json` 配 `k8s.image`。
-  脚本经 ConfigMap 挂载（只读），per-pod 值（fabric IP / urma 设备）容器内自动解析；
+- **k8s 通道额外前置**：
+  - controller（`127.0.0.1` 可本地）有 `kubectl` + kubeconfig，具备
+    **namespace/pod/configmap 的 create/delete** 权限；
+  - 镜像含 mooncake SDK + `python3` + `bash` + **`tar`**（`kubectl cp` 依赖），
+    ub 协议还需 `urma_admin`；
+  - `configs/_k8s/cluster.json` 配 `k8s.image/namespace/workspaces`；
+  - 脚本经 ConfigMap 挂载（只读），per-pod 值（fabric IP / urma 设备）容器内自动解析；
 - 服务器已安装 mooncake Python 包。
 
-首次使用前，复制集群配置模板并修改：
+首次使用前，按部署形态复制模板并修改（三件套都在 `_ssh/` 与 `_k8s/` 下）：
 
 ```
-cp configs/cluster.example.json configs/cluster.json
-cp configs/global.example.json configs/global.json
+# 真机
+cp configs/_ssh/cluster.example.json configs/_ssh/cluster.json
+cp configs/_ssh/global.example.json  configs/_ssh/global.json
+# k8s
+cp configs/_k8s/cluster.example.json configs/_k8s/cluster.json
+cp configs/_k8s/global.example.json  configs/_k8s/global.json
+# 需要 profiling 时
+cp configs/_k8s/matrix.example.json  configs/_k8s/matrix.json
 ```
 
 > `--config` 按给定路径**原样**解析（相对当前目录或绝对路径），不再默认拼接 `configs/` 前缀。

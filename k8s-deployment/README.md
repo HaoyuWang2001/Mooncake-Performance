@@ -1,3 +1,8 @@
+> **注意（新版）**：自动编排的 k8s 配置已迁移到 `configs/_k8s/`
+> （cluster 只含 controller；namespace 由编排器创建/删除；工作 pod 自动生成；路径分
+> controller_workspace / pod_workspace）。本目录保留手动验证脚本与旧版说明，实际跑
+> benchmark 请使用 `configs/_k8s/*.example.json` 与 `benchmark.py --k8s`。
+
 # k8s-deployment — k8s 形态部署与运行支持
 
 SSH 直连裸机节点之外的第二种运行形态：**编排器创建 k8s pod（每配置 run 一批全新 pod）→
