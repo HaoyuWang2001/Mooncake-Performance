@@ -1,28 +1,39 @@
 "use strict";
-/* 配置维护视图（v3）：
-   - 运行框（通栏最上方）：选中文件展示 / cluster / global / profile / 选项 + 运行
-   - 左列：通用配置（configs 根 *.json，点击编辑）+ 运行配置（复选框树）
-   - 右侧：编辑器
-   复选框语义：勾目录=整目录收编（子孙 disabled+checked，不可单独取消）；勾文件=独立
-   选中（父目录半选）；目录已选时文件勾选标志保留（取消目录后恢复独立选中），提交时
-   按祖先过滤去重。提交：dirs（先）+ files（后）。 */
-
-function _cfgHasSel(node) {
-  if (node.checked) return true;
-  return (node.children || []).some(_cfgHasSel);
-}
-
-function _cfgCollectSel(node, acc) {
-  if (node.isDir && node.checked) { acc.dirs.push(node.path); return; }
-  if (!node.isDir && node.checked) acc.files.push(node.path);
-  for (const c of node.children || []) _cfgCollectSel(c, acc);
-}
+/* 配置维护视图（v4）：
+   - 左列：通用配置（configs 根 *.json，点击编辑）+ 运行配置树（点击文件名编辑）
+   - 右侧：编辑器（校验/保存）
+   运行框已移至“性能测试”页；本页只负责配置浏览与编辑。 */
 
 const CfgNode = {
   name: "CfgNode",
   props: { node: { type: Object, required: true },
-           parentSel: { type: Boolean, default: false },
            depth: { type: Number, default: 0 } },
+  template: `
+  <div>
+    <div class="cfg-row" :style="{ paddingLeft: (depth * 14 + 4) + 'px' }">
+      <span v-if="node.isDir" class="tgl" @click="open = !open">{{ open ? "▾" : "▸" }}</span>
+      <span v-else class="tgl tgl-dot"></span>
+      <span class="cfg-name" :class="{ dir: node.isDir }" :title="node.path"
+            @click="onName">{{ node.name }}</span>
+      <span v-if="node.isDir" class="cfg-count">({{ node.count }})</span>
+    </div>
+    <div v-if="node.isDir" v-show="open">
+      <cfg-node v-for="c in node.children" :key="c.path" :node="c"
+                :depth="depth + 1"></cfg-node>
+    </div>
+  </div>`,
+  setup(props) {
+    const open = Vue.ref(props.depth < 1);
+    const openFile = Vue.inject("openConfigFile", () => {});
+    const onName = () => {
+      if (props.node.isDir) open.value = !open.value;
+      else openFile(props.node.path);
+    };
+    return { open, onName };
+  },
+};
+
+const ConfigView = {
   template: `
   <div class="page">
     <el-row :gutter="14">
@@ -53,8 +64,6 @@ const CfgNode = {
             <div class="header-row" style="margin: 0">
               <b>运行配置</b>
               <span class="hint" style="margin-left: 8px">点击文件名可编辑</span>
-              <span class="spacer"></span>
-              <el-button size="small" @click="clearSelection">清空选中</el-button>
             </div>
           </template>
           <div class="cfg-tree">
@@ -84,23 +93,13 @@ const CfgNode = {
   </div>
 `,
   setup() {
-    const loading = Vue.ref(false);
     const treeRoots = Vue.ref([]);
     const general = Vue.ref([]);
-    const clusterCandidates = Vue.ref([]);
-    const globalCandidates = Vue.ref([]);
-    const matrixCandidates = Vue.ref([]);
 
     // 新建配置：默认基于 cluster.example.json 模板；候选 = 三个模板 + 现有通用配置
     const newCfgName = Vue.ref("");
     const newCfgSource = Vue.ref("configs/cluster.example.json");
     const newCfgSources = Vue.ref(["configs/cluster.example.json"]);
-
-    const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
-                                 protocol: "", cluster: "configs/_ssh/cluster.json",
-                                 global: "configs/_ssh/global.json", profile: "" });
-    const warnings = Vue.ref([]);
-    const starting = Vue.ref(false);
 
     const editPath = Vue.ref("");
     const editContent = Vue.ref("");
@@ -110,27 +109,19 @@ const CfgNode = {
     const dirty = Vue.computed(() =>
       !!editPath.value && editContent.value !== editSnapshot.value);
 
-
-    function clearSelection() {
-      const walk = n => { n.checked = false; (n.children || []).forEach(walk); };
-      treeRoots.value.forEach(walk);
-    }
-
     function toNode(treeNode) {
       const children = [
         ...treeNode.dirs.map(toNode),
-        ...treeNode.files.map(f => ({ name: f.split("/").pop(), path: f,
-                                      isDir: false, checked: false })),
+        ...treeNode.files.map(f => ({ name: f.split("/").pop(), path: f, isDir: false })),
       ];
       return { name: treeNode.name, path: treeNode.path, isDir: true,
-               checked: false, count: _cfgTreeCount(treeNode), children };
+               count: _cfgTreeCount(treeNode), children };
     }
     function _cfgTreeCount(n) {
       return n.files.length + n.dirs.reduce((a, d) => a + _cfgTreeCount(d), 0);
     }
 
     async function loadAll() {
-      loading.value = true;
       try {
         const cfg = await api("GET", "/api/configs");
         store.cfgTree = cfg;
@@ -142,25 +133,11 @@ const CfgNode = {
         if (!newCfgSources.value.includes(newCfgSource.value)) {
           newCfgSource.value = "configs/cluster.example.json";
         }
-        clusterCandidates.value = cfg.cluster_candidates.length
-          ? cfg.cluster_candidates : ["configs/_ssh/cluster.json"];
-        globalCandidates.value = cfg.global_candidates.length
-          ? cfg.global_candidates : ["configs/_ssh/global.json"];
-        matrixCandidates.value = cfg.matrix_candidates;
-        if (!clusterCandidates.value.includes(flags.cluster)) flags.cluster = clusterCandidates.value[0];
-        if (!globalCandidates.value.includes(flags.global)) flags.global = globalCandidates.value[0];
-        if (!matrixCandidates.value.includes(flags.profile)) {
-          flags.profile = matrixCandidates.value.includes("configs/matrix.json")
-            ? "configs/matrix.json"
-            : (matrixCandidates.value[0] || "");
-        }
         treeRoots.value = Object.values(cfg.categories)
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))
           .map(c => toNode(c.tree));
       } catch (e) {
         ElementPlus.ElMessage.error("加载配置失败: " + e.message);
-      } finally {
-        loading.value = false;
       }
     }
 
@@ -228,16 +205,13 @@ const CfgNode = {
       }
     }
 
-
     Vue.provide("openConfigFile", openFile);
     Vue.onMounted(loadAll);
     // 每次切入页签都重新拉取：手动创建/修改的配置文件切回即自动可见
     Vue.onActivated(loadAll);
 
-    return { loading, treeRoots, general, clusterCandidates, globalCandidates,
-             matrixCandidates, clearSelection,
-             openFile, newCfgName, newCfgSource, newCfgSources, newConfig,
-             editPath, editContent, editMsg, saving, dirty,
+    return { treeRoots, general, openFile, newCfgName, newCfgSource, newCfgSources,
+             newConfig, editPath, editContent, editMsg, saving, dirty,
              validate, save, loadAll };
   },
 };

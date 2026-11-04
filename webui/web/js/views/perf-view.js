@@ -12,7 +12,7 @@ function _perfCountSel(sel) {
   return total;
 }
 
-const _SelNode = {
+const SelNode = {
   name: "SelNode",
   props: { node: { type: Object, required: true },
            parentSel: { type: Boolean, default: false },
