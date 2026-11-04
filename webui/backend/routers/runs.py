@@ -34,10 +34,10 @@ def _build_run_argv(body):
         argv += ["--config-dir", ",".join(dirs)]
     if files:
         argv += ["-f", ",".join(files)]
-    cluster = flags.get("cluster") or "configs/cluster.json"
+    cluster = flags.get("cluster") or "configs/_ssh/cluster.json"
     if not os.path.isfile(os.path.join(ROOT, cluster)):
         raise ApiError(400, "cluster config not found: {}".format(cluster))
-    global_cfg = flags.get("global") or "configs/global.json"
+    global_cfg = flags.get("global") or "configs/_ssh/global.json"
     if not os.path.isfile(os.path.join(ROOT, global_cfg)):
         raise ApiError(400, "global config not found: {}".format(global_cfg))
     argv += ["--cluster", cluster, "--global", global_cfg]

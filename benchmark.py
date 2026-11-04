@@ -2245,7 +2245,9 @@ def collect_config_files(directory):
     not runnable scenarios)."""
     found = []
     for root, dirs, files in os.walk(directory):
-        dirs[:] = sorted(dirs)
+        # "_"-prefixed directories are deployment/tuning config dirs
+        # (_ssh/_k8s/_spdiag_trees), never scenario collections
+        dirs[:] = sorted(d for d in dirs if not d.startswith("_"))
         for f in sorted(files):
             if f.endswith(".json") and not f.startswith("_"):
                 found.append(os.path.join(root, f))
@@ -2258,13 +2260,22 @@ def parse_arguments(argv=None):
     Returns (args, cfg_paths).
     """
     parser = argparse.ArgumentParser(description="Mooncake benchmark orchestrator (runs locally)")
-    parser.add_argument("--cluster", default=os.path.join(CONFIGS_DIR, "cluster.json"),
-                        help="path to cluster json")
-    parser.add_argument("--global", dest="global_cfg",
-                        default=os.path.join(CONFIGS_DIR, "global.json"),
-                        help="path to global hyper json")
+    parser.add_argument("--ssh", action="store_true",
+                        help="run against bare-metal nodes via ssh (default when "
+                             "neither --ssh nor --k8s is given; deployment configs "
+                             "default to configs/_ssh/)")
+    parser.add_argument("--k8s", action="store_true",
+                        help="run against k8s pods (kubectl transport; deployment "
+                             "configs default to configs/_k8s/, all nodes are pods). "
+                             "pipeline scenarios are not supported yet in this channel")
+    parser.add_argument("--cluster", default=None,
+                        help="path to cluster json (default: configs/_ssh/cluster.json "
+                             "or configs/_k8s/cluster.json per mode)")
+    parser.add_argument("--global", dest="global_cfg", default=None,
+                        help="path to global hyper json (default: configs/_ssh/global.json "
+                             "or configs/_k8s/global.json per mode)")
     parser.add_argument("--profile", default=None,
-                        help="profiling matrix json (default: configs/matrix.json "
+                        help="profiling matrix json (default: <mode-dir>/matrix.json "
                              "when present; no file -> profiling off)")
     parser.add_argument("--config", "-f", default=None,
                         help="scenario config json(s), comma-separated multi values; "
@@ -2290,11 +2301,22 @@ def parse_arguments(argv=None):
                              "cluster.json. Standalone: only cleanup and exit. "
                              "Combined with --config/--config-dir: cleanup after the run.")
     args = parser.parse_args(argv)
+    if args.ssh and args.k8s:
+        sys.exit("[ERROR] --ssh and --k8s are mutually exclusive")
+    # deployment config dir per mode (default --ssh for backward compat);
+    # explicit --cluster/--global/--profile always win over the mode defaults
+    args.mode = "k8s" if args.k8s else "ssh"
+    args.mode_dir = os.path.join(CONFIGS_DIR, "_k8s" if args.k8s else "_ssh")
+    if args.cluster is None:
+        args.cluster = os.path.join(args.mode_dir, "cluster.json")
+    if args.global_cfg is None:
+        args.global_cfg = os.path.join(args.mode_dir, "global.json")
     if not os.path.exists(args.cluster):
-        example = os.path.join(CONFIGS_DIR, "cluster.example.json")
+        example = os.path.join(args.mode_dir, "cluster.example.json")
         sys.exit("[ERROR] cluster config not found: {}\n"
                  "       copy {} to {} and edit it first.".format(
-                     args.cluster, example, os.path.join(CONFIGS_DIR, "cluster.json")))
+                     args.cluster, example,
+                     os.path.join(args.mode_dir, "cluster.json")))
     if not os.path.exists(args.global_cfg):
         sys.exit("[ERROR] global config not found: {}".format(args.global_cfg))
     # selectors accept comma-separated multi values and MAY coexist:
@@ -2371,12 +2393,16 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
 
 def main(args, cfg_paths):
     cluster = load_json(args.cluster)
+    if args.mode == "k8s":
+        # k8s channel: every node is a pod (roles are logical names)
+        for n in (cluster.get("nodes") or {}).values():
+            n.setdefault("kind", "k8s-pod")
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
     _validate_master_mode(globals_cfg)
     # profiling matrix: explicit --profile wins (and must exist); otherwise
     # default configs/matrix.json when present; absent -> profiling off
-    profile_path = args.profile or os.path.join(CONFIGS_DIR, "matrix.json")
+    profile_path = args.profile or os.path.join(args.mode_dir, "matrix.json")
     matrix = None
     if args.profile and not os.path.isfile(args.profile):
         sys.exit("[ERROR] --profile matrix not found: {}".format(args.profile))
@@ -2421,6 +2447,11 @@ def main(args, cfg_paths):
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         try:
             if cfg.get("scenario") == "pipeline":
+                if args.mode == "k8s":
+                    log("[FAIL] scenario {}: --k8s does not support pipeline "
+                        "scenarios yet (skipped)".format(name))
+                    failed_scenarios.append(name)
+                    continue
                 sweep_remove = run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
             else:
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)

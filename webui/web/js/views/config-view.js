@@ -175,8 +175,8 @@ const ConfigView = {
     const newCfgSources = Vue.ref(["configs/cluster.example.json"]);
 
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
-                                 protocol: "", cluster: "configs/cluster.json",
-                                 global: "configs/global.json", profile: "" });
+                                 protocol: "", cluster: "configs/_ssh/cluster.json",
+                                 global: "configs/_ssh/global.json", profile: "" });
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
 
@@ -226,9 +226,9 @@ const ConfigView = {
           newCfgSource.value = "configs/cluster.example.json";
         }
         clusterCandidates.value = cfg.cluster_candidates.length
-          ? cfg.cluster_candidates : ["configs/cluster.json"];
+          ? cfg.cluster_candidates : ["configs/_ssh/cluster.json"];
         globalCandidates.value = cfg.global_candidates.length
-          ? cfg.global_candidates : ["configs/global.json"];
+          ? cfg.global_candidates : ["configs/_ssh/global.json"];
         matrixCandidates.value = cfg.matrix_candidates;
         if (!clusterCandidates.value.includes(flags.cluster)) flags.cluster = clusterCandidates.value[0];
         if (!globalCandidates.value.includes(flags.global)) flags.global = globalCandidates.value[0];

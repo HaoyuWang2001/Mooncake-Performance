@@ -131,17 +131,24 @@ def _tree_count(node):
 
 
 def api_configs(handler, query):
-    """Config inventory: `general` = every configs/*.json except *.example.json
-    templates; `categories` = a config tree for EVERY non-underscore
-    subdirectory of configs/."""
+    """Config inventory: `general` = every deployment json (configs root +
+    _ssh/ + _k8s/ dirs) except *.example.json templates; `categories` = a
+    config tree for EVERY non-underscore subdirectory of configs/."""
     out = {"general": [], "categories": {}, "cluster_candidates": [],
            "global_candidates": [], "matrix_candidates": []}
     if not os.path.isdir(bm.CONFIGS_DIR):
         return out
-    for f in sorted(os.listdir(bm.CONFIGS_DIR)):
-        fp = os.path.join(bm.CONFIGS_DIR, f)
-        if os.path.isfile(fp) and f.endswith(".json") and not f.endswith(".example.json"):
-            out["general"].append("configs/" + f)
+    general_dirs = ["", "_ssh", "_k8s"]
+    for sub in general_dirs:
+        dpath = os.path.join(bm.CONFIGS_DIR, sub)
+        if not os.path.isdir(dpath):
+            continue
+        prefix = ("configs/" + sub) if sub else "configs"
+        for f in sorted(os.listdir(dpath)):
+            fp = os.path.join(dpath, f)
+            if os.path.isfile(fp) and f.endswith(".json") \
+                    and not f.endswith(".example.json"):
+                out["general"].append(prefix.rstrip("/") + "/" + f)
     for name in sorted(os.listdir(bm.CONFIGS_DIR)):
         dpath = os.path.join(bm.CONFIGS_DIR, name)
         if not os.path.isdir(dpath) or name.startswith("_") or name.startswith("."):
