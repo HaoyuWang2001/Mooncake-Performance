@@ -363,6 +363,25 @@ pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-n
 > 把同一 etcd URI 传给 setup 两参数）；http 模式只导出 `MC_MASTER_TYPE`/`MC_MASTER_ADDR`/
 > `MC_METADATA_SERVER`。
 
+### 7.2.0 env.sh 环境变量前缀分类
+
+env.sh 生成的环境变量按**消费者**分四组（各用独立前缀，Mooncake C++ 进程仅读取 `MC_` 前缀）：
+
+| 前缀 | 组 | 读者 | 说明 |
+|---|---|---|---|
+| `MC_` | Mooncake C++ 进程直读 | C++ SDK `getenv` | 仅 `MC_TCP_BIND_ADDRESS`、`MC_YLT_LOG_PATH`（runner 逐 client inline 注入） |
+| `SETUP_` | wrapper→setup() 传参 | mooncake_benchmark_client.py 读取后显式传给 `store.setup()` | `SETUP_PROTOCOL/MASTER_TYPE/MASTER_ADDR/METADATA_SERVER/ETCD_ENDPOINTS/FABRIC_IP/UB_DEVICE/LOCAL_BUFFER_SIZE/TENANT_ID/RANDOM_SEED` |
+| `BENCH_` | 仓库基准逻辑自用 | 仅本仓库 | `BENCH_SCENARIO/WORK_MODE/OPERATION/KEY_PREFIX/KEY_COUNT/DATA_SIZE/BATCH_SIZE/PUT_RATIO/DURATION/WARMUP_DURATION/REMOTE_DATA_DIR/EXCLUDE_CPUS` + pipeline 族 |
+| `ORCH_` | 编排/runner 传输层 | runner 脚本 | `ORCH_VENV`（python 解释器）、`ORCH_CPU_SHARD`（绑核分片） |
+
+env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），与 env.sh 无同名冲突。
+`LD_LIBRARY_PATH` 不再生成——如需注入请手写 env.mooncake.sh（在 env.sh 后 source，优先级正确）。
+
+**k8s 通道差异**：env.sh 共享同一份（ConfigMap 挂载）；`SETUP_FABRIC_IP` 和
+`MC_TCP_BIND_ADDRESS` 写 `$POD_IP`（晚绑定，pod spec downward API 提供）；
+`SETUP_UB_DEVICE` 由容器内 `urma_admin show` 自动探测（取首个 bonding_dev_*，
+仅 ub 协议时）；绑核相关变量不注入（容器不做 numactl）。
+
 ### 7.2.1 scripts/env.mooncake.sh（手工调优面板）
 
 mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`（git 跟踪，手工编辑），
@@ -508,6 +527,25 @@ key 空间，靠 remove-keys 串行隔离）。
 
 ## 8. 运行方式
 
+### 8.1 部署形态与配置分割
+
+部署配置按形态分割（测试用例共享）：
+
+```
+configs/
+├── _ssh/     # 真机三件套（cluster/global/matrix，example 已提供）
+├── _k8s/     # k8s 三件套（同上 + templates/benchmark-pod.yaml.tpl）
+├── basic/ pipeline/ …  # 测试用例：两种形态同一套
+└── _spdiag_trees/
+```
+
+```bash
+# 真机通道（默认，缺省旗标兼容旧行为）
+python benchmark.py -f configs/basic/put.json
+# k8s 通道（basic 场景；pipeline 暂不支持）
+python benchmark.py --k8s -f configs/basic/put.json
+```
+
 前置条件：
 
 - 集群中 mooncake_master、mooncake_store 已手动启动；
@@ -515,6 +553,9 @@ key 空间，靠 remove-keys 串行隔离）。
   实现，密码/密钥登录，无需外部 ssh/scp/sshpass 二进制，Windows 原生可用）；节点缺省走密钥
   登录（`ssh_key` 空 = 默认密钥 + ssh-agent），配 `passwd` 字段走密码登录（每节点独立，明文
   存于 cluster.json，已 gitignored）；
+- **k8s 通道额外前置**：编排机 kubectl + kubeconfig（可创建/删除 pod/configmap 的 RBAC）；
+  镜像含 mooncake SDK + python3 + bash；`configs/_k8s/cluster.json` 配 `k8s.image`。
+  脚本经 ConfigMap 挂载（只读），per-pod 值（fabric IP / urma 设备）容器内自动解析；
 - 服务器已安装 mooncake Python 包。
 
 首次使用前，复制集群配置模板并修改：
