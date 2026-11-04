@@ -63,6 +63,42 @@ def _build_run_argv(body):
     return [sys.executable, runmgr.BENCH] + argv
 
 
+def _build_cleanup_argv(body):
+    flags = body.get("flags") or {}
+    mode = flags.get("mode") or "ssh"
+    if mode not in ("ssh", "k8s"):
+        raise ApiError(400, "flags.mode must be 'ssh' or 'k8s'")
+    mode_dir = "configs/_k8s" if mode == "k8s" else "configs/_ssh"
+    cluster = flags.get("cluster") or (mode_dir + "/cluster.json")
+    global_cfg = flags.get("global") or (mode_dir + "/global.json")
+    for name, path in (("cluster", cluster), ("global", global_cfg)):
+        if not os.path.isfile(os.path.join(ROOT, path)):
+            example = mode_dir + "/" + name + ".example.json"
+            target = mode_dir + "/" + name + ".json"
+            raise ApiError(
+                400, "{} config not found: {}. copy {} to {} and edit it "
+                     "first".format(name, path, example, target))
+    # standalone clean-up does not need profile/scenario configs
+    argv = ["--" + mode, "--cluster", cluster, "--global", global_cfg,
+            "--clean-up"]
+    return [sys.executable, runmgr.BENCH] + argv
+
+
+def api_cleanup_post(handler, query):
+    body = read_json_body(handler)
+    argv = _build_cleanup_argv(body)
+    warnings = []
+    sch = runmgr.MGR.scheduler
+    if sch is not None and sch.state in ("waiting", "waiting_slot"):
+        warnings.append(
+            "scheduler active (plan {}, next task @ {}) - its task may "
+            "collide with this cleanup".format(
+                os.path.basename(sch.plan_path), sch.next_trigger))
+    run = runmgr.MGR.start_benchmark(argv, meta={"request": body,
+                                                 "action": "cleanup"})
+    return {"run": run.to_dict(), "warnings": warnings}
+
+
 def api_run_post(handler, query):
     body = read_json_body(handler)
     argv = _build_run_argv(body)
@@ -121,6 +157,7 @@ def api_run_stop(handler, query, rid):
 
 ROUTES += [
     ("POST", r"^/api/run$", lambda h, q, m=None: api_run_post(h, q)),
+    ("POST", r"^/api/cleanup$", lambda h, q, m=None: api_cleanup_post(h, q)),
     ("GET", r"^/api/runs$", lambda h, q, m=None: api_runs(h, q)),
     ("GET", r"^/api/runs/(?P<rid>[^/]+)$", api_run_get),
     ("GET", r"^/api/runs/(?P<rid>[^/]+)/log$", api_run_log),

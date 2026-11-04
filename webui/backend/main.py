@@ -159,6 +159,8 @@ def _generate_openapi():
     paths["/api/config/validate"] = _post("Validate config content without saving")
     paths["/api/run"] = _post("Launch benchmark run (mode: ssh/k8s)")
     paths["/api/run"]["post"]["responses"]["409"] = {"description": "Slot busy"}
+    paths["/api/cleanup"] = _post("Standalone clean-up (k8s namespace/workspace or SSH remote_dir)")
+    paths["/api/cleanup"]["post"]["responses"]["409"] = {"description": "Slot busy"}
     paths["/api/runs"] = _p("Run history (max 60)")
     paths["/api/runs/{id}"] = _p("Run metadata by id")
     paths["/api/runs/{id}/log"] = _p("Incremental log fetch by byte offset")

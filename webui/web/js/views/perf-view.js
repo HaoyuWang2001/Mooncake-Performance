@@ -158,8 +158,16 @@ const PerfView = {
       </div>
       <div class="rb-row">
         <el-button type="primary" size="large" style="width: 160px" :loading="starting"
-                   :disabled="!hasSelection"
+                   :disabled="!hasSelection || cleaning"
                    @click="startRun">运行测试</el-button>
+        <el-button type="danger" size="large" style="width: 160px" :loading="cleaning"
+                   :disabled="busy || cleaning"
+                   @click="cleanup">clean-up</el-button>
+      </div>
+      <div class="rb-clean-hint">
+        <b>危险</b>：clean-up 删除远端残留——k8s：配置的 namespace（pods/configmaps）
+        与 controller workspace；SSH：cluster.json 所有节点的 remote_dir；
+        本地 outputs/日志保留，操作不可恢复。
       </div>
       <el-alert v-if="warnings.length" type="warning" :closable="false" style="margin-top: 8px"
                 :title="warnings.join('；')"></el-alert>
@@ -249,6 +257,7 @@ const PerfView = {
                                  protocol: "", cluster: "", global: "", profile: "" });
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
+    const cleaning = Vue.ref(false);
 
     // 最终选择（与 startRun 提交内容一致）：勾目录=收编该目录并停止下钻
     const selected = Vue.computed(() => {
@@ -359,6 +368,13 @@ const PerfView = {
     const drawerOpen = Vue.ref(false);
     const currentId = Vue.ref(null);
 
+    const busy = Vue.computed(() => {
+      if (store.status.active_run) return true;
+      if (meta.value.status === "running") return true;
+      const sch = store.status.scheduler;
+      return !!(sch && ["executing", "stopping"].includes(sch.state));
+    });
+
     const viewingHistory = Vue.computed(() =>
       !!(currentId.value && meta.value.id && meta.value.id !== currentId.value));
 
@@ -438,6 +454,38 @@ const PerfView = {
       finally { stopping.value = false; }
     }
 
+    async function cleanup() {
+      if (busy.value) {
+        ElementPlus.ElMessage.warning("当前有运行/调度任务，先停止后再清理");
+        return;
+      }
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          "clean-up 会删除远端残留，且不可恢复：\n" +
+          "· k8s：配置的 namespace（pods/configmaps）+ controller workspace\n" +
+          "· SSH：cluster.json 中所有节点的 remote_dir\n" +
+          "本地 outputs/日志保留。确定继续？",
+          "clean-up（危险）",
+          { type: "error", confirmButtonText: "清理", cancelButtonText: "取消",
+            confirmButtonClass: "el-button--danger" });
+      } catch (e) { return; }
+      cleaning.value = true;
+      warnings.value = [];
+      try {
+        const r = await api("POST", "/api/cleanup", {
+          flags: { mode: mode.value, cluster: flags.cluster,
+                   global: flags.global },
+        });
+        warnings.value = r.warnings || [];
+        viewRun(r.run.id, true);
+        refreshRuns();
+      } catch (e) {
+        ElementPlus.ElMessage.error("清理失败: " + e.message);
+      } finally {
+        cleaning.value = false;
+      }
+    }
+
     function gotoResults() {
       if (meta.value.ts_dir) {
         store.resultsTarget = meta.value.ts_dir.split("/").pop();
@@ -456,7 +504,7 @@ const PerfView = {
     Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
     return { mode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
-             flags, warnings, starting, clearSel, startRun,
+             flags, warnings, starting, cleaning, busy, clearSel, startRun, cleanup,
              meta, logLines, logEl, logH, runs, stopping, drawerOpen, viewingHistory,
              statusType, stop, gotoResults, onHistoryClick };
   },

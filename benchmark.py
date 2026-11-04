@@ -2795,10 +2795,14 @@ def parse_arguments(argv=None):
         args.cluster = os.path.join(args.mode_dir, "cluster.json")
     if args.global_cfg is None:
         args.global_cfg = os.path.join(args.mode_dir, "global.json")
-    if args.profile is None:
+    standalone_cleanup = bool(
+        args.clean_up and not (args.config or args.config_dir))
+    if args.profile is None and not standalone_cleanup:
         args.profile = os.path.join(args.mode_dir, "profile.json")
-    for name, path in (("cluster", args.cluster), ("global", args.global_cfg),
-                       ("profile", args.profile)):
+    required = [("cluster", args.cluster), ("global", args.global_cfg)]
+    if args.profile is not None or not standalone_cleanup:
+        required.append(("profile", args.profile))
+    for name, path in required:
         if not os.path.exists(path):
             example = os.path.join(args.mode_dir, name + ".example.json")
             target = os.path.join(args.mode_dir, name + ".json")

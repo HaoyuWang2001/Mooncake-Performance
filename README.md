@@ -663,6 +663,11 @@ WebUI 点击「停止」或命令行 Ctrl+C 时，benchmark **不会立即被杀
 - 本地 `webui/data/runs/<id>.log` / `outputs/` 保留用于排查；run 状态先 `stopping`，最终 `stopped`；
 - scheduler 执行中的任务同样走优雅停止（stop 文件 + 信号 + grace）。
 
+运行框还提供红色 **clean-up** 按钮：二次确认后启动 standalone clean-up
+（k8s 删除配置的 namespace/pods/configmaps 与 controller workspace；SSH 删除
+cluster.json 所有节点的 remote_dir；本地 outputs/日志保留）。该操作使用当前选择的
+mode + cluster + global，**不需要 profile**，不可恢复。
+
 ## 9. 结果目录结构
 
 ```

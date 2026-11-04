@@ -94,6 +94,11 @@ html, body, #app { height: 100%; margin: 0; }
 .runbox .rb-seg { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
 .runbox .rb-k { color: var(--el-color-primary); margin-right: 6px; font-weight: 600; }
 .runbox .rb-note { color: var(--el-text-color-secondary); font-size: 12px; }
+.runbox .rb-clean-hint {
+  font-size: 12px; line-height: 1.5; color: var(--el-text-color-secondary);
+  margin: 2px 0 4px;
+}
+.runbox .rb-clean-hint b { color: var(--el-color-danger); }
 
 /* 运行框：已选配置（目录/文件分开展示，过滤合并后） */
 .runbox .rb-selected {

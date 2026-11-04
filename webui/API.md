@@ -77,12 +77,48 @@ selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files
 → `201` 意义上返回 `{"run":{"id":"r...","status":"running","cmd":"..."},"warnings":[]}`
 槽位被占 → `409 {"error":"benchmark run r... is still active ..."}`
 
+### POST /api/cleanup
+standalone clean-up（不跑场景；不需要 profile）：
+```json
+{"flags": {"mode": "ssh|k8s", "cluster": "configs/_k8s/cluster.json",
+           "global": "configs/_k8s/global.json"}}
+```
+- k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
+- SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
+- 本地 `outputs/` 与 run 日志保留；不可恢复；
+- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
+
 ### GET /api/runs
 历史运行列表（最多 60 条，新→旧）：`{"runs":[<run meta>...]}`。
 run meta 字段：`id/kind/cmd/argv/log/status/stopping/rc/t0/t1/elapsed/ts_dir/meta`；`ts_dir` 如 `outputs/20261029-2230`（dry-run 无）。
 
+### POST /api/cleanup
+standalone clean-up（不跑场景；不需要 profile）：
+```json
+{"flags": {"mode": "ssh|k8s", "cluster": "configs/_k8s/cluster.json",
+           "global": "configs/_k8s/global.json"}}
+```
+- k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
+- SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
+- 本地 `outputs/` 与 run 日志保留；不可恢复；
+- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
+
 ### GET /api/runs/{id}
 单条 run meta。404 若不存在。
+
+### POST /api/cleanup
+standalone clean-up（不跑场景；不需要 profile）：
+```json
+{"flags": {"mode": "ssh|k8s", "cluster": "configs/_k8s/cluster.json",
+           "global": "configs/_k8s/global.json"}}
+```
+- k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
+- SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
+- 本地 `outputs/` 与 run 日志保留；不可恢复；
+- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
 ### GET /api/runs/{id}/log?offset=0
 增量日志：`{"offset":<新字节偏移>,"size":<总字节>,"content":"<新增文本>","eof":bool}`
