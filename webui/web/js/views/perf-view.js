@@ -47,6 +47,13 @@ function _perfApplyChecked(roots, set) {
   (roots || []).forEach(walk);
 }
 
+/* 是否需要拉取日志：running 必拉；从 running 变为终态的那一次也必须拉，
+   否则快速结束的 run 会因首次空日志把 logEof 置 true 而永远跳过。 */
+function _perfShouldFetchLog(prevStatus, status, logEof) {
+  if (status === "running") return true;
+  return prevStatus === "running" || !logEof;
+}
+
 const SelNode = {
   name: "SelNode",
   props: { node: { type: Object, required: true },
@@ -391,10 +398,11 @@ const PerfView = {
       const id = meta.value.id;
       if (!id) return;
       try {
+        const prevStatus = meta.value.status;
         const m = await api("GET", "/api/runs/" + id);
         if (meta.value.id !== id) return;
         meta.value = m;
-        if (m.status !== "running" && logEof.value) return;
+        if (!_perfShouldFetchLog(prevStatus, m.status, logEof.value)) return;
         const lg = await api("GET", "/api/runs/" + id + "/log?offset=" + logOffset.value);
         if (meta.value.id !== id) return;
         if (lg.content) appendLog(lg.content);

@@ -201,5 +201,30 @@ try {
   console.error("[FAIL] default/checked helpers: " + e.message);
 }
 
+// 回归：终态切换时必须再拉一次日志（快速 run 首次空日志的竞态）
+try {
+  const cases = [
+    [undefined, "running", true, true],
+    ["running", "done", true, true],
+    ["running", "failed", true, true],
+    ["done", "done", true, false],
+    ["done", "done", false, true],
+    [undefined, "done", false, true],
+  ];
+  for (const [prev, status, eof, want] of cases) {
+    const got = vm.runInContext(
+      "_perfShouldFetchLog(" + JSON.stringify(prev) + "," +
+      JSON.stringify(status) + "," + String(eof) + ")", ctx);
+    if (got !== want) {
+      failed = true;
+      console.error("[FAIL] _perfShouldFetchLog(" + prev + "," + status + "," +
+                    eof + ") = " + got + ", want " + want);
+    }
+  }
+} catch (e) {
+  failed = true;
+  console.error("[FAIL] _perfShouldFetchLog: " + e.message);
+}
+
 if (failed) process.exit(1);
 console.log("FRONTEND_BOOT_OK (" + registered.map(([n]) => n).join(", ") + ")");
