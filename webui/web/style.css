@@ -98,28 +98,60 @@ html, body, #app { height: 100%; margin: 0; }
 
 /* ---- 运行结果 ---- */
 .run-item {
+  position: relative; display: flex; align-items: flex-start; gap: 8px;
   padding: 8px 10px; border: 1px solid var(--el-border-color-light);
   border-radius: var(--el-border-radius-base); margin-bottom: 8px;
   cursor: pointer; background: var(--el-bg-color);
+  transition: border-color .15s, background .15s;
 }
 .run-item:hover { border-color: var(--el-color-primary); }
 .run-item.active { border-color: var(--el-color-primary); background: var(--el-color-primary-light-9); }
-.run-item .ri-title { font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; }
+.run-item.selected { border-color: var(--el-color-danger); background: var(--el-color-danger-light-9); }
+.run-item .ri-check { margin-top: 2px; flex: none; }
+.run-item .ri-body { flex: 1; min-width: 0; }
+.run-item .ri-title { font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
+.run-item .ri-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-item .ri-sub { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 2px; }
-.pane {
-  border: 1px solid var(--el-border-color-light); border-radius: var(--el-border-radius-base);
-  padding: 10px 12px; background: var(--el-bg-color);
+.run-item .ri-actions {
+  position: absolute; right: 6px; top: 6px; display: none; gap: 2px;
+  padding: 0 2px; background: var(--el-bg-color); border-radius: 6px;
+  box-shadow: var(--el-box-shadow-light);
 }
-.pane.focus { border-color: var(--el-color-primary); }
-.pane-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.run-item:hover .ri-actions { display: inline-flex; }
+.run-item:hover .ri-tag { visibility: hidden; }
+.ms-bar {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  padding: 6px 8px; background: var(--el-fill-color-light); border-radius: 6px;
+}
+.ms-bar .spacer { flex: 1; }
+
+/* 结果框：全局 2px 边框避免焦点切换抖动；焦点 = 主色边框 + 外发光 */
+.pane {
+  border: 2px solid var(--el-border-color-lighter); border-radius: var(--el-border-radius-base);
+  padding: 10px 12px; background: var(--el-bg-color);
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+.pane:hover { border-color: var(--el-color-primary-light-5); }
+.pane.focus {
+  border-color: var(--el-color-primary);
+  box-shadow: 0 0 0 3px var(--el-color-primary-light-8);
+}
+.pane-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 2px; padding-bottom: 6px;
+  border-bottom: 1px solid transparent;
+}
+.pane.focus .pane-head { border-bottom-color: var(--el-color-primary-light-7); }
+.focus-badge {
+  font-size: 12px; font-weight: 600; color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9); border-radius: 10px; padding: 1px 8px;
+}
 .pane-body {
   height: auto;
   min-height: 200px;
   max-height: calc(100vh - 180px);
   overflow-y: auto;
 }
-.pane.focus { border-color: var(--el-color-primary); }
-.pane.focuspane { /* 行内形态：焦点由父级 .focus 类控制 */ }
 .pane-empty { display: flex; align-items: center; justify-content: center; }
 .pane-tools { margin-left: auto; display: inline-flex; align-items: center; }
 

@@ -41,16 +41,31 @@ function _treeShortcut(pane) {
   return pane.files.filter(f => /spdiag_tree\.[^.]+\.txt$/.test(f.split("/").pop()));
 }
 
-async function _loadFiles(pane) {
-  pane.file = "";
+async function _loadFiles(pane, keepFile) {
+  const prev = pane.file;
   pane.rows = []; pane.headers = []; pane.text = "";
-  if (!pane.ts) { pane.files = []; return; }
+  if (!pane.ts) { pane.files = []; pane.file = ""; return; }
   pane.loading = true;
   try {
     const r = await api("GET", "/api/outputs/" + encodeURIComponent(pane.ts) + "/tree");
     pane.files = r.files;
-    const detail = pane.files.find(f => f === "benchmark_detail.csv");
-    if (detail) pane.file = detail;
+    let target = "";
+    if (keepFile) {
+      // 切换 run：保留之前选中的文件；没有选中则维持不选中
+      if (prev && pane.files.includes(prev)) {
+        target = prev;
+      } else if (prev) {
+        ElementPlus.ElMessage.warning("该 run 无同名文件，已清空选择：" + prev);
+      }
+    } else {
+      // 新建框 / 结果跳转：沿用默认选中 benchmark_detail.csv
+      target = pane.files.find(f => f === "benchmark_detail.csv") || "";
+    }
+    if (target === prev) {
+      if (target) await _loadContent(pane);   // 值未变不会触发 watcher
+    } else {
+      pane.file = target;                     // 由文件 watcher 加载内容
+    }
   } catch (e) {
     ElementPlus.ElMessage.error(e.message);
   } finally {
@@ -99,14 +114,16 @@ const ResPane = {
   props: { pane: { type: Object, required: true },
            idx: { type: Number, required: true },
            runs: { type: Array, default: () => [] },
-           fs: { type: Boolean, default: false } },
+           fs: { type: Boolean, default: false },
+           focused: { type: Boolean, default: false } },
   emits: ["focus", "close", "toggle-fs"],
   template: `
   <div class="pane" :class="{ focuspane: !fs }" @click="$emit('focus')">
     <div class="pane-head">
-      <el-tag size="small" type="info">#{{ idx + 1 }}</el-tag>
+      <el-tag size="small" :type="focused && !fs ? 'primary' : 'info'">#{{ idx + 1 }}</el-tag>
+      <span v-if="focused && !fs" class="focus-badge">焦点</span>
       <el-select v-model="pane.ts" filterable placeholder="选择 run" size="small"
-                 style="width: 190px" @change="loadFiles(pane)">
+                 style="width: 190px" @change="loadFiles(pane, true)">
         <el-option v-for="r in runs" :key="r.ts" :label="r.ts" :value="r.ts"></el-option>
       </el-select>
       <el-select v-model="pane.file" filterable placeholder="选择文件" size="small"
@@ -224,7 +241,7 @@ const ResultsView = {
   template: `
   <div class="page">
     <div class="header-row">
-      <span class="hint">点击左侧 run 分配到焦点框（虚线高亮 = 焦点，点任意框头部切换）；框可任意增删/拖高/全屏</span>
+      <span class="hint">点击左侧 run 分配到焦点框（主色描边 + 发光 = 焦点，点框内任意处切换）；框可任意增删/全屏</span>
       <span class="spacer"></span>
       <template v-if="panes.length >= 2">
         <span style="font-size: 13px">同文件锁定</span>
@@ -237,16 +254,41 @@ const ResultsView = {
     <el-row :gutter="14">
       <el-col :span="6">
         <el-card shadow="never">
-          <template #header><b>运行结果（{{ runs.length }}）</b></template>
-          <div v-for="r in runs" :key="r.ts" class="run-item"
-               :class="{ active: isActivePaneTs(r.ts) }" @click="pickRun(r.ts)">
-            <div class="ri-title">
-              <span>{{ r.ts }}</span>
-              <el-tag :type="r.has_detail ? 'success' : 'info'" size="small">
-                {{ r.has_detail ? "detail" : "无 detail" }}
-              </el-tag>
+          <template #header>
+            <div class="header-row" style="margin: 0">
+              <b>运行结果（{{ runs.length }}）</b>
+              <span class="spacer"></span>
+              <el-button size="small" :type="multiSelect ? 'primary' : ''" @click="toggleMulti">
+                {{ multiSelect ? "退出多选" : "多选" }}
+              </el-button>
             </div>
-            <div class="ri-sub">{{ r.mtime }} · {{ r.csv_count }} csv</div>
+          </template>
+          <div v-if="multiSelect" class="ms-bar">
+            <el-checkbox :model-value="allSelected" @change="onSelectAll">全选</el-checkbox>
+            <span class="hint">已选 {{ selected.length }}</span>
+            <span class="spacer"></span>
+            <el-button size="small" type="danger" :disabled="!selected.length"
+                       @click="deleteSelected">删除选中</el-button>
+          </div>
+          <div v-for="r in runs" :key="r.ts" class="run-item"
+               :class="{ active: isActivePaneTs(r.ts), selected: isSelected(r.ts) }"
+               @click="pickRun(r.ts)">
+            <el-checkbox v-if="multiSelect" class="ri-check"
+                         :model-value="isSelected(r.ts)"
+                         @click.stop @change="toggleSelect(r.ts)"></el-checkbox>
+            <div class="ri-body">
+              <div class="ri-title">
+                <span class="ri-name">{{ r.ts }}</span>
+                <el-tag class="ri-tag" :type="r.has_detail ? 'success' : 'info'" size="small">
+                  {{ r.has_detail ? "detail" : "无 detail" }}
+                </el-tag>
+              </div>
+              <div class="ri-sub">{{ r.mtime }} · {{ r.csv_count }} csv</div>
+            </div>
+            <div v-if="!multiSelect" class="ri-actions">
+              <el-button size="small" text @click.stop="renameRun(r.ts)" title="重命名">改名</el-button>
+              <el-button size="small" text type="danger" @click.stop="deleteRun(r.ts)" title="删除">删除</el-button>
+            </div>
           </div>
           <el-empty v-if="!runs.length" description="暂无结果" :image-size="60"></el-empty>
         </el-card>
@@ -260,7 +302,7 @@ const ResultsView = {
         </div>
         <res-pane v-for="(p, i) in panes" :key="p.uid"
                   :class="{ focus: activePane === i }"
-                  :pane="p" :idx="i" :runs="runs"
+                  :pane="p" :idx="i" :runs="runs" :focused="activePane === i"
                   @focus="activePane = i"
                   @close="removePane(i)"
                   @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"
@@ -316,12 +358,12 @@ const ResultsView = {
       }
     }
 
-    function addPane(ts) {
+    function addPane(ts, keepFile) {
       const p = newPane(panes.length);
       p.ts = ts !== undefined ? ts : (runs.value.length ? runs.value[0].ts : "");
       panes.push(p);
       activePane.value = panes.length - 1;
-      _loadFiles(p);
+      _loadFiles(p, !!keepFile);
       return p;
     }
 
@@ -332,15 +374,99 @@ const ResultsView = {
       if (activePane.value >= panes.length) activePane.value = Math.max(0, panes.length - 1);
     }
 
+    // ---- 多选（删除） ----
+    const multiSelect = Vue.ref(false);
+    const selected = Vue.ref([]);
+    const allSelected = Vue.computed(() =>
+      runs.value.length > 0 && selected.value.length === runs.value.length);
+    function isSelected(ts) { return selected.value.includes(ts); }
+    function toggleSelect(ts) {
+      const i = selected.value.indexOf(ts);
+      if (i >= 0) selected.value.splice(i, 1);
+      else selected.value.push(ts);
+    }
+    function selectAll() { selected.value = runs.value.map(r => r.ts); }
+    function clearSelected() { selected.value = []; }
+    function toggleMulti() {
+      multiSelect.value = !multiSelect.value;
+      if (!multiSelect.value) clearSelected();
+    }
+    function onSelectAll() {
+      if (allSelected.value) clearSelected();
+      else selectAll();
+    }
+
     function pickRun(ts) {
-      if (!panes.length) { addPane(ts); return; }
+      if (multiSelect.value) { toggleSelect(ts); return; }
+      if (!panes.length) { addPane(ts, true); return; }
       const p = panes[activePane.value];
-      if (p.ts !== ts) { p.ts = ts; _loadFiles(p); }
+      if (p.ts !== ts) { p.ts = ts; _loadFiles(p, true); }
     }
 
     function isActivePaneTs(ts) {
       const p = panes[activePane.value];
       return p && p.ts === ts;
+    }
+
+    function _applyRename(oldName, newName) {
+      for (const p of panes) if (p.ts === oldName) p.ts = newName;
+      if (store.resultsTarget === oldName) store.resultsTarget = newName;
+      const i = selected.value.indexOf(oldName);
+      if (i >= 0) selected.value.splice(i, 1);
+    }
+
+    async function renameRun(ts) {
+      let name;
+      try {
+        const r = await ElementPlus.ElMessageBox.prompt("重命名运行结果目录", "重命名 " + ts, {
+          confirmButtonText: "重命名", cancelButtonText: "取消", inputValue: ts,
+          inputValidator: v => {
+            v = (v || "").trim();
+            if (!v) return "名称不能为空";
+            if (v === "." || v === ".." || v.startsWith(".")) return "不能以 . 开头";
+            if (!/^[0-9A-Za-z._-]+$/.test(v)) return "仅允许字母、数字、点、下划线、短横线";
+            if (v === ts) return "与原名称相同";
+            return true;
+          },
+        });
+        name = r.value.trim();
+      } catch (e) { return; }
+      try {
+        const r = await api("POST", "/api/outputs/" + encodeURIComponent(ts) + "/rename",
+                            { name: name });
+        _applyRename(ts, r.ts);
+        ElementPlus.ElMessage.success("已重命名为 " + r.ts);
+        await loadRuns();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      }
+    }
+
+    async function _deleteNames(names, label) {
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          "将把" + label + "移入回收站（webui/backups/outputs-trash），确定？",
+          "删除运行结果", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+      } catch (e) { return; }
+      try {
+        const r = await api("POST", "/api/outputs/delete", { names: names });
+        if (r.failed && r.failed.length) {
+          ElementPlus.ElMessage.warning("部分删除失败：" +
+            r.failed.map(f => f.ts + "（" + f.error + "）").join("；"));
+        } else {
+          ElementPlus.ElMessage.success("已删除 " + r.deleted.length + " 项（已移入回收站）");
+        }
+        selected.value = selected.value.filter(t => !names.includes(t));
+        await loadRuns();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      }
+    }
+
+    function deleteRun(ts) { return _deleteNames([ts], " " + ts + " "); }
+    function deleteSelected() {
+      if (!selected.value.length) return;
+      return _deleteNames(selected.value.slice(), "选中的 " + selected.value.length + " 个运行结果");
     }
 
     // 文件变化：加载内容 + 同文件锁定（任一框换文件，其余框跟随）
@@ -387,6 +513,9 @@ const ResultsView = {
     });
 
     return { runs, loading, lockFile, activePane, fullscreenIdx, panes,
-             loadRuns, addPane, removePane, pickRun, isActivePaneTs };
+             multiSelect, selected, allSelected,
+             loadRuns, addPane, removePane, pickRun, isActivePaneTs,
+             isSelected, toggleSelect, onSelectAll, toggleMulti,
+             renameRun, deleteRun, deleteSelected };
   },
 };
