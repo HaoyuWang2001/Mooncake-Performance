@@ -33,7 +33,8 @@ from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    clear_stop, controller_desc, controller_diagnose,
                    controller_mkdir, controller_put, controller_remove,
                    controller_run, controller_stream, get_node, is_k8s_node,
-                   load_json, log, log_detail, parse_data_size, percentile,
+                   kubectl_exec_line, kubectl_prefix, load_json, log,
+                   log_detail, parse_data_size, percentile,
                    request_stop, run_ssh, scp_pull, scp_push, set_stop_file,
                    set_verbose, ssh_check_output, stop_requested,
                    verbose_enabled)
@@ -794,6 +795,10 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         k8s_node = out.strip()
         log("[k8s] pod {} ready (ns={}, ip={}, node={}, elapsed={:.1f}s)"
             "".format(pod, ns, ip, k8s_node or "?", time.time() - t0))
+        _view = " ".join(kubectl_prefix({"_ctx": c.get("_ctx", ""),
+                                          "_ns": ns}))
+        log("[k8s] view:  {} get pods -o wide".format(_view))
+        log("[k8s] shell: {} exec -it {} -- bash".format(_view, pod))
     node = {"kind": "k8s-pod", "_pod": pod, "_ns": ns,
             "_ctx": c.get("_ctx", ""), "_controller": c,
             "_controller_workspace": k8s["controller_workspace"],
@@ -1408,7 +1413,7 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     .state ledger under cfg_name — so a crashed orchestrator still leaves a
     killable trail."""
     if is_k8s_node(node):
-        log("[exec] {} : {}".format(node["_pod"], command))
+        log("[k8s] $ {}".format(kubectl_exec_line(node, command)))
     else:
         log("[ssh] {} : {}".format(host, command))
     if dry_run:

@@ -121,6 +121,38 @@ def controller_desc(controller):
                           controller.get("ip", "?"))
 
 
+def kubectl_prefix(node):
+    """kubectl base args (context + namespace) matching kubectl_cmd()."""
+    parts = ["kubectl"]
+    if node.get("_ctx"):
+        parts += ["--context", node["_ctx"]]
+    if node.get("_ns"):
+        parts += ["-n", node["_ns"]]
+    return parts
+
+
+def kubectl_exec_line(node, command):
+    """Full copy-pasteable kubectl exec command (runs on the controller)."""
+    parts = kubectl_prefix(node)
+    parts += ["exec", node["_pod"], "--", "bash", "-c", command]
+    return " ".join(str(a) for a in parts)
+
+
+def kubectl_cp_to_line(node, local_file, remote_path):
+    """Copy-pasteable kubectl cp (local -> pod)."""
+    parts = kubectl_prefix(node)
+    parts += ["cp", local_file,
+              "{}:{}".format(node["_pod"], remote_path)]
+    return " ".join(str(a) for a in parts)
+
+
+def kubectl_cp_from_line(node, remote_file, local_path):
+    """Copy-pasteable kubectl cp (pod -> local)."""
+    parts = kubectl_prefix(node)
+    parts += ["cp", "{}:{}".format(node["_pod"], remote_file), local_path]
+    return " ".join(str(a) for a in parts)
+
+
 def _remote_path(path):
     """Controller/pod paths are POSIX; Windows orchestrators must not emit '\\'."""
     return str(path).replace("\\", "/")
@@ -464,7 +496,7 @@ def _ssh_exec(node, command, relay=False):
 
 def run_ssh(host, node, command, dry_run=False):
     if is_k8s_node(node):
-        log("[exec] {} : {}".format(node["_pod"], command))
+        log("[k8s] $ {}".format(kubectl_exec_line(node, command)))
         if dry_run:
             log("      (dry-run, skipped)")
             return
@@ -488,7 +520,7 @@ def run_ssh(host, node, command, dry_run=False):
 def ssh_check_output(host, node, command, dry_run=False, quiet=False):
     if is_k8s_node(node):
         if not quiet:
-            log("[exec] {} : {}".format(node["_pod"], command))
+            log("[k8s] $ {}".format(kubectl_exec_line(node, command)))
         if dry_run:
             log("      (dry-run, skipped)")
             return ""
@@ -521,9 +553,11 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
             return
         controller_put(c, local_files, stage)
         for f in local_files:
+            staged = posixpath.join(stage, os.path.basename(f))
+            log("[k8s] $ {}".format(
+                kubectl_cp_to_line(node, staged, remote_path)))
             out, rc = controller_run(c,
-                                     ["-n", node["_ns"], "cp",
-                                      posixpath.join(stage, os.path.basename(f)),
+                                     ["-n", node["_ns"], "cp", staged,
                                       "{}:{}".format(node["_pod"], remote_path)],
                                      check=False)
             if rc != 0:
@@ -562,17 +596,20 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         if not dry_run:
             controller_mkdir(c, stage)
         for f in files:
-            log_detail("[kcp] <- {} : {}".format(node["_pod"], f))
+            if controller_is_local(c):
+                dst = local_dir.rstrip("\\/") + os.sep
+            else:
+                dst = posixpath.join(stage, os.path.basename(f))
+            log("[k8s] $ {}".format(
+                kubectl_cp_from_line(node, f, dst)))
             if dry_run:
                 log_detail("      (dry-run, skipped)")
                 continue
             if controller_is_local(c):
                 out, rc = controller_run(
                     c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f),
-                        local_dir.rstrip("\\/") + os.sep], check=False)
+                        dst], check=False)
             else:
-                base = os.path.basename(f)
-                dst = posixpath.join(stage, base)
                 out, rc = controller_run(
                     c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f), dst],
                     check=False)
