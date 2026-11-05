@@ -158,12 +158,16 @@ const PerfView = {
         </el-select>
       </div>
       <div class="rb-row">
-        <el-button type="primary" size="large" style="width: 160px" :loading="starting"
-                   :disabled="!hasSelection || cleaning"
-                   @click="startRun">运行测试</el-button>
-        <el-button type="danger" size="large" style="width: 160px" :loading="cleaning"
-                   :disabled="busy || cleaning"
-                   @click="cleanup">clean-up</el-button>
+        <el-button type="primary" size="default" style="width: 110px" :loading="starting"
+                   :disabled="!hasSelection || busy || cleaning || starting"
+                   @click="startRun">RUN</el-button>
+        <el-button type="danger" size="default" style="width: 110px" :loading="cleaning"
+                   :disabled="busy || cleaning || starting"
+                   @click="cleanup">CLEAN-UP</el-button>
+        <el-button type="warning" size="default" style="width: 110px"
+                   :loading="stopping || meta.stopping"
+                   :disabled="meta.status !== 'running' || meta.stopping"
+                   @click="stop">{{ meta.stopping ? "STOP..." : "STOP" }}</el-button>
       </div>
       <div class="rb-clean-hint">
         <b>危险</b>：clean-up 删除远端残留——k8s：配置的 namespace（pods/configmaps）
@@ -179,9 +183,6 @@ const PerfView = {
         <div class="header-row" style="margin: 0">
           <b>当前 RUN</b>
           <span class="spacer"></span>
-          <el-button v-if="meta.status === 'running'" size="small" type="danger"
-                     @click="stop" :loading="stopping || meta.stopping"
-                     :disabled="meta.stopping">{{ meta.stopping ? "停止中…" : "停止" }}</el-button>
           <el-button v-if="meta.ts_dir && meta.status !== 'running'" size="small" type="primary"
                      @click="gotoResults">查看运行结果</el-button>
           <el-button size="small" @click="drawerOpen = true">历史</el-button>
