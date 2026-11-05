@@ -65,6 +65,7 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
   },
   "flags": {
     "dry_run": false, "no_warmup": false, "no_plot": false,
+    "verbose": false,                     // 详细日志（上传路径/逐文件拉取/kubectl 命令/pod 详情）
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"
     "cluster": "configs/_ssh/cluster.json",
     "global": "configs/_ssh/global.json",

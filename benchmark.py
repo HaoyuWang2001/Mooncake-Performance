@@ -30,12 +30,13 @@ import time
 import urllib.parse
 
 from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
-                   clear_stop, controller_diagnose, controller_mkdir,
-                   controller_put, controller_remove, controller_run,
-                   controller_stream, get_node, is_k8s_node, load_json, log,
-                   parse_data_size, percentile, request_stop, run_ssh,
-                   scp_pull, scp_push, set_stop_file, ssh_check_output,
-                   stop_requested)
+                   clear_stop, controller_desc, controller_diagnose,
+                   controller_mkdir, controller_put, controller_remove,
+                   controller_run, controller_stream, get_node, is_k8s_node,
+                   load_json, log, log_detail, parse_data_size, percentile,
+                   request_stop, run_ssh, scp_pull, scp_push, set_stop_file,
+                   set_verbose, ssh_check_output, stop_requested,
+                   verbose_enabled)
 
 # profiling matrix core (optional tools: spdiag / perf / bpftrace)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling"))
@@ -587,11 +588,15 @@ def k8s_workspace_dirs(cluster, dry_run=False):
     k8s = k8s_settings(cluster)
     c = cluster["_controller"]
     root = k8s["controller_workspace"]
-    for sub in ("scripts", "data", "logs", "pods", "push-tmp", "pull-tmp"):
-        if dry_run:
+    subs = ("scripts", "data", "logs", "pods", "push-tmp", "pull-tmp")
+    if dry_run:
+        for sub in subs:
             log("[k8s] (dry-run) would create {}/{}".format(root, sub))
-            continue
+        return root
+    for sub in subs:
         controller_mkdir(c, posixpath.join(root, sub))
+    log("[k8s] workspace ready on {}: {} ({})".format(
+        controller_desc(c), root, ",".join(subs)))
     return root
 
 
@@ -668,9 +673,11 @@ def cleanup_k8s_namespace(cluster, dry_run=False):
             c, ["get", "namespace", ns, "-o",
                 "jsonpath={.metadata.labels.managed-by}"], check=False)
         if label.strip() == "mcbench":
+            t0 = time.time()
             controller_run(c, ["delete", "namespace", ns,
                                "--wait=true", "--timeout=180s"], check=False)
-            log("[k8s] namespace {} deleted".format(ns))
+            log("[k8s] namespace {} deleted (elapsed={:.1f}s)".format(
+                ns, time.time() - t0))
         else:
             log("[WARN] namespace {} is not managed by mcbench; not deleted"
                 "".format(ns))
@@ -716,17 +723,36 @@ def _render_pod_yaml(cluster, ts, cfg_name):
     return pod, run_label, text
 
 
+def _log_pod_events(controller, ns, pod):
+    """Best-effort: dump the tail of `kubectl describe pod` on failure."""
+    try:
+        out, rc = controller_run(controller, ["-n", ns, "describe", "pod", pod],
+                                 check=False)
+        if rc == 0 and out.strip():
+            lines = out.strip().splitlines()
+            log("[k8s] pod {} describe (tail):\n{}".format(
+                pod, "\n".join(lines[-25:])))
+    except Exception:
+        pass
+
+
 def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
     """Create the per-config client pod and register a runtime node."""
     k8s = k8s_settings(cluster)
     c = cluster["_controller"]
     ns = k8s["namespace"]
     pod, run_label, yaml_text = _render_pod_yaml(cluster, ts, cfg_name)
+    cm_name = _configmap_name(run_label)
+    role = "client-0"
+    mounts_line = ("configmap {} -> {} (ro); emptyDir -> {}".format(
+        cm_name, k8s["pod_workspace"] + "/scripts", k8s["pod_workspace"]))
     if dry_run:
         log("[k8s] (dry-run) would create pod {} in ns {} (image {})"
             "".format(pod, ns, k8s["image"]))
+        log("[k8s] (dry-run) mounts: {}".format(mounts_line))
         ip = "10.0.0.0"
     else:
+        t0 = time.time()
         import tempfile
         local_dir = tempfile.mkdtemp(prefix="mc-pod-")
         local_yaml = os.path.join(local_dir, pod + ".yaml")
@@ -736,6 +762,12 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
             yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
             controller_put(c, [local_yaml], yaml_dir)
             remote_yaml = posixpath.join(yaml_dir, pod + ".yaml")
+            log("[k8s] pod manifest: template={} -> {}:{}".format(
+                os.path.relpath(_pod_template_path(cluster), ROOT),
+                controller_desc(c), remote_yaml))
+            log("[k8s] pod {} create: ns={} image={} labels={{run={}, role={}}}"
+                "".format(pod, ns, k8s["image"], run_label, role))
+            log("[k8s] pod mounts: {}".format(mounts_line))
             out, rc = controller_run(
                 c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
             if rc != 0:
@@ -747,6 +779,7 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
             c, ["-n", ns, "wait", "--for=condition=Ready", "pod/" + pod,
                 "--timeout=180s"], check=False)
         if rc != 0:
+            _log_pod_events(c, ns, pod)
             raise RuntimeError("pod {} not Ready in 180s: {}"
                                "".format(pod, out.strip()[:400]))
         out, rc = controller_run(
@@ -755,6 +788,12 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         ip = out.strip()
         if rc != 0 or not ip:
             raise RuntimeError("cannot resolve Pod IP for {}".format(pod))
+        out, _rc = controller_run(
+            c, ["-n", ns, "get", "pod", pod, "-o",
+                "jsonpath={.spec.nodeName}"], check=False)
+        k8s_node = out.strip()
+        log("[k8s] pod {} ready (ns={}, ip={}, node={}, elapsed={:.1f}s)"
+            "".format(pod, ns, ip, k8s_node or "?", time.time() - t0))
     node = {"kind": "k8s-pod", "_pod": pod, "_ns": ns,
             "_ctx": c.get("_ctx", ""), "_controller": c,
             "_controller_workspace": k8s["controller_workspace"],
@@ -954,8 +993,13 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
         with open(os.path.join(local_stage, "env.sh"), "w",
                   encoding="utf-8", newline="\n") as f:
             f.write(env_content)
+        staged = sorted(os.listdir(local_stage))
+        log("[k8s] staging {} files (run={}) -> {}:{}".format(
+            len(staged), run_label, controller_desc(c), stage_remote))
+        for fname in staged:
+            log("[k8s]   + {}".format(fname))
         controller_put(c, [os.path.join(local_stage, f)
-                           for f in os.listdir(local_stage)], stage_remote)
+                           for f in staged], stage_remote)
     finally:
         shutil.rmtree(local_stage, ignore_errors=True)
     ns = k8s["namespace"]
@@ -967,7 +1011,8 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
     if rc != 0:
         raise RuntimeError("kubectl create configmap {} failed: {}"
                            "".format(cm_name, out.strip()[:400]))
-    log("[k8s] configmap {} created (run={})".format(cm_name, run_label))
+    log("[k8s] configmap {} created (ns={}, keys={})".format(
+        cm_name, ns, ",".join(staged)))
     return cm_name
 
 def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
@@ -986,6 +1031,9 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
             # k8s: scripts + env.sh are already delivered via ConfigMap
             # (ensure_configmap); the pods mount them read-only at
             # remote_scripts. Only ensure the log dir exists (emptyDir).
+            log("[k8s] pod {}: scripts via configmap (ro at {}), "
+                "log dir {}".format(n.get("_pod", "?"), remote_scripts,
+                                    remote_log_dir))
             run_ssh(n["ip"], n, "mkdir -p {}".format(remote_log_dir),
                     dry_run=dry_run)
             continue
@@ -1428,6 +1476,8 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
             time.sleep(0.05)
         _drain_chan(chan, True, [])
         rc = chan.recv_exit_status()
+    log("{} done rc={} elapsed={:.1f}s".format(
+        label, rc, time.time() - t0))
     if rc != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
             rc, host, command))
@@ -2270,13 +2320,14 @@ def cleanup_pods(cluster, involved_nodes, dry_run):
                 "".format(pod, label))
             continue
         if pod:
+            log("[k8s] delete pod {} (ns={})".format(pod, ns))
             controller_run(c, ["-n", ns, "delete", "pod", pod,
                                "--ignore-not-found=true"], check=False)
         if label:
-            controller_run(c, ["-n", ns, "delete", "configmap",
-                               _configmap_name(label),
+            cm = _configmap_name(label)
+            log("[k8s] delete configmap {} (ns={})".format(cm, ns))
+            controller_run(c, ["-n", ns, "delete", "configmap", cm,
                                "--ignore-not-found=true"], check=False)
-        log("[k8s] pod + configmap deleted (ns={}, pod={})".format(ns, pod))
         cluster.get("nodes", {}).pop(name, None)
 
 def cleanup_cluster(cluster, globals_cfg, dry_run=False):
@@ -2770,6 +2821,9 @@ def parse_arguments(argv=None):
                              "comma-separated multi values; config-dir entries run "
                              "BEFORE --config files")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="verbose logging (upload paths, per-file pulls, "
+                             "kubectl commands, pod details)")
     parser.add_argument("--stop-file", default=None,
                         help="cooperative stop flag file (WebUI stop); a "
                              "SIGINT/SIGTERM/SIGBREAK also requests stop")
@@ -2886,6 +2940,8 @@ def main(args, cfg_paths):
     if stop_file:
         args.stop_file = stop_file
         set_stop_file(stop_file)
+    set_verbose(getattr(args, "verbose", False)
+                or os.environ.get("MC_BENCH_VERBOSE", "") == "1")
     cluster = load_json(args.cluster)
     if args.mode == "k8s":
         cluster["_controller"] = build_controller(cluster)
@@ -2899,6 +2955,18 @@ def main(args, cfg_paths):
     globals_cfg = load_json(args.global_cfg)
     if args.mode == "k8s":
         globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
+    # startup summary (mode, config paths, k8s settings)
+    log("mode={} dry_run={} cluster={} global={} profile={}".format(
+        args.mode, args.dry_run, os.path.relpath(args.cluster, ROOT),
+        os.path.relpath(args.global_cfg, ROOT),
+        os.path.relpath(args.profile, ROOT) if args.profile else "-"))
+    if args.mode == "k8s":
+        _ks = k8s_settings(cluster)
+        log("[k8s] settings: namespace={} image={} template={}".format(
+            _ks["namespace"], _ks["image"],
+            os.path.relpath(_pod_template_path(cluster), ROOT)))
+        log("[k8s] workspaces: controller={} pod={}".format(
+            _ks["controller_workspace"], _ks["pod_workspace"]))
     _validate_master_mode(globals_cfg)
     _STOP_CTX.update(cluster=cluster, globals_cfg=globals_cfg, args=args)
     _check_stop()

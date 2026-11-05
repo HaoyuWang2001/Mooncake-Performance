@@ -60,6 +60,8 @@ def _build_run_argv(body):
         if protocol not in ("tcp", "rdma", "ub"):
             raise ApiError(400, "protocol must be tcp|rdma|ub")
         argv += ["--protocol", protocol]
+    if flags.get("verbose"):
+        argv.append("--verbose")
     return [sys.executable, runmgr.BENCH] + argv
 
 
@@ -81,6 +83,8 @@ def _build_cleanup_argv(body):
     # standalone clean-up does not need profile/scenario configs
     argv = ["--" + mode, "--cluster", cluster, "--global", global_cfg,
             "--clean-up"]
+    if flags.get("verbose"):
+        argv.append("--verbose")
     return [sys.executable, runmgr.BENCH] + argv
 
 

@@ -434,6 +434,14 @@ env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），�
 `SETUP_UB_DEVICE` 由容器内 `urma_admin show` 自动探测（取首个 bonding_dev_*，
 仅 ub 协议时）；绑核相关变量不注入（容器不做 numactl）。
 
+**编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头。
+**verbose 开关**：CLI `--verbose`/`-v`、环境变量 `MC_BENCH_VERBOSE=1`、
+WebUI 运行框勾选 `verbose`。默认打印：启动摘要（mode/配置路径/k8s 设置）、
+workspace 创建、脚本 staging 目录与文件清单（upload → controller 路径）、
+ConfigMap 创建（ns + keys）、pod 创建/挂载/ready（含 k8s node 与耗时）、
+每个 stage 的 done rc/elapsed、日志拉取汇总（源→目标）。verbose 额外输出：
+逐文件上传大小、逐文件拉取、完整 kubectl 命令、失败时 `kubectl describe pod` 尾部。
+
 **client 启动环境快照**：每个 benchmark client 进程启动的最开始会打印一行
 `[client-env] pid=... argv=...`，包含 `POD_IP / NODE_NAME / LD_LIBRARY_PATH /
 SETUP_FABRIC_IP / MC_FABRIC_IP / MC_TCP_BIND_ADDRESS / SETUP_UB_DEVICE /

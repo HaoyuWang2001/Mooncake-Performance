@@ -29,7 +29,27 @@ import time
 
 
 def log(msg):
-    print("[benchmark] {}".format(msg), flush=True)
+    print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
+          flush=True)
+
+
+# --- verbose logging (CLI --verbose / env MC_BENCH_VERBOSE / WebUI toggle) ---
+_VERBOSE = False
+
+
+def set_verbose(enabled):
+    global _VERBOSE
+    _VERBOSE = bool(enabled)
+
+
+def verbose_enabled():
+    return _VERBOSE
+
+
+def log_detail(msg):
+    """Verbose-only log line (same timestamped format as log())."""
+    if _VERBOSE:
+        log(msg)
 
 
 # --- cooperative stop (WebUI stop file / Ctrl+C signals) -------------------
@@ -93,6 +113,14 @@ def controller_is_local(controller):
     return bool(controller.get("_local"))
 
 
+def controller_desc(controller):
+    """Human-readable controller destination for upload/pull logs."""
+    if controller_is_local(controller):
+        return "local"
+    return "{}@{}".format(controller.get("ssh_user", "root"),
+                          controller.get("ip", "?"))
+
+
 def _remote_path(path):
     """Controller/pod paths are POSIX; Windows orchestrators must not emit '\\'."""
     return str(path).replace("\\", "/")
@@ -115,6 +143,9 @@ def _controller_kubectl_argv(controller, args):
 def controller_run(controller, args, check=True, timeout=None):
     """Run kubectl on the controller; return (combined_output, rc)."""
     argv = _controller_kubectl_argv(controller, args)
+    if _VERBOSE:
+        log_detail("[k8s] $ {} {}".format(
+            controller_desc(controller), " ".join(str(a) for a in argv)))
     if controller_is_local(controller):
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
@@ -232,11 +263,18 @@ def controller_mkdir(controller, path):
 def controller_put(controller, local_files, remote_dir):
     """Copy local files into a controller directory (local copy or SFTP)."""
     controller_mkdir(controller, remote_dir)
+    desc = controller_desc(controller)
+    clean_dir = _remote_path(remote_dir)
+    for f in local_files:
+        base = os.path.basename(f)
+        log("[k8s] upload {} -> {}:{}".format(base, desc,
+                                              clean_dir.rstrip("/") + "/" + base))
+        log_detail("[k8s]   size: {} bytes".format(
+            os.path.getsize(f) if os.path.isfile(f) else "?"))
     if controller_is_local(controller):
         for f in local_files:
             shutil.copy2(f, os.path.join(remote_dir, os.path.basename(f)))
         return
-    remote_dir = _remote_path(remote_dir)
     sftp = _ssh_client(controller).open_sftp()
     try:
         for f in local_files:
@@ -509,8 +547,8 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         # then copy each file individually. A single missing non-glob path
         # raises (mimics scp failure semantics for guarded collectors).
         if dry_run:
-            log("[kcp] <- {} : {}".format(node["_pod"], remote_glob))
-            log("      (dry-run, skipped)")
+            log_detail("[kcp] <- {} : {}".format(node["_pod"], remote_glob))
+            log_detail("      (dry-run, skipped)")
             return
         listing = ssh_check_output(host, node,
                                    "ls -1 {} 2>/dev/null || true".format(remote_glob),
@@ -524,9 +562,9 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         if not dry_run:
             controller_mkdir(c, stage)
         for f in files:
-            log("[kcp] <- {} : {}".format(node["_pod"], f))
+            log_detail("[kcp] <- {} : {}".format(node["_pod"], f))
             if dry_run:
-                log("      (dry-run, skipped)")
+                log_detail("      (dry-run, skipped)")
                 continue
             if controller_is_local(c):
                 out, rc = controller_run(
@@ -542,6 +580,8 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                     controller_get_file(c, dst, local_dir)
             if rc != 0:
                 raise RuntimeError("kubectl cp pull failed for {}: {}".format(f, out.strip()[:300]))
+        log("[k8s] pulled {} files from pod {} -> {}".format(
+            len(files), node["_pod"], local_dir))
         return
     # SFTP cannot expand remote globs: list matching paths via exec, then
     # fetch each file (mirrors the k8s branch). A single missing non-glob
@@ -553,17 +593,20 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
     if not files and not any(c in remote_glob for c in "*?["):
         raise RuntimeError("scp pull failed: no such file on {}: {}".format(
             host, remote_glob))
-    log("[scp] <- {} : {}".format(host, remote_glob))
+    log_detail("[scp] <- {} : {}".format(host, remote_glob))
     if dry_run:
-        log("      (dry-run, skipped)")
+        log_detail("      (dry-run, skipped)")
         return
     os.makedirs(local_dir, exist_ok=True)
     sftp = _ssh_client(node).open_sftp()
     try:
         for f in files:
+            log_detail("[scp] <- {} : {}".format(host, f))
             sftp.get(f, os.path.join(local_dir, os.path.basename(f)))
     finally:
         sftp.close()
+    log("[ssh] pulled {} files from {} -> {}".format(
+        len(files), host, local_dir))
 
 
 def parse_data_size(data_size_str):

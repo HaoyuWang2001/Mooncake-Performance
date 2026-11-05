@@ -149,6 +149,7 @@ const PerfView = {
         <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
         <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
         <el-checkbox v-model="flags.noPlot">no-plot</el-checkbox>
+        <el-checkbox v-model="flags.verbose" title="详细日志：上传路径、逐文件拉取、kubectl 命令、pod 详情">verbose</el-checkbox>
         <el-select v-model="flags.protocol" size="small" style="width: 110px; margin-left: 12px">
           <el-option label="(协议=配置值)" value=""></el-option>
           <el-option label="tcp" value="tcp"></el-option>
@@ -254,7 +255,8 @@ const PerfView = {
     const treeRoots = Vue.ref([]);
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
-                                 protocol: "", cluster: "", global: "", profile: "" });
+                                 verbose: false, protocol: "", cluster: "",
+                                 global: "", profile: "" });
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
     const cleaning = Vue.ref(false);
@@ -341,7 +343,8 @@ const PerfView = {
           selector: { dirs: acc.dirs, files: acc.files },
           flags: { mode: mode.value,
                    dry_run: flags.dryRun, no_warmup: flags.noWarmup,
-                   no_plot: flags.noPlot, protocol: flags.protocol || null,
+                   no_plot: flags.noPlot, verbose: flags.verbose,
+                   protocol: flags.protocol || null,
                    cluster: flags.cluster, global: flags.global,
                    profile: flags.profile },
         });
