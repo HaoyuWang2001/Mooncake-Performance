@@ -619,6 +619,9 @@ python benchmark.py --k8s -f configs/basic/put.json
   实现，密码/密钥登录，无需外部 ssh/scp/sshpass 二进制，Windows 原生可用）；节点缺省走密钥
   登录（`ssh_key` 空 = 默认密钥 + ssh-agent），配 `passwd` 字段走密码登录（每节点独立，明文
   存于 cluster.json，已 gitignored）；
+- **k8s 预运行脚本**：`k8s-deployment/scripts/k8s-prerun.sh` 会在 benchmark
+  流程开始前在 controller 上执行一次（检查/导入镜像等自定义前置操作）；
+  返回非零即终止运行；standalone `--clean-up` 与 dry-run 不执行。
 - **k8s 通道额外前置**：
   - controller（`127.0.0.1` 可本地）有 `kubectl` + kubeconfig，具备
     **namespace/pod/configmap 的 create/delete** 权限；

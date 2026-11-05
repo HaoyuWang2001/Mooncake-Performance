@@ -66,7 +66,8 @@ k8s-deployment/
 │   └── benchmark-pod.yaml.tpl    # pod 模板（POD_NAME/IMAGE/NAMESPACE/RUN_LABEL/NODE_LABEL 占位 + ub 注释段）
 ├── scripts/
 │   ├── manual-basic.sh           # 手动一键 basic（含 base64 注入兜底）
-│   └── pod_lifecycle.sh          # create/wait/ip/delete-run/delete-all/list
+│   ├── pod_lifecycle.sh          # create/wait/ip/delete-run/delete-all/list
+│   └── k8s-prerun.sh             # controller 预运行脚本（检查/导入镜像等；benchmark 前执行一次，失败终止）
 ├── env.k8s.example.sh            # 手动 env.sh 模板
 └── cluster.k8s.example.json      # k8s 形态 cluster.json 模板
 ```

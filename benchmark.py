@@ -49,6 +49,7 @@ except ImportError:  # profiling dir missing -> feature silently off
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
+K8S_PRERUN = os.path.join(ROOT, "k8s-deployment", "scripts", "k8s-prerun.sh")
 
 # --- cooperative stop context (WebUI stop file / Ctrl+C) -------------------
 _STOP_CTX = {}
@@ -604,9 +605,9 @@ def k8s_workspace_dirs(cluster, dry_run=False):
 
 def k8s_prerun(cluster, dry_run=False):
     """Run the user-maintained pre-run script on the controller (k8s only).
-    File: configs/_k8s/k8s-prerun.sh — absent/empty => silently skip.
+    File: k8s-deployment/scripts/k8s-prerun.sh — absent => silently skip.
     Non-zero rc => RuntimeError (abort the benchmark)."""
-    script = os.path.join(CONFIGS_DIR, "_k8s", "k8s-prerun.sh")
+    script = K8S_PRERUN
     if not os.path.isfile(script):
         return
     k8s = k8s_settings(cluster)
