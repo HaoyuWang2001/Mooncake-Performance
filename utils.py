@@ -365,6 +365,21 @@ def controller_remove(controller, path):
     _ssh_exec(controller, "rm -rf " + shlex.quote(_remote_path(path)))
 
 
+def controller_exec(controller, command):
+    """Run a raw shell command on the controller (not kubectl).
+    Returns (combined_output, rc)."""
+    if controller_is_local(controller):
+        try:
+            proc = subprocess.run(["bash", "-c", command],
+                                  capture_output=True, text=True,
+                                  env=_controller_env(controller))
+            return (proc.stdout or "") + (proc.stderr or ""), proc.returncode
+        except FileNotFoundError:
+            raise RuntimeError("bash not found (controller local)")
+    out, rc = _ssh_exec(controller, command + " 2>&1")
+    return out, rc
+
+
 def get_node(cluster, name):
     node = cluster.get("nodes", {}).get(name)
     if node is None:

@@ -205,3 +205,54 @@ if __name__ == "__main__":
             if len(sig.parameters) == 0:
                 fn()
     print("PASS test_k8s_config")
+
+
+def test_k8s_prerun_skip_when_absent(tmp_path, monkeypatch):
+    """No script file -> k8s_prerun silently returns (no error, no log)."""
+    c = _cluster()
+    c["_controller"] = bm.build_controller(c)
+    # point CONFIGS_DIR at a temp dir without k8s-prerun.sh
+    orig = bm.CONFIGS_DIR
+    monkeypatch.setattr(bm, "CONFIGS_DIR", str(tmp_path))
+    try:
+        bm.k8s_prerun(c, dry_run=False)  # should not raise
+    finally:
+        monkeypatch.setattr(bm, "CONFIGS_DIR", orig)
+
+
+def test_k8s_prerun_failure_aborts(tmp_path, monkeypatch):
+    """Script returns non-zero -> RuntimeError."""
+    import utils as u
+    c = _cluster()
+    c["_controller"] = bm.build_controller(c)
+    d = tmp_path / "_k8s"
+    d.mkdir()
+    (d / "k8s-prerun.sh").write_text("#!/bin/bash\nexit 1\n")
+    orig = bm.CONFIGS_DIR
+    monkeypatch.setattr(bm, "CONFIGS_DIR", str(tmp_path))
+    monkeypatch.setattr(bm, "controller_put", lambda *a, **k: None)
+    monkeypatch.setattr(bm, "controller_exec", lambda c, cmd: ("fail", 1))
+    try:
+        bm.k8s_prerun(c, dry_run=False)
+        raise AssertionError("should have raised")
+    except RuntimeError as exc:
+        assert "pre-run" in str(exc)
+    finally:
+        monkeypatch.setattr(bm, "CONFIGS_DIR", orig)
+
+
+def test_k8s_prerun_success(tmp_path, monkeypatch):
+    """Script returns 0 -> no exception."""
+    c = _cluster()
+    c["_controller"] = bm.build_controller(c)
+    d = tmp_path / "_k8s"
+    d.mkdir()
+    (d / "k8s-prerun.sh").write_text("#!/bin/bash\nexit 0\n")
+    orig = bm.CONFIGS_DIR
+    monkeypatch.setattr(bm, "CONFIGS_DIR", str(tmp_path))
+    monkeypatch.setattr(bm, "controller_put", lambda *a, **k: None)
+    monkeypatch.setattr(bm, "controller_exec", lambda c, cmd: ("ok", 0))
+    try:
+        bm.k8s_prerun(c, dry_run=False)  # should not raise
+    finally:
+        monkeypatch.setattr(bm, "CONFIGS_DIR", orig)

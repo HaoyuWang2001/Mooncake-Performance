@@ -31,7 +31,8 @@ import urllib.parse
 
 from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    clear_stop, controller_desc, controller_diagnose,
-                   controller_mkdir, controller_put, controller_remove,
+                   controller_exec, controller_mkdir, controller_put,
+                   controller_remove,
                    controller_run, controller_stream, get_node, is_k8s_node,
                    kubectl_exec_line, kubectl_prefix, load_json, log,
                    log_detail, parse_data_size, percentile,
@@ -599,6 +600,34 @@ def k8s_workspace_dirs(cluster, dry_run=False):
     log("[k8s] workspace ready on {}: {} ({})".format(
         controller_desc(c), root, ",".join(subs)))
     return root
+
+
+def k8s_prerun(cluster, dry_run=False):
+    """Run the user-maintained pre-run script on the controller (k8s only).
+    File: configs/_k8s/k8s-prerun.sh — absent/empty => silently skip.
+    Non-zero rc => RuntimeError (abort the benchmark)."""
+    script = os.path.join(CONFIGS_DIR, "_k8s", "k8s-prerun.sh")
+    if not os.path.isfile(script):
+        return
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    remote_path = posixpath.join(k8s["controller_workspace"],
+                                 "k8s-prerun.sh")
+    if dry_run:
+        log("[k8s] (dry-run) would run pre-run script -> {}:{}".format(
+            controller_desc(c), remote_path))
+        return
+    log("[k8s] pre-run script: {} -> {}:{}".format(
+        os.path.relpath(script, ROOT), controller_desc(c), remote_path))
+    controller_put(c, [script], k8s["controller_workspace"])
+    log("[k8s] prerun: bash {}".format(remote_path))
+    t0 = time.time()
+    out, rc = controller_exec(c, "bash " + remote_path)
+    log("[k8s] pre-run done rc={} elapsed={:.1f}s".format(
+        rc, time.time() - t0))
+    if rc != 0:
+        raise RuntimeError("k8s pre-run script failed (rc={}): {}".format(
+            rc, out.strip()[:400]))
 
 
 def reap_k8s_namespaces(cluster):
@@ -3014,6 +3043,7 @@ def main(args, cfg_paths):
         log("results root: {}".format(ts_dir))
     if args.mode == "k8s":
         k8s_workspace_dirs(cluster, dry_run=args.dry_run)
+        k8s_prerun(cluster, dry_run=args.dry_run)
         ensure_k8s_namespace(cluster, ts, dry_run=args.dry_run)
         if not args.dry_run:
             def _ns_atexit():
