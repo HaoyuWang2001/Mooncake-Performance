@@ -49,6 +49,16 @@ source "$ENV_FILE"
 # -f guard keeps the script working without the file (local ad-hoc runs).
 # Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
 [ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
+
+# Print the inherited transport/env snapshot before each client starts.
+print_client_env() {
+  printf '[client-env] %s POD_IP=%s NODE_NAME=%s LD_LIBRARY_PATH=%s SETUP_FABRIC_IP=%s MC_FABRIC_IP=%s MC_TCP_BIND_ADDRESS=%s SETUP_UB_DEVICE=%s MC_URMA_TRANS_MODE=%s SETUP_PROTOCOL=%s\n' \
+    "$1" \
+    "${POD_IP:-<unset>}" "${NODE_NAME:-<unset>}" "${LD_LIBRARY_PATH:-<unset>}" \
+    "${SETUP_FABRIC_IP:-<unset>}" "${MC_FABRIC_IP:-<unset>}" \
+    "${MC_TCP_BIND_ADDRESS:-<unset>}" "${SETUP_UB_DEVICE:-<unset>}" \
+    "${MC_URMA_TRANS_MODE:-<unset>}" "${SETUP_PROTOCOL:-<unset>}"
+}
 # Collect passthrough args; extract script-level flags (--num-clients and
 # --client-binds are consumed here and NOT forwarded to the client).
 NUM_CLIENTS=1
@@ -144,6 +154,7 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
     START=$(( (i - 1) * KEY_COUNT / NUM_CLIENTS ))
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
     bind_launch "$i"
+    print_client_env "client-id=$i mode=$MODE"
     # per-client ylt easylog file (absolute path; merged below with headers)
     MC_YLT_LOG_PATH="$LOG_DIR/client.$i.ylt.log" \
     ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" \
@@ -181,6 +192,7 @@ else
     LAUNCH_CMD=()
     BIND_ARGS=""
   fi
+  print_client_env "client-id=1 mode=$MODE"
   MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
   ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" --mode "$MODE" ${BIND_ARGS} "${ARGS[@]}" \
     > "$LOG_FILE" 2>&1 &

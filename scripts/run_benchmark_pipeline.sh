@@ -45,10 +45,20 @@ source "$ENV_FILE"
 # Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
 [ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
 
+print_client_env() {
+  printf '[client-env] %s POD_IP=%s NODE_NAME=%s LD_LIBRARY_PATH=%s SETUP_FABRIC_IP=%s MC_FABRIC_IP=%s MC_TCP_BIND_ADDRESS=%s SETUP_UB_DEVICE=%s MC_URMA_TRANS_MODE=%s SETUP_PROTOCOL=%s\n' \
+    "$1" \
+    "${POD_IP:-<unset>}" "${NODE_NAME:-<unset>}" "${LD_LIBRARY_PATH:-<unset>}" \
+    "${SETUP_FABRIC_IP:-<unset>}" "${MC_FABRIC_IP:-<unset>}" \
+    "${MC_TCP_BIND_ADDRESS:-<unset>}" "${SETUP_UB_DEVICE:-<unset>}" \
+    "${MC_URMA_TRANS_MODE:-<unset>}" "${SETUP_PROTOCOL:-<unset>}"
+}
+
 PYTHON="${ORCH_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
 
+print_client_env "mode=$MODE"
 MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
 "$PYTHON" "$CLIENT" --mode "$MODE" "$@" \
   > "$LOG_FILE" 2>&1

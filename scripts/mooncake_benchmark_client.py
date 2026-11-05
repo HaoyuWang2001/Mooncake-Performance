@@ -111,6 +111,17 @@ def unbuffer_stdio():
     except Exception:
         pass
 
+# Environment snapshot printed once at process start (per client), before
+# argparse / SDK import. <unset> keeps missing values explicit.
+_ENV_LOG_KEYS = ("POD_IP", "NODE_NAME", "LD_LIBRARY_PATH", "SETUP_FABRIC_IP",
+                 "MC_FABRIC_IP", "MC_TCP_BIND_ADDRESS", "SETUP_UB_DEVICE",
+                 "MC_URMA_TRANS_MODE", "SETUP_PROTOCOL")
+
+
+def env_snapshot():
+    return " ".join("{}={}".format(k, os.environ.get(k, "<unset>"))
+                    for k in _ENV_LOG_KEYS)
+
 
 # --- NUMA / CPU affinity binding ------------------------------------------
 
@@ -1475,6 +1486,8 @@ def _resolve_env(args):
         args.timeout = int(os.environ.get("BENCH_TIMEOUT", "300"))
 def main():
     unbuffer_stdio()
+    log("[client-env] pid={} argv={} {}".format(
+        os.getpid(), " ".join(sys.argv[1:]), env_snapshot()))
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
     parser.add_argument("--mode", required=True, choices=["generate-data", "remove-keys", "prepare-store", "benchmark", "pipeline"])
     parser.add_argument("--scope", default="key-prefix", choices=["key-prefix", "full"])

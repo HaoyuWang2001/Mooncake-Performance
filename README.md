@@ -434,6 +434,12 @@ env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），�
 `SETUP_UB_DEVICE` 由容器内 `urma_admin show` 自动探测（取首个 bonding_dev_*，
 仅 ub 协议时）；绑核相关变量不注入（容器不做 numactl）。
 
+**client 启动环境快照**：每个 benchmark client 进程启动的最开始会打印一行
+`[client-env] pid=... argv=...`，包含 `POD_IP / NODE_NAME / LD_LIBRARY_PATH /
+SETUP_FABRIC_IP / MC_FABRIC_IP / MC_TCP_BIND_ADDRESS / SETUP_UB_DEVICE /
+MC_URMA_TRANS_MODE / SETUP_PROTOCOL`（未设置为 `<unset>`）；runner 在启动每个
+client 前也会 echo 同样的快照（实时进入编排日志）。
+
 ### 7.2.1 scripts/env.mooncake.sh（手工调优面板）
 
 mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`（git 跟踪，手工编辑），
