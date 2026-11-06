@@ -376,8 +376,8 @@ k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口
 `{{MC_ROLE_LABEL}}`、`{{MC_CONFIGMAP_NAME}}`、`{{MC_SCRIPTS_MOUNT}}`、`{{MC_WORKDIR_MOUNT}}`。
 模板硬性要求：容器常驻（`sleep infinity`）、downward API 提供 `POD_IP`、
 `scripts` ConfigMap 卷 + `workdir` emptyDir 卷、labels（`app/run/role`）、
-默认不设 `nodeSelector`（调度到全部可用节点）；如需限定节点，在模板中自行添加
-`nodeSelector`。`imagePullPolicy`/resources/UB device plugin 按集群自行维护。
+默认不设 `nodeSelector`（使用全部可用节点）。`imagePullPolicy`/resources/UB
+device plugin 按集群自行维护。
 `RUN_LABEL` = `<ts>-<cfg>`（写 `labels.run`，用于清理）；`ROLE_LABEL` 是 pod 的逻辑角色
 （如 `client-0`），**不是** k8s 节点名。
 
