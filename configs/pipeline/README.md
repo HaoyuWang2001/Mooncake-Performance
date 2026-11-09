@@ -1,7 +1,18 @@
 # configs/pipeline — 精排/召排（生产-消费）配置
 
-writer 按 QPS 写入并通知随机 reader 子集，reader 消费读取。配置按
-**reader 参与节点数 → work_mode** 两级目录组织，每层 `_configs.json` 逐层继承。
+writer 按 QPS 写入并通知随机 reader 子集，reader 消费读取。
+
+**运行架构（etcd rendezvous）**：reader 自注册进 etcd（`mcbench/<run_id>/readers/<i>`）
+→ 编排器等全部 reader 就绪 → writer 从 etcd 拉全量 reader 列表并注册自身 → 编排器
+HTTP `/start` 统一触发 → warmup + 测量。要求 global.json `etcd_endpoints` 非空
+（与 master_type 无关，同一 etcd 兼作协调面）；屏障超时 `rendezvous_timeout_s`（默认 120）。
+
+**面向集群**：不再按角色指定节点（`client_nodes` 已删除）。writer/reader 进程数 =
+`count_per_node × N`，N = cluster.json 全部节点（SSH）/ 全部 Ready 节点（k8s，master 计入；
+每角色一个 Deployment，pod=进程，全部同角色 pod 用同一端口）。目录 `1/2/4-nodes/`
+为历史档位归档，n{N} 仅作标注。
+
+配置按 **档位 → work_mode** 两级目录组织，每层 `_configs.json` 逐层继承。
 
 ## 目录结构与继承链
 
@@ -11,7 +22,7 @@ configs/pipeline/
 ├── README.md
 ├── demo/                       # 冒烟（--config-dir configs/pipeline/demo，自带全字段）
 ├── 1-nodes/                    # reader 侧 1 个节点
-│   ├── _configs.json           # writer/reader 骨架（client_nodes 按层）
+│   ├── _configs.json           # writer/reader 骨架（count_per_node 等）
 │   ├── rank/_configs.json      # work_mode=rank + base_qps=105 + data_size
 │   ├── rank/   (24 用例)
 │   ├── recall/_configs.json    # work_mode=recall + base_qps=35 + 常量字段 + data_size
@@ -55,7 +66,7 @@ configs/pipeline/
 | `count_per_node` | 每节点 writer 进程数 |
 | `operation` | 写接口，可选值见下表 |
 | `notify_threads` | notify 发送线程池大小 |
-| `client_nodes` | writer 部署节点列表（每节点启动 count_per_node 个进程） |
+| `port_base` | writer HTTP `/start` 触发端口段，默认 9101；节点内编号（第 i 个进程用 port_base+i；k8s 全部 pod 同端口） |
 
 **writer.operation 可选值**：
 
@@ -72,7 +83,7 @@ configs/pipeline/
 | `count_per_node` | 每节点 reader 进程数（池 = count_per_node × 节点数，须 ≥ notify_count） |
 | `operation` | 读接口，可选值见下表 |
 | `num_threads` | 单进程消费线程数 |
-| `client_nodes` | reader 部署节点列表 |
+| `port_base` | reader HTTP `/notify` 端口段，默认 9201；节点内编号（第 i 个进程用 port_base+i；k8s 全部 pod 同端口） |
 
 **reader.operation 可选值**：
 
@@ -99,10 +110,10 @@ configs/pipeline/
 | 层 | 字段 |
 | --- | --- |
 | 根基座 `_configs.json` | `scenario` / `protocol` / `key_prefix` / `notify_pipeline` / `warmup` / `duration` / `batch_size` |
-| x-nodes 层 `_configs.json` | `writer{count_per_node, operation, client_nodes}` + `reader{operation, num_threads, client_nodes}`（client_nodes 按层：writer_node1 + reader_node1..K） |
+| x-nodes 层 `_configs.json` | `writer{count_per_node, operation}` + `reader{operation, num_threads}`（集群面向：进程数 = count_per_node × N，N 为 cluster 全部节点数） |
 | rank 层 `_configs.json` | `work_mode` / `base_qps` / `data_size` |
 | recall 层 `_configs.json` | `work_mode` / `base_qps` / `notify_count` / `writer.notify_threads` / `reader.count_per_node` / `data_size` |
-| rank 用例 | `traffic_mode` / `qps_multiple` / `notify_count` / `writer.notify_threads`（2w 双写档另覆盖 `writer.client_nodes`）/ `reader.count_per_node` |
+| rank 用例 | `traffic_mode` / `qps_multiple` / `notify_count` / `writer.notify_threads` / `reader.count_per_node` |
 | recall 用例 | `traffic_mode` / `qps_multiple` |
 | `demo/` | 自带全字段（不参与继承链） |
 
@@ -126,8 +137,8 @@ reader 池 = count_per_node × 节点数 ≥ notify_count。每档跑 pulse/bala
 | `traffic_mode` | pulse/balanced | pulse/balanced | 脉冲（每秒窗口突发）/ 均衡（匀速节流） |
 | `notify_count` | =档位读者数 | 1 | 每批写后随机通知的 reader 数 |
 | `writer.notify_threads` | =notify_count | 1 | notify 发送线程池 |
-| `writer.count_per_node` / client_nodes | 1 / [writer_node1] | 同左 | 2w10r 档用例显式双写节点 |
-| `reader.count_per_node` / client_nodes | 按档位表 | 1 / 按 tier | 部署拓扑 |
+| `writer.count_per_node` | 1 | 同左 | 2w10r 档为 2（每节点） |
+| `reader.count_per_node` | 按档位表 | 1 | 池 = cpn × N |
 | `reader.operation` / `num_threads` | get / 1 | get / 1 | 层基座固定（可选值语义见「配置总览」） |
 | `data_size` | ["8MB"] | ["3.5MB"] | 每 size 完整跑一轮写读流水 |
 

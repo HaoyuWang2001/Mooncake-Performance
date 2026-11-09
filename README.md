@@ -121,7 +121,7 @@ basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字
 reader 侧节点数归档进 `1-nodes/`、`2-nodes/`、`4-nodes/`，其下再按 work_mode 分 `rank/` 与
 `recall/` 子目录。每层 `_configs.json` 逐层继承：根基座（scenario/protocol/key_prefix/
 notify_pipeline/warmup/duration/batch_size，不含 data_size/writer/reader/numa_bind）→
-x-nodes 层（writer/reader 骨架，client_nodes 按层配置）→ rank|recall 层（work_mode、
+x-nodes 层（writer/reader 骨架：count_per_node/operation 等）→ rank|recall 层（work_mode、
 base_qps、data_size；recall 另含 notify_count/writer.notify_threads/reader.count_per_node）→
 用例（rank：traffic_mode/qps_multiple/notify_count/writer.notify_threads/reader.count_per_node，
 5 字段；recall：traffic_mode/qps_multiple，2 字段）。numa_bind 属全局配置（global.json，
@@ -140,9 +140,9 @@ rank|recall 层，直接指向叶子目录最精准（如 `--config-dir configs/
 | `traffic_mode` | `balanced`=均衡（按 QPS 均匀节流）/ `pulse`=脉冲（每秒窗口集中突发） | 两者皆测 | 两者皆测 |
 | `base_qps` | 基准写入 QPS | 105 | 35 |
 | `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
-| `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
-| `writer` | `{count_per_node, operation, notify_threads, client_nodes}`：每节点 writer 数 / 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / 部署节点 | cpn=1（notify_threads=notify_count） | cpn=1 |
-| `reader` | `{count_per_node, operation, num_threads, client_nodes}`：每节点 reader 数（池 = cpn×节点数，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / 部署节点 | 见下方档位表 | 恒 1 |
+| `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数；须 ≤ reader 池 cpn×N） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
+| `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101） | cpn=1（notify_threads=notify_count） | cpn=1 |
+| `reader` | `{count_per_node, operation, num_threads, port_base}`：每节点 reader 数（池 = cpn×N，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / HTTP /notify 端口段（默认 9201） | 见下方档位表 | 恒 1 |
 | `data_size` | **必填，数组形式**：逐个 size 循环，每个 size 完整跑一轮写读流水（value.bin 自动按尺寸重建）；单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` | `["8MB"]` | `["3.5MB"]` |
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
@@ -163,11 +163,27 @@ store 节点由 **global.json 的 `mooncake_store_nodes`**（cluster.json 节点
 各场景配置**不再携带 store_node**；该列表仅用于指标行的 local/remote 拓扑标注（local = 该节点 ∈
 store 节点列表），实际通信仍经 master 发现 store。
 
-- **部署语义**：writer/reader 各自在 client_nodes 的**每个节点**启动 count_per_node 个进程（节点列表
-  正序）；writer 全局编号按节点正序，reader 端口 9201..9200+池大小；节点按角色命名（`writer_nodeX` /
-  `reader_nodeX`，见 cluster 配置）；**n{N} 表示 reader 侧参与节点数**（reader_node1..N），writer 数由
-  家族名固定：1w 家族仅 `writer_node1`（1 个 writer），2w 家族为 `writer_node1,2`（2 个 writer，
-  与 n 无关）；
+- **面向集群（N 语义）**：不再配置 writer/reader 的部署节点（`client_nodes` 字段已删除）。编排器按
+  **整个集群**部署：writer 总数 = `writer.count_per_node × N`、reader 池 = `reader.count_per_node × N`，
+  其中 **N = SSH 通道 cluster.json 全部 nodes / k8s 通道全部 Ready 节点**（master 也计入——该部署上
+  master 参与压测）。配置文件名里的 `n{N}` 是历史归档语义（原 reader 侧节点数），现仅作档位标注。
+  **端口段可配**：`writer.port_base`（默认 9101，writer HTTP /start 触发端口）与
+  `reader.port_base`（默认 9201，reader HTTP /notify 端口）；端口按**节点内编号**分配——每节点
+  第 i 个进程用 `port_base + i`（k8s 下每个 pod 独立网络命名空间，**全部 pod 用同一端口
+  port_base**）；
+- **etcd rendezvous 架构**（取代旧的 reader IP 手工注入）：① 各 reader 进程自选端口绑听
+  HTTP `/notify` 服务并**自注册**到 etcd（`mcbench/<run_id>/readers/<index>` = host/port/node，
+  host 优先 POD_IP、兜底 SETUP_FABRIC_IP）；② 编排器轮询 etcd 等**全部 reader 就绪**；③ 各
+  writer 从 etcd **拉取全量 reader 列表**后注册自身（`writers/<gid>` = 其 /start 地址）；
+  ④ 编排器等全部 writer 就绪后**逐个 POST HTTP `/start` 触发**（k8s 直连 pod IP / SSH 节点内
+  回环 curl，秒级完成，对 30s+ 压测窗口无影响）；⑤ writer 统一起跑（先 warmup 后测量）。
+  屏障超时 = global.json `rendezvous_timeout_s`（默认 120s）。键前缀无 TTL，靠清理保证：
+  运行启动清整个 `mcbench/`、每 size/场景结束/失败/STOP 清 `run_id` 前缀；
+- **k8s 通道（pipeline 已支持）**：每角色一个 **Deployment**（`benchmark-deployment.yaml.tpl`
+  渲染；pod=进程、replicas=count_per_node×N、`topologySpreadConstraints` maxSkew=1 软均匀
+  分布、Recreate 不自动补副本）；pod 内仍 `sleep infinity` + `kubectl exec` 启动进程（脚本经
+  ConfigMap 挂载，与 basic 同机制）；**注意 k8s 全部同角色 pod 监听同一端口**（每 pod 独立
+  网络命名空间）；
 - **负载语义**：总写入 QPS = base_qps × qps_multiple，由全部 writer（cpn × 节点数）均分（2w 家族
   双 writer 各半即原系统 "105/2" 语义，总量守恒；小数速率由窗口预算累积保证长期精确）；
 - **扇出语义**：每批写入后从 reader 池随机选 notify_count 个 reader，单次 HTTP 请求携带整批 key
@@ -187,7 +203,8 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **指标输出**：每个 writer 一行、每 writer 聚合一行、每个 reader 一行、全 reader 聚合一行
   （instance=TOTAL），`role/node/instance/topology` 列区分；
 - **FAIL 处理**：场景失败时先优雅 shutdown reader（使其落盘 SUMMARY/RESULT）→ kill 残留进程 → 
-  拉取全部远程日志，再继续后续场景（端口随进程结束释放，避免级联失败）；
+  拉取全部远程日志，再继续后续场景（端口随进程结束释放，避免级联失败）；k8s 通道失败保留
+  pod/Deployment 与 namespace 供排查（打印 exec/describe 命令），STOP / `--clean-up` 收场；
 - **运行**：
 
 ```
@@ -397,7 +414,8 @@ device plugin 按集群自行维护。
 | --- | --- |
 | master_type | **必填**，选择连接 mooncake master 的方式：`"etcd"`（走 etcd_endpoints）或 `"http"`（走 master_addr） |
 | venv | 选用 cluster.json `venvs` 中的**名称**（如 `"mooncake-benchmark"`）；留空且仅一条时自动取用 |
-| etcd_endpoints | **etcd 模式**：经 etcd 连接 master 的完整 URI，如 `etcd://192.168.84.151:2379;192.168.84.149:2379`（分号分隔多节点）。`master_type="etcd"` 时必须非空；客户端把该 URI 原样传给 `setup` 的 `metadata_server` 与 `master_server_addr` |
+| etcd_endpoints | **etcd 模式**：经 etcd 连接 master 的完整 URI，如 `etcd://192.168.84.151:2379;192.168.84.149:2379`（分号分隔多节点）。`master_type="etcd"` 时必须非空；客户端把该 URI 原样传给 `setup` 的 `metadata_server` 与 `master_server_addr`。**pipeline 场景必填**（与 master_type 无关）：同一 etcd 兼作 rendezvous 协调面（reader 注册 / writer 发现 / start 触发，见 3.3）；要求 etcd client 端口开放**明文 HTTP gRPC gateway**（标准 etcd 部署默认开启） |
+| rendezvous_timeout_s | pipeline rendezvous 屏障超时（等 reader 注册 / 等 writer 就绪），默认 120 秒；超时报错并列出已注册/缺失清单 |
 | master_addr | **http 模式**：mooncake_master rpc 地址（必须用内网高性能网卡 IP），如 `192.168.84.151:50051`；`master_type="http"` 时必须非空 |
 | metadata_server | **http 模式**：`setup` 的 metadata_server 参数，如 `http://192.168.84.151:9999/metadata`（master 的 HTTP 元数据端口，必须用内网 IP）；可省略，默认 `http://{master_addr}/metadata` |
 | protocol.ub.device | ub 设备名；`"auto"`（或空）= 运行期 `urma_admin` 自动探测首个 `bonding_dev_*`；也可显式指定（如 `bonding_dev_0`），显式时不再探测 |
@@ -616,7 +634,7 @@ configs/
 ```bash
 # 真机通道（默认，缺省旗标兼容旧行为）
 python benchmark.py -f configs/basic/put.json
-# k8s 通道（basic 场景；pipeline 暂不支持）
+# k8s 通道（basic：每配置一个 pod；pipeline：每角色一个 Deployment，pod=进程）
 python benchmark.py --k8s -f configs/basic/put.json
 ```
 
