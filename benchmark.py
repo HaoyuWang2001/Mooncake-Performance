@@ -1580,14 +1580,12 @@ def _pipeline_wipe_etcd(cluster, globals_cfg):
 
 def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
     """POST to a pipeline process's HTTP endpoint (writer /start, reader
-    /shutdown). k8s pods are directly reachable by pod IP from the
-    orchestrator; ssh nodes curl loopback ON the node itself (the fabric
-    network may not be routable from the orchestrator). Returns True on
-    HTTP 200 (k8s path raises on connection/HTTP errors)."""
-    if is_k8s_node(node_entry):
-        http_probe("http://{}:{}{}".format(node_entry["ip"], port, path),
-                   method="POST", timeout=timeout)
-        return True
+    /shutdown) by curling LOOPBACK ON THE NODE ITSELF. The node transport
+    dispatches automatically: ssh nodes run curl over the ssh connection,
+    k8s pods run it via kubectl exec inside the pod. The orchestrator host
+    must NEVER be assumed to reach pod IPs / fabric IPs directly — it sits
+    outside those networks on real clusters (a direct http_probe to the
+    pod IP times out there). Returns True on HTTP 200."""
     url = "http://127.0.0.1:{}{}".format(port, path)
     cmd = ("curl -s --noproxy '*' --connect-timeout 2 --max-time {} "
            "-X POST -o /dev/null -w '%{{http_code}}' {}").format(timeout, url)

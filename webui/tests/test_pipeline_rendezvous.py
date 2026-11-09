@@ -239,3 +239,34 @@ def test_render_deployment_yaml_structure():
         "Deployment pod template restartPolicy must be Always")
     assert "{{MC_" not in text
     assert "replicas: 4" in text and "role: client" in text
+
+
+def test_pipeline_http_call_always_loops_back_via_node(monkeypatch):
+    """Pipeline HTTP calls (/start, /shutdown) must curl 127.0.0.1 ON THE
+    NODE ITSELF — the transport (ssh / kubectl exec) carries the command.
+    The orchestrator host must never be assumed to reach pod IPs directly:
+    a real cluster sat outside the pod network and every direct probe
+    timed out."""
+    calls = {}
+
+    def fake_ssh(ip, node, cmd, dry_run=False, quiet=False):
+        calls["cmd"] = cmd
+        calls["ip"] = ip
+        return "200"
+
+    monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
+    # a k8s pod node entry: is_k8s_node -> dispatches via kubectl exec
+    pod_node = {"kind": "k8s-pod", "_pod": "mc-x-client-0", "_ns": "ns",
+                "ip": "192.168.83.76", "_controller": {}}
+    assert bm._pipeline_http_call(pod_node, 9301, "/start") is True
+    assert "127.0.0.1:9301/start" in calls["cmd"]
+    assert "192.168.83.76" not in calls["cmd"], (
+        "must not target the pod IP from the orchestrator")
+    # ssh node: same loopback command over ssh
+    ssh_node = {"ip": "10.1.1.5"}
+    assert bm._pipeline_http_call(ssh_node, 9201, "/shutdown") is True
+    assert "127.0.0.1:9201/shutdown" in calls["cmd"]
+    # non-200 -> False
+    monkeypatch.setattr(bm, "ssh_check_output",
+                        lambda ip, node, cmd, dry_run=False, quiet=False: "503")
+    assert bm._pipeline_http_call(ssh_node, 9201, "/shutdown") is False
