@@ -144,6 +144,10 @@ const PerfView = {
                      :label="m.path || m" :value="m.path || m"></el-option>
         </el-select>
       </div>
+      <div v-if="mode === 'k8s'" class="rb-row" style="margin-top: 2px">
+        <span class="rb-label">image</span>
+        <span :title="clusterImage" style="font-family: monospace; color: #606266">{{ clusterImage || "-" }}</span>
+      </div>
       <div class="rb-row">
         <span class="rb-label">选项</span>
         <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
@@ -261,6 +265,7 @@ const PerfView = {
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
     const cleaning = Vue.ref(false);
+    const clusterImage = Vue.ref("");
 
     // 最终选择（与 startRun 提交内容一致）：勾目录=收编该目录并停止下钻
     const selected = Vue.computed(() => {
@@ -299,6 +304,18 @@ const PerfView = {
       return { name: treeNode.name, path: treeNode.path, isDir: true,
                checked: false, count: _perfTreeCount(treeNode), children };
     }
+
+    async function loadClusterImage() {
+      clusterImage.value = "";
+      const p = flags.cluster || "";
+      if (mode.value !== "k8s" || !p) return;
+      try {
+        const r = await api("GET", "/api/config?path=" + encodeURIComponent(p));
+        const obj = typeof r.content === "string" ? JSON.parse(r.content) : r.content;
+        clusterImage.value = (obj && obj.k8s && obj.k8s.image) || "";
+      } catch (e) { clusterImage.value = ""; }
+    }
+    Vue.watch([() => flags.cluster, () => mode.value], loadClusterImage);
 
     async function loadConfigs() {
       try {
@@ -498,7 +515,7 @@ const PerfView = {
     }
 
     let timer = null, histTimer = null;
-    Vue.onMounted(() => { loadConfigs(); refreshRuns(); });
+    Vue.onMounted(() => { loadConfigs().then(loadClusterImage); refreshRuns(); });
     Vue.onActivated(() => {
       loadConfigs();
       refreshRuns();
@@ -508,7 +525,7 @@ const PerfView = {
     Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
     return { mode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
-             flags, warnings, starting, cleaning, busy, clearSel, startRun, cleanup,
+             flags, warnings, starting, cleaning, busy, clusterImage, clearSel, startRun, cleanup,
              meta, logLines, logEl, logH, runs, stopping, drawerOpen, viewingHistory,
              statusType, stop, gotoResults, onHistoryClick };
   },
