@@ -932,41 +932,14 @@ def _self_node():
 
 def _rendezvous_prefix(args):
     return "mcbench/{}/".format(args.run_id)
-def _pipeline_writer(args, store, do_warmup=True):
-    """Writer process: write keys at target_qps, notify a random subset of readers.
-
-    Optionally runs a warmup phase first: the SAME deployment shape (same
-    pacing, same notify path) for warmup_duration seconds to activate the
-    writer->store, writer->reader and reader->store connections. Warmup
-    writes carry a warmup=1 flag so readers process them without recording.
-    """
-    value = load_value(args.remote_data_dir, args.scenario)
-    batch_keys = max(1, args.batch_size)
-    prefix = args.key_prefix
-    scenario = args.scenario
-    writer_id = args.client_id
-    writer_op = args.operation or "put_batch"
-    if writer_op not in PUT_IFACE_DEFS:
-        raise SystemExit("[ERROR] unsupported writer operation: {}".format(writer_op))
-    effective_writer_op = (
-        "put" if writer_op == "put_batch" and batch_keys == 1 else writer_op
-    )
-    if effective_writer_op != writer_op:
-        log("pipeline writer batch_size=1: using put instead of put_batch")
-    ctx = None
-    if effective_writer_op == "put_from":
-        ctx = _BufferCtx(len(value))
-        if not ctx.setup(store):
-            raise SystemExit("[ERROR] writer register_buffer failed")
-    duration = float(args.duration)
-    warmup_duration = float(getattr(args, "warmup_duration", 0) or 0)
-    target_qps = float(args.target_qps) if args.target_qps > 0 else 0
-    traffic_mode = args.traffic_mode
+def _discover_readers(args, expected, who):
+    """Pull the FULL reader list from etcd (readers self-registered) and
+    block until `expected` entries exist. Shared by --role writer and
+    --role both; replaces the old manually injected --peers argv."""
     # ---- rendezvous: pull the FULL reader list from etcd (readers were
     # started first and self-registered). This replaces the old manually
     # injected --peers argv. Registration happens only after the list is
     # complete, so a registered writer == fully prepared writer. ----
-    expected_readers = int(args.reader_count or 0)
     timeout_s = float(getattr(args, "rendezvous_timeout", 120) or 120)
     rdz_prefix = _rendezvous_prefix(args)
     readers = []
@@ -981,15 +954,20 @@ def _pipeline_writer(args, store, do_warmup=True):
                 readers.append(r)
             except ValueError:
                 pass
-        if len(readers) >= expected_readers:
+        if len(readers) >= expected:
             break
         if time.time() - t0 > timeout_s:
             raise SystemExit(
-                "[ERROR] writer {}: only {}/{} readers registered in etcd "
+                "[ERROR] {}: only {}/{} readers registered in etcd "
                 "after {}s (prefix={})".format(
-                    writer_id, len(readers), expected_readers,
+                    who, len(readers), expected,
                     int(timeout_s), rdz_prefix))
         time.sleep(0.5)
+    return readers
+
+
+def _normalize_local_readers(readers):
+    """Auto-resolve reader hosts that live on this machine to 127.0.0.1."""
     # Auto-resolve reader host to 127.0.0.1 if they are on the same machine
     local_ips = set()
     try:
@@ -1016,6 +994,43 @@ def _pipeline_writer(args, store, do_warmup=True):
             r["host"] = "127.0.0.1"
         _norm_readers.append(r)
     readers = _norm_readers
+    return readers
+
+
+def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
+    """Writer write+notify phases (warmup -> measured -> SUMMARY).
+
+    Shared by --role writer and the dual-role (--role both) client. readers
+    is the FULL normalized reader list; the notify sampling pool excludes
+    exclude_id when set (a dual-role client never notifies its own
+    reader)."""
+    value = load_value(args.remote_data_dir, args.scenario)
+    batch_keys = max(1, args.batch_size)
+    prefix = args.key_prefix
+    scenario = args.scenario
+    writer_id = args.client_id
+    writer_op = args.operation or "put_batch"
+    if writer_op not in PUT_IFACE_DEFS:
+        raise SystemExit("[ERROR] unsupported writer operation: {}".format(writer_op))
+    effective_writer_op = (
+        "put" if writer_op == "put_batch" and batch_keys == 1 else writer_op
+    )
+    if effective_writer_op != writer_op:
+        log("pipeline writer batch_size=1: using put instead of put_batch")
+    ctx = None
+    if effective_writer_op == "put_from":
+        ctx = _BufferCtx(len(value))
+        if not ctx.setup(store):
+            raise SystemExit("[ERROR] writer register_buffer failed")
+    duration = float(args.duration)
+    warmup_duration = float(getattr(args, "warmup_duration", 0) or 0)
+    target_qps = float(args.target_qps) if args.target_qps > 0 else 0
+    traffic_mode = args.traffic_mode
+    if exclude_id is not None:
+        # dual role: never notify our own reader
+        pool = [r for r in readers if r.get("id") != exclude_id]
+    else:
+        pool = list(readers)
     notify_count = int(getattr(args, "notify_count", 0) or 0)
     notify_threads = max(1, int(getattr(args, "notify_threads", 1) or 1))
     # Original datasystem semantics:
@@ -1030,66 +1045,9 @@ def _pipeline_writer(args, store, do_warmup=True):
                   "traffic_mode": traffic_mode, "batch_size": batch_keys,
                   "duration": duration, "warmup_duration": warmup_duration,
                   "start_ts": time.time(),
-                  "num_readers": len(readers), "notify_count": notify_count,
+                  "num_readers": len(pool), "notify_count": notify_count,
                   "notify_threads": notify_threads,
                   "writer_count": args.writer_count, "reader_count": args.reader_count})
-    # ---- writer HTTP /start endpoint: the orchestrator triggers the run
-    # here after seeing ALL writers registered in etcd ----
-    started = threading.Event()
-
-    class _WriterStartHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self._handle()
-
-        def do_POST(self):
-            self._handle()
-
-        def _handle(self):
-            # NOTE: no urllib here — the enclosing function imports
-            # urllib.request LATER, which would shadow the closure binding
-            path = self.path.split("?")[0]
-            if path == "/start":
-                started.set()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"STARTED")
-            elif path == "/health":
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"HEALTHY")
-            else:
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"UNKNOWN:" + self.path.encode())
-
-        def log_message(self, fmt, *args):
-            pass
-
-    socketserver.ThreadingTCPServer.allow_reuse_address = True
-    try:
-        wserver = socketserver.ThreadingTCPServer(
-            ("0.0.0.0", args.listen_port), _WriterStartHandler)
-    except OSError as exc:
-        raise SystemExit("[ERROR] writer failed to bind port {}: {}".format(
-            args.listen_port, exc))
-    wserver.daemon_threads = True
-    threading.Thread(target=wserver.serve_forever, daemon=True).start()
-    wreg = {"host": _self_host(), "port": args.listen_port}
-    bench_etcd.kv_put(args.etcd_endpoints,
-                      rdz_prefix + "writers/{}".format(writer_id),
-                      json.dumps(wreg))
-    emit("META", {"mode": "pipeline_writer_registered", "writer_id": writer_id,
-                  "reg": wreg, "ts": time.time()})
-    log("pipeline writer registered (gid={}, http_port={}); waiting for "
-        "/start trigger (timeout={}s)".format(writer_id, args.listen_port,
-                                              int(timeout_s)))
-    if not started.wait(timeout=timeout_s):
-        wserver.shutdown()
-        raise SystemExit("[ERROR] writer {}: no /start trigger within {}s"
-                         "".format(writer_id, int(timeout_s)))
-    wserver.shutdown()
-    emit("META", {"mode": "pipeline_writer_started", "writer_id": writer_id,
-                  "ts": time.time()})
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     from concurrent.futures import ThreadPoolExecutor
@@ -1187,8 +1145,8 @@ def _pipeline_writer(args, store, do_warmup=True):
                 # write_ts is retained for diagnostics only — reader latency is
                 # measured locally on the reader node with time.perf_counter();
                 # warmup flag lets readers warm up without recording).
-                n_sel = min(notify_count, len(readers)) if notify_count > 0 else len(readers)
-                selected = random.sample(readers, n_sel) if readers else []
+                n_sel = min(notify_count, len(pool)) if notify_count > 0 else len(pool)
+                selected = random.sample(pool, n_sel) if pool else []
                 write_ts = time.time()
                 wflag = "1" if is_warmup else "0"
                 def _notify(r, ks=keys, ts=write_ts, wf=wflag):
@@ -1266,12 +1224,88 @@ def _pipeline_writer(args, store, do_warmup=True):
         "data_size": len(value),
     })
     sys.stdout.flush()
+
+
+def _pipeline_writer(args, store, do_warmup=True):
+    """Writer process: discover readers from etcd, register the /start
+    address, wait for the orchestrator trigger, then run the write+notify
+    phases (see _writer_run_phases; warmup uses the same deployment shape
+    to activate writer->store, writer->reader and reader->store paths)."""
+    writer_id = args.client_id
+    readers = _discover_readers(args, int(args.reader_count or 0),
+                                "writer {}".format(writer_id))
+    readers = _normalize_local_readers(readers)
+    # ---- writer HTTP /start endpoint: the orchestrator triggers the run
+    # here after seeing ALL writers registered in etcd ----
+    started = threading.Event()
+
+    class _WriterStartHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._handle()
+
+        def do_POST(self):
+            self._handle()
+
+        def _handle(self):
+            # NOTE: no urllib here — the enclosing function imports
+            # urllib.request LATER, which would shadow the closure binding
+            path = self.path.split("?")[0]
+            if path == "/start":
+                started.set()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"STARTED")
+            elif path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"HEALTHY")
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"UNKNOWN:" + self.path.encode())
+
+        def log_message(self, fmt, *args):
+            pass
+
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    try:
+        wserver = socketserver.ThreadingTCPServer(
+            ("0.0.0.0", args.listen_port), _WriterStartHandler)
+    except OSError as exc:
+        raise SystemExit("[ERROR] writer failed to bind port {}: {}".format(
+            args.listen_port, exc))
+    wserver.daemon_threads = True
+    threading.Thread(target=wserver.serve_forever, daemon=True).start()
+    wreg = {"host": _self_host(), "port": args.listen_port,
+            "id": writer_id}
+    bench_etcd.kv_put(args.etcd_endpoints,
+                      rdz_prefix + "writers/{}".format(writer_id),
+                      json.dumps(wreg))
+    emit("META", {"mode": "pipeline_writer_registered", "writer_id": writer_id,
+                  "reg": wreg, "ts": time.time()})
+    log("pipeline writer registered (gid={}, http_port={}); waiting for "
+        "/start trigger (timeout={}s)".format(writer_id, args.listen_port,
+                                              int(timeout_s)))
+    if not started.wait(timeout=timeout_s):
+        wserver.shutdown()
+        raise SystemExit("[ERROR] writer {}: no /start trigger within {}s"
+                         "".format(writer_id, int(timeout_s)))
+    wserver.shutdown()
+    emit("META", {"mode": "pipeline_writer_started", "writer_id": writer_id,
+                  "ts": time.time()})
+    _writer_run_phases(args, store, readers, do_warmup)
+
+
 class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP handler for reader: receives write notifications from writers."""
-    # Class-level shared state set by _pipeline_reader
+    """HTTP handler for reader: receives write notifications from writers.
+
+    Dual-role clients additionally arm start_event so the SAME port also
+    serves the writer-side /start trigger."""
+    # Class-level shared state set by _pipeline_reader / _pipeline_dual
     queue = None
     deadline = 0.0
     exit_grace = 5.0
+    start_event = None  # armed by _pipeline_dual; None = pure reader
     # backlog diagnostics: exact queue depth (lock-protected) + observed max
     qdepth = 0
     qmax = 0
@@ -1304,6 +1338,12 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"HEALTHY")
+        elif parsed.path == "/start" and \
+                _PipelineNotifyHandler.start_event is not None:
+            _PipelineNotifyHandler.start_event.set()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"STARTED")
         elif parsed.path == "/shutdown":
             _PipelineNotifyHandler.deadline = -1.0
             self.send_response(200)
@@ -1401,8 +1441,14 @@ def cmd_pipeline(args, store):
         if args.listen_port is None:
             raise SystemExit("[ERROR] pipeline reader requires --listen-port")
         _pipeline_reader(args, store)
+    elif role == "both":
+        if args.listen_port is None:
+            raise SystemExit("[ERROR] pipeline dual role requires "
+                             "--listen-port (shared /notify + /start port)")
+        _pipeline_dual(args, store)
     else:
-        raise SystemExit("[ERROR] pipeline mode requires --role writer|reader")
+        raise SystemExit("[ERROR] pipeline mode requires --role "
+                         "writer|reader|both")
 
 # --------------------------------------------------------------------------
 
@@ -1458,7 +1504,8 @@ def _pipeline_reader(args, store):
         my_port, reader_op, num_threads))
     # ---- rendezvous: self-register into etcd so writers (and the
     # orchestrator's shutdown pass) can discover this reader ----
-    rreg = {"host": _self_host(), "port": my_port, "node": _self_node()}
+    rreg = {"host": _self_host(), "port": my_port, "node": _self_node(),
+            "id": args.client_id}
     if not rreg["host"]:
         raise SystemExit("[ERROR] reader {}: no routable host for etcd "
                          "registration (POD_IP/SETUP_FABRIC_IP unset)"
@@ -1486,6 +1533,13 @@ def _pipeline_reader(args, store):
     log("pipeline reader done (items={})".format(len(results)))
     if ctx is not None:
         ctx.teardown(store)
+    _emit_reader_summary(args, results, num_threads, meas_duration)
+
+# --------------------------------------------------------------------------
+
+def _emit_reader_summary(args, results, num_threads, meas_duration):
+    """Flush the reader-side SUMMARY + RESULT rows (shared by the pure
+    reader process and the dual-role client)."""
     data_size = parse_size(args.data_size)
     # split off warmup items: processed (store reads warmed up) but not
     # part of the measured metrics; counts are key-based (r[5] = key_count)
@@ -1530,6 +1584,135 @@ def _pipeline_reader(args, store):
         sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\t{:.6f}\t{}\n".format(
             ts, opname, k, lat, status, qw, kc))
     sys.stdout.flush()
+
+
+def _pipeline_dual(args, store):
+    """Dual-role pipeline client (--role both): ONE process hosting BOTH
+    roles behind ONE HTTP port — /notify + /health + /shutdown for the
+    reader side, /start for the writer side.
+
+    Sequence: bind + register the reader entry -> discover the full reader
+    list from etcd -> register the writer entry -> wait for the
+    orchestrator's /start trigger -> run the writer phases (warmup ->
+    measured, notify sampling EXCLUDES our own reader) in a thread while
+    the main thread serves the reader queue -> /shutdown flushes both
+    summaries and exits."""
+    my_id = args.client_id
+    my_port = args.listen_port
+    num_threads = max(1, args.num_threads)
+    writer_op = (args.writer_operation or args.operation or "put_batch")
+    reader_op = (args.reader_operation or args.operation or "get")
+    if writer_op not in PUT_IFACE_DEFS:
+        raise SystemExit("[ERROR] unsupported writer operation: {}".format(writer_op))
+    if reader_op not in GET_IFACE_DEFS:
+        raise SystemExit("[ERROR] unsupported reader operation: {}".format(reader_op))
+    # dual argv carries BOTH operations; stash them where the shared phase
+    # functions expect them (args.operation stays reader-side default)
+    args_wr = copy.copy(args)
+    args_wr.operation = writer_op
+    lifetime = float(args.timeout)
+    meas_duration = float(args.duration or 0) or lifetime
+    exit_grace = 5.0
+    timeout_s = float(getattr(args, "rendezvous_timeout", 120) or 120)
+    rdz_prefix = _rendezvous_prefix(args)
+    rctx = None
+    if reader_op in ("get_into",):
+        rctx = _BufferCtx(parse_size(args.data_size))
+        if not rctx.setup(store):
+            raise SystemExit("[ERROR] dual client register_buffer failed")
+    emit("META", {"mode": "pipeline_dual", "scenario": args.scenario,
+                  "work_mode": args.work_mode or "recall", "protocol": args.protocol,
+                  "client_id": my_id, "listen_port": my_port,
+                  "writer_operation": writer_op, "reader_operation": reader_op,
+                  "num_threads": num_threads, "duration": lifetime,
+                  "measure_window": meas_duration, "start_ts": time.time()})
+    queue = Queue(maxsize=max(8192, num_threads * 1024))
+    deadline = time.time() + lifetime
+    results = []
+    started = threading.Event()
+    _PipelineNotifyHandler.queue = queue
+    _PipelineNotifyHandler.deadline = deadline
+    _PipelineNotifyHandler.exit_grace = exit_grace
+    _PipelineNotifyHandler.qdepth = 0
+    _PipelineNotifyHandler.qmax = 0
+    _PipelineNotifyHandler.qlock = threading.Lock()
+    _PipelineNotifyHandler.start_event = started
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    try:
+        server = socketserver.ThreadingTCPServer(("0.0.0.0", my_port),
+                                                 _PipelineNotifyHandler)
+    except OSError as exc:
+        raise SystemExit("[ERROR] dual client failed to bind port {}: {}"
+                         "".format(my_port, exc))
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # rendezvous: register reader, discover peers, register writer
+    rreg = {"host": _self_host(), "port": my_port, "node": _self_node(),
+            "id": my_id}
+    if not rreg["host"]:
+        raise SystemExit("[ERROR] dual {}: no routable host for etcd "
+                         "registration (POD_IP/SETUP_FABRIC_IP unset)"
+                         "".format(my_id))
+    bench_etcd.kv_put(args.etcd_endpoints,
+                      rdz_prefix + "readers/{}".format(my_id), json.dumps(rreg))
+    readers = _discover_readers(args, int(args.reader_count or 0),
+                                "dual {}".format(my_id))
+    readers = _normalize_local_readers(readers)
+    wreg = {"host": _self_host(), "port": my_port, "id": my_id}
+    bench_etcd.kv_put(args.etcd_endpoints,
+                      rdz_prefix + "writers/{}".format(my_id), json.dumps(wreg))
+    emit("META", {"mode": "pipeline_dual_registered", "client_id": my_id,
+                  "reg": wreg, "ts": time.time()})
+    log("pipeline dual client registered (id={}, http_port={}); waiting for "
+        "/start trigger (timeout={}s)".format(my_id, my_port, int(timeout_s)))
+    if not started.wait(timeout=timeout_s):
+        server.shutdown()
+        raise SystemExit("[ERROR] dual {}: no /start trigger within {}s"
+                         "".format(my_id, int(timeout_s)))
+    emit("META", {"mode": "pipeline_dual_started", "client_id": my_id,
+                  "ts": time.time()})
+    # writer phases in a thread (exceptions captured; reader loop watches)
+    writer_error = []
+    def _wthread():
+        try:
+            _writer_run_phases(args_wr, store, readers,
+                               do_warmup=(args.warmup == "true"),
+                               exclude_id=my_id)
+        except BaseException as exc:
+            import traceback
+            traceback.print_exc()
+            writer_error.append(exc)
+    wthread = threading.Thread(target=_wthread, daemon=True)
+    wthread.start()
+    # reader side: worker pool + wait for /shutdown (or writer failure)
+    with ThreadPoolExecutor(max_workers=num_threads) as pool:
+        worker_futures = [
+            pool.submit(_reader_worker, args, store, queue,
+                        deadline + exit_grace, results, rctx)
+            for _ in range(num_threads)]
+        remaining = deadline + exit_grace - time.time()
+        while remaining > 0 and _PipelineNotifyHandler.deadline > 0 \
+                and not writer_error:
+            time.sleep(min(1.0, remaining))
+            remaining = deadline + exit_grace - time.time()
+        if writer_error:
+            log("[ERROR] dual {}: writer phase failed: {}".format(
+                my_id, writer_error[0]))
+            _PipelineNotifyHandler.deadline = -1.0
+        for _ in range(num_threads):
+            queue.put(None)
+        for f in worker_futures:
+            f.result()
+        server.shutdown()
+    wthread.join(timeout=60)
+    log("pipeline dual client done (reader items={})".format(len(results)))
+    if rctx is not None:
+        rctx.teardown(store)
+    _emit_reader_summary(args, results, num_threads, meas_duration)
+    if writer_error:
+        raise SystemExit("[ERROR] dual {}: writer phase failed: {}"
+                         "".format(my_id, writer_error[0]))
+
 
 # --------------------------------------------------------------------------
 
@@ -1603,6 +1786,10 @@ def _resolve_env(args):
         args.timeout = int(os.environ.get("BENCH_TIMEOUT", "300"))
     if args.run_id is None:
         args.run_id = os.environ.get("BENCH_RUN_ID", None)
+    if args.writer_operation is None:
+        args.writer_operation = os.environ.get("BENCH_WRITER_OPERATION", None)
+    if args.reader_operation is None:
+        args.reader_operation = os.environ.get("BENCH_READER_OPERATION", None)
     if args.rendezvous_timeout is None:
         args.rendezvous_timeout = int(
             os.environ.get("BENCH_RENDEZVOUS_TIMEOUT", "120"))
@@ -1630,6 +1817,14 @@ def main():
     parser.add_argument("--work-mode", default=None,
                         help="business type (rank/recall) for pipeline; informational")
     parser.add_argument("--operation", default=None)
+    parser.add_argument("--writer-operation", default=None,
+                        help="pipeline dual role: writer-side operation "
+                             "(env BENCH_WRITER_OPERATION; falls back to "
+                             "--operation then put_batch)")
+    parser.add_argument("--reader-operation", default=None,
+                        help="pipeline dual role: reader-side operation "
+                             "(env BENCH_READER_OPERATION; falls back to "
+                             "--operation then get)")
     parser.add_argument("--protocol", default=None)
     parser.add_argument("--key-prefix", default=None)
     parser.add_argument("--key-count", type=int, default=None)
@@ -1647,7 +1842,8 @@ def main():
     parser.add_argument("--notify-count", type=int, default=None)
     parser.add_argument("--notify-pipeline", default=None)
     parser.add_argument("--traffic-mode", default=None)
-    parser.add_argument("--role", default=None, choices=["writer", "reader"])
+    parser.add_argument("--role", default=None,
+                        choices=["writer", "reader", "both"])
     parser.add_argument("--listen-port", type=int, default=None,
                         help="pipeline HTTP port (reader: /notify server; "
                              "writer: /start trigger server; required for both)")
