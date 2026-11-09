@@ -48,12 +48,37 @@ def test_pipeline_plan_port_bases_configurable():
     assert plan["reader_port_base"] == 8001
 
 
-def test_pipeline_plan_qps_split():
+def test_pipeline_plan_qps_per_node_semantics():
+    # qps is PER-NODE: total = base x multiple x N; each client of a node
+    # shares that node's rate equally
     cfg = {"base_qps": 105, "qps_multiple": 2,
            "writer": {"count_per_node": 1}, "reader": {"count_per_node": 1}}
     plan = bm.pipeline_plan(cfg, node_count=2)
-    assert plan["total_qps"] == 210
-    assert plan["per_writer_qps"] == 105
+    assert plan["per_node_qps"] == 210
+    assert plan["total_qps"] == 420          # 210 per node x 2 nodes
+    assert plan["per_writer_qps"] == 210     # 1 writer per node -> whole rate
+    cfg = {"base_qps": 105, "qps_multiple": 1,
+           "writer": {"count_per_node": 2}, "reader": {"count_per_node": 1}}
+    plan = bm.pipeline_plan(cfg, node_count=3)
+    assert plan["total_qps"] == 315
+    assert plan["per_writer_qps"] == 52.5    # 105 per node / 2 writers
+
+
+def test_pipeline_plan_dual_client_mode():
+    cfg = {"base_qps": 105, "qps_multiple": 1, "notify_count": 10,
+           "client": {"count_per_node": 2, "port_base": 9301},
+           "writer": {"operation": "put_batch", "notify_threads": 10},
+           "reader": {"operation": "get", "num_threads": 1}}
+    plan = bm.pipeline_plan(cfg, node_count=6)
+    assert plan["dual"] is True
+    assert len(plan["clients"]) == 12          # 2 per node x 6 nodes
+    assert [c["id"] for c in plan["clients"]] == list(range(12))
+    # per-node port numbering; k8s overrides all to port_base at
+    # materialization time (every pod has its own netns)
+    assert [c["port"] for c in plan["clients"]] == [9301, 9302] * 6
+    assert plan["per_node_qps"] == 105
+    assert plan["per_writer_qps"] == 52.5      # 105 / 2 clients per node
+    assert plan["writers"] is plan["clients"] and plan["readers"] is plan["clients"]
 
 
 def test_loader_strips_client_nodes(tmp_path, capsys):

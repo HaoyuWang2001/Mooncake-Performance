@@ -111,7 +111,7 @@ PIPELINE_CSV_HEADER = [
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_threads", "notify_threads",
     "data_size", "key_count", "batch_size", "duration", "warmup_duration",
-    "writer_count", "reader_count", "notify_count",
+    "writer_count", "reader_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
     "total", "success", "fail", "fail_rate",
     "total_bytes", "wall_s", "qps",
@@ -204,10 +204,45 @@ def pipeline_plan(cfg, node_count=1):
     """
     writer_cfg = cfg.get("writer", {}) or {}
     reader_cfg = cfg.get("reader", {}) or {}
+    client_cfg = cfg.get("client", {}) or {}
     w_cpn = int(writer_cfg.get("count_per_node", 1))
     r_cpn = int(reader_cfg.get("count_per_node", 1))
     w_base = int(writer_cfg.get("port_base", 9101))
     r_base = int(reader_cfg.get("port_base", 9201))
+    # ---- qps is PER-NODE: base_qps (x qps_multiple) is the rate ONE node
+    # sustains; every client of that node shares it equally. Cluster total
+    # = per_node x N. ----
+    base_qps = float(cfg.get("base_qps", 0))
+    qps_multiple = float(cfg.get("qps_multiple", 1))
+    per_node_qps = base_qps * qps_multiple
+    total_qps = per_node_qps * node_count
+    if client_cfg:
+        # ---- dual-role deployment (rank/recall minimal shape): one process
+        # per entry hosting BOTH writer and reader behind one HTTP port.
+        # "client" block presence selects this mode. ----
+        c_cpn = int(client_cfg.get("count_per_node", 1))
+        c_base = int(client_cfg.get("port_base", 9301))
+        clients = []
+        for slot in range(node_count):
+            for local in range(c_cpn):
+                clients.append({"id": len(clients), "slot": slot,
+                                "local": local, "port": c_base + local})
+        per_client_qps = (per_node_qps / c_cpn) if c_cpn else per_node_qps
+        return {
+            "dual": True,
+            "clients": clients,
+            # aliases so the generic ledger/cleanup/CSV paths keep working
+            "writers": clients,
+            "readers": clients,
+            "total_qps": total_qps,
+            "per_node_qps": per_node_qps,
+            "per_writer_qps": per_client_qps,
+            "notify_count": int(cfg.get("notify_count", 1)),
+            "notify_threads": int(writer_cfg.get("notify_threads", 1)),
+            "reader_threads": int(reader_cfg.get("num_threads", 1)),
+            "writer_port_base": c_base,
+            "reader_port_base": c_base,
+        }
     writers = []
     readers = []
     for slot in range(node_count):
@@ -217,14 +252,13 @@ def pipeline_plan(cfg, node_count=1):
         for local in range(r_cpn):
             readers.append({"index": len(readers), "slot": slot,
                             "local": local, "port": r_base + local})
-    base_qps = float(cfg.get("base_qps", 0))
-    qps_multiple = float(cfg.get("qps_multiple", 1))
-    total_qps = base_qps * qps_multiple
-    per_writer_qps = (total_qps / len(writers)) if writers else total_qps
+    per_writer_qps = (per_node_qps / w_cpn) if w_cpn else per_node_qps
     return {
+        "dual": False,
         "writers": writers,
         "readers": readers,
         "total_qps": total_qps,
+        "per_node_qps": per_node_qps,
         "per_writer_qps": per_writer_qps,
         "notify_count": int(cfg.get("notify_count", 1)),
         "notify_threads": int(writer_cfg.get("notify_threads", 1)),
@@ -2268,11 +2302,21 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 "nodes")
         n_nodes = len(node_names)
         plan = pipeline_plan(cfg, node_count=n_nodes)
-        for entry in plan["writers"] + plan["readers"]:
+        pool = plan["clients"] if plan.get("dual") else \
+            plan["writers"] + plan["readers"]
+        for entry in pool:
             entry["node"] = node_names[entry["slot"]]
     if plan["notify_count"] < 1:
         raise RuntimeError("pipeline config requires notify_count >= 1")
-    if plan["notify_count"] > len(plan["readers"]):
+    if plan.get("dual"):
+        # dual role: a writer never notifies its own reader -> the sampling
+        # pool is clients-1
+        if plan["notify_count"] > len(plan["clients"]) - 1:
+            raise RuntimeError(
+                "notify_count={} exceeds the dual-role sampling pool {} "
+                "(client.count_per_node x N - 1; own reader excluded)".format(
+                    plan["notify_count"], len(plan["clients"]) - 1))
+    elif plan["notify_count"] > len(plan["readers"]):
         raise RuntimeError("notify_count={} exceeds reader count {} "
                            "(reader.count_per_node x N)".format(
                                plan["notify_count"], len(plan["readers"])))
@@ -2360,9 +2404,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # ---- per-role Deployments (pod = process): replicas = cpn x N ----
         _k8s = k8s_settings(cluster)
         _run_label = k8s_run_label(ts, cfg_name)
-        for role, entries, base in (
-                ("reader", plan["readers"], plan["reader_port_base"]),
-                ("writer", plan["writers"], plan["writer_port_base"])):
+        _roles = (("client", plan["clients"], plan["writer_port_base"])
+                  if plan.get("dual") else
+                  (("reader", plan["readers"], plan["reader_port_base"]),
+                   ("writer", plan["writers"], plan["writer_port_base"])))
+        for role, entries, base in _roles:
             ensure_k8s_deployment(cluster, ts, cfg_name, role,
                                   len(entries), dry)
             if dry:
@@ -2395,10 +2441,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         primary_node_name = (plan["writers"] or plan["readers"])[0]["node"]
         node = get_node(cluster, primary_node_name)
         host = node["ip"]
-        log("[k8s] pipeline pods ready: {} writers + {} readers "
-            "(N={}, spread maxSkew=1, run={})".format(
-                len(plan["writers"]), len(plan["readers"]),
-                n_nodes, _run_label))
+        if plan.get("dual"):
+            log("[k8s] pipeline pods ready: {} dual clients "
+                "(N={}, spread maxSkew=1, run={})".format(
+                    len(plan["clients"]), n_nodes, _run_label))
+        else:
+            log("[k8s] pipeline pods ready: {} writers + {} readers "
+                "(N={}, spread maxSkew=1, run={})".format(
+                    len(plan["writers"]), len(plan["readers"]),
+                    n_nodes, _run_label))
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    remote_scripts, remote_log_dir, dry)
     reader_pids = []
@@ -2511,167 +2562,262 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             remote_profiling_dir(remote_log_dir, cfg_name))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
-            # Step 1: start all readers (one process per reader). Each reader
-            # binds its HTTP /notify server and SELF-REGISTERS into etcd
-            # (host=POD_IP/SETUP_FABRIC_IP, port, node); no peer addresses
-            # are injected by the orchestrator anymore. Log names carry the
-            # node segment: per-node port numbering (9201+i) is no longer
-            # globally unique once several nodes each run x readers.
-            for r in plan["readers"]:
-                rn = get_node(cluster, r["node"])
-                merged_log = "{}.reader_{}_r{}_p{}.log".format(
-                    base_noext, r["node"], r["index"], r["port"])
-                nohup_log = merged_log.replace(".log", ".nohup")
-                numa_arg = ""
-                launch_prefix = ""
-                if (cpu_shard > 0 or numa_bind) and not dry \
-                        and not is_k8s_node(rn):
-                    # round-robin over NUMA nodes; with cpu_shard the
-                    # per-(node,numa) ordinal picks a consecutive slice
-                    nn = numa_counter[r["node"]] % numa_node_count[r["node"]]
-                    numa_counter[r["node"]] += 1
-                    idx = shard_ordinal(r["node"], nn) if cpu_shard > 0 else 0
-                    cl = numa_binding_spec(numa_topo[r["node"]][nn],
-                                           node_exclude(cluster, rn),
-                                           cpu_shard, idx)
-                    numa_arg = "--cpu-bind {}".format(cl)
-                    if numactl_ok.get(r["node"]):
-                        launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                rcmd = ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
-                        "--role reader --listen-port {} --warmup false --timeout 300 "
-                        "--operation {} {} > {} 2>&1 & echo $!").format(
-                    launch_prefix, remote_runner, merged_log, r["index"],
-                    reader_threads, r["port"], reader_op, numa_arg, nohup_log)
-                pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
-                reader_pids.append((r, pid))
-                if not dry and pid:
-                    # ledger: this reader can always be found & killed later
-                    state_append([{
-                        "ip": rn["ip"], "node": r["node"], "port": r["port"],
-                        "fabric_host": rn.get("fabric_ip", rn.get("ip", "")),
-                        "pid": pid.strip(), "label": "reader r{}".format(r["index"]),
-                        # pid 是 run_benchmark_pipeline.sh 的 bash 包装进程（echo $!），
-                        # python client 是其子进程；marker 用于 reap 的防误杀校验
-                        "marker": "run_benchmark_pipeline.sh",
-                        "cfg": cfg_name,
-                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-            # Step 2: etcd barrier — wait for the FULL reader pool to
-            # self-register before any writer starts (readers that fail to
-            # boot surface here as a timeout with the missing list)
-            if not dry:
-                t0 = time.time()
-                _pipeline_barrier(etcd_endpoints,
-                                  "mcbench/{}/readers/".format(run_id),
-                                  len(plan["readers"]), rendezvous_timeout_s,
-                                  "readers", run_id)
-                log("pipeline rendezvous: {}/{} readers registered ({:.1f}s)"
-                    "".format(len(plan["readers"]), len(plan["readers"]),
-                              time.time() - t0))
-            # Step 3: start all writers in parallel (one invocation per writer; the
-            # explicit --client-id in EXTRA overrides the per-invocation default
-            # and gives each writer a globally unique id). ALL writers run the
-            # warmup phase so every writer's store/notify connections are warmed.
-            if matrix and not dry and prof_core and profile_sess is None:
-                # per_stage trigger: profiling starts at the measurement window
-                try:
-                    profile_sess = prof_core.start_profiling(
-                        cluster, matrix, involved_nodes, cfg_name,
-                        remote_profiling_dir(remote_log_dir, cfg_name))
-                except Exception as exc:
-                    log("[WARN] [profile] start failed: {}".format(exc))
-            for w in plan["writers"]:
-                wn = get_node(cluster, w["node"])
-                merged_log = "{}.writer_{}_w{}.log".format(
-                    base_noext, w["node"], w["gid"])
-                nohup_log = merged_log.replace(".log", ".nohup")
-                numa_arg = ""
-                launch_prefix = ""
-                if (cpu_shard > 0 or numa_bind) and not dry \
-                        and not is_k8s_node(wn):
-                    nn = numa_counter[w["node"]] % numa_node_count[w["node"]]
-                    numa_counter[w["node"]] += 1
-                    idx = shard_ordinal(w["node"], nn) if cpu_shard > 0 else 0
-                    cl = numa_binding_spec(numa_topo[w["node"]][nn],
-                                           node_exclude(cluster, wn),
-                                           cpu_shard, idx)
-                    numa_arg = "--cpu-bind {}".format(cl)
-                    if numactl_ok.get(w["node"]):
-                        launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                wcmd = ("nohup {}bash {} pipeline {} --client-id {} --role writer "
-                        "--listen-port {} --warmup {} --operation {} {} > {} 2>&1 "
-                        "& echo $!").format(
-                    launch_prefix, remote_runner, merged_log, w["gid"], w["port"],
-                    warmup, writer_op, numa_arg, nohup_log)
-                pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
-                writer_pids.append((w, pid))
-                if not dry and pid:
-                    state_append([{
-                        "ip": wn["ip"], "node": w["node"], "port": w["port"],
-                        "fabric_host": wn.get("fabric_ip", wn.get("ip", "")),
-                        "pid": pid.strip(), "label": "writer w{}".format(w["gid"]),
-                        "marker": "run_benchmark_pipeline.sh",
-                        "cfg": cfg_name,
-                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-            # Step 4: etcd barrier — every writer registered (= reader list
-            # pulled from etcd + HTTP /start server bound), then TRIGGER the
-            # run: POST /start to each writer (k8s: direct pod IP; ssh:
-            # loopback curl on the writer's node). All writers enter their
-            # warmup + measured phases only after this synchronized start.
-            if not dry:
-                t0 = time.time()
-                _pipeline_barrier(etcd_endpoints,
-                                  "mcbench/{}/writers/".format(run_id),
-                                  len(plan["writers"]), rendezvous_timeout_s,
-                                  "writers", run_id)
-                log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
-                    "".format(len(plan["writers"]), len(plan["writers"]),
-                              time.time() - t0))
+            if plan.get("dual"):
+                # ---- dual-role flow: every client hosts writer+reader behind
+                # one HTTP port; pids ledger into BOTH lists so the shared
+                # fail-path (graceful /shutdown + kill + pull) just works ----
+                for c in plan["clients"]:
+                    rn = get_node(cluster, c["node"])
+                    merged_log = "{}.dual_{}_c{}_p{}.log".format(
+                        base_noext, c["node"], c["id"], c["port"])
+                    nohup_log = merged_log.replace(".log", ".nohup")
+                    numa_arg = ""
+                    launch_prefix = ""
+                    if (cpu_shard > 0 or numa_bind) and not dry \
+                            and not is_k8s_node(rn):
+                        nn = numa_counter[c["node"]] % numa_node_count[c["node"]]
+                        numa_counter[c["node"]] += 1
+                        idx = shard_ordinal(c["node"], nn) if cpu_shard > 0 else 0
+                        cl = numa_binding_spec(numa_topo[c["node"]][nn],
+                                               node_exclude(cluster, rn),
+                                               cpu_shard, idx)
+                        numa_arg = "--cpu-bind {}".format(cl)
+                        if numactl_ok.get(c["node"]):
+                            launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
+                    ccmd = ("nohup {}bash {} pipeline {} --client-id {} --role both "
+                            "--listen-port {} --writer-operation {} --reader-operation {} "
+                            "--num-threads {} --warmup {} --timeout 300 {} > {} 2>&1 "
+                            "& echo $!").format(
+                        launch_prefix, remote_runner, merged_log, c["id"], c["port"],
+                        writer_op, reader_op, reader_threads, warmup, numa_arg,
+                        nohup_log)
+                    pid = ssh_check_output(rn["ip"], rn, ccmd, dry_run=dry)
+                    reader_pids.append((c, pid))
+                    writer_pids.append((c, pid))
+                    if not dry and pid:
+                        state_append([{
+                            "ip": rn["ip"], "node": c["node"], "port": c["port"],
+                            "fabric_host": rn.get("fabric_ip", rn.get("ip", "")),
+                            "pid": pid.strip(), "label": "dual c{}".format(c["id"]),
+                            "marker": "run_benchmark_pipeline.sh",
+                            "cfg": cfg_name,
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+                # barriers: every client registered BOTH roles, then trigger
+                if not dry:
+                    t0 = time.time()
+                    _pipeline_barrier(etcd_endpoints,
+                                      "mcbench/{}/readers/".format(run_id),
+                                      len(plan["clients"]), rendezvous_timeout_s,
+                                      "dual readers", run_id)
+                    _pipeline_barrier(etcd_endpoints,
+                                      "mcbench/{}/writers/".format(run_id),
+                                      len(plan["clients"]), rendezvous_timeout_s,
+                                      "dual writers", run_id)
+                    log("pipeline rendezvous: {}/{} dual clients registered "
+                        "({:.1f}s)".format(len(plan["clients"]),
+                                           len(plan["clients"]),
+                                           time.time() - t0))
+                    for c in plan["clients"]:
+                        cn = get_node(cluster, c["node"])
+                        if not _pipeline_http_call(cn, c["port"], "/start"):
+                            raise RuntimeError(
+                                "pipeline trigger failed: dual c{} /start at "
+                                "{} p{} returned non-200".format(
+                                    c["id"], cn["ip"], c["port"]))
+                    log("pipeline trigger: /start sent to {} dual clients"
+                        "".format(len(plan["clients"])))
+                    # writers run INSIDE the clients: after the expected
+                    # window (+grace) shut the reader side down so every
+                    # client flushes both summaries and exits
+                    expected_s = float(cfg.get("warmup", {}).get("duration", 0) or 0) \
+                        + float(cfg.get("duration", 30)) + 10.0
+                    log("pipeline dual: waiting {:.0f}s for writer phases, "
+                        "then /shutdown".format(expected_s))
+                    t0 = time.time()
+                    while time.time() - t0 < expected_s:
+                        _check_stop()
+                        time.sleep(min(1.0, expected_s - (time.time() - t0)))
+                    for c in plan["clients"]:
+                        cn = get_node(cluster, c["node"])
+                        try:
+                            _pipeline_http_call(cn, c["port"], "/shutdown")
+                        except Exception as exc:
+                            log("[WARN] dual c{} shutdown: {}".format(
+                                c["id"], exc))
+                    for c, pid in writer_pids:
+                        if not dry and pid:
+                            wait_process_exit(cluster, c["node"], pid,
+                                              "dual c{}".format(c["id"]),
+                                              60, dry_run=dry, expected_s=60)
+                    for c in plan["clients"]:
+                        cn = get_node(cluster, c["node"])
+                        pull_stage_logs(cn["ip"], cn,
+                                        ["{}.dual_{}_c{}_p{}.log".format(
+                                            base_noext, c["node"], c["id"],
+                                            c["port"])],
+                                        local_log_dir, dry)
+            else:
+                # Step 1: start all readers (one process per reader). Each reader
+                # binds its HTTP /notify server and SELF-REGISTERS into etcd
+                # (host=POD_IP/SETUP_FABRIC_IP, port, node); no peer addresses
+                # are injected by the orchestrator anymore. Log names carry the
+                # node segment: per-node port numbering (9201+i) is no longer
+                # globally unique once several nodes each run x readers.
+                for r in plan["readers"]:
+                    rn = get_node(cluster, r["node"])
+                    merged_log = "{}.reader_{}_r{}_p{}.log".format(
+                        base_noext, r["node"], r["index"], r["port"])
+                    nohup_log = merged_log.replace(".log", ".nohup")
+                    numa_arg = ""
+                    launch_prefix = ""
+                    if (cpu_shard > 0 or numa_bind) and not dry \
+                            and not is_k8s_node(rn):
+                        # round-robin over NUMA nodes; with cpu_shard the
+                        # per-(node,numa) ordinal picks a consecutive slice
+                        nn = numa_counter[r["node"]] % numa_node_count[r["node"]]
+                        numa_counter[r["node"]] += 1
+                        idx = shard_ordinal(r["node"], nn) if cpu_shard > 0 else 0
+                        cl = numa_binding_spec(numa_topo[r["node"]][nn],
+                                               node_exclude(cluster, rn),
+                                               cpu_shard, idx)
+                        numa_arg = "--cpu-bind {}".format(cl)
+                        if numactl_ok.get(r["node"]):
+                            launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
+                    rcmd = ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
+                            "--role reader --listen-port {} --warmup false --timeout 300 "
+                            "--operation {} {} > {} 2>&1 & echo $!").format(
+                        launch_prefix, remote_runner, merged_log, r["index"],
+                        reader_threads, r["port"], reader_op, numa_arg, nohup_log)
+                    pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
+                    reader_pids.append((r, pid))
+                    if not dry and pid:
+                        # ledger: this reader can always be found & killed later
+                        state_append([{
+                            "ip": rn["ip"], "node": r["node"], "port": r["port"],
+                            "fabric_host": rn.get("fabric_ip", rn.get("ip", "")),
+                            "pid": pid.strip(), "label": "reader r{}".format(r["index"]),
+                            # pid 是 run_benchmark_pipeline.sh 的 bash 包装进程（echo $!），
+                            # python client 是其子进程；marker 用于 reap 的防误杀校验
+                            "marker": "run_benchmark_pipeline.sh",
+                            "cfg": cfg_name,
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+                # Step 2: etcd barrier — wait for the FULL reader pool to
+                # self-register before any writer starts (readers that fail to
+                # boot surface here as a timeout with the missing list)
+                if not dry:
+                    t0 = time.time()
+                    _pipeline_barrier(etcd_endpoints,
+                                      "mcbench/{}/readers/".format(run_id),
+                                      len(plan["readers"]), rendezvous_timeout_s,
+                                      "readers", run_id)
+                    log("pipeline rendezvous: {}/{} readers registered ({:.1f}s)"
+                        "".format(len(plan["readers"]), len(plan["readers"]),
+                                  time.time() - t0))
+                # Step 3: start all writers in parallel (one invocation per writer; the
+                # explicit --client-id in EXTRA overrides the per-invocation default
+                # and gives each writer a globally unique id). ALL writers run the
+                # warmup phase so every writer's store/notify connections are warmed.
+                if matrix and not dry and prof_core and profile_sess is None:
+                    # per_stage trigger: profiling starts at the measurement window
+                    try:
+                        profile_sess = prof_core.start_profiling(
+                            cluster, matrix, involved_nodes, cfg_name,
+                            remote_profiling_dir(remote_log_dir, cfg_name))
+                    except Exception as exc:
+                        log("[WARN] [profile] start failed: {}".format(exc))
                 for w in plan["writers"]:
                     wn = get_node(cluster, w["node"])
-                    if not _pipeline_http_call(wn, w["port"], "/start"):
-                        raise RuntimeError(
-                            "pipeline trigger failed: writer w{} /start at "
-                            "{} p{} returned non-200".format(
-                                w["gid"], wn["ip"], w["port"]))
-                log("pipeline trigger: /start sent to {} writers".format(
-                    len(plan["writers"])))
-            # Step 5: wait for all writers to finish (warmup + measured run)
-            warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
-            duration = float(cfg.get("duration", 30))
-            for w, pid in writer_pids:
-                if not dry and pid:
-                    wait_process_exit(cluster, w["node"], pid,
-                                      "writer w{}".format(w["gid"]),
-                                      int(warmup_duration + duration) + 300, dry_run=dry,
-                                      expected_s=warmup_duration + duration)
-            for w in plan["writers"]:
-                wn = get_node(cluster, w["node"])
-                pull_stage_logs(wn["ip"], wn,
-                                ["{}.writer_{}_w{}.log".format(
-                                    base_noext, w["node"], w["gid"])],
-                                local_log_dir, dry)
-            # Step 6: shutdown readers via their /shutdown endpoint (k8s:
-            # direct pod IP; ssh: loopback curl on the reader's node) and
-            # wait for their final logs
-            for r in plan["readers"]:
-                rn = get_node(cluster, r["node"])
+                    merged_log = "{}.writer_{}_w{}.log".format(
+                        base_noext, w["node"], w["gid"])
+                    nohup_log = merged_log.replace(".log", ".nohup")
+                    numa_arg = ""
+                    launch_prefix = ""
+                    if (cpu_shard > 0 or numa_bind) and not dry \
+                            and not is_k8s_node(wn):
+                        nn = numa_counter[w["node"]] % numa_node_count[w["node"]]
+                        numa_counter[w["node"]] += 1
+                        idx = shard_ordinal(w["node"], nn) if cpu_shard > 0 else 0
+                        cl = numa_binding_spec(numa_topo[w["node"]][nn],
+                                               node_exclude(cluster, wn),
+                                               cpu_shard, idx)
+                        numa_arg = "--cpu-bind {}".format(cl)
+                        if numactl_ok.get(w["node"]):
+                            launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
+                    wcmd = ("nohup {}bash {} pipeline {} --client-id {} --role writer "
+                            "--listen-port {} --warmup {} --operation {} {} > {} 2>&1 "
+                            "& echo $!").format(
+                        launch_prefix, remote_runner, merged_log, w["gid"], w["port"],
+                        warmup, writer_op, numa_arg, nohup_log)
+                    pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
+                    writer_pids.append((w, pid))
+                    if not dry and pid:
+                        state_append([{
+                            "ip": wn["ip"], "node": w["node"], "port": w["port"],
+                            "fabric_host": wn.get("fabric_ip", wn.get("ip", "")),
+                            "pid": pid.strip(), "label": "writer w{}".format(w["gid"]),
+                            "marker": "run_benchmark_pipeline.sh",
+                            "cfg": cfg_name,
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+                # Step 4: etcd barrier — every writer registered (= reader list
+                # pulled from etcd + HTTP /start server bound), then TRIGGER the
+                # run: POST /start to each writer (k8s: direct pod IP; ssh:
+                # loopback curl on the writer's node). All writers enter their
+                # warmup + measured phases only after this synchronized start.
                 if not dry:
-                    try:
-                        _pipeline_http_call(rn, r["port"], "/shutdown")
-                    except Exception as exc:
-                        log("[WARN] reader r{} shutdown: {}".format(
-                            r["index"], exc))
-            for r, pid in reader_pids:
-                if not dry and pid:
-                    wait_process_exit(cluster, r["node"], pid,
-                                      "reader r{} (port {})".format(r["index"], r["port"]),
-                                      60, dry_run=dry, expected_s=60)
-            for r in plan["readers"]:
-                rn = get_node(cluster, r["node"])
-                pull_stage_logs(rn["ip"], rn,
-                                ["{}.reader_{}_r{}_p{}.log".format(
-                                    base_noext, r["node"], r["index"], r["port"])],
-                                local_log_dir, dry)
+                    t0 = time.time()
+                    _pipeline_barrier(etcd_endpoints,
+                                      "mcbench/{}/writers/".format(run_id),
+                                      len(plan["writers"]), rendezvous_timeout_s,
+                                      "writers", run_id)
+                    log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
+                        "".format(len(plan["writers"]), len(plan["writers"]),
+                                  time.time() - t0))
+                    for w in plan["writers"]:
+                        wn = get_node(cluster, w["node"])
+                        if not _pipeline_http_call(wn, w["port"], "/start"):
+                            raise RuntimeError(
+                                "pipeline trigger failed: writer w{} /start at "
+                                "{} p{} returned non-200".format(
+                                    w["gid"], wn["ip"], w["port"]))
+                    log("pipeline trigger: /start sent to {} writers".format(
+                        len(plan["writers"])))
+                # Step 5: wait for all writers to finish (warmup + measured run)
+                warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
+                duration = float(cfg.get("duration", 30))
+                for w, pid in writer_pids:
+                    if not dry and pid:
+                        wait_process_exit(cluster, w["node"], pid,
+                                          "writer w{}".format(w["gid"]),
+                                          int(warmup_duration + duration) + 300, dry_run=dry,
+                                          expected_s=warmup_duration + duration)
+                for w in plan["writers"]:
+                    wn = get_node(cluster, w["node"])
+                    pull_stage_logs(wn["ip"], wn,
+                                    ["{}.writer_{}_w{}.log".format(
+                                        base_noext, w["node"], w["gid"])],
+                                    local_log_dir, dry)
+                # Step 6: shutdown readers via their /shutdown endpoint (k8s:
+                # direct pod IP; ssh: loopback curl on the reader's node) and
+                # wait for their final logs
+                for r in plan["readers"]:
+                    rn = get_node(cluster, r["node"])
+                    if not dry:
+                        try:
+                            _pipeline_http_call(rn, r["port"], "/shutdown")
+                        except Exception as exc:
+                            log("[WARN] reader r{} shutdown: {}".format(
+                                r["index"], exc))
+                for r, pid in reader_pids:
+                    if not dry and pid:
+                        wait_process_exit(cluster, r["node"], pid,
+                                          "reader r{} (port {})".format(r["index"], r["port"]),
+                                          60, dry_run=dry, expected_s=60)
+                for r in plan["readers"]:
+                    rn = get_node(cluster, r["node"])
+                    pull_stage_logs(rn["ip"], rn,
+                                    ["{}.reader_{}_r{}_p{}.log".format(
+                                        base_noext, r["node"], r["index"], r["port"])],
+                                    local_log_dir, dry)
             # Step 7: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
@@ -2679,14 +2825,23 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 for node_name in involved_nodes:
                     n = get_node(cluster, node_name)
                     nohup_files = []
-                    for r in plan["readers"]:
-                        if r["node"] == node_name:
-                            nohup_files.append("{}.reader_{}_r{}_p{}.nohup".format(
-                                base_noext, r["node"], r["index"], r["port"]))
-                    for w in plan["writers"]:
-                        if w["node"] == node_name:
-                            nohup_files.append("{}.writer_{}_w{}.nohup".format(
-                                base_noext, w["node"], w["gid"]))
+                    if plan.get("dual"):
+                        for c in plan["clients"]:
+                            if c["node"] == node_name:
+                                nohup_files.append(
+                                    "{}.dual_{}_c{}_p{}.nohup".format(
+                                        base_noext, c["node"], c["id"], c["port"]))
+                    else:
+                        for r in plan["readers"]:
+                            if r["node"] == node_name:
+                                nohup_files.append(
+                                    "{}.reader_{}_r{}_p{}.nohup".format(
+                                        base_noext, r["node"], r["index"], r["port"]))
+                        for w in plan["writers"]:
+                            if w["node"] == node_name:
+                                nohup_files.append(
+                                    "{}.writer_{}_w{}.nohup".format(
+                                        base_noext, w["node"], w["gid"]))
                     if nohup_files:
                         cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
                             " ".join(nohup_files))
@@ -2984,6 +3139,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "writer_count": "N*{}".format(w_cpn),
                 "reader_count": "N*{}".format(r_cpn),
                 "notify_count": plan["notify_count"],
+                # store count is RECORD-ONLY metadata (stores are deployed
+                # externally and discovered via the master)
+                "store_count": ("N*{}".format(cfg.get("store_count_per_node"))
+                                if cfg.get("store_count_per_node") else ""),
                 "base_qps": cfg.get("base_qps", ""),
                 "qps_multiple": cfg.get("qps_multiple", ""),
                 "target_qps": plan["total_qps"],
@@ -3071,6 +3230,18 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 if not m:
                     continue
                 reader_files[int(m.group(2))] = (m.group(1), p)
+            # dual-role logs: ONE file per client carries BOTH the writer
+            # and the reader rows (role split by op filter)
+            dual_files = {}   # id -> (nodename, path)
+            for p in sorted(glob.glob(os.path.join(
+                    local_log_dir, "{}.{}.dual_*.log".format(name, run_name)))):
+                base = os.path.basename(p)
+                if ".ylt." in base:
+                    continue
+                m = re.search(r"\.dual_(.+)_c(\d+)_p(\d+)\.log$", base)
+                if not m:
+                    continue
+                dual_files[int(m.group(2))] = (m.group(1), p)
             for gid in sorted(writer_files):
                 nodename, f = writer_files[gid]
                 agg = parse_benchmark_log(f, op_filter="pipeline_write")
@@ -3104,6 +3275,36 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 metrics_into(row, agg, ds_bytes, with_queue=True,
                              throughput_mb=busy_throughput_mb(
                                  (f for _n, f in reader_files.values()),
+                                 "pipeline_read", ds_bytes))
+                rows.append(row)
+            # dual-role rows: writer metrics + reader metrics per client log
+            for cid in sorted(dual_files):
+                nodename, f = dual_files[cid]
+                agg = parse_benchmark_log(f, op_filter="pipeline_write")
+                row = base_row("writer", "c{}".format(cid), nodename, ds)
+                metrics_into(row, agg, ds_bytes)
+                rows.append(row)
+                agg = parse_benchmark_log(f, op_filter="pipeline_read")
+                row = base_row("reader", "c{}".format(cid), nodename, ds)
+                metrics_into(row, agg, ds_bytes, with_queue=True)
+                rows.append(row)
+            if dual_files:
+                agg = parse_benchmark_log(
+                    [f for _n, f in dual_files.values()],
+                    op_filter="pipeline_write")
+                row = base_row("writer", "TOTAL", "", ds)
+                metrics_into(row, agg, ds_bytes,
+                             throughput_mb=busy_throughput_mb(
+                                 (f for _n, f in dual_files.values()),
+                                 "pipeline_write", ds_bytes))
+                rows.append(row)
+                agg = parse_benchmark_log(
+                    [f for _n, f in dual_files.values()],
+                    op_filter="pipeline_read")
+                row = base_row("reader", "TOTAL", "", ds)
+                metrics_into(row, agg, ds_bytes, with_queue=True,
+                             throughput_mb=busy_throughput_mb(
+                                 (f for _n, f in dual_files.values()),
                                  "pipeline_read", ds_bytes))
                 rows.append(row)
     else:
