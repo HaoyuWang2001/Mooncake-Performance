@@ -62,7 +62,7 @@ const SelNode = {
   template: `
   <div>
     <div class="cfg-row" :style="{ paddingLeft: (depth * 14 + 4) + 'px' }">
-      <span v-if="node.isDir" class="tgl" @click="open = !open">{{ open ? "▾" : "▸" }}</span>
+      <span v-if="node.isDir" class="tgl" @click="toggle(node.path)">{{ open ? "▾" : "▸" }}</span>
       <span v-else class="tgl tgl-dot"></span>
       <el-checkbox v-if="node.isDir"
                    :model-value="node.checked"
@@ -73,7 +73,7 @@ const SelNode = {
                    :disabled="parentSel"
                    @update:model-value="v => { node.checked = v; }" />
       <span class="cfg-name" :class="{ dir: node.isDir }" :title="node.path"
-            @click="open = !open">{{ node.name }}</span>
+            @click="toggle(node.path)">{{ node.name }}</span>
       <span v-if="node.isDir" class="cfg-count">({{ node.count }})</span>
     </div>
     <div v-if="node.isDir" v-show="open">
@@ -83,12 +83,22 @@ const SelNode = {
     </div>
   </div>`,
   setup(props) {
-    const open = Vue.ref(false);   // 选择测试配置弹窗：默认全部折叠
+    // 手风琴展开约束：展开状态来自注入的共享链（见 perf-view 的
+    // cfgTreeNav），展开某目录时只保留「根→该目录」一条链，兄弟与
+    // 父辈兄弟自动回收；无注入时退化为独立开关（组件独立可用）
+    const nav = Vue.inject("cfgTreeNav", null);
+    const localOpen = Vue.ref(false);
+    const open = Vue.computed(() =>
+      nav ? nav.expandedPaths.value.has(props.node.path) : localOpen.value);
+    const toggle = (path) => {
+      if (nav) { nav.toggleDir(path); return; }
+      localOpen.value = !localOpen.value;
+    };
     const hasSel = Vue.computed(() => {
       const walk = (n) => n.checked || (n.children || []).some(walk);
       return walk(props.node);
     });
-    return { open, hasSel };
+    return { open, toggle, hasSel };
   },
 };
 
@@ -266,6 +276,25 @@ const PerfView = {
     const starting = Vue.ref(false);
     const cleaning = Vue.ref(false);
     const clusterImage = Vue.ref("");
+
+    // 配置树手风琴约束：同一时刻仅保留「根→当前展开目录」一条展开链。
+    // 展开某目录 -> 集合替换为其全部前缀级（兄弟、父辈兄弟随之回收）；
+    // 折叠某目录 -> 移除自身及子孙（重新展开时不记忆之前的深度）。
+    // 目录路径均以 "/" 结尾，前缀链即父子链，无需组件间传递祖先信息。
+    const expandedPaths = Vue.ref(new Set());
+    function toggleDir(path) {
+      const cur = expandedPaths.value;
+      if (cur.has(path)) {
+        expandedPaths.value = new Set([...cur].filter(p => !p.startsWith(path)));
+      } else {
+        const parts = path.replace(/\/+$/, "").split("/");
+        const chain = [];
+        for (let i = 2; i <= parts.length; i++)   // "configs/<cat>/" 起始
+          chain.push(parts.slice(0, i).join("/") + "/");
+        expandedPaths.value = new Set(chain);
+      }
+    }
+    Vue.provide("cfgTreeNav", { expandedPaths, toggleDir });
 
     // 最终选择（与 startRun 提交内容一致）：勾目录=收编该目录并停止下钻
     const selected = Vue.computed(() => {
