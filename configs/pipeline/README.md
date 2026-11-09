@@ -104,30 +104,20 @@ client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样�
 | 层 | 字段 |
 | --- | --- |
 | 根基座 `_configs.json` | `scenario` / `protocol` / `key_prefix` / `notify_pipeline` / `warmup` / `duration` / `batch_size` |
-| x-nodes 层 `_configs.json` | `writer{count_per_node, operation}` + `reader{operation, num_threads}`（集群面向：进程数 = count_per_node × N，N 为 cluster 全部节点数） |
-| rank 层 `_configs.json` | `work_mode` / `base_qps` / `data_size` |
-| recall 层 `_configs.json` | `work_mode` / `base_qps` / `notify_count` / `writer.notify_threads` / `reader.count_per_node` / `data_size` |
+| `rank/_configs.json` | `work_mode` / `base_qps` / `data_size` / `writer{count_per_node, operation}` / `reader{operation, num_threads}` |
+| `recall/_configs.json` | `work_mode` / `base_qps` / `notify_count` / `writer{count_per_node, operation, notify_threads}` / `reader{operation, num_threads, count_per_node}` / `data_size` |
 | rank 用例 | `traffic_mode` / `qps_multiple` / `notify_count` / `writer.notify_threads` / `reader.count_per_node` |
 | recall 用例 | `traffic_mode` / `qps_multiple` |
+| smoke/ 用例 | 自带全字段（`client` 块 + 业务参数，不参与继承链） |
 | `demo/` | 自带全字段（不参与继承链） |
 
-## 档位矩阵（reader 节点数 × 稀疏读者档）
-
-名字 `rank_{traffic}_1w{N}r_{mult}_n{K}.json`：`{N}r` 即 notify_count（x==notify 语义），
-reader 池 = count_per_node × 节点数 ≥ notify_count。每档跑 pulse/balanced × 1x/2x/3x。
-
-| 目录 | 档位 | 池 |
-| --- | --- | --- |
-| 1-nodes/rank | 1w1r、1w2r、1w4r、1w10r | 1 / 2 / 4 / 10 |
-| 2-nodes/rank | 1w2r、1w4r、1w8r、1w10r、2w10r（双写） | 2 / 4 / 8 / 10 / 10 |
-| 4-nodes/rank | 1w4r、1w8r、1w10r、1w16r、2w10r（双写） | 4 / 8 / 12 / 16 / 12 |
-| */recall | 1w1r（n1/n2/n4） | 1 |
+档位矩阵与双角色说明见上文「档位矩阵（rank）」「双角色模式（smoke/）」两节。
 
 ## resolved 全参数语义（业务模型）
 
 | 参数 | rank | recall | 语义 |
 | --- | --- | --- | --- |
-| `base_qps` × `qps_multiple` | 105×1/2/3 | 35×1/2/3 | 总写入 QPS，全部 writer 均分 |
+| `base_qps` × `qps_multiple` | 105×1/2/3 | 35×1/2/3 | **单节点**写入 QPS，节点内全部 writer 均分（每 client = 节点速率 / cpn；集群总量 = × N） |
 | `traffic_mode` | pulse/balanced | pulse/balanced | 脉冲（每秒窗口突发）/ 均衡（匀速节流） |
 | `notify_count` | =档位读者数 | 1 | 每批写后随机通知的 reader 数 |
 | `writer.notify_threads` | =notify_count | 1 | notify 发送线程池 |
@@ -139,8 +129,8 @@ reader 池 = count_per_node × 节点数 ≥ notify_count。每档跑 pulse/bala
 ## 运行方式
 
 ```bash
-python benchmark.py --config-dir configs/pipeline                       # 递归全部（含 demo/）
-python benchmark.py --config-dir configs/pipeline/2-nodes               # 含子目录递归
-python benchmark.py --config-dir configs/pipeline/2-nodes/rank          # rank 层
-python benchmark.py --config-dir configs/pipeline/demo                  # 冒烟
+python benchmark.py --config-dir configs/pipeline                       # 递归全部（含 smoke/ demo/）
+python benchmark.py --config-dir configs/pipeline/rank                  # rank 全部档位
+python benchmark.py --config-dir configs/pipeline/smoke                 # 双角色最小场景集
+python benchmark.py --config-dir configs/pipeline/demo                  # 冒烟（demo 目录）
 ```
