@@ -2334,6 +2334,19 @@ def _k8s_pod_ip(controller, ns, pod):
     return ip
 
 
+def _pipeline_k8s_roles(plan):
+    """Deployment role list for the k8s pipeline channel. dual mode deploys
+    ONE "client" role (pod = dual-role process); separate mode deploys a
+    reader and a writer role. Each entry: (role, plan entries, port base).
+    NOTE: the dual branch MUST stay a 1-tuple wrapping the role tuple —
+    returning the bare tuple makes the caller's for-loop iterate its
+    ELEMENTS and unpack the role STRING ("too many values to unpack")."""
+    if plan.get("dual"):
+        return (("client", plan["clients"], plan["writer_port_base"]),)
+    return (("reader", plan["readers"], plan["reader_port_base"]),
+            ("writer", plan["writers"], plan["writer_port_base"]))
+
+
 def _k8s_deployment_pods(cluster, run_label, role):
     """Sorted pod names of a pipeline role's Deployment (label selector)."""
     c = cluster["_controller"]
@@ -2482,11 +2495,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # ---- per-role Deployments (pod = process): replicas = cpn x N ----
         _k8s = k8s_settings(cluster)
         _run_label = k8s_run_label(ts, cfg_name)
-        _roles = (("client", plan["clients"], plan["writer_port_base"])
-                  if plan.get("dual") else
-                  (("reader", plan["readers"], plan["reader_port_base"]),
-                   ("writer", plan["writers"], plan["writer_port_base"])))
-        for role, entries, base in _roles:
+        for role, entries, base in _pipeline_k8s_roles(plan):
             ensure_k8s_deployment(cluster, ts, cfg_name, role,
                                   len(entries), dry)
             if dry:

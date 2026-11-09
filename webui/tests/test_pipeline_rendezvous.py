@@ -185,3 +185,30 @@ def test_etcd_range_via_controller_proxy(endpoints):
     n = bm._etcd_delete_prefix(cluster, endpoints, "mcbench/px/")
     assert n == 2
     assert bm._etcd_range(cluster, endpoints, "mcbench/px/") == {}
+
+
+def test_pipeline_k8s_roles_shape():
+    """k8s deployment role list shape: each item must be an unpackable
+    (role, entries, port_base) 3-tuple — dual yields ONE 'client' entry,
+    separate yields reader+writer. Locks the regression where the dual
+    branch returned the bare tuple and the for-loop unpacked its elements
+    ('too many values to unpack (expected 3)')."""
+    dual = bm.pipeline_plan(
+        {"client": {"count_per_node": 2, "port_base": 9301},
+         "writer": {}, "reader": {}}, node_count=2)
+    roles = bm._pipeline_k8s_roles(dual)
+    items = list(roles)
+    assert len(items) == 1
+    role, entries, base = items[0]           # must unpack cleanly
+    assert role == "client" and base == 9301 and len(entries) == 4
+    assert all(isinstance(i, tuple) and len(i) == 3 for i in items)
+
+    sep = bm.pipeline_plan(
+        {"writer": {"count_per_node": 1}, "reader": {"count_per_node": 2}},
+        node_count=2)
+    items = list(bm._pipeline_k8s_roles(sep))
+    assert len(items) == 2
+    assert [i[0] for i in items] == ["reader", "writer"]
+    assert items[0][2] == 9201 and items[1][2] == 9101
+    assert len(items[0][1]) == 4 and len(items[1][1]) == 2
+    assert all(isinstance(i, tuple) and len(i) == 3 for i in items)
