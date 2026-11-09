@@ -1,0 +1,13 @@
+{
+  "work_mode": "rank",
+  "base_qps": 105,
+  "data_size": ["8MB"],
+  "writer": {
+    "count_per_node": 1,
+    "operation": "put_batch"
+  },
+  "reader": {
+    "operation": "get",
+    "num_threads": 1
+  }
+}

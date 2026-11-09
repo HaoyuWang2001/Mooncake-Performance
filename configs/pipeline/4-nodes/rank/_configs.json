@@ -1,7 +1,0 @@
-{
-  "work_mode": "rank",
-  "base_qps": 105,
-  "data_size": [
-    "8MB"
-  ]
-}

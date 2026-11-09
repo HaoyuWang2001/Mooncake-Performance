@@ -1,0 +1,16 @@
+{
+  "work_mode": "recall",
+  "base_qps": 35,
+  "notify_count": 1,
+  "data_size": ["3.5MB"],
+  "writer": {
+    "count_per_node": 1,
+    "operation": "put_batch",
+    "notify_threads": 1
+  },
+  "reader": {
+    "operation": "get",
+    "num_threads": 1,
+    "count_per_node": 1
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "traffic_mode": "pulse",
+  "qps_multiple": 1,
+  "notify_count": 1,
+  "client": {
+    "count_per_node": 6,
+    "port_base": 9301
+  },
+  "writer": {
+    "operation": "put_batch",
+    "notify_threads": 1
+  },
+  "reader": {
+    "operation": "get",
+    "num_threads": 1
+  },
+  "store_count_per_node": 2,
+  "data_size": [
+    "3.5MB"
+  ],
+  "duration": 30,
+  "warmup": {
+    "duration": 5
+  }
+}

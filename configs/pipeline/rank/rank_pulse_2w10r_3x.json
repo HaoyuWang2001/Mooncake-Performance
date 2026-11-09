@@ -1,0 +1,12 @@
+{
+  "traffic_mode": "pulse",
+  "qps_multiple": 3,
+  "notify_count": 10,
+  "writer": {
+    "count_per_node": 2,
+    "notify_threads": 10
+  },
+  "reader": {
+    "count_per_node": 5
+  }
+}
