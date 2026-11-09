@@ -1,4 +1,6 @@
 {
+  "work_mode": "recall",
+  "base_qps": 35,
   "traffic_mode": "pulse",
   "qps_multiple": 1,
   "notify_count": 1,

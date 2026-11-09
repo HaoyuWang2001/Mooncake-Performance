@@ -1,4 +1,6 @@
 {
+  "work_mode": "rank",
+  "base_qps": 105,
   "traffic_mode": "pulse",
   "qps_multiple": 1,
   "notify_count": 10,
