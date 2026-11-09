@@ -212,3 +212,30 @@ def test_pipeline_k8s_roles_shape():
     assert items[0][2] == 9201 and items[1][2] == 9101
     assert len(items[0][1]) == 4 and len(items[1][1]) == 2
     assert all(isinstance(i, tuple) and len(i) == 3 for i in items)
+
+
+def test_render_deployment_yaml_structure():
+    """Deployment template field placement: topologySpreadConstraints is a
+    POD-spec field (must sit inside template.spec, 6-space indent — a real
+    k8s server rejected it at Deployment.spec level) and the pod template
+    must use restartPolicy: Always (Deployments reject Never)."""
+    cluster = {
+        "k8s": {"namespace": "mc-test", "image": "local/test:1",
+                "controller_workspace": "/tmp/cw", "pod_workspace": "/tmp/pw"},
+        "_controller": {"ip": "127.0.0.1", "_ctx": ""},
+    }
+    deploy, run_label, text = bm._render_deployment_yaml(
+        cluster, "20261109-x", "pipeline", "client", 4)
+    lines = text.split("\n")
+    # never at Deployment.spec level (2-space, before '  template:')
+    for ln in lines[:lines.index("  template:")]:
+        assert not ln.startswith("  topologySpreadConstraints"), (
+            "topologySpreadConstraints must not sit at Deployment.spec level")
+    # must exist inside template.spec (6-space indent)
+    assert "      topologySpreadConstraints:" in lines, (
+        "topologySpreadConstraints missing from template.spec")
+    # Deployment pod template requires restartPolicy Always
+    assert "      restartPolicy: Always" in lines, (
+        "Deployment pod template restartPolicy must be Always")
+    assert "{{MC_" not in text
+    assert "replicas: 4" in text and "role: client" in text
