@@ -1232,6 +1232,8 @@ def _pipeline_writer(args, store, do_warmup=True):
     phases (see _writer_run_phases; warmup uses the same deployment shape
     to activate writer->store, writer->reader and reader->store paths)."""
     writer_id = args.client_id
+    timeout_s = float(getattr(args, "rendezvous_timeout", 120) or 120)
+    rdz_prefix = _rendezvous_prefix(args)
     readers = _discover_readers(args, int(args.reader_count or 0),
                                 "writer {}".format(writer_id))
     readers = _normalize_local_readers(readers)
