@@ -117,13 +117,13 @@ def endpoints():
 def test_pipeline_barrier_success_and_timeout(endpoints, monkeypatch):
     et.kv_put(endpoints, "mcbench/t1/readers/0", "a")
     et.kv_put(endpoints, "mcbench/t1/readers/1", "b")
-    kvs = bm._pipeline_barrier(endpoints, "mcbench/t1/readers/", 2, 5,
+    kvs = bm._pipeline_barrier(None, endpoints, "mcbench/t1/readers/", 2, 5,
                                "readers", "t1")
     assert len(kvs) == 2
     # timeout path: expect 5, only 2 present; shrink poll so the test is fast
     monkeypatch.setattr(bm.time, "sleep", lambda s: None)
     try:
-        bm._pipeline_barrier(endpoints, "mcbench/t1/readers/", 5, 0.01,
+        bm._pipeline_barrier(None, endpoints, "mcbench/t1/readers/", 5, 0.01,
                              "readers", "t1")
         raise AssertionError("should raise")
     except RuntimeError as exc:
@@ -133,10 +133,10 @@ def test_pipeline_barrier_success_and_timeout(endpoints, monkeypatch):
 def test_pipeline_wipe_etcd(endpoints):
     et.kv_put(endpoints, "mcbench/x/readers/0", "a")
     et.kv_put(endpoints, "mcbench/y/writers/1", "b")
-    bm._pipeline_wipe_etcd({"etcd_endpoints": endpoints})
+    bm._pipeline_wipe_etcd(None, {"etcd_endpoints": endpoints})
     assert et.kv_range(endpoints, "mcbench/") == {}
     # no etcd configured -> silent no-op
-    bm._pipeline_wipe_etcd({"etcd_endpoints": ""})
+    bm._pipeline_wipe_etcd(None, {"etcd_endpoints": ""})
 
 
 def test_run_pipeline_rejects_without_nodes(monkeypatch):
@@ -153,3 +153,35 @@ def test_run_pipeline_rejects_without_nodes(monkeypatch):
         raise AssertionError("should raise")
     except RuntimeError as exc:
         assert "non-empty cluster node set" in str(exc)
+
+
+def test_k8s_pipeline_nodes_jsonpath_has_no_raw_newline(monkeypatch):
+    """kubectl must receive a LITERAL backslash-n in the jsonpath; a raw
+    newline makes real kubectl fail with 'unterminated quoted string'."""
+    captured = {}
+
+    def fake_run(controller, args, check=True, timeout=None):
+        captured["argv"] = list(args)
+        return "node-a True\nnode-b True", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake_run)
+    nodes = bm._k8s_pipeline_nodes({"_controller": {"ip": "1.2.3.4", "_ctx": ""}})
+    assert nodes == ["node-a", "node-b"]
+    jp = captured["argv"][captured["argv"].index("-o") + 1]
+    assert "\\n" in jp, "jsonpath must carry a literal backslash-n"
+    assert "\n" not in jp, "jsonpath must not carry a raw newline"
+
+
+def test_etcd_range_via_controller_proxy(endpoints):
+    """k8s mode: orchestrator-side etcd access goes through the controller
+    (curl), never directly from the orchestrator host."""
+    cluster = {"_controller": {"ip": "127.0.0.1", "_local": True,
+                               "_ctx": ""}}
+    et.kv_put(endpoints, "mcbench/px/readers/0", "a")
+    et.kv_put(endpoints, "mcbench/px/readers/1", "b")
+    # route through the controller-proxy layer (local controller -> curl)
+    kvs = bm._etcd_range(cluster, endpoints, "mcbench/px/readers/")
+    assert kvs == {"mcbench/px/readers/0": "a", "mcbench/px/readers/1": "b"}
+    n = bm._etcd_delete_prefix(cluster, endpoints, "mcbench/px/")
+    assert n == 2
+    assert bm._etcd_range(cluster, endpoints, "mcbench/px/") == {}

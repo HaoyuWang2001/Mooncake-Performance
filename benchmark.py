@@ -1502,13 +1502,78 @@ def _pipeline_etcd_endpoints(globals_cfg):
     return eps
 
 
-def _pipeline_wipe_etcd(globals_cfg):
+def _etcd_http_urls(cluster, endpoints):
+    """Gateway base URLs for ORCHESTRATOR-side access. k8s mode resolves
+    *.svc.cluster.local Service DNS via the controller first (the
+    orchestrator host sits outside the cluster and cannot route it); the
+    resolution is cached on the cluster dict (barriers poll every second)."""
+    if cluster is not None and cluster.get("_controller") is not None:
+        cache = cluster.setdefault("_etcd_resolved", {})
+        if endpoints not in cache:
+            try:
+                cache[endpoints] = _resolve_k8s_addr(endpoints, cluster)
+            except Exception as exc:
+                log("[WARN] etcd endpoint resolution via controller: {}".format(exc))
+                cache[endpoints] = endpoints
+        endpoints = cache[endpoints] or endpoints
+    return bench_etcd.endpoint_urls(endpoints)
+
+
+def _controller_etcd_post(cluster, endpoints, path, payload, timeout):
+    """POST to the etcd gateway FROM THE CONTROLLER (k8s mode: the
+    orchestrator cannot reach cluster-internal etcd directly). Returns the
+    parsed JSON response."""
+    c = cluster["_controller"]
+    body = json.dumps(payload)
+    last = None
+    for url in _etcd_http_urls(cluster, endpoints):
+        cmd = ("curl -s --max-time {t} -X POST "
+               "-H 'Content-Type: application/json' -d {d} {u}").format(
+                   t=int(max(1, timeout)), d=shlex.quote(body),
+                   u=shlex.quote(url + path))
+        out, rc = controller_exec(c, cmd)
+        if rc == 0 and out.strip():
+            try:
+                return json.loads(out)
+            except ValueError:
+                last = "bad json: {}".format(out.strip()[:120])
+        else:
+            last = (out or "").strip()[:120]
+    raise RuntimeError("etcd gateway {} failed via controller: {}".format(
+        path, last))
+
+
+def _etcd_range(cluster, endpoints, prefix, timeout=5):
+    """Orchestrator-side prefix scan: k8s -> via controller; ssh -> direct."""
+    if cluster is not None and cluster.get("_controller") is not None:
+        payload = {"key": bench_etcd._b64(prefix),
+                   "range_end": bench_etcd._b64(bench_etcd._prefix_end(prefix))}
+        out = _controller_etcd_post(cluster, endpoints, "/v3/kv/range",
+                                    payload, timeout)
+        kvs = out.get("kvs") or []
+        return {bench_etcd._unb64(kv["key"]): bench_etcd._unb64(kv["value"])
+                for kv in kvs}
+    return bench_etcd.kv_range(endpoints, prefix, timeout)
+
+
+def _etcd_delete_prefix(cluster, endpoints, prefix, timeout=5):
+    """Orchestrator-side prefix delete: k8s -> via controller; ssh -> direct."""
+    if cluster is not None and cluster.get("_controller") is not None:
+        payload = {"key": bench_etcd._b64(prefix),
+                   "range_end": bench_etcd._b64(bench_etcd._prefix_end(prefix))}
+        out = _controller_etcd_post(cluster, endpoints, "/v3/kv/deleterange",
+                                    payload, timeout)
+        return int(out.get("deleted", 0) or 0)
+    return bench_etcd.kv_delete_prefix(endpoints, prefix, timeout)
+
+
+def _pipeline_wipe_etcd(cluster, globals_cfg):
     """Best-effort wipe of the whole mcbench/ rendezvous tree (single active
     benchmark per cluster assumption). No-op when etcd is unconfigured."""
     eps = (globals_cfg.get("etcd_endpoints", "") or "").strip()
     if not eps:
         return
-    n = bench_etcd.kv_delete_prefix(eps, "mcbench/")
+    n = _etcd_delete_prefix(cluster, eps, "mcbench/")
     if n:
         log("[k8s-pipeline] etcd: wiped {} stale mcbench/ keys".format(n))
 
@@ -1530,13 +1595,13 @@ def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
     return str(out).strip() == "200"
 
 
-def _pipeline_barrier(etcd_endpoints, prefix, expected, timeout_s, what,
-                      run_id):
+def _pipeline_barrier(cluster, etcd_endpoints, prefix, expected, timeout_s,
+                      what, run_id):
     """Poll etcd until `expected` registrations exist under prefix; raises
     with the registered/missing list on timeout. Returns the kv dict."""
     t0 = time.time()
     while True:
-        kvs = bench_etcd.kv_range(etcd_endpoints, prefix)
+        kvs = _etcd_range(cluster, etcd_endpoints, prefix)
         if len(kvs) >= expected:
             return kvs
         if time.time() - t0 > timeout_s:
@@ -1601,7 +1666,8 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
     # 5. wipe this run's etcd rendezvous prefix
     if etcd_endpoints and run_id:
         try:
-            bench_etcd.kv_delete_prefix(etcd_endpoints, "mcbench/{}/".format(run_id))
+            _etcd_delete_prefix(cluster, etcd_endpoints,
+                                "mcbench/{}/".format(run_id))
         except Exception as exc:
             log("[WARN] fail-cleanup: etcd prefix wipe failed: {}".format(exc))
 
@@ -2150,7 +2216,7 @@ def _k8s_pipeline_nodes(cluster, dry_run=False):
     out, rc = controller_run(
         c, ["get", "nodes", "-o",
             "jsonpath={range .items[*]}{.metadata.name}{' '}"
-            "{.status.conditions[?(@.type=='Ready')].status}{'\n'}{end}"],
+            "{.status.conditions[?(@.type=='Ready')].status}{'\\n'}{end}"],
         check=False)
     if rc != 0:
         raise RuntimeError("kubectl get nodes failed: {}".format(
@@ -2557,8 +2623,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             reader_pids = []
             writer_pids = []
             if not dry:
-                bench_etcd.kv_delete_prefix(etcd_endpoints,
-                                           "mcbench/{}/".format(run_id))
+                _etcd_delete_prefix(cluster, etcd_endpoints,
+                                    "mcbench/{}/".format(run_id))
             # data_size is always part of the run file name, so different
             # sizes never share writer/reader logs
             run_name = "benchmark_c1_t{}_{}".format(reader_threads, ds)
@@ -2617,11 +2683,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # barriers: every client registered BOTH roles, then trigger
                 if not dry:
                     t0 = time.time()
-                    _pipeline_barrier(etcd_endpoints,
+                    _pipeline_barrier(cluster, etcd_endpoints,
                                       "mcbench/{}/readers/".format(run_id),
                                       len(plan["clients"]), rendezvous_timeout_s,
                                       "dual readers", run_id)
-                    _pipeline_barrier(etcd_endpoints,
+                    _pipeline_barrier(cluster, etcd_endpoints,
                                       "mcbench/{}/writers/".format(run_id),
                                       len(plan["clients"]), rendezvous_timeout_s,
                                       "dual writers", run_id)
@@ -2718,7 +2784,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # boot surface here as a timeout with the missing list)
                 if not dry:
                     t0 = time.time()
-                    _pipeline_barrier(etcd_endpoints,
+                    _pipeline_barrier(cluster, etcd_endpoints,
                                       "mcbench/{}/readers/".format(run_id),
                                       len(plan["readers"]), rendezvous_timeout_s,
                                       "readers", run_id)
@@ -2777,7 +2843,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # warmup + measured phases only after this synchronized start.
                 if not dry:
                     t0 = time.time()
-                    _pipeline_barrier(etcd_endpoints,
+                    _pipeline_barrier(cluster, etcd_endpoints,
                                       "mcbench/{}/writers/".format(run_id),
                                       len(plan["writers"]), rendezvous_timeout_s,
                                       "writers", run_id)
@@ -2859,8 +2925,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             " ".join(nohup_files))
                         ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
                 # this size iteration is done: wipe its rendezvous state
-                bench_etcd.kv_delete_prefix(etcd_endpoints,
-                                            "mcbench/{}/".format(run_id))
+                _etcd_delete_prefix(cluster, etcd_endpoints,
+                                    "mcbench/{}/".format(run_id))
         # Config end: remove-all — clears everything this config's writers
         # wrote. Pipeline env clears BENCH_KEY_COUNT, so the key-prefix scope has
         # no key count to work with; a full sweep here is short and precise
@@ -3664,7 +3730,7 @@ def main(args, cfg_paths):
     # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
     # run prefix is also wiped per scenario/size; this covers the rest)
     try:
-        _pipeline_wipe_etcd(globals_cfg)
+        _pipeline_wipe_etcd(cluster, globals_cfg)
     except Exception as exc:
         log("[WARN] etcd stale-key wipe failed: {}".format(exc))
     if args.mode == "k8s":
@@ -3914,7 +3980,7 @@ def cleanup_on_stop():
             except Exception as exc:
                 log("[WARN] [STOP] delete namespace: {}".format(exc))
             try:
-                _pipeline_wipe_etcd(globals_cfg)
+                _pipeline_wipe_etcd(cluster, globals_cfg)
             except Exception as exc:
                 log("[WARN] [STOP] etcd wipe: {}".format(exc))
             try:
@@ -3932,7 +3998,7 @@ def cleanup_on_stop():
             except Exception as exc:
                 log("[WARN] [STOP] state reap: {}".format(exc))
             try:
-                _pipeline_wipe_etcd(globals_cfg)
+                _pipeline_wipe_etcd(cluster, globals_cfg)
             except Exception as exc:
                 log("[WARN] [STOP] etcd wipe: {}".format(exc))
             if args is not None and getattr(args, "clean_up", False):
