@@ -1092,6 +1092,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
         files = [("run_benchmark_basic.sh", SCRIPTS_DIR),
                  ("run_benchmark_pipeline.sh", SCRIPTS_DIR),
                  ("mooncake_benchmark_client.py", SCRIPTS_DIR),
+                 ("bench_etcd.py", SCRIPTS_DIR),
                  ("env.sh", None)]
         mooncake_env = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
         if os.path.exists(mooncake_env):
@@ -1162,7 +1163,8 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
         push_files = [env_sh_path,
                       os.path.join(SCRIPTS_DIR, "run_benchmark_basic.sh"),
                       os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
-                      os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py")]
+                      os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py"),
+                      os.path.join(SCRIPTS_DIR, "bench_etcd.py")]
         if os.path.exists(mooncake_env_path):
             push_files.append(mooncake_env_path)
         scp_push(n["ip"], n, push_files, remote_scripts, dry_run=dry_run)

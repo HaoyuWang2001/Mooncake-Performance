@@ -17,11 +17,17 @@ import json
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+# bench_etcd lives next to this file on every node (pushed together with
+# the runner scripts); pipeline rendezvous uses it over the etcd gateway.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_etcd
 VALIDATE_BYTES = 64
 def parse_size(size_str):
     """Parse 8MB / 1GB / 512KB style strings into byte counts."""
@@ -911,6 +917,21 @@ import socketserver
 import urllib.parse
 import threading
 from queue import Queue
+
+
+def _self_host():
+    """Routable host for etcd registration: POD_IP (k8s downward API)
+    wins, then SETUP_FABRIC_IP (ssh high-perf NIC)."""
+    return (os.environ.get("POD_IP")
+            or os.environ.get("SETUP_FABRIC_IP") or "").strip()
+
+
+def _self_node():
+    return os.environ.get("NODE_NAME") or socket.gethostname()
+
+
+def _rendezvous_prefix(args):
+    return "mcbench/{}/".format(args.run_id)
 def _pipeline_writer(args, store, do_warmup=True):
     """Writer process: write keys at target_qps, notify a random subset of readers.
 
@@ -941,10 +962,35 @@ def _pipeline_writer(args, store, do_warmup=True):
     warmup_duration = float(getattr(args, "warmup_duration", 0) or 0)
     target_qps = float(args.target_qps) if args.target_qps > 0 else 0
     traffic_mode = args.traffic_mode
-    peers = json.loads(args.peers) if isinstance(args.peers, str) else args.peers
-    readers = [p for p in peers if p.get("role") == "reader"]
+    # ---- rendezvous: pull the FULL reader list from etcd (readers were
+    # started first and self-registered). This replaces the old manually
+    # injected --peers argv. Registration happens only after the list is
+    # complete, so a registered writer == fully prepared writer. ----
+    expected_readers = int(args.reader_count or 0)
+    timeout_s = float(getattr(args, "rendezvous_timeout", 120) or 120)
+    rdz_prefix = _rendezvous_prefix(args)
+    readers = []
+    t0 = time.time()
+    while True:
+        kvs = bench_etcd.kv_range(args.etcd_endpoints, rdz_prefix + "readers/")
+        readers = []
+        for _k, v in sorted(kvs.items()):
+            try:
+                r = json.loads(v)
+                r.setdefault("role", "reader")
+                readers.append(r)
+            except ValueError:
+                pass
+        if len(readers) >= expected_readers:
+            break
+        if time.time() - t0 > timeout_s:
+            raise SystemExit(
+                "[ERROR] writer {}: only {}/{} readers registered in etcd "
+                "after {}s (prefix={})".format(
+                    writer_id, len(readers), expected_readers,
+                    int(timeout_s), rdz_prefix))
+        time.sleep(0.5)
     # Auto-resolve reader host to 127.0.0.1 if they are on the same machine
-    import socket
     local_ips = set()
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
@@ -987,6 +1033,63 @@ def _pipeline_writer(args, store, do_warmup=True):
                   "num_readers": len(readers), "notify_count": notify_count,
                   "notify_threads": notify_threads,
                   "writer_count": args.writer_count, "reader_count": args.reader_count})
+    # ---- writer HTTP /start endpoint: the orchestrator triggers the run
+    # here after seeing ALL writers registered in etcd ----
+    started = threading.Event()
+
+    class _WriterStartHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._handle()
+
+        def do_POST(self):
+            self._handle()
+
+        def _handle(self):
+            # NOTE: no urllib here — the enclosing function imports
+            # urllib.request LATER, which would shadow the closure binding
+            path = self.path.split("?")[0]
+            if path == "/start":
+                started.set()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"STARTED")
+            elif path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"HEALTHY")
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"UNKNOWN:" + self.path.encode())
+
+        def log_message(self, fmt, *args):
+            pass
+
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    try:
+        wserver = socketserver.ThreadingTCPServer(
+            ("0.0.0.0", args.listen_port), _WriterStartHandler)
+    except OSError as exc:
+        raise SystemExit("[ERROR] writer failed to bind port {}: {}".format(
+            args.listen_port, exc))
+    wserver.daemon_threads = True
+    threading.Thread(target=wserver.serve_forever, daemon=True).start()
+    wreg = {"host": _self_host(), "port": args.listen_port}
+    bench_etcd.kv_put(args.etcd_endpoints,
+                      rdz_prefix + "writers/{}".format(writer_id),
+                      json.dumps(wreg))
+    emit("META", {"mode": "pipeline_writer_registered", "writer_id": writer_id,
+                  "reg": wreg, "ts": time.time()})
+    log("pipeline writer registered (gid={}, http_port={}); waiting for "
+        "/start trigger (timeout={}s)".format(writer_id, args.listen_port,
+                                              int(timeout_s)))
+    if not started.wait(timeout=timeout_s):
+        wserver.shutdown()
+        raise SystemExit("[ERROR] writer {}: no /start trigger within {}s"
+                         "".format(writer_id, int(timeout_s)))
+    wserver.shutdown()
+    emit("META", {"mode": "pipeline_writer_started", "writer_id": writer_id,
+                  "ts": time.time()})
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     from concurrent.futures import ThreadPoolExecutor
@@ -1277,19 +1380,21 @@ def _reader_worker(args, store, queue, deadline, results, ctx=None):
                 local.append(("pipeline_read", k, lat_ms, status, queue_wait_ms, 1, now_hms()))
     results.extend(local)
 def cmd_pipeline(args, store):
-    """Run pipeline (精排/召排) — dispatches to writer or reader based on --role."""
+    """Run pipeline (精排/召排) — dispatches to writer or reader based on --role.
+
+    Rendezvous (etcd, prefix mcbench/<run-id>/): readers self-register after
+    their HTTP server binds; writers pull the full reader list from etcd,
+    register their own /start address, then wait for the orchestrator's
+    HTTP trigger before entering warmup + measured phases."""
     role = args.role
+    if not args.run_id or not args.etcd_endpoints:
+        raise SystemExit("[ERROR] pipeline requires --run-id and "
+                         "--etcd-endpoints (BENCH_RUN_ID / "
+                         "SETUP_ETCD_ENDPOINTS via env.sh)")
     if role == "writer":
-        if not args.peers:
-            raise SystemExit("[ERROR] pipeline writer requires --peers "
-                             "(reader host/port list)")
-        try:
-            peer_list = json.loads(args.peers) if isinstance(args.peers, str) else args.peers
-        except ValueError:
-            raise SystemExit("[ERROR] --peers is not valid JSON: {}".format(args.peers))
-        readers = [p for p in peer_list if p.get("role") == "reader"]
-        if not readers:
-            raise SystemExit("[ERROR] --peers contains no reader entries")
+        if args.listen_port is None:
+            raise SystemExit("[ERROR] pipeline writer requires --listen-port "
+                             "(HTTP /start trigger port)")
         # warmup is a short same-deployment run handled inside the writer
         _pipeline_writer(args, store, do_warmup=(args.warmup == "true"))
     elif role == "reader":
@@ -1351,6 +1456,18 @@ def _pipeline_reader(args, store):
     emit("META", {"mode": "pipeline_reader_ready", "port": my_port, "ts": time.time()})
     log("pipeline reader ready (port={}, operation={}, threads={})".format(
         my_port, reader_op, num_threads))
+    # ---- rendezvous: self-register into etcd so writers (and the
+    # orchestrator's shutdown pass) can discover this reader ----
+    rreg = {"host": _self_host(), "port": my_port, "node": _self_node()}
+    if not rreg["host"]:
+        raise SystemExit("[ERROR] reader {}: no routable host for etcd "
+                         "registration (POD_IP/SETUP_FABRIC_IP unset)"
+                         "".format(args.client_id))
+    bench_etcd.kv_put(args.etcd_endpoints,
+                      _rendezvous_prefix(args) + "readers/{}".format(args.client_id),
+                      json.dumps(rreg))
+    emit("META", {"mode": "pipeline_reader_registered", "client_id": args.client_id,
+                  "reg": rreg, "ts": time.time()})
     # Start worker threads
     with ThreadPoolExecutor(max_workers=num_threads) as pool:
         worker_futures = [pool.submit(_reader_worker, args, store, queue, deadline + exit_grace, results, ctx)
@@ -1484,6 +1601,11 @@ def _resolve_env(args):
         args.traffic_mode = os.environ.get("BENCH_TRAFFIC_MODE", "pulse")
     if args.timeout is None:
         args.timeout = int(os.environ.get("BENCH_TIMEOUT", "300"))
+    if args.run_id is None:
+        args.run_id = os.environ.get("BENCH_RUN_ID", None)
+    if args.rendezvous_timeout is None:
+        args.rendezvous_timeout = int(
+            os.environ.get("BENCH_RENDEZVOUS_TIMEOUT", "120"))
 def main():
     unbuffer_stdio()
     log("[client-env] pid={} argv={} {}".format(
@@ -1527,9 +1649,15 @@ def main():
     parser.add_argument("--traffic-mode", default=None)
     parser.add_argument("--role", default=None, choices=["writer", "reader"])
     parser.add_argument("--listen-port", type=int, default=None,
-                        help="pipeline reader HTTP notify port (required for reader)")
-    parser.add_argument("--peers", default=None,
-                        help="pipeline writer reader list JSON (required for writer)")
+                        help="pipeline HTTP port (reader: /notify server; "
+                             "writer: /start trigger server; required for both)")
+    parser.add_argument("--run-id", default=None,
+                        help="pipeline rendezvous run id (<ts>-<cfg>); scopes the "
+                             "etcd registration prefix (env BENCH_RUN_ID)")
+    parser.add_argument("--rendezvous-timeout", type=int, default=None,
+                        help="seconds to wait for etcd rendezvous barriers "
+                             "(reader discovery / writer /start); env "
+                             "BENCH_RENDEZVOUS_TIMEOUT, default 120")
     parser.add_argument("--master-addr", default=None)
     parser.add_argument("--metadata-server", default=None)
     parser.add_argument("--etcd-endpoints", default=None,
@@ -1567,9 +1695,6 @@ def main():
     # Bind to NUMA node / cpu list before any store work so all measurement
     # threads inherit the affinity
     apply_cpu_binding(args)
-    # Resolve peers from JSON string
-    if isinstance(args.peers, str):
-        args.peers = json.loads(args.peers)
     # Parse special args
     if args.notify_pipeline is not None and isinstance(args.notify_pipeline, str):
         args.notify_pipeline = [s.strip() for s in args.notify_pipeline.split(",")]
