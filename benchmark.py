@@ -2099,9 +2099,141 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
 def _k8s_pipeline_nodes(cluster, dry_run=False):
     """k8s pipeline node set: N = ALL Ready cluster nodes (masters included —
     they participate in the work on this deployment). Returns sorted node
-    names; the per-role Deployments spread replicas across them. Implemented
-    with the k8s pipeline channel (benchmark-deployment.yaml.tpl)."""
-    raise RuntimeError("k8s pipeline channel not enabled yet")
+    names; the per-role Deployments spread replicas across them."""
+    c = cluster["_controller"]
+    out, rc = controller_run(
+        c, ["get", "nodes", "-o",
+            "jsonpath={range .items[*]}{.metadata.name}{' '}"
+            "{.status.conditions[?(@.type=='Ready')].status}{'\n'}{end}"],
+        check=False)
+    if rc != 0:
+        raise RuntimeError("kubectl get nodes failed: {}".format(
+            out.strip()[:300]))
+    nodes = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "True":
+            nodes.append(parts[0])
+    if not nodes:
+        raise RuntimeError("no Ready k8s nodes found (kubectl get nodes)")
+    return sorted(nodes)
+
+
+def _deployment_template_path(cluster):
+    k8s = cluster.get("k8s") or {}
+    return k8s.get("deployment_template") or os.path.join(
+        CONFIGS_DIR, "_k8s", "templates", "benchmark-deployment.yaml.tpl")
+
+
+def _render_deployment_yaml(cluster, ts, cfg_name, role, replicas):
+    k8s = k8s_settings(cluster)
+    run_label = k8s_run_label(ts, cfg_name)
+    deploy = "{}-{}".format(k8s_pod_name(ts, cfg_name), role)
+    with open(_deployment_template_path(cluster), "r", encoding="utf-8") as f:
+        text = f.read()
+    repl = {
+        "{{MC_DEPLOY_NAME}}": deploy,
+        "{{MC_NAMESPACE}}": k8s["namespace"],
+        "{{MC_REPLICAS}}": str(replicas),
+        "{{MC_RUN_LABEL}}": run_label,
+        "{{MC_ROLE_LABEL}}": role,
+        "{{MC_IMAGE}}": k8s["image"],
+        "{{MC_CONFIGMAP_NAME}}": _configmap_name(run_label),
+        "{{MC_SCRIPTS_MOUNT}}": k8s["pod_workspace"] + "/scripts",
+        "{{MC_WORKDIR_MOUNT}}": k8s["pod_workspace"],
+    }
+    for key, val in repl.items():
+        text = text.replace(key, val)
+    if "{{MC_" in text:
+        raise RuntimeError("deployment template has unresolved "
+                           "{{MC_*}} placeholders")
+    return deploy, run_label, text
+
+
+def _log_deployment_events(controller, ns, deploy):
+    """Best-effort: dump the tail of `kubectl describe deployment`."""
+    try:
+        out, rc = controller_run(
+            controller, ["-n", ns, "describe", "deployment", deploy],
+            check=False)
+        if rc == 0 and out.strip():
+            lines = out.strip().splitlines()
+            log("[k8s] deployment {} describe (tail):\n{}".format(
+                deploy, "\n".join(lines[-25:])))
+    except Exception:
+        pass
+
+
+def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
+    """Create the per-role pipeline Deployment (pod = process) and wait for
+    its rollout (60s, describe dump on failure). Registers the deployment
+    for cleanup_pods. Returns (deploy_name, run_label)."""
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    ns = k8s["namespace"]
+    deploy, run_label, yaml_text = _render_deployment_yaml(
+        cluster, ts, cfg_name, role, replicas)
+    cluster.setdefault("_k8s_deployments", []).append(deploy)
+    if dry_run:
+        log("[k8s] (dry-run) would create deployment {} (role={}, "
+            "replicas={}, ns={})".format(deploy, role, replicas, ns))
+        return deploy, run_label
+    import tempfile
+    local_dir = tempfile.mkdtemp(prefix="mc-deploy-")
+    local_yaml = os.path.join(local_dir, deploy + ".yaml")
+    try:
+        with open(local_yaml, "w", encoding="utf-8", newline="\n") as f:
+            f.write(yaml_text)
+        yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
+        controller_put(c, [local_yaml], yaml_dir)
+        remote_yaml = posixpath.join(yaml_dir, deploy + ".yaml")
+        log("[k8s] deployment manifest: template={} -> {}:{}".format(
+            os.path.relpath(_deployment_template_path(cluster), ROOT),
+            controller_desc(c), remote_yaml))
+        log("[k8s] deployment {} create: ns={} role={} replicas={} image={}"
+            "".format(deploy, ns, role, replicas, k8s["image"]))
+        out, rc = controller_run(
+            c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
+        if rc != 0:
+            raise RuntimeError("kubectl apply failed for deployment {}: {}"
+                               "".format(deploy, out.strip()[:400]))
+    finally:
+        shutil.rmtree(local_dir, ignore_errors=True)
+    t0 = time.time()
+    out, rc = controller_run(
+        c, ["-n", ns, "rollout", "status", "deployment/" + deploy,
+            "--timeout=60s"], check=False)
+    if rc != 0:
+        _log_deployment_events(c, ns, deploy)
+        raise RuntimeError("deployment {} not ready in 60s: {}".format(
+            deploy, out.strip()[:400]))
+    log("[k8s] deployment {} ready (role={}, replicas={}, elapsed={:.1f}s)"
+        "".format(deploy, role, replicas, time.time() - t0))
+    return deploy, run_label
+
+
+def _k8s_pod_ip(controller, ns, pod):
+    out, rc = controller_run(
+        controller, ["-n", ns, "get", "pod", pod, "-o",
+                     "jsonpath={.status.podIP}"], check=False)
+    ip = out.strip()
+    if rc != 0 or not ip:
+        raise RuntimeError("cannot resolve Pod IP for {}".format(pod))
+    return ip
+
+
+def _k8s_deployment_pods(cluster, run_label, role):
+    """Sorted pod names of a pipeline role's Deployment (label selector)."""
+    c = cluster["_controller"]
+    ns = k8s_settings(cluster)["namespace"]
+    out, rc = controller_run(
+        c, ["-n", ns, "get", "pods", "-l",
+            "run={},role={}".format(run_label, role),
+            "-o", "jsonpath={.items[*].metadata.name}"], check=False)
+    if rc != 0:
+        raise RuntimeError("cannot list pods (run={}, role={}): {}".format(
+            run_label, role, out.strip()[:200]))
+    return sorted(p for p in out.split() if p)
 
 
 def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
@@ -2118,19 +2250,26 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     rendezvous_timeout_s = int(globals_cfg.get("rendezvous_timeout_s", 120) or 120)
     run_id = "{}-{}".format(ts, cfg_name)
     # ---- cluster-oriented node set: both roles run on EVERY cluster node ----
-    if cluster.get("_controller") is not None:
-        node_names = _k8s_pipeline_nodes(cluster, dry)
+    is_k8s = cluster.get("_controller") is not None
+    if is_k8s:
+        # k8s channel: N = ALL Ready cluster nodes; one Deployment per role
+        # (pod = process, replicas = count_per_node x N, spread maxSkew=1).
+        # Plan slots materialize to POD names after the Deployments roll out.
+        k8s_nodes = _k8s_pipeline_nodes(cluster, dry)
+        n_nodes = len(k8s_nodes)
+        plan = pipeline_plan(cfg, node_count=n_nodes)
     else:
         node_names = sorted(n for n in (cluster.get("nodes") or {})
                             if not str(n).startswith("_"))
-    if not node_names:
-        raise RuntimeError(
-            "pipeline requires a non-empty cluster node set (N): put worker "
-            "nodes in cluster.json (ssh) or use a k8s cluster with Ready "
-            "nodes")
-    plan = pipeline_plan(cfg, node_count=len(node_names))
-    for entry in plan["writers"] + plan["readers"]:
-        entry["node"] = node_names[entry["slot"]]
+        if not node_names:
+            raise RuntimeError(
+                "pipeline requires a non-empty cluster node set (N): put worker "
+                "nodes in cluster.json (ssh) or use a k8s cluster with Ready "
+                "nodes")
+        n_nodes = len(node_names)
+        plan = pipeline_plan(cfg, node_count=n_nodes)
+        for entry in plan["writers"] + plan["readers"]:
+            entry["node"] = node_names[entry["slot"]]
     if plan["notify_count"] < 1:
         raise RuntimeError("pipeline config requires notify_count >= 1")
     if plan["notify_count"] > len(plan["readers"]):
@@ -2157,24 +2296,33 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     if reader_op not in PIPELINE_GET_IFACES:
         raise RuntimeError("pipeline reader operation must be one of {} "
                            "(got {})".format(PIPELINE_GET_IFACES, reader_op))
-    involved_nodes = []
-    seen_nodes = set()
-    for p in plan["writers"] + plan["readers"]:
-        if p["node"] not in seen_nodes:
-            seen_nodes.add(p["node"])
-            involved_nodes.append(p["node"])
-    primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
-    # k8s-pod nodes: create pods FIRST (pod IPs are needed for topology/host
-    # detection and every transport call below)
+    if is_k8s:
+        # pods do not exist yet: involved_nodes / primary / host materialize
+        # after the Deployments roll out (below); topology is meaningless
+        # for pods (the store is an external Service)
+        involved_nodes = []
+        primary_node_name = None
+        node = None
+        host = None
+        topology = "remote_node"
+    else:
+        involved_nodes = []
+        seen_nodes = set()
+        for p in plan["writers"] + plan["readers"]:
+            if p["node"] not in seen_nodes:
+                seen_nodes.add(p["node"])
+                involved_nodes.append(p["node"])
+        primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
+        node = get_node(cluster, primary_node_name)
+        host = node["ip"]
+        # topology: local iff the primary client node's IP is one of the
+        # store nodes' IPs (mooncake_store_nodes from global.json,
+        # resolved via cluster.json)
+        store_node_ips = resolve_store_node_ips(
+            cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+        topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
+    # k8s-pod nodes: pods are created by ensure_k8s_deployment below
     ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
-    node = get_node(cluster, primary_node_name)
-    host = node["ip"]
-    # topology: local iff the primary client node's IP is one of the store
-    # nodes' IPs (mooncake_store_nodes from global.json, resolved via
-    # cluster.json)
-    store_node_ips = resolve_store_node_ips(
-        cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
-    topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
     remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
         remote_runner_pipeline, local_log_dir = \
         scenario_paths(globals_cfg, ts, cfg_name)
@@ -2208,6 +2356,49 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     # k8s: ConfigMap (scripts + shared env.sh) must exist before pods mount it
     ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
+    if is_k8s:
+        # ---- per-role Deployments (pod = process): replicas = cpn x N ----
+        _k8s = k8s_settings(cluster)
+        _run_label = k8s_run_label(ts, cfg_name)
+        for role, entries, base in (
+                ("reader", plan["readers"], plan["reader_port_base"]),
+                ("writer", plan["writers"], plan["writer_port_base"])):
+            ensure_k8s_deployment(cluster, ts, cfg_name, role,
+                                  len(entries), dry)
+            if dry:
+                pods = ["{}-{}-{:03d}".format(_run_label, role, i)
+                        for i in range(len(entries))]
+            else:
+                pods = _k8s_deployment_pods(cluster, _run_label, role)
+                if len(pods) < len(entries):
+                    raise RuntimeError(
+                        "deployment role={} has {}/{} pods (run={})".format(
+                            role, len(pods), len(entries), _run_label))
+            for entry, pod in zip(entries, pods):
+                entry["node"] = pod
+                # every pod has its own network namespace: ALL pods of a
+                # role listen on the SAME port
+                entry["port"] = base
+                ip = "0.0.0.0" if dry else _k8s_pod_ip(
+                    cluster["_controller"], _k8s["namespace"], pod)
+                cluster.setdefault("nodes", {})[pod] = {
+                    "kind": "k8s-pod", "_pod": pod, "_ns": _k8s["namespace"],
+                    "_ctx": cluster["_controller"].get("_ctx", ""),
+                    "_controller": cluster["_controller"],
+                    "_controller_workspace": _k8s["controller_workspace"],
+                    "_run_label": _run_label, "_role": role,
+                    "ip": ip, "fabric_ip": ip}
+        involved_nodes = []
+        for e in plan["writers"] + plan["readers"]:
+            if e["node"] not in involved_nodes:
+                involved_nodes.append(e["node"])
+        primary_node_name = (plan["writers"] or plan["readers"])[0]["node"]
+        node = get_node(cluster, primary_node_name)
+        host = node["ip"]
+        log("[k8s] pipeline pods ready: {} writers + {} readers "
+            "(N={}, spread maxSkew=1, run={})".format(
+                len(plan["writers"]), len(plan["readers"]),
+                n_nodes, _run_label))
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    remote_scripts, remote_log_dir, dry)
     reader_pids = []
@@ -2229,6 +2420,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
     if cpu_shard > 0 and not numa_bind:
         numa_bind = True  # sharding needs the NUMA topology probes
+    if is_k8s and (numa_bind or cpu_shard > 0):
+        # containers do not do numactl: binding disabled for pipeline pods
+        numa_bind = False
+        cpu_shard = 0
+        log("k8s pipeline pods: numa/cpu binding disabled (containers)")
     # numactl policy: membind (strict, default) | preferred | off, and
     # strict/auto behavior when numactl is missing on a node
     membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
@@ -2269,7 +2465,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         log("scenario {} (pipeline, {}): N={}, writers={}, readers={}, "
             "notify_count={}, total_qps={}, per_writer_qps={}, traffic={}, "
             "run_id={}, sizes={}".format(
-                cfg_name, work_mode, len(node_names), len(plan["writers"]),
+                cfg_name, work_mode, n_nodes, len(plan["writers"]),
                 len(plan["readers"]), plan["notify_count"], plan["total_qps"],
                 plan["per_writer_qps"], cfg.get("traffic_mode", "pulse"),
                 run_id, sizes))
@@ -2535,7 +2731,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
-            cleanup_pods(cluster, involved_nodes, dry)
+            if is_k8s:
+                # pods were Ready (or rolled out); keep Deployments + pods +
+                # namespace for troubleshooting (STOP / --clean-up tears down)
+                cluster["_k8s_keep_ns"] = True
+                _k8s_debug_hints(cluster, involved_nodes, cfg_name)
+            else:
+                cleanup_pods(cluster, involved_nodes, dry)
         raise
 
 
@@ -2546,8 +2748,9 @@ def _pod_template_path(cluster):
 
 
 def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
-    """Legacy hook for the SSH/pipeline path. k8s basic pods are created by
-    ensure_k8s_pod (one per config); k8s pipeline is rejected earlier."""
+    """Legacy hook for the SSH path. k8s basic pods are created by
+    ensure_k8s_pod (one per config); k8s pipeline pods live in per-role
+    Deployments created inside run_pipeline_scenario."""
     return
 
 
@@ -2573,12 +2776,22 @@ def _k8s_debug_hints(cluster, involved_nodes, cfg_name):
 
 
 def cleanup_pods(cluster, involved_nodes, dry_run):
-    """Delete the per-config client pod + ConfigMap (basic, k8s)."""
+    """Delete the per-config client pods + Deployments + ConfigMap (k8s)."""
     c = cluster.get("_controller")
     if c is None:
         return
     k8s = k8s_settings(cluster)
     ns = k8s["namespace"]
+    # pipeline Deployments must be deleted AS OBJECTS (deleting their pods
+    # individually just makes the ReplicaSet recreate them)
+    for deploy in (cluster.pop("_k8s_deployments", None) or []):
+        if dry_run:
+            log("[k8s] (dry-run) would delete deployment {} (ns={})"
+                "".format(deploy, ns))
+            continue
+        log("[k8s] delete deployment {} (ns={})".format(deploy, ns))
+        controller_run(c, ["-n", ns, "delete", "deployment", deploy,
+                           "--ignore-not-found=true"], check=False)
     for name in involved_nodes:
         n = get_node(cluster, name)
         if not is_k8s_node(n):
@@ -3079,8 +3292,9 @@ def parse_arguments(argv=None):
                              "default to configs/_ssh/)")
     parser.add_argument("--k8s", action="store_true",
                         help="run against k8s pods (kubectl transport; deployment "
-                             "configs default to configs/_k8s/, all nodes are pods). "
-                             "pipeline scenarios are not supported yet in this channel")
+                             "configs default to configs/_k8s/). basic: one pod "
+                             "per config; pipeline: per-role Deployments "
+                             "(pod = process, spread across all Ready nodes)")
     parser.add_argument("--cluster", default=None,
                         help="path to cluster json (default: configs/_ssh/cluster.json "
                              "or configs/_k8s/cluster.json per mode)")
@@ -3324,11 +3538,6 @@ def main(args, cfg_paths):
         name = os.path.splitext(os.path.basename(cfg_path))[0]
         try:
             if cfg.get("scenario") == "pipeline":
-                if args.mode == "k8s":
-                    log("[FAIL] scenario {}: --k8s does not support pipeline "
-                        "scenarios yet (skipped)".format(name))
-                    failed_scenarios.append(name)
-                    continue
                 sweep_remove = run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
             else:
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
