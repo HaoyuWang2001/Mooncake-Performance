@@ -1549,6 +1549,17 @@ def _pipeline_barrier(etcd_endpoints, prefix, expected, timeout_s, what,
         time.sleep(1.0)
 
 
+def _pipeline_entry_label(entry):
+    """Human label for a plan entry (dual clients / readers / writers)."""
+    if "id" in entry:
+        return "dual c{}".format(entry["id"])
+    if "index" in entry:
+        return "reader r{}".format(entry["index"])
+    if "gid" in entry:
+        return "writer w{}".format(entry["gid"])
+    return "client"
+
+
 def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
                           involved_nodes, remote_log_dir, cfg_name, local_log_dir,
                           etcd_endpoints=None, run_id=None):
@@ -1565,13 +1576,14 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
             rn = get_node(cluster, r["node"])
             _pipeline_http_call(rn, r["port"], "/shutdown")
         except Exception as exc:
-            log("[WARN] fail-cleanup: reader {} shutdown failed: {}".format(r["index"], exc))
+            log("[WARN] fail-cleanup: {} shutdown failed: {}".format(
+                _pipeline_entry_label(r), exc))
     # 2. short wait for readers to exit (their final logs are written on exit)
     for r, pid in reader_pids:
         if pid:
             try:
                 wait_process_exit(cluster, r["node"], pid,
-                                  "reader r{}".format(r["index"]), 30)
+                                  _pipeline_entry_label(r), 30)
             except Exception:
                 pass
     # 3. kill any still-alive writers/readers

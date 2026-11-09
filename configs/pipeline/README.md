@@ -18,48 +18,42 @@ HTTP `/start` 统一触发 → warmup + 测量。要求 global.json `etcd_endpoi
 
 ```
 configs/pipeline/
-├── _configs.json               # 根基座（全部 102 用例共用）
-├── README.md
-├── demo/                       # 冒烟（--config-dir configs/pipeline/demo，自带全字段）
-├── 1-nodes/                    # reader 侧 1 个节点
-│   ├── _configs.json           # writer/reader 骨架（count_per_node 等）
-│   ├── rank/_configs.json      # work_mode=rank + base_qps=105 + data_size
-│   ├── rank/   (24 用例)
-│   ├── recall/_configs.json    # work_mode=recall + base_qps=35 + 常量字段 + data_size
-│   └── recall/ (6 用例)
-├── 2-nodes/ (36: rank 30 + recall 6)
-└── 4-nodes/ (36: rank 30 + recall 6)
+├── _configs.json               # 根基座（scenario/protocol/key_prefix/notify_pipeline/warmup/duration/batch_size）
+├── rank/                       # 精排档位（42 个，平铺）
+│   ├── _configs.json           # work_mode=rank, base_qps=105, data_size=8MB, writer/reader 骨架
+│   ├── rank_{pulse,balanced}_1w{1,2,4,8,10,16}r_{1,2,3}x.json
+│   └── rank_{pulse,balanced}_2w10r_{1,2,3}x.json      # 真双写（writer.count_per_node=2）
+├── recall/                     # 召排（6 个，平铺，恒 1w1r）
+│   ├── _configs.json
+│   └── recall_{pulse,balanced}_1w1r_{1,2,3}x.json
+├── smoke/                      # 双角色最小场景集（client 块选择 dual 模式）
+│   ├── rank_smoke.json         # 105qps/1x/1写10读/client N*2/store N*1/8MB（需 N>=6）
+│   └── recall_smoke.json       # 35qps/1x/1写1读/client N*6/store N*2/3.5MB
+└── demo/                       # 传统分离角色冒烟（2 个）
 ```
 
-合并顺序：根 → x-nodes → rank|recall → 用例（dict 深合并，下层覆盖上层，
-**用例永远最优先**）。`_configs.json` 不作为用例运行，收集时自动跳过。
+继承链：根基座 → `rank|recall/_configs.json` → 用例叶子（仅档位差异字段）。
+历史 `1/2/4-nodes/` 档位目录已废止（N 为集群节点数，与配置无关）；叶子文件名的
+`_n{N}` 后缀已去除。
 
-## 配置总览
+## 档位矩阵（rank）
 
-核心规则：**实际调用哪个 store SDK 函数完全由各自 `operation` 决定**；
-`notify_pipeline` 只是 notify 到达后、读取前的附加处理步骤，不参与函数选择。
+| 档位 | notify_count | writer cpn | reader cpn（canonical，旧 2 节点参考） |
+| --- | --- | --- | --- |
+| 1w1r / 1w2r | 1 / 2 | 1 | 1 |
+| 1w4r / 1w8r | 4 / 8 | 1 | 2 / 4 |
+| 1w10r / 1w16r | 10 / 16 | 1 | 5 / 4 |
+| 2w10r | 10 | 2（真双写） | 5 |
 
-### 顶层字段
+## 双角色模式（smoke/）
 
-| 字段 | 类型/默认 | 语义 |
-| --- | --- | --- |
-| `scenario` | `"pipeline"` | 场景类别（固定） |
-| `work_mode` | `rank` / `recall` | 精排 / 召排业务模式 |
-| `protocol` | `"ub"` / `"tcp"` | 传输协议 |
-| `key_prefix` | `"mc_bench"` | key 前缀 |
-| `data_size` | 数组，**必填** | value 大小数组：逐个 size 循环，每个 size 完整跑一轮写读流水，`value.bin` 自动按尺寸重建。单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` |
-| `notify_pipeline` | `["get"]` | notify 到达后、读取前的处理步骤列表，可选步骤见下文 |
-| `warmup` | `{duration: 5}` | 正式测量前以相同部署形态预热（writer 同 pacing 写+notify、reader 真实读取）；带 warmup 标记不计入指标 |
-| `duration` | 秒，**必填 > 0** | writer/reader 共同的测量窗口 |
-| `batch_size` | `1` | writer 每批写入的 key 数（reader 按 notify 批处理） |
-| `traffic_mode` | `pulse` / `balanced` | 脉冲（每秒窗口集中突发）/ 均衡（匀速节流） |
-| `base_qps` | 数值 | 基准写入 QPS |
-| `qps_multiple` | `1` / `2` / `3` | 总写入 QPS = base_qps × 倍数，全部 writer 均分（2w 双写各半，总量守恒） |
-| `notify_count` | ≥ 1 | 每批写完后随机选择的 reader 数，须 ≤ reader 池（count_per_node × 节点数） |
-| `numa_bind` | 三级解析 | 用例/层级显式值 > `configs/global.json`（默认 true）> 代码默认 true；显式 `false` 关闭 |
-| `writer` / `reader` | 对象 | 角色块，字段见下 |
+`client` 块出现即选择 dual 部署：`{"count_per_node": X, "port_base": 9301}`。每个
+client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样排除自身，
+**校验条件 notify_count ≤ client 数 - 1**；`store_count_per_node` 为记录性元数据
+（进 CSV `store_count` 列，store 由外部部署）。qps 为单节点语义：每 client =
+节点速率 / cpn。
 
-### writer 块
+## writer 块
 
 | 字段 | 语义 |
 | --- | --- |

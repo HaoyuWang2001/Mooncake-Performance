@@ -51,7 +51,7 @@ CLI 的 `--protocol` 可选值为 `tcp / rdma / ub`，优先级最高、可覆�
 | --- | --- |
 | `configs/basic/` | 接口级 benchmark（put/put_batch/put_from、get/get_batch/get_into/get_buffer、mixed `put_iface/get_iface`，各 × local/remote） |
 | `configs/basic/demo/` | basic 冒烟用例（simple-*，非主测试，用于打通验证） |
-| `configs/pipeline/` | 精排/召排 pipeline 场景（48 个正式场景） |
+| `configs/pipeline/` | 精排/召排 pipeline 场景（rank 42 + recall 6 + smoke 2；另 demo 2） |
 | `configs/pipeline/demo/` | pipeline 冒烟用例 |
 | `configs/cluster.example.json` | 集群基础设施模板（复制为 cluster.json 后修改） |
 | `configs/global.example.json` | 全局超参模板（复制为 global.json 后修改） |
@@ -117,22 +117,19 @@ basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字
 精排/召排是**生产-消费（pipeline）**测试模式，与单接口 benchmark 并列。通过
 `scenario: "pipeline"` 识别。
 
-**配置组织**：`configs/pipeline/` 顶层仅放根基座 `_configs.json` 与 `demo/`，正式配置按
-reader 侧节点数归档进 `1-nodes/`、`2-nodes/`、`4-nodes/`，其下再按 work_mode 分 `rank/` 与
-`recall/` 子目录。每层 `_configs.json` 逐层继承：根基座（scenario/protocol/key_prefix/
-notify_pipeline/warmup/duration/batch_size，不含 data_size/writer/reader/numa_bind）→
-x-nodes 层（writer/reader 骨架：count_per_node/operation 等）→ rank|recall 层（work_mode、
-base_qps、data_size；recall 另含 notify_count/writer.notify_threads/reader.count_per_node）→
-用例（rank：traffic_mode/qps_multiple/notify_count/writer.notify_threads/reader.count_per_node，
-5 字段；recall：traffic_mode/qps_multiple，2 字段）。numa_bind 属全局配置（global.json，
-默认 true，用例/层级可覆盖）。字段语义与可选值（writer/reader.operation、
-notify_pipeline 步骤）详见 configs/pipeline/README.md 的「配置总览」。
-`--config-dir` 指定某目录运行（**恒递归**，含 demo/，仅排除 `_` 前缀碎片）：用例已下沉到
-rank|recall 层，直接指向叶子目录最精准（如 `--config-dir configs/pipeline/2-nodes/rank`），
-指向 x-nodes 层则会带上其全部子目录（如 `--config-dir configs/pipeline/2-nodes`）。
+**配置组织**（平铺后）：`configs/pipeline/` 下为根基座 `_configs.json` + 四个平铺目录
+`rank/`、`recall/`、`smoke/`、`demo/`。每层 `_configs.json` 逐层继承：根基座（scenario/
+protocol/key_prefix/notify_pipeline/warmup/duration/batch_size）→ rank|recall 层基座
+（work_mode、base_qps、data_size、writer/reader 骨架）→ 用例叶子（仅档位差异字段）。
+**双角色用例**（smoke/）在叶子里写 `client` 块选择 dual 模式。numa_bind 属全局配置
+（global.json，默认 true，用例/层级可覆盖）。字段语义详见 configs/pipeline/README.md。
+`--config-dir` 恒递归：`--config-dir configs/pipeline/rank` 跑全部 rank 档，
+`--config-dir configs/pipeline/smoke` 跑双角色最小集。
 
-**配置命名**：`{work_mode}_{traffic_mode}_1w{notify}r_{倍数}x_n{节点数}.json`
-（单 writer 家族中名字里的 `{notify}r` 即 notify_count 扇出数，非 reader 池大小；池 = cpn×节点数 ≥ notify_count）
+**配置命名**：`{work_mode}_{traffic_mode}_{w}w{notify}r_{倍数}x.json`
+（名字里的 `{notify}r` 即 notify_count 扇出数；`1w` = writer.count_per_node=1，`2w` = 真双写
+writer.count_per_node=2；历史文件名的 `_n{N}` 后缀已随档位目录废止一并去除——N 现为集群
+节点数，与配置文件无关）
 
 | 参数 | 说明 | rank 值 | recall 值 |
 | --- | --- | --- | --- |
@@ -141,23 +138,35 @@ rank|recall 层，直接指向叶子目录最精准（如 `--config-dir configs/
 | `base_qps` | 基准写入 QPS | 105 | 35 |
 | `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数；须 ≤ reader 池 cpn×N） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
+| `client` | **双角色部署块（出现即选择 dual 模式）**：`{count_per_node, port_base}`——每节点 client 进程数（总数 = cpn×N，每个进程**同时是 writer+reader**，端口默认 9301，单端口四 endpoint）；出现该块时 writer/reader 块仅提供 operation/线程数等接口参数 | smoke 两用例必填 | 不使用 |
 | `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101） | cpn=1（notify_threads=notify_count） | cpn=1 |
 | `reader` | `{count_per_node, operation, num_threads, port_base}`：每节点 reader 数（池 = cpn×N，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / HTTP /notify 端口段（默认 9201） | 见下方档位表 | 恒 1 |
+| `store_count_per_node` | **记录性元数据**：每节点 mooncake store 数（store 由外部部署、master 发现，编排器不管理）；进 CSV `store_count` 列（值如 `N*1`） | 1 | 2 |
 | `data_size` | **必填，数组形式**：逐个 size 循环，每个 size 完整跑一轮写读流水（value.bin 自动按尺寸重建）；单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` | `["8MB"]` | `["3.5MB"]` |
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
 | `batch_size` | writer 每批写入的 key 数（reader 按 notify 批处理） | 1 | 1 |
 | `key_count` | **可选**，每 writer 的 key 空间封顶：序列在 0..key_count-1 内回绕，回绕批**先删后写**（batch_remove 旧 key 后再写，写路径始终真实）。存储上界 = writers × key_count × data_size；缺省不设限（key 序列单调递增，长时间运行会耗尽 store 空间——writer 检测到连续 10 批 rc=-200 insufficient space 即失败并给出调优提示）。须 ≥ batch_size | 按需 | 按需 |
 
-rank 档位矩阵（按 reader 参与节点数归档进同名目录；每档均跑 pulse/balanced × 1x/2x/3x）：
+rank 档位矩阵（平铺于 `configs/pipeline/rank/`；每档均跑 pulse/balanced × 1x/2x/3x；canonical
+cpn = 旧 2 节点参考值，2 节点集群上池恰等于扇出数即广播语义）：
 
-| 目录 | 档位（1w{x}r = notify x） | reader 池（cpn×节点） |
-| --- | --- | --- |
-| 1-nodes/ | 1w1r_n1、1w2r_n1、1w4r_n1；另有 1w10r_n1（池 10） | 1 / 2 / 4 / 10 |
-| 2-nodes/ | 1w2r_n2、1w4r_n2、1w8r_n2；另有 1w10r_n2（池 10）、2w10r_n2（双写） | 2 / 4 / 8 / 10 |
-| 4-nodes/ | 1w4r_n4、1w8r_n4、1w16r_n4；另有 1w10r_n4（池 12=3×4）、2w10r_n4（双写） | 4 / 8 / 16 / 12 |
+| 档位（{w}w{notify}r） | notify_count | writer cpn | reader cpn |
+| --- | --- | --- | --- |
+| 1w1r / 1w2r | 1 / 2 | 1 | 1 |
+| 1w4r / 1w8r | 4 / 8 | 1 | 2 / 4 |
+| 1w10r / 1w16r | 10 / 16 | 1 | 5 / 4 |
+| 2w10r（真双写） | 10 | **2**（每节点 2 writer，总 2N） | 5 |
 
-recall（1w1r，notify=1，恒 cpn=1）按 n1/n2/n4 同样归档进三个目录。
+recall（1w1r，notify=1，恒 cpn=1）平铺于 `configs/pipeline/recall/`。
+
+**smoke/ 双角色最小场景集**（`client` 块选择 dual 模式，每个 client 进程同时是 writer+reader，
+notify 抽样**排除自身**——校验条件 notify ≤ client 数-1）：
+
+| 用例 | base_qps | 倍数 | 业务模型 | client 数 | store 数（记录） | 数据 |
+| --- | --- | --- | --- | --- | --- | --- |
+| rank_smoke | 105 | 1 | 1写10读（notify=10，**需 N≥6**） | N×2（cpn=2，端口 9301/9302） | N×1 | 8MB |
+| recall_smoke | 35 | 1 | 1写1读（notify=1） | N×6（cpn=6，端口 9301..9306） | N×2 | 3.5MB |
 
 store 节点由 **global.json 的 `mooncake_store_nodes`**（cluster.json 节点名列表，可多个）统一标识，
 各场景配置**不再携带 store_node**；该列表仅用于指标行的 local/remote 拓扑标注（local = 该节点 ∈
@@ -179,13 +188,20 @@ store 节点列表），实际通信仍经 master 发现 store。
   回环 curl，秒级完成，对 30s+ 压测窗口无影响）；⑤ writer 统一起跑（先 warmup 后测量）。
   屏障超时 = global.json `rendezvous_timeout_s`（默认 120s）。键前缀无 TTL，靠清理保证：
   运行启动清整个 `mcbench/`、每 size/场景结束/失败/STOP 清 `run_id` 前缀；
+- **双角色模式（`client` 块）**：每个 client 进程同时承载 writer+reader（`--role both`，单端口
+  四 endpoint：/notify /start /shutdown /health，端口段默认 9301）；流程 = 注册 reader →
+  发现全量 → 注册 writer → 等 /start → writer 相位线程 + reader 队列主循环并发 →
+  /shutdown 后双份 SUMMARY；writer 的 notify 抽样**排除自身 reader**（校验
+  notify ≤ client 数-1；如 rank_smoke 的 1写10读需 N≥6）；一份日志同时产出 writer 与
+  reader 两组指标行（instance=c{id}）；
 - **k8s 通道（pipeline 已支持）**：每角色一个 **Deployment**（`benchmark-deployment.yaml.tpl`
   渲染；pod=进程、replicas=count_per_node×N、`topologySpreadConstraints` maxSkew=1 软均匀
   分布、Recreate 不自动补副本）；pod 内仍 `sleep infinity` + `kubectl exec` 启动进程（脚本经
   ConfigMap 挂载，与 basic 同机制）；**注意 k8s 全部同角色 pod 监听同一端口**（每 pod 独立
   网络命名空间）；
-- **负载语义**：总写入 QPS = base_qps × qps_multiple，由全部 writer（cpn × 节点数）均分（2w 家族
-  双 writer 各半即原系统 "105/2" 语义，总量守恒；小数速率由窗口预算累积保证长期精确）；
+- **负载语义（qps 为单节点语义）**：base_qps × qps_multiple = **单节点**写入 QPS，由该节点的
+  全部 writer（cpn 个）均分（每 client = 节点速率 / cpn，如 105qps 双 client 各 52.5）；集群总
+  写入 = 节点速率 × N（小数速率由窗口预算累积保证长期精确）；
 - **扇出语义**：每批写入后从 reader 池随机选 notify_count 个 reader，单次 HTTP 请求携带整批 key
   （读总量 = 写入批数 × notify_count）；reader 侧**按 notify 批入队处理**（queue 深度单位 = 待处理
   notify 批数，`max_depth` 以此计）；
@@ -208,10 +224,10 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **运行**：
 
 ```
-python benchmark.py --config configs/pipeline/2-nodes/rank/rank_pulse_2w10r_3x_n2.json
-python benchmark.py --config-dir configs/pipeline        # 递归跑全部 pipeline 场景（含 demo/）
-python benchmark.py --config-dir configs/pipeline/2-nodes # 跑 2-nodes 目录全部配置（含子目录）
-python benchmark.py --config-dir configs/pipeline/demo    # 冒烟（demo 目录）
+python benchmark.py --config configs/pipeline/rank/rank_pulse_2w10r_3x.json
+python benchmark.py --config-dir configs/pipeline        # 递归跑全部 pipeline 场景（含 smoke/ demo/）
+python benchmark.py --config-dir configs/pipeline/rank   # 跑 rank 全部档位（含子目录）
+python benchmark.py --config-dir configs/pipeline/smoke  # 双角色最小场景集（rank_smoke + recall_smoke）
 ```
 
 ### 3.4 数据集
@@ -238,8 +254,9 @@ basic：9 种操作各一个场景（`configs/basic/` 顶层平铺，client 节�
 | 读 | get、get_batch、get_into、get_buffer |
 | 混合 | mixed（put/get）、mixed_batch（put_batch/get_batch） |
 
-pipeline：正式配置按 reader 节点数归档在 `configs/pipeline/{1,2,4}-nodes/` 下（102 个，见 3.3
-档位矩阵表），demo/ 另有 2 个冒烟配置。
+pipeline：正式配置平铺在 `configs/pipeline/rank/`（42 个）与 `configs/pipeline/recall/`
+（6 个）下（见 3.3 档位矩阵表），`smoke/` 为当前主打的**双角色最小场景集**（2 个），
+demo/ 另有 2 个传统分离角色冒烟配置。
 
 ## 5. 测试部署架构
 
