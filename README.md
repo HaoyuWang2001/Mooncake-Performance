@@ -381,6 +381,13 @@ device plugin 按集群自行维护。
 `RUN_LABEL` = `<ts>-<cfg>`（写 `labels.run`，用于清理）；`ROLE_LABEL` 是 pod 的逻辑角色
 （如 `client-0`），**不是** k8s 节点名。
 
+**k8s 失败处理**：启动时单独打印镜像名；创建 ns 后给出 `get pods` 命令、pod 创建后
+给出 `describe` 命令、Ready 后给出 `exec` 命令。pod 60s 内未 Ready 会识别
+`ErrImageNeverPull`/`ImagePullBackOff`/`CreateContainerError`/`FailedScheduling`
+等事件并立即报错终止。pod 正常启动但 benchmark 命令失败时，保留 pod 与 namespace、
+打印排查命令并进入等待（不自动退出）：按 STOP/Ctrl+C 或 `--clean-up` 收场；
+下次运行会自动回收遗留 namespace。
+
 ### 7.2 configs/global.json（业务无关全局超参）
 
 与业务无关的全局超参数与服务器端路径独立放在 `configs/global.json`，由 `--global` 指定

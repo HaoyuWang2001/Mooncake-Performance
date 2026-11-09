@@ -241,3 +241,101 @@ def test_k8s_prerun_success(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "controller_put", lambda *a, **k: None)
     monkeypatch.setattr(bm, "controller_exec", lambda c, cmd: ("ok", 0))
     bm.k8s_prerun(c, dry_run=False)  # should not raise
+
+
+def test_wait_k8s_pod_ready_success(monkeypatch):
+    c = _cluster()
+    c["_controller"] = {"ip": "127.0.0.1", "_ctx": ""}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if ".status.phase" in a:
+            return "Running", 0
+        if "conditions" in a:
+            return "True", 0
+        if "status.podIP" in a:
+            return "10.0.0.9", 0
+        if "spec.nodeName" in a:
+            return "node-x", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    ip, node = bm.wait_k8s_pod_ready(c, "mc-p", timeout=5, poll=0.0)
+    assert (ip, node) == ("10.0.0.9", "node-x")
+
+
+def test_wait_k8s_pod_ready_fails_on_image(monkeypatch):
+    c = _cluster()
+    c["_controller"] = {"ip": "127.0.0.1", "_ctx": ""}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if ".status.phase" in a:
+            return "Pending", 0
+        if "conditions" in a:
+            return "", 0
+        if "state.waiting.reason" in a:
+            return "ErrImageNeverPull", 0
+        if "events" in a:
+            return ("REASON  MESSAGE  COUNT\n"
+                    "ErrImageNeverPull  image \"x\" not found  1"), 0
+        if "describe" in a:
+            return "Name: p", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    try:
+        bm.wait_k8s_pod_ready(c, "mc-p", timeout=5, poll=0.0)
+        raise AssertionError("should have raised")
+    except RuntimeError as exc:
+        assert "ErrImageNeverPull" in str(exc)
+
+
+def test_wait_k8s_pod_ready_fails_on_failed_scheduling(monkeypatch):
+    c = _cluster()
+    c["_controller"] = {"ip": "127.0.0.1", "_ctx": ""}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if ".status.phase" in a:
+            return "Pending", 0
+        if "conditions" in a:
+            return "", 0
+        if "state.waiting.reason" in a:
+            return "", 0
+        if "events" in a:
+            return ("REASON  MESSAGE  COUNT\n"
+                    "FailedScheduling  0/3 nodes available: insufficient cpu  1"), 0
+        if "describe" in a:
+            return "Name: p", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    try:
+        bm.wait_k8s_pod_ready(c, "mc-p", timeout=5, poll=0.0)
+        raise AssertionError("should have raised")
+    except RuntimeError as exc:
+        assert "FailedScheduling" in str(exc)
+        assert "insufficient cpu" in str(exc)
+
+
+def test_wait_k8s_pod_ready_times_out(monkeypatch):
+    c = _cluster()
+    c["_controller"] = {"ip": "127.0.0.1", "_ctx": ""}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if ".status.phase" in a:
+            return "Pending", 0
+        if "events" in a:
+            return "REASON  MESSAGE  COUNT", 0
+        if "describe" in a:
+            return "Name: p", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    try:
+        bm.wait_k8s_pod_ready(c, "mc-p", timeout=0, poll=0.0)
+        raise AssertionError("should have raised")
+    except RuntimeError as exc:
+        assert "not Ready" in str(exc)

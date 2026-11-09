@@ -689,6 +689,8 @@ def ensure_k8s_namespace(cluster, ts, dry_run=False):
                    "context": c.get("_ctx", ""), "namespace": ns, "ts": ts,
                    "controller_workspace": k8s.get("controller_workspace", "")}])
     log("[k8s] namespace {} created".format(ns))
+    log("[k8s] pods:     {} get pods -o wide".format(" ".join(
+        kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns}))))
 
 
 def cleanup_k8s_namespace(cluster, dry_run=False):
@@ -767,6 +769,94 @@ def _log_pod_events(controller, ns, pod):
         pass
 
 
+_K8S_FATAL_WAITING = {
+    "ErrImageNeverPull", "ErrImagePull", "ImagePullBackOff",
+    "InvalidImageName", "CreateContainerConfigError",
+    "CreateContainerError", "CrashLoopBackOff",
+}
+_K8S_FATAL_EVENTS = {
+    "FailedScheduling", "ErrImageNeverPull", "ErrImagePull",
+    "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError",
+    "CreateContainerError", "FailedCreatePodSandBox", "FailedMount",
+}
+
+
+def _k8s_pod_events(controller, ns, pod, limit=20):
+    """Best-effort pod events (reason/message/count), for anomaly reporting."""
+    out, rc = controller_run(
+        controller,
+        ["-n", ns, "get", "events", "--field-selector",
+         "involvedObject.name=" + pod,
+         "-o", "custom-columns=REASON:.reason,MESSAGE:.message,COUNT:.count"],
+        check=False)
+    if rc != 0 or not out.strip():
+        return []
+    lines = [ln.rstrip() for ln in out.strip().splitlines() if ln.strip()]
+    return lines[:limit]
+
+
+def _k8s_fatal_events(events):
+    fatal = []
+    for ln in events:
+        reason = ln.split()[0] if ln.split() else ""
+        if reason in _K8S_FATAL_EVENTS:
+            fatal.append(ln)
+    return fatal
+
+
+def wait_k8s_pod_ready(cluster, pod, timeout=60, poll=3.0):
+    """Poll pod readiness; fail fast on fatal reasons/events.
+    Returns (podIP, nodeName). Raises RuntimeError with a clear reason."""
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    ns = k8s["namespace"]
+    deadline = time.time() + timeout
+    phase = "?"
+    while True:
+        out, _ = controller_run(
+            c, ["-n", ns, "get", "pod", pod, "-o",
+                "jsonpath={.status.phase}"], check=False)
+        phase = out.strip() or phase
+        out, _ = controller_run(
+            c, ["-n", ns, "get", "pod", pod, "-o",
+                "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            check=False)
+        if out.strip() == "True":
+            ipout, rc = controller_run(
+                c, ["-n", ns, "get", "pod", pod, "-o",
+                    "jsonpath={.status.podIP}"], check=False)
+            ip = ipout.strip()
+            if rc == 0 and ip:
+                nodeout, _ = controller_run(
+                    c, ["-n", ns, "get", "pod", pod, "-o",
+                        "jsonpath={.spec.nodeName}"], check=False)
+                return ip, nodeout.strip()
+        reasons, _ = controller_run(
+            c, ["-n", ns, "get", "pod", pod, "-o",
+                "jsonpath={.status.containerStatuses[*].state.waiting.reason}"],
+            check=False)
+        waiting = [r for r in reasons.split() if r in _K8S_FATAL_WAITING]
+        events = _k8s_pod_events(c, ns, pod)
+        fatal_events = _k8s_fatal_events(events)
+        if waiting or fatal_events:
+            if events:
+                log("[k8s] pod {} events:\n{}".format(pod, "\n".join(events)))
+            _log_pod_events(c, ns, pod)
+            reason = waiting[0] if waiting else fatal_events[0].split()[0]
+            detail = fatal_events[0] if fatal_events else ""
+            raise RuntimeError(
+                "pod {} failed to start (phase={}, reason={}){}".format(
+                    pod, phase, reason, (": " + detail) if detail else ""))
+        if time.time() >= deadline:
+            if events:
+                log("[k8s] pod {} events:\n{}".format(pod, "\n".join(events)))
+            _log_pod_events(c, ns, pod)
+            raise RuntimeError(
+                "pod {} not Ready in {}s (phase={})".format(
+                    pod, int(timeout), phase))
+        time.sleep(poll)
+
+
 def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
     """Create the per-config client pod and register a runtime node."""
     k8s = k8s_settings(cluster)
@@ -804,31 +894,16 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
             if rc != 0:
                 raise RuntimeError("kubectl apply failed for {}: {}"
                                    "".format(pod, out.strip()[:400]))
+            log("[k8s] describe: {} describe pod {}".format(" ".join(
+                kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns})), pod))
         finally:
             shutil.rmtree(local_dir, ignore_errors=True)
-        out, rc = controller_run(
-            c, ["-n", ns, "wait", "--for=condition=Ready", "pod/" + pod,
-                "--timeout=180s"], check=False)
-        if rc != 0:
-            _log_pod_events(c, ns, pod)
-            raise RuntimeError("pod {} not Ready in 180s: {}"
-                               "".format(pod, out.strip()[:400]))
-        out, rc = controller_run(
-            c, ["-n", ns, "get", "pod", pod, "-o",
-                "jsonpath={.status.podIP}"], check=False)
-        ip = out.strip()
-        if rc != 0 or not ip:
-            raise RuntimeError("cannot resolve Pod IP for {}".format(pod))
-        out, _rc = controller_run(
-            c, ["-n", ns, "get", "pod", pod, "-o",
-                "jsonpath={.spec.nodeName}"], check=False)
-        k8s_node = out.strip()
+        ip, k8s_node = wait_k8s_pod_ready(cluster, pod)
         log("[k8s] pod {} ready (ns={}, ip={}, node={}, elapsed={:.1f}s)"
             "".format(pod, ns, ip, k8s_node or "?", time.time() - t0))
         _view = " ".join(kubectl_prefix({"_ctx": c.get("_ctx", ""),
                                           "_ns": ns}))
-        log("[k8s] view:  {} get pods -o wide".format(_view))
-        log("[k8s] shell: {} exec -it {} -- bash".format(_view, pod))
+        log("[k8s] shell:    {} exec -it {} -- bash".format(_view, pod))
     node = {"kind": "k8s-pod", "_pod": pod, "_ns": ns,
             "_ctx": c.get("_ctx", ""), "_controller": c,
             "_controller_workspace": k8s["controller_workspace"],
@@ -1919,7 +1994,13 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
-            cleanup_pods(cluster, involved_nodes, dry)
+            if is_k8s:
+                # pod was Ready; the benchmark command failed -> keep pod and
+                # namespace for troubleshooting (STOP / --clean-up tears down)
+                cluster["_k8s_keep_ns"] = True
+                _k8s_debug_hints(cluster, involved_nodes, cfg_name)
+            else:
+                cleanup_pods(cluster, involved_nodes, dry)
         raise
 
 
@@ -2335,6 +2416,27 @@ def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
     """Legacy hook for the SSH/pipeline path. k8s basic pods are created by
     ensure_k8s_pod (one per config); k8s pipeline is rejected earlier."""
     return
+
+
+def _k8s_debug_hints(cluster, involved_nodes, cfg_name):
+    """Print copy-pasteable debug commands for kept pods (post-ready fail)."""
+    k8s = k8s_settings(cluster)
+    ns = k8s["namespace"]
+    for name in involved_nodes:
+        n = get_node(cluster, name)
+        if not is_k8s_node(n) or not n.get("_pod"):
+            continue
+        pod = n["_pod"]
+        view = " ".join(kubectl_prefix(n))
+        log("[k8s][DEBUG] scenario {} failed; pod {} kept for troubleshooting"
+            "".format(cfg_name, pod))
+        log("[k8s][DEBUG]   {} exec -it {} -- bash".format(view, pod))
+        log("[k8s][DEBUG]   {} describe pod {}".format(view, pod))
+        log("[k8s][DEBUG]   {} exec {} -- bash -c {}".format(
+            view, pod, shlex.quote(
+                "ls -lt {}/logs | head".format(k8s["pod_workspace"]))))
+    log("[k8s][DEBUG] cleanup: STOP / --clean-up deletes namespace {}; "
+        "next run auto-reaps it".format(ns))
 
 
 def cleanup_pods(cluster, involved_nodes, dry_run):
@@ -2997,9 +3099,9 @@ def main(args, cfg_paths):
         os.path.relpath(args.profile, ROOT) if args.profile else "-"))
     if args.mode == "k8s":
         _ks = k8s_settings(cluster)
-        log("[k8s] settings: namespace={} image={} template={}".format(
-            _ks["namespace"], _ks["image"],
-            os.path.relpath(_pod_template_path(cluster), ROOT)))
+        log("[k8s] settings: namespace={} template={}".format(
+            _ks["namespace"], os.path.relpath(_pod_template_path(cluster), ROOT)))
+        log("[k8s] image: {}".format(_ks["image"]))
         log("[k8s] workspaces: controller={} pod={}".format(
             _ks["controller_workspace"], _ks["pod_workspace"]))
     _validate_master_mode(globals_cfg)
@@ -3049,6 +3151,11 @@ def main(args, cfg_paths):
         if not args.dry_run:
             def _ns_atexit():
                 try:
+                    if cluster.get("_k8s_keep_ns"):
+                        log("[k8s] namespace {} kept for troubleshooting "
+                            "(STOP / --clean-up deletes it; next run reaps it)"
+                            "".format(k8s_settings(cluster)["namespace"]))
+                        return
                     cleanup_k8s_namespace(cluster, dry_run=False)
                 except Exception as exc:
                     log("[WARN] k8s namespace cleanup at exit: {}".format(exc))
@@ -3154,7 +3261,12 @@ def main(args, cfg_paths):
     else:
         log("SUMMARY: all {} scenarios OK".format(len(cfg_paths)))
     if args.mode == "k8s" and not args.dry_run:
-        cleanup_k8s_namespace(cluster, dry_run=False)
+        if cluster.get("_k8s_keep_ns"):
+            log("[k8s] namespace {} kept for troubleshooting; teardown "
+                "deferred until STOP/Ctrl+C".format(
+                    k8s_settings(cluster)["namespace"]))
+        else:
+            cleanup_k8s_namespace(cluster, dry_run=False)
     log("done. results in {}".format(ts_dir))
     # auto-plot runs on the ORCHESTRATOR (local sys.executable, local logs dir);
     # it must never run on remote nodes. Skip when a failed run produced no logs.
@@ -3185,9 +3297,28 @@ def main(args, cfg_paths):
             log("[WARN] .state reap failed: {}".format(exc))
         cleanup_cluster(cluster, globals_cfg, dry_run=False)
         log("cleanup done")
+    if (args.mode == "k8s" and not args.dry_run
+            and cluster.get("_k8s_keep_ns")
+            and not getattr(args, "clean_up", False)):
+        _k8s_hold_for_debug(cluster)
+        raise StopRequested()
     if failed_scenarios:
         # non-zero exit so runmgr/WebUI marks the run "failed"
         sys.exit(1)
+
+
+def _k8s_hold_for_debug(cluster):
+    """Block until STOP/Ctrl+C so the user can inspect kept pods."""
+    ns = k8s_settings(cluster)["namespace"]
+    log("[k8s][DEBUG] holding run for troubleshooting (namespace {}); "
+        "press STOP (WebUI) or Ctrl+C to tear down".format(ns))
+    last = time.time()
+    while not stop_requested():
+        time.sleep(1.0)
+        if time.time() - last >= 30:
+            last = time.time()
+            log("[k8s][DEBUG] still holding namespace {} (STOP to tear down)"
+                "".format(ns))
 
 
 def cleanup_on_stop():
@@ -3207,6 +3338,7 @@ def cleanup_on_stop():
         if cluster.get("_controller") is not None:
             try:
                 cleanup_k8s_namespace(cluster, dry_run=False)
+                cluster.pop("_k8s_keep_ns", None)
             except Exception as exc:
                 log("[WARN] [STOP] delete namespace: {}".format(exc))
             try:
