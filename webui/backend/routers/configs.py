@@ -70,7 +70,7 @@ def validate_config_content(path, content):
                           "{num_clients, num_threads} objects")
     else:
         try:
-            bm.pipeline_plan(merged)
+            bm.pipeline_plan(merged, 1)  # node_count=1: shape validation only
         except (RuntimeError, KeyError, ValueError) as exc:
             errors.append("pipeline plan invalid: {}".format(exc))
     if merged.get("protocol") not in (None, "tcp", "rdma", "ub"):

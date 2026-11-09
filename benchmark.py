@@ -47,6 +47,11 @@ try:
 except ImportError:  # profiling dir missing -> feature silently off
     prof_core = None
 
+# pipeline rendezvous KV (etcd v3 gRPC gateway, stdlib only); lives in
+# scripts/ so both this orchestrator and the remote client use one impl
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+import bench_etcd
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
 K8S_PRERUN = os.path.join(ROOT, "k8s-deployment", "scripts", "k8s-prerun.sh")
@@ -172,37 +177,46 @@ def build_runs(cfg):
     return [(c, t, ds) for ds in sizes for (c, t) in combos]
 
 
-def pipeline_plan(cfg):
+def pipeline_plan(cfg, node_count=1):
     """Derive the writer/reader process plan from a pipeline config.
 
-    Shared by run_pipeline_scenario (orchestration) and write_scenario_csv
-    (metrics attribution) so the assignment stays deterministic and
-    consistent. Both roles start count_per_node processes on EVERY node of
-    their client_nodes (ascending node order), so:
-      writer total = writer.count_per_node * len(writer.client_nodes)
-      reader pool = reader.count_per_node * len(reader.client_nodes)
+    Cluster-oriented: both roles start count_per_node processes on EVERY
+    node of the cluster (N = cluster.json nodes on ssh / Ready k8s nodes),
+    so:
+      writer total = writer.count_per_node * N
+      reader pool = reader.count_per_node * N
+    ("1w*xr" is simply writer.count_per_node=1 + notify_count=x.)
+
+    Port bases are configurable per role — writer.port_base (default 9101,
+    the writer HTTP /start port) and reader.port_base (default 9201, the
+    reader HTTP /notify port). Ports number PER NODE: the i-th process of
+    a node gets port_base + i (k8s pods all use port_base itself — every
+    pod has its own network namespace).
+
     Total write QPS = base_qps * qps_multiple, split evenly across all
-    writers (n2 dual-writer reproduces the datasystem "105/2" semantics
-    with the total held constant). Writers get global ids 1..W in node
-    order; readers get ports 9201..9200+R. The reader pool must cover
-    notify_count (each batch notifies a random subset of notify_count
-    readers). The business model "1写10读" maps to writer count_per_node=1
-    and notify_count=10 — the reader pool is a deployment parameter.
+    writers. Writers get global gids 1..W and readers global indices 0..R-1
+    in node order. The plan carries the node SLOT; the caller materializes
+    concrete node names (ssh cluster nodes / k8s pod names) into
+    entry["node"]. The reader pool must cover notify_count.
+
+    The legacy writer/reader client_nodes lists are gone — the benchmark
+    faces the whole cluster, not per-role node assignments.
     """
     writer_cfg = cfg.get("writer", {}) or {}
     reader_cfg = cfg.get("reader", {}) or {}
     w_cpn = int(writer_cfg.get("count_per_node", 1))
     r_cpn = int(reader_cfg.get("count_per_node", 1))
-    w_nodes = writer_cfg.get("client_nodes") or [cfg.get("store_node", "")]
-    r_nodes = reader_cfg.get("client_nodes") or [cfg.get("store_node", "")]
+    w_base = int(writer_cfg.get("port_base", 9101))
+    r_base = int(reader_cfg.get("port_base", 9201))
     writers = []
-    for node in w_nodes:
-        for _ in range(w_cpn):
-            writers.append({"gid": len(writers) + 1, "node": node})
     readers = []
-    for node in r_nodes:
-        for _ in range(r_cpn):
-            readers.append({"index": len(readers) + 1, "port": 9201 + len(readers), "node": node})
+    for slot in range(node_count):
+        for local in range(w_cpn):
+            writers.append({"gid": len(writers) + 1, "slot": slot,
+                            "local": local, "port": w_base + local})
+        for local in range(r_cpn):
+            readers.append({"index": len(readers), "slot": slot,
+                            "local": local, "port": r_base + local})
     base_qps = float(cfg.get("base_qps", 0))
     qps_multiple = float(cfg.get("qps_multiple", 1))
     total_qps = base_qps * qps_multiple
@@ -215,8 +229,8 @@ def pipeline_plan(cfg):
         "notify_count": int(cfg.get("notify_count", 1)),
         "notify_threads": int(writer_cfg.get("notify_threads", 1)),
         "reader_threads": int(reader_cfg.get("num_threads", 1)),
-        "writer_nodes": w_nodes,
-        "reader_nodes": r_nodes,
+        "writer_port_base": w_base,
+        "reader_port_base": r_base,
     }
 
 
@@ -348,6 +362,12 @@ def build_cluster_session(cluster, globals_cfg, remote_dir):
             globals_cfg.get("master_addr", ""), cluster)
         session["SETUP_METADATA_SERVER"] = _resolve_k8s_addr(
             globals_cfg.get("metadata_server", ""), cluster)
+        # the SAME etcd (when configured) still serves the pipeline
+        # rendezvous (reader registration / writer discovery) — the client
+        # consumes it independently of the master connection mode
+        if (globals_cfg.get("etcd_endpoints", "") or "").strip():
+            session["SETUP_ETCD_ENDPOINTS"] = _resolve_k8s_addr(
+                globals_cfg.get("etcd_endpoints", ""), cluster)
     return session
 
 
@@ -1434,22 +1454,82 @@ def _kill_remote_process(cluster, node_name, pid):
         log("[WARN] fail-cleanup: kill pid {} on {} failed: {}".format(pid, node_name, exc))
 
 
-def fail_cleanup_pipeline(cluster, plan, reader_peers, reader_pids, writer_pids,
-                          involved_nodes, remote_log_dir, cfg_name, local_log_dir):
+def _pipeline_etcd_endpoints(globals_cfg):
+    """Pipeline rendezvous etcd endpoints (global.json etcd_endpoints).
+    Required for pipeline regardless of master_type: readers self-register
+    there and writers discover them from there."""
+    eps = (globals_cfg.get("etcd_endpoints", "") or "").strip()
+    if not eps:
+        raise RuntimeError(
+            "pipeline scenario requires global.json 'etcd_endpoints' "
+            "(rendezvous: reader registration / writer discovery / start "
+            "trigger); master_type may stay 'http' — the same etcd serves "
+            "coordination")
+    return eps
+
+
+def _pipeline_wipe_etcd(globals_cfg):
+    """Best-effort wipe of the whole mcbench/ rendezvous tree (single active
+    benchmark per cluster assumption). No-op when etcd is unconfigured."""
+    eps = (globals_cfg.get("etcd_endpoints", "") or "").strip()
+    if not eps:
+        return
+    n = bench_etcd.kv_delete_prefix(eps, "mcbench/")
+    if n:
+        log("[k8s-pipeline] etcd: wiped {} stale mcbench/ keys".format(n))
+
+
+def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
+    """POST to a pipeline process's HTTP endpoint (writer /start, reader
+    /shutdown). k8s pods are directly reachable by pod IP from the
+    orchestrator; ssh nodes curl loopback ON the node itself (the fabric
+    network may not be routable from the orchestrator). Returns True on
+    HTTP 200 (k8s path raises on connection/HTTP errors)."""
+    if is_k8s_node(node_entry):
+        http_probe("http://{}:{}{}".format(node_entry["ip"], port, path),
+                   method="POST", timeout=timeout)
+        return True
+    url = "http://127.0.0.1:{}{}".format(port, path)
+    cmd = ("curl -s --noproxy '*' --connect-timeout 2 --max-time {} "
+           "-X POST -o /dev/null -w '%{{http_code}}' {}").format(timeout, url)
+    out = ssh_check_output(node_entry["ip"], node_entry, cmd, dry_run=dry)
+    return str(out).strip() == "200"
+
+
+def _pipeline_barrier(etcd_endpoints, prefix, expected, timeout_s, what,
+                      run_id):
+    """Poll etcd until `expected` registrations exist under prefix; raises
+    with the registered/missing list on timeout. Returns the kv dict."""
+    t0 = time.time()
+    while True:
+        kvs = bench_etcd.kv_range(etcd_endpoints, prefix)
+        if len(kvs) >= expected:
+            return kvs
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(
+                "pipeline rendezvous: only {}/{} {} registered in etcd "
+                "after {}s (run_id={}, registered keys={})".format(
+                    len(kvs), expected, what, int(timeout_s), run_id,
+                    sorted(kvs)))
+        _check_stop()
+        time.sleep(1.0)
+
+
+def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
+                          involved_nodes, remote_log_dir, cfg_name, local_log_dir,
+                          etcd_endpoints=None, run_id=None):
     """Best-effort cleanup after a pipeline scenario failure, so remote logs
     (including the reader SUMMARY/RESULT that is only flushed at exit) are
     preserved for diagnosis and ports are freed. Every step is guarded so the
     original exception is never masked. Order: graceful reader shutdown ->
-    wait for exit -> kill stragglers -> pull all logs."""
+    wait for exit -> kill stragglers -> pull all logs -> wipe the etcd
+    rendezvous prefix."""
     log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
     # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
-    for r, peer in zip(plan["readers"], reader_peers):
+    for r in plan["readers"]:
         try:
             rn = get_node(cluster, r["node"])
-            url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
-            ssh_check_output(rn["ip"], rn,
-                             "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(url),
-                             quiet=True)
+            _pipeline_http_call(rn, r["port"], "/shutdown")
         except Exception as exc:
             log("[WARN] fail-cleanup: reader {} shutdown failed: {}".format(r["index"], exc))
     # 2. short wait for readers to exit (their final logs are written on exit)
@@ -1472,6 +1552,12 @@ def fail_cleanup_pipeline(cluster, plan, reader_peers, reader_pids, writer_pids,
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
     except Exception as exc:
         log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
+    # 5. wipe this run's etcd rendezvous prefix
+    if etcd_endpoints and run_id:
+        try:
+            bench_etcd.kv_delete_prefix(etcd_endpoints, "mcbench/{}/".format(run_id))
+        except Exception as exc:
+            log("[WARN] fail-cleanup: etcd prefix wipe failed: {}".format(exc))
 
 
 def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir):
@@ -2010,6 +2096,14 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
 # pipeline scenario (producer/consumer: writers notify random reader subsets)
 # --------------------------------------------------------------------------
 
+def _k8s_pipeline_nodes(cluster, dry_run=False):
+    """k8s pipeline node set: N = ALL Ready cluster nodes (masters included —
+    they participate in the work on this deployment). Returns sorted node
+    names; the per-role Deployments spread replicas across them. Implemented
+    with the k8s pipeline channel (benchmark-deployment.yaml.tpl)."""
+    raise RuntimeError("k8s pipeline channel not enabled yet")
+
+
 def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
     matrix = getattr(args, "_matrix", None)
@@ -2018,12 +2112,31 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     dry = args.dry_run
     op = cfg.get("operation", "")
     work_mode = cfg.get("work_mode", cfg.get("mode", ""))
-    plan = pipeline_plan(cfg)
+    # pipeline rendezvous requires the coordination etcd (reader
+    # registration / writer discovery / start trigger)
+    etcd_endpoints = _pipeline_etcd_endpoints(globals_cfg)
+    rendezvous_timeout_s = int(globals_cfg.get("rendezvous_timeout_s", 120) or 120)
+    run_id = "{}-{}".format(ts, cfg_name)
+    # ---- cluster-oriented node set: both roles run on EVERY cluster node ----
+    if cluster.get("_controller") is not None:
+        node_names = _k8s_pipeline_nodes(cluster, dry)
+    else:
+        node_names = sorted(n for n in (cluster.get("nodes") or {})
+                            if not str(n).startswith("_"))
+    if not node_names:
+        raise RuntimeError(
+            "pipeline requires a non-empty cluster node set (N): put worker "
+            "nodes in cluster.json (ssh) or use a k8s cluster with Ready "
+            "nodes")
+    plan = pipeline_plan(cfg, node_count=len(node_names))
+    for entry in plan["writers"] + plan["readers"]:
+        entry["node"] = node_names[entry["slot"]]
     if plan["notify_count"] < 1:
         raise RuntimeError("pipeline config requires notify_count >= 1")
     if plan["notify_count"] > len(plan["readers"]):
-        raise RuntimeError("notify_count={} exceeds reader count {}".format(
-            plan["notify_count"], len(plan["readers"])))
+        raise RuntimeError("notify_count={} exceeds reader count {} "
+                           "(reader.count_per_node x N)".format(
+                               plan["notify_count"], len(plan["readers"])))
     # optional per-writer key-space cap: must hold at least one full batch
     key_count = int(cfg.get("key_count", 0) or 0)
     if key_count and key_count < int(cfg.get("batch_size", 1)):
@@ -2088,13 +2201,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # clear basic-only vars that are meaningless for pipeline
         "BENCH_OPERATION": "",
         "BENCH_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
+        # etcd rendezvous scope + barrier timeouts (client-side fallbacks)
+        "BENCH_RUN_ID": run_id,
+        "BENCH_RENDEZVOUS_TIMEOUT": str(rendezvous_timeout_s),
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     # k8s: ConfigMap (scripts + shared env.sh) must exist before pods mount it
     ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    remote_scripts, remote_log_dir, dry)
-    reader_peers = []
     reader_pids = []
     writer_pids = []
     profile_sess = None  # profiling session (started at Step 1 or Step 3)
@@ -2151,11 +2266,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         sizes = data_size_list(cfg)
         warmup = "false" if args.no_warmup else "true"
         reader_threads = plan["reader_threads"]
-        log("scenario {} (pipeline, {}): writers={}, readers={}, notify_count={}, "
-            "total_qps={}, per_writer_qps={}, traffic={}, sizes={}".format(
-                cfg_name, work_mode, len(plan["writers"]), len(plan["readers"]),
-                plan["notify_count"], plan["total_qps"], plan["per_writer_qps"],
-                cfg.get("traffic_mode", "pulse"), sizes))
+        log("scenario {} (pipeline, {}): N={}, writers={}, readers={}, "
+            "notify_count={}, total_qps={}, per_writer_qps={}, traffic={}, "
+            "run_id={}, sizes={}".format(
+                cfg_name, work_mode, len(node_names), len(plan["writers"]),
+                len(plan["readers"]), plan["notify_count"], plan["total_qps"],
+                plan["per_writer_qps"], cfg.get("traffic_mode", "pulse"),
+                run_id, sizes))
         current_ds = None
         for ds in sizes:
             if ds != current_ds:
@@ -2176,21 +2293,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
                       node_name=primary_node_name)
-            # Reader peers: host resolved from each reader node's fabric_ip so the
-            # same config works unchanged on any deployment. Rebuilt per size so
-            # the fail-path cleanup only ever sees the current run's processes.
-            reader_peers = []
+            # fresh rendezvous state per size iteration (stale registrations
+            # from a previous size must never leak into this one)
             reader_pids = []
             writer_pids = []
-            for r in plan["readers"]:
-                rn = get_node(cluster, r["node"])
-                reader_peers.append({
-                    "role": "reader",
-                    "host": rn.get("fabric_ip", rn.get("ip", "")),
-                    "port": r["port"],
-                    "node": r["node"],
-                })
-            peers_json = json.dumps(reader_peers)
+            if not dry:
+                bench_etcd.kv_delete_prefix(etcd_endpoints,
+                                           "mcbench/{}/".format(run_id))
             # data_size is always part of the run file name, so different
             # sizes never share writer/reader logs
             run_name = "benchmark_c1_t{}_{}".format(reader_threads, ds)
@@ -2206,11 +2315,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             remote_profiling_dir(remote_log_dir, cfg_name))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
-            # Step 1: start all readers (one process per reader, unique port and id)
-            for r, peer in zip(plan["readers"], reader_peers):
+            # Step 1: start all readers (one process per reader). Each reader
+            # binds its HTTP /notify server and SELF-REGISTERS into etcd
+            # (host=POD_IP/SETUP_FABRIC_IP, port, node); no peer addresses
+            # are injected by the orchestrator anymore. Log names carry the
+            # node segment: per-node port numbering (9201+i) is no longer
+            # globally unique once several nodes each run x readers.
+            for r in plan["readers"]:
                 rn = get_node(cluster, r["node"])
-                merged_log = "{}.reader_port{}.log".format(base_noext, r["port"])
-                nohup_log = "{}.reader_port{}.nohup".format(base_noext, r["port"])
+                merged_log = "{}.reader_{}_r{}_p{}.log".format(
+                    base_noext, r["node"], r["index"], r["port"])
+                nohup_log = merged_log.replace(".log", ".nohup")
                 numa_arg = ""
                 launch_prefix = ""
                 if (cpu_shard > 0 or numa_bind) and not dry \
@@ -2226,53 +2341,36 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     numa_arg = "--cpu-bind {}".format(cl)
                     if numactl_ok.get(r["node"]):
                         launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                rcmd = "nohup {}bash {} pipeline {} --client-id {} --num-threads {} --role reader --listen-port {} --peers '{}' --warmup false --timeout 300 --operation {} {} > {} 2>&1 & echo $!".format(
-                    launch_prefix, remote_runner, merged_log, r["index"], reader_threads,
-                    r["port"], peers_json, reader_op, numa_arg, nohup_log)
+                rcmd = ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
+                        "--role reader --listen-port {} --warmup false --timeout 300 "
+                        "--operation {} {} > {} 2>&1 & echo $!").format(
+                    launch_prefix, remote_runner, merged_log, r["index"],
+                    reader_threads, r["port"], reader_op, numa_arg, nohup_log)
                 pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
                 reader_pids.append((r, pid))
                 if not dry and pid:
                     # ledger: this reader can always be found & killed later
                     state_append([{
                         "ip": rn["ip"], "node": r["node"], "port": r["port"],
-                        "fabric_host": peer["host"],
+                        "fabric_host": rn.get("fabric_ip", rn.get("ip", "")),
                         "pid": pid.strip(), "label": "reader r{}".format(r["index"]),
                         # pid 是 run_benchmark_pipeline.sh 的 bash 包装进程（echo $!），
                         # python client 是其子进程；marker 用于 reap 的防误杀校验
                         "marker": "run_benchmark_pipeline.sh",
                         "cfg": cfg_name,
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-            # give readers a moment to boot before the health polling starts
+            # Step 2: etcd barrier — wait for the FULL reader pool to
+            # self-register before any writer starts (readers that fail to
+            # boot surface here as a timeout with the missing list)
             if not dry:
-                time.sleep(5)
-            # Step 2: wait for all readers to be healthy
-            for r, peer in zip(plan["readers"], reader_peers):
-                rn = get_node(cluster, r["node"])
-                health_url = "http://{}:{}/health".format(peer["host"], r["port"])
-                HEALTHY = False
-                for attempt in range(10):
-                    if is_k8s_node(rn):
-                        # pods are directly reachable from the orchestrator
-                        try:
-                            http_probe(health_url, timeout=2)
-                            HEALTHY = True
-                        except Exception:
-                            pass
-                    else:
-                        health_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 2 {} || echo '__NOT_READY__'".format(health_url)
-                        result = ssh_check_output(rn["ip"], rn, health_cmd, dry_run=dry, quiet=True) if not dry else "HEALTHY"
-                        if "HEALTHY" in result:
-                            HEALTHY = True
-                    if HEALTHY:
-                        break
-                    time.sleep(1)
-                if not dry:
-                    if not HEALTHY:
-                        err_msg = "reader at {}:{} not ready after 30s".format(peer["host"], r["port"])
-                        log("[ERROR] " + err_msg)
-                        raise RuntimeError(err_msg)
-                    else:
-                        log("reader at {}:{}=READY".format(peer["host"], r["port"]))
+                t0 = time.time()
+                _pipeline_barrier(etcd_endpoints,
+                                  "mcbench/{}/readers/".format(run_id),
+                                  len(plan["readers"]), rendezvous_timeout_s,
+                                  "readers", run_id)
+                log("pipeline rendezvous: {}/{} readers registered ({:.1f}s)"
+                    "".format(len(plan["readers"]), len(plan["readers"]),
+                              time.time() - t0))
             # Step 3: start all writers in parallel (one invocation per writer; the
             # explicit --client-id in EXTRA overrides the per-invocation default
             # and gives each writer a globally unique id). ALL writers run the
@@ -2287,8 +2385,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("[WARN] [profile] start failed: {}".format(exc))
             for w in plan["writers"]:
                 wn = get_node(cluster, w["node"])
-                merged_log = "{}.writer{}.log".format(base_noext, w["gid"])
-                nohup_log = "{}.writer{}.nohup".format(base_noext, w["gid"])
+                merged_log = "{}.writer_{}_w{}.log".format(
+                    base_noext, w["node"], w["gid"])
+                nohup_log = merged_log.replace(".log", ".nohup")
                 numa_arg = ""
                 launch_prefix = ""
                 if (cpu_shard > 0 or numa_bind) and not dry \
@@ -2302,20 +2401,45 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     numa_arg = "--cpu-bind {}".format(cl)
                     if numactl_ok.get(w["node"]):
                         launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                wcmd = "nohup {}bash {} pipeline {} --client-id {} --role writer --peers '{}' --warmup {} --operation {} {} > {} 2>&1 & echo $!".format(
-                    launch_prefix, remote_runner, merged_log, w["gid"], peers_json,
+                wcmd = ("nohup {}bash {} pipeline {} --client-id {} --role writer "
+                        "--listen-port {} --warmup {} --operation {} {} > {} 2>&1 "
+                        "& echo $!").format(
+                    launch_prefix, remote_runner, merged_log, w["gid"], w["port"],
                     warmup, writer_op, numa_arg, nohup_log)
                 pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
                 writer_pids.append((w, pid))
                 if not dry and pid:
                     state_append([{
-                        "ip": wn["ip"], "node": w["node"], "port": None,
-                        "fabric_host": None,
+                        "ip": wn["ip"], "node": w["node"], "port": w["port"],
+                        "fabric_host": wn.get("fabric_ip", wn.get("ip", "")),
                         "pid": pid.strip(), "label": "writer w{}".format(w["gid"]),
                         "marker": "run_benchmark_pipeline.sh",
                         "cfg": cfg_name,
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-            # Step 4: wait for all writers to finish (warmup + measured run)
+            # Step 4: etcd barrier — every writer registered (= reader list
+            # pulled from etcd + HTTP /start server bound), then TRIGGER the
+            # run: POST /start to each writer (k8s: direct pod IP; ssh:
+            # loopback curl on the writer's node). All writers enter their
+            # warmup + measured phases only after this synchronized start.
+            if not dry:
+                t0 = time.time()
+                _pipeline_barrier(etcd_endpoints,
+                                  "mcbench/{}/writers/".format(run_id),
+                                  len(plan["writers"]), rendezvous_timeout_s,
+                                  "writers", run_id)
+                log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
+                    "".format(len(plan["writers"]), len(plan["writers"]),
+                              time.time() - t0))
+                for w in plan["writers"]:
+                    wn = get_node(cluster, w["node"])
+                    if not _pipeline_http_call(wn, w["port"], "/start"):
+                        raise RuntimeError(
+                            "pipeline trigger failed: writer w{} /start at "
+                            "{} p{} returned non-200".format(
+                                w["gid"], wn["ip"], w["port"]))
+                log("pipeline trigger: /start sent to {} writers".format(
+                    len(plan["writers"])))
+            # Step 5: wait for all writers to finish (warmup + measured run)
             warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
             duration = float(cfg.get("duration", 30))
             for w, pid in writer_pids:
@@ -2327,21 +2451,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             for w in plan["writers"]:
                 wn = get_node(cluster, w["node"])
                 pull_stage_logs(wn["ip"], wn,
-                                ["{}.writer{}.log".format(base_noext, w["gid"])],
+                                ["{}.writer_{}_w{}.log".format(
+                                    base_noext, w["node"], w["gid"])],
                                 local_log_dir, dry)
-            # Step 5: shutdown readers and wait for their final logs
-            for r, peer in zip(plan["readers"], reader_peers):
+            # Step 6: shutdown readers via their /shutdown endpoint (k8s:
+            # direct pod IP; ssh: loopback curl on the reader's node) and
+            # wait for their final logs
+            for r in plan["readers"]:
                 rn = get_node(cluster, r["node"])
-                shutdown_url = "http://{}:{}/shutdown".format(peer["host"], r["port"])
                 if not dry:
-                    if is_k8s_node(rn):
-                        try:
-                            http_probe(shutdown_url, method="POST", timeout=5)
-                        except Exception:
-                            pass
-                    else:
-                        curl_cmd = "curl -s --noproxy '*' --connect-timeout 2 --max-time 5 -X POST {} || true".format(shutdown_url)
-                        ssh_check_output(rn["ip"], rn, curl_cmd, dry_run=dry)
+                    try:
+                        _pipeline_http_call(rn, r["port"], "/shutdown")
+                    except Exception as exc:
+                        log("[WARN] reader r{} shutdown: {}".format(
+                            r["index"], exc))
             for r, pid in reader_pids:
                 if not dry and pid:
                     wait_process_exit(cluster, r["node"], pid,
@@ -2350,9 +2473,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             for r in plan["readers"]:
                 rn = get_node(cluster, r["node"])
                 pull_stage_logs(rn["ip"], rn,
-                                ["{}.reader_port{}.log".format(base_noext, r["port"])],
+                                ["{}.reader_{}_r{}_p{}.log".format(
+                                    base_noext, r["node"], r["index"], r["port"])],
                                 local_log_dir, dry)
-            # Step 6: remove empty .nohup redirect files (they capture script-level
+            # Step 7: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
             if not dry:
@@ -2361,14 +2485,19 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     nohup_files = []
                     for r in plan["readers"]:
                         if r["node"] == node_name:
-                            nohup_files.append("{}.reader_port{}.nohup".format(base_noext, r["port"]))
+                            nohup_files.append("{}.reader_{}_r{}_p{}.nohup".format(
+                                base_noext, r["node"], r["index"], r["port"]))
                     for w in plan["writers"]:
                         if w["node"] == node_name:
-                            nohup_files.append("{}.writer{}.nohup".format(base_noext, w["gid"]))
+                            nohup_files.append("{}.writer_{}_w{}.nohup".format(
+                                base_noext, w["node"], w["gid"]))
                     if nohup_files:
                         cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
                             " ".join(nohup_files))
                         ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+                # this size iteration is done: wipe its rendezvous state
+                bench_etcd.kv_delete_prefix(etcd_endpoints,
+                                            "mcbench/{}/".format(run_id))
         # Config end: remove-all — clears everything this config's writers
         # wrote. Pipeline env clears BENCH_KEY_COUNT, so the key-prefix scope has
         # no key count to work with; a full sweep here is short and precise
@@ -2397,8 +2526,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # FAIL path: preserve every remote log (reader SUMMARY/RESULT is only
         # flushed on exit) and free ports, then re-raise for main's [FAIL]
         if not dry:
-            fail_cleanup_pipeline(cluster, plan, reader_peers, reader_pids, writer_pids,
-                                  involved_nodes, remote_log_dir, cfg_name, local_log_dir)
+            fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
+                                  involved_nodes, remote_log_dir, cfg_name,
+                                  local_log_dir, etcd_endpoints=etcd_endpoints,
+                                  run_id=run_id)
             # 复核台账：已死删行、杀不死的保留待下次 reap
             reap_state_entries(cluster)
             if profile_sess is not None:
@@ -2703,62 +2834,64 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         for ds in data_size_list(cfg):
             ds_bytes = parse_data_size(ds)
             run_name = "benchmark_c1_t{}_{}".format(plan["reader_threads"], ds)
-            writer_files = {}
+            # log names carry the node segment (per-node port numbering is
+            # no longer globally unique): *.writer_<node>_w<gid>.log and
+            # *.reader_<node>_r<index>_p<port>.log — node, gid, index and
+            # port are parsed straight from the filename
+            writer_files = {}   # gid -> (nodename, path)
             for p in sorted(glob.glob(os.path.join(
-                    local_log_dir, "{}.{}.writer*.log".format(name, run_name)))):
+                    local_log_dir, "{}.{}.writer_*.log".format(name, run_name)))):
                 base = os.path.basename(p)
                 if ".ylt." in base:
                     continue
-                try:
-                    gid = int(base.replace(".log", "").split(".writer")[-1])
-                except ValueError:
+                m = re.search(r"\.writer_(.+)_w(\d+)\.log$", base)
+                if not m:
                     continue
-                writer_files[gid] = p
-            reader_files = {}
+                writer_files[int(m.group(2))] = (m.group(1), p)
+            reader_files = {}   # index -> (nodename, path)
             for p in sorted(glob.glob(os.path.join(
-                    local_log_dir, "{}.{}.reader_port*.log".format(name, run_name)))):
+                    local_log_dir, "{}.{}.reader_*.log".format(name, run_name)))):
                 base = os.path.basename(p)
                 if ".ylt." in base:
                     continue
-                try:
-                    port = int(base.replace(".log", "").split(".reader_port")[-1])
-                except ValueError:
+                m = re.search(r"\.reader_(.+)_r(\d+)_p(\d+)\.log$", base)
+                if not m:
                     continue
-                reader_files[port] = p
-            for w in plan["writers"]:
-                f = writer_files.get(w["gid"])
-                if not f:
-                    continue
+                reader_files[int(m.group(2))] = (m.group(1), p)
+            for gid in sorted(writer_files):
+                nodename, f = writer_files[gid]
                 agg = parse_benchmark_log(f, op_filter="pipeline_write")
-                row = base_row("writer", "w{}".format(w["gid"]), w["node"], ds)
+                row = base_row("writer", "w{}".format(gid), nodename, ds)
                 metrics_into(row, agg, ds_bytes)
                 rows.append(row)
             # writer TOTAL row: all writers aggregated; throughput = sum of each
             # writer's busy-time throughput
             if writer_files:
-                agg = parse_benchmark_log(list(writer_files.values()), op_filter="pipeline_write")
+                agg = parse_benchmark_log(
+                    [f for _n, f in writer_files.values()], op_filter="pipeline_write")
                 row = base_row("writer", "TOTAL", "", ds)
                 metrics_into(row, agg, ds_bytes,
                              throughput_mb=busy_throughput_mb(
-                                 writer_files.values(), "pipeline_write", ds_bytes))
+                                 (f for _n, f in writer_files.values()),
+                                 "pipeline_write", ds_bytes))
                 rows.append(row)
-            for r in plan["readers"]:
-                f = reader_files.get(r["port"])
-                if not f:
-                    continue
+            for idx in sorted(reader_files):
+                nodename, f = reader_files[idx]
                 agg = parse_benchmark_log(f, op_filter="pipeline_read")
-                row = base_row("reader", "r{}".format(r["index"]), r["node"], ds)
+                row = base_row("reader", "r{}".format(idx), nodename, ds)
                 metrics_into(row, agg, ds_bytes, with_queue=True)
                 rows.append(row)
             # TOTAL row: all readers aggregated (aligns with the datasystem
             # single GET row per test group); throughput = sum of each reader's
             # busy-time throughput
             if reader_files:
-                agg = parse_benchmark_log(list(reader_files.values()), op_filter="pipeline_read")
+                agg = parse_benchmark_log(
+                    [f for _n, f in reader_files.values()], op_filter="pipeline_read")
                 row = base_row("reader", "TOTAL", "", ds)
                 metrics_into(row, agg, ds_bytes, with_queue=True,
                              throughput_mb=busy_throughput_mb(
-                                 reader_files.values(), "pipeline_read", ds_bytes))
+                                 (f for _n, f in reader_files.values()),
+                                 "pipeline_read", ds_bytes))
                 rows.append(row)
     else:
         def fill_basic_row(row, agg, op_label):
@@ -2906,6 +3039,15 @@ def load_scenario_config(cfg_path):
                     _deep_merge(merged, load_json(frag))
             break
     _deep_merge(merged, cfg)
+    # pipeline roles are cluster-oriented now (count_per_node x N on every
+    # cluster node); the legacy per-role node lists are ignored with a WARN
+    for role in ("writer", "reader"):
+        blk = merged.get(role)
+        if isinstance(blk, dict) and "client_nodes" in blk:
+            log("[WARN] pipeline {}.client_nodes is deprecated and ignored "
+                "(cluster-oriented: count_per_node x N on every cluster node); "
+                "remove the field from the config".format(role))
+            blk.pop("client_nodes", None)
     return merged
 
 
@@ -3092,6 +3234,12 @@ def main(args, cfg_paths):
             log("[WARN] k8s controller info: {}".format(exc))
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
+    # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
+    # run prefix is also wiped per scenario/size; this covers the rest)
+    try:
+        _pipeline_wipe_etcd(globals_cfg)
+    except Exception as exc:
+        log("[WARN] etcd stale-key wipe failed: {}".format(exc))
     if args.mode == "k8s":
         globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
     # startup summary (mode, config paths, k8s settings)
@@ -3344,6 +3492,10 @@ def cleanup_on_stop():
             except Exception as exc:
                 log("[WARN] [STOP] delete namespace: {}".format(exc))
             try:
+                _pipeline_wipe_etcd(globals_cfg)
+            except Exception as exc:
+                log("[WARN] [STOP] etcd wipe: {}".format(exc))
+            try:
                 reap_state_entries(cluster)
             except Exception as exc:
                 log("[WARN] [STOP] state reap: {}".format(exc))
@@ -3357,6 +3509,10 @@ def cleanup_on_stop():
                 reap_state_entries(cluster)
             except Exception as exc:
                 log("[WARN] [STOP] state reap: {}".format(exc))
+            try:
+                _pipeline_wipe_etcd(globals_cfg)
+            except Exception as exc:
+                log("[WARN] [STOP] etcd wipe: {}".format(exc))
             if args is not None and getattr(args, "clean_up", False):
                 try:
                     cleanup_cluster(cluster, globals_cfg, dry_run=False)

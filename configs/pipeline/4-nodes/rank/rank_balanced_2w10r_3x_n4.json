@@ -3,11 +3,7 @@
   "qps_multiple": 3,
   "notify_count": 10,
   "writer": {
-    "notify_threads": 10,
-    "client_nodes": [
-      "writer_node1",
-      "writer_node2"
-    ]
+    "notify_threads": 10
   },
   "reader": {
     "count_per_node": 3
