@@ -147,7 +147,7 @@ writer.count_per_node=2；历史文件名的 `_n{N}` 后缀已随档位目录废
 | `warmup` | `{duration}`：相同部署形态下的短暂运行（writer 同 pacing 写+notify、reader 真实读取），激活 writer→store、writer→reader、reader→store 链路；warmup 项带标记**不计入指标** | 5s | 5s |
 | `duration` | 压测时长（秒） | 30 | 30 |
 | `batch_size` | writer 每批写入的 key 数（reader 按 notify 批处理） | 1 | 1 |
-| `key_count` | **可选**，每 writer 的 key 空间封顶：序列在 0..key_count-1 内回绕，回绕批**先删后写**（batch_remove 旧 key 后再写，写路径始终真实）。存储上界 = writers × key_count × data_size；缺省不设限（key 序列单调递增，长时间运行会耗尽 store 空间——writer 检测到连续 10 批 rc=-200 insufficient space 即失败并给出调优提示）。须 ≥ batch_size | 按需 | 按需 |
+| `key_count` | **pipeline 已移除**（残留字段 WARN+忽略）：key 空间由 store 容量自动推导（`floor(store × 0.9 / data_size / writers)`），先删后写回绕。basic 模式仍使用该参数（固定 key 空间模型） | — | — |
 
 rank 档位矩阵（平铺于 `configs/pipeline/rank/`；每档均跑 pulse/balanced × 1x/2x/3x；canonical
 cpn = 旧 2 节点参考值，2 节点集群上池恰等于扇出数即广播语义）：
@@ -197,12 +197,12 @@ store 节点列表），实际通信仍经 master 发现 store。
   `*.dual_<node>_c<id>_p<port>.writer.log` 与 `*.dual_<node>_c<id>_p<port>.reader.log` 两个日志，
   CSV 按后缀归组（writer 行 / reader 行含 queue_wait），**绘图天然按角色分开**
   （writer 仅 latency 图；reader 出 latency + queue-wait 图），历史混合日志仍兼容解析；
-- **store 空间约束（store_total_size / 自动发现）**：启动时自动从 master metrics 抓取 store 总量（`segment_total_capacity_bytes`，
-  全量指标行打印进日志；显式 `store_total_size` 优先于自动值；发现失败仅 WARN 回退“无限”），pipeline 的 key 空间按下列规则规划——显式
-  `key_count`：`writers × key_count × data_size` 必须**严格小于** store，否则该 config 直接 FAIL；缺省 `key_count`：
-  自动计算 per-writer 上限 `floor(store × 0.9 / data_size / writers)` 并经 `--key-count` 注入（每 size 重算），writer
-  写满自己的 key 段后回绕——**未计时 `batch_remove` 旧 key 再写**（方法 a），put 性能样本始终是真实写入；CSV
-  `key_count` 列记录实际生效值。不设 store_total_size = 无穷大（不约束，长跑会耗尽 store 触发 -200 fail-fast）；
+- **store 空间约束（唯一 key 空间来源）**：pipeline **没有 key_count 参数**——可写 key 空间完全由 store 容量决定：
+  `per-writer 上限 = floor(store × 0.9 / data_size / writers)`（每 size 重算）并经 `--key-count` **恒注入**；
+  `store` 来源 = global.json `store_total_size`（显式）> master metrics 自动发现（`segment_total_capacity_bytes`，
+  全量指标行打印进日志）。**两者都缺失 → 场景直接 FAIL**（无法推导可写量，避免无界打满 store）；writer 写满
+  自己 key 段后回绕——put 家族**未计时 `batch_remove` 旧 key 再写**、`upsert_from` 直接覆盖写，性能样本始终是
+  真实写入；CSV `key_count` 列记录实际生效的 per-writer 上限。basic 模式保留自身的 `key_count`（固定 key 空间模型）；
 - **规模行为（32-client 实测）**：/start 触发、/shutdown 关闭、日志拉取均为**有界并行**
   （并发 8；单次失败自动重连重试一次），32 客户端下三段合计从 ~3 分钟降至 ~10 秒，同时消除
   writer 起跑的墙钟时延差；`/shutdown` 探测前先查 pid（marker 校验），已死客户端直接跳过

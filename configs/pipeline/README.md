@@ -53,10 +53,10 @@ client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样�
 （进 CSV `store_count` 列，store 由外部部署）。qps 为单节点语义：每 client =
 节点速率 / cpn。
 
-**key 空间**：smoke 用例不设 `key_count`——store 总量默认**自动从 master metrics 发现**
-（`segment_total_capacity_bytes`；也可在 global.json 显式 `store_total_size` 覆盖，失败回退
-无限），由编排器自动计算 per-writer 上限 `floor(store × 0.9 / data_size / writers)` 并
-注入（写满回绕，先删后写）。
+**key 空间**：pipeline **没有 `key_count` 参数**（残留字段 WARN+忽略）——可写量完全由 store
+容量决定：`floor(store × 0.9 / data_size / writers)`，经 `--key-count` 恒注入（写满回绕，
+put 家族先删后写、upsert_from 覆盖写）。store 来源 = global.json `store_total_size`（显式）
+或 master metrics 自动发现；**两者都缺失时场景直接 FAIL**。
 
 **日志分离**：dual client 的 writer/reader 输出写入两个日志
 （`*.dual_<node>_c<id>_p<port>.writer.log` / `.reader.log`），CSV 与 latency/queue-wait
@@ -78,7 +78,7 @@ client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样�
 | `put` | `store.put(key, value)` | 每 key 一次计时调用 | 基础单写 |
 | `put_batch` | `store.put_batch(keys, values)` | 整批一次计时调用 | 批大小 = `batch_size` |
 | `put_from` | `store.put_from(key, ptr, size)` | 每 key 一次计时调用 | 从已注册本地缓冲写入；writer 启动时注册页对齐缓冲（value 写入缓冲为未计时准备），注册失败即退出 |
-| `upsert_from` | `store.upsert_from(key, ptr, size)` | 每 key 一次计时调用 | 零拷贝插入或覆盖写；`key_count` 可选（不设则无限写新 key；设置后写满回绕覆盖，不做删除） |
+| `upsert_from` | `store.upsert_from(key, ptr, size)` | 每 key 一次计时调用 | 零拷贝插入或覆盖写；pipeline 下 key 空间由 store 容量推导（写满回绕覆盖，不做删除） |
 
 ### reader 块
 
