@@ -54,9 +54,11 @@ client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样�
 节点速率 / cpn。
 
 **key 空间**：pipeline **没有 `key_count` 参数**（残留字段 WARN+忽略）——可写量完全由 store
-容量决定：`floor(store × 0.9 / data_size / writers)`，经 `--key-count` 恒注入（写满回绕，
-put 家族先删后写、upsert_from 覆盖写）。store 来源 = global.json `store_total_size`（显式）
-或 master metrics 自动发现；**两者都缺失时场景直接 FAIL**。
+容量决定：`floor(effective × 0.9 / data_size / writers)`，经 `--key-count` 恒注入（写满回绕，
+put 家族先删后写、upsert_from 覆盖写）。**容量解析**：探测恒执行（B = master metrics
+`segment_total_capacity_bytes`）；配置 `store_total_size`（A）与 B 同时存在时
+**effective = min(A, B)**（A>B 用满集群、A<B 只用部分），单源直用，双缺场景 FAIL。
+启动摘要与场景头（资源创建前）会打印 configured/probed/effective 与每 size 的 per-writer key 数。
 
 **日志分离**：dual client 的 writer/reader 输出写入两个日志
 （`*.dual_<node>_c<id>_p<port>.writer.log` / `.reader.log`），CSV 与 latency/queue-wait

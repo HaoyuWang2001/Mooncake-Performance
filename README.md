@@ -198,11 +198,16 @@ store 节点列表），实际通信仍经 master 发现 store。
   CSV 按后缀归组（writer 行 / reader 行含 queue_wait），**绘图天然按角色分开**
   （writer 仅 latency 图；reader 出 latency + queue-wait 图），历史混合日志仍兼容解析；
 - **store 空间约束（唯一 key 空间来源）**：pipeline **没有 key_count 参数**——可写 key 空间完全由 store 容量决定：
-  `per-writer 上限 = floor(store × 0.9 / data_size / writers)`（每 size 重算）并经 `--key-count` **恒注入**；
-  `store` 来源 = global.json `store_total_size`（显式）> master metrics 自动发现（`segment_total_capacity_bytes`，
-  全量指标行打印进日志）。**两者都缺失 → 场景直接 FAIL**（无法推导可写量，避免无界打满 store）；writer 写满
-  自己 key 段后回绕——put 家族**未计时 `batch_remove` 旧 key 再写**、`upsert_from` 直接覆盖写，性能样本始终是
-  真实写入；CSV `key_count` 列记录实际生效的 per-writer 上限。basic 模式保留自身的 `key_count`（固定 key 空间模型）；
+  `per-writer 上限 = floor(effective × 0.9 / data_size / writers)`（每 size 重算）并经 `--key-count` **恒注入**。
+  **容量解析（探测恒执行）**：A = global.json `store_total_size`（配置），B = master metrics 探测总量
+  （`segment_total_capacity_bytes`）——**两者同时获得时 effective = min(A, B)**（A>B = 用满集群实际容量；
+  A<B = 只允许使用部分容量），仅一方则直接采用；**双缺 → 场景在创建任何资源前秒级 FAIL**（零残留）。
+  日志前置：启动摘要打印 `store capacity: configured=…, probed=…, effective=… (source)`；场景头
+  （`=== scenario … ===` 之后、configmap/deployment/staging 之前）打印每 size 的预览块
+  `8MB: 32 writers x 72 keys = 17.3 GiB (of 20 GiB effective, 0.9 headroom)`。writer 写满自己 key 段后回绕——
+  put 家族**未计时 `batch_remove` 旧 key 再写**、`upsert_from` 直接覆盖写，性能样本始终是真实写入；CSV
+  `key_count` 列记录实际生效的 per-writer 上限。basic 模式保留自身的 `key_count`，其 `key_count × data_size`
+  校验同样使用 effective；
 - **规模行为（32-client 实测）**：/start 触发、/shutdown 关闭、日志拉取均为**有界并行**
   （并发 8；单次失败自动重连重试一次），32 客户端下三段合计从 ~3 分钟降至 ~10 秒，同时消除
   writer 起跑的墙钟时延差；`/shutdown` 探测前先查 pid（marker 校验），已死客户端直接跳过
@@ -458,7 +463,7 @@ STOP/Ctrl+C 或 `--clean-up` 收场；下次运行会自动回收遗留 namespac
 | protocol.ub.device | ub 设备名；`"auto"`（或空）= 运行期 `urma_admin` 自动探测首个 `bonding_dev_*`；也可显式指定（如 `bonding_dev_0`），显式时不再探测 |
 | mooncake_store_nodes | store 节点名列表（取自 cluster.json 的 nodes），可多个；仅用于指标行 local/remote 拓扑标注 |
 | local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size；支持字节数（number）或字符串（如 `"1GB"`，1024 进制） |
-| store_total_size | **mooncake store 总空间约束**（可选，手动覆盖）：字符串（`"20GB"`，1024 进制）或字节数。**缺省时自动发现**：启动时抓取 master metrics 的 `segment_total_capacity_bytes` 作为总量（失败仅 WARN 回退“无限”）。生效后：basic 校验 `key_count × data_size < store`、pipeline 显式 key_count 校验 `writers × key_count × data_size < store`（严格小于，超限该 config 直接 FAIL 带算式明细）；pipeline **缺省 key_count 时自动计算** per-writer 上限 `floor(store × 0.9 / data_size / writers)`（0.9 = 对象元数据+在途批次余量），writer 写满后回绕（先删后写，put 样本始终真实写入） |
+| store_total_size | **mooncake store 总空间约束**（可选）：字符串（`"20GB"`，1024 进制）或字节数。探测恒执行（B = master metrics 的 `segment_total_capacity_bytes`）；**两者都有时 effective = min(A, B)**（A>B 用满集群、A<B 只用部分），单源直用，双缺则 pipeline 场景 FAIL。pipeline 的 per-writer 上限 = `floor(effective × 0.9 / data_size / writers)`（0.9 = 对象元数据+在途批次余量）；basic 的 `key_count × data_size` 校验同样用 effective |
 | master_metrics_url | **可选**：mooncake master 的 Prometheus metrics 完整 URL（如 `http://mooncake-master.mooncake.svc.cluster.local:17702/metrics`）；k8s 模式经 controller curl（svc DNS 自动解析），ssh 模式编排器直连、失败回退首个节点 ssh curl |
 | master_metrics_port | **可选**：未配 `master_metrics_url` 时，用 `master_addr` 的 host + 本端口拼 metrics URL，默认 `17702` |
 | tenant_id | 租户标识，默认 "default" |
