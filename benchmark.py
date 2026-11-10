@@ -188,21 +188,12 @@ _STORE_METRICS = (
 
 
 def _master_metrics_url(globals_cfg):
-    """Master Prometheus metrics URL: explicit master_metrics_url wins; else
-    derived from master_addr's host + master_metrics_port (default 17702).
-    Empty string when neither is configured (auto-discovery skipped)."""
-    url = (globals_cfg.get("master_metrics_url") or "").strip()
-    if url:
-        return url
-    master = (globals_cfg.get("master_addr") or "").strip()
-    if not master:
-        return ""
-    host = master.split(":")[0]
-    try:
-        port = int(globals_cfg.get("master_metrics_port", 17702) or 17702)
-    except (TypeError, ValueError):
-        port = 17702
-    return "http://{}:{}/metrics".format(host, port)
+    """Master Prometheus metrics URL: ONLY the explicit global.json
+    master_metrics_url is used (must include the metrics port). Nothing is
+    derived from master_addr and no port/host default is baked in — an
+    unset URL simply disables the probe (pipeline then needs
+    store_total_size)."""
+    return (globals_cfg.get("master_metrics_url") or "").strip()
 
 
 def _parse_prometheus_metrics(text):
@@ -260,53 +251,42 @@ def _controller_curl_get(cluster, url, timeout=5):
     return out if rc == 0 and out.strip() else None
 
 
-def _master_metrics_exec_params(cluster):
-    """Exec-probe parameters from cluster.json's k8s section (k8s mode
-    only). Defaults match the reference deployment; override per cluster:
-      k8s.master_metrics_namespace  (default "mooncake")
-      k8s.master_metrics_pod        (pod name PREFIX, default "mooncake-master")
-      k8s.master_metrics_port       (default 17702)"""
-    if cluster is None or cluster.get("_controller") is None:
-        return None
-    k8s = cluster.get("k8s") or {}
-    return {
-        "namespace": str(k8s.get("master_metrics_namespace") or "mooncake"),
-        "pod_prefix": str(k8s.get("master_metrics_pod") or "mooncake-master"),
-        "port": int(k8s.get("master_metrics_port", 17702) or 17702),
-    }
-
-
-def _probe_metrics_via_exec(cluster):
+def _probe_metrics_via_exec(cluster, url):
     """curl the metrics INSIDE the master pod via kubectl exec.
 
     The metrics port is typically pod-internal only: the controller node
     does not use cluster DNS (so Service names do not resolve there) and no
     Service may expose the port at all. kubectl exec needs zero cluster
-    changes. Returns (text, source_label) or (None, reason)."""
-    params = _master_metrics_exec_params(cluster)
-    if params is None:
-        return None, "not a k8s cluster"
+    changes: API server -> kubelet -> container.
+
+    The pod NAME is discovered from the Service named in
+    master_metrics_url (endpoints targetRef), so svc/ns/port all come from
+    the URL — no cluster.json metrics params, no baked-in defaults. Returns
+    (text, source_label) or (None, reason)."""
     c = cluster["_controller"]
-    ns = params["namespace"]
-    prefix = params["pod_prefix"]
-    port = params["port"]
+    try:
+        p = urllib.parse.urlsplit(url or "")
+        host, port = p.hostname, p.port
+    except Exception:
+        return None, "cannot parse master_metrics_url {!r}".format(url)
+    if not host:
+        return None, "master_metrics_url has no host"
+    if port is None:
+        return None, ("master_metrics_url must include the metrics port "
+                      "(e.g. http://<svc>.<ns>.svc.cluster.local:<port>/metrics)")
+    svc, ns = _svc_ns_from_host(host)
+    if not svc:
+        return None, ("cannot derive a Service name from host {!r}; the "
+                      "exec fallback needs the svc DNS form "
+                      "<svc>.<ns>.svc.cluster.local".format(host))
     out, rc = controller_run(
-        c, ["-n", ns, "get", "pods", "-o",
-            "jsonpath={range .items[*]}{.metadata.name}{' '}"
-            "{.status.phase}{'\\n'}{end}"], check=False)
-    if rc != 0:
-        return None, "cannot list pods in namespace {!r}: {}".format(
-            ns, out.strip()[:200])
-    pod = ""
-    for line in out.strip().splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].startswith(prefix) \
-                and parts[1] == "Running":
-            pod = parts[0]
-            break
-    if not pod:
-        return None, ("no Running pod with prefix {!r} in namespace {!r}"
-                      .format(prefix, ns))
+        c, ["-n", ns, "get", "endpoints", svc, "-o",
+            "jsonpath={.subsets[0].addresses[0].targetRef.name}"], check=False)
+    pod = (out or "").strip()
+    if rc != 0 or not pod:
+        return None, ("cannot find the backing pod of svc {!r} in ns {!r} "
+                      "({})".format(svc, ns, (out or "").strip()[:200] or
+                                    "no endpoints targetRef"))
     out, rc = controller_run(
         c, ["-n", ns, "exec", pod, "--", "curl", "-s", "--max-time", "5",
             "http://localhost:{}/metrics".format(port)], check=False)
@@ -320,16 +300,25 @@ def discover_store_capacity(cluster, globals_cfg):
     """Fetch the master's Prometheus metrics and record the store TOTAL
     capacity (B) for the key-space budget. Failure only WARNs.
 
-    Probe chain:
-      k8s: global.json master_metrics_url (direct, via controller)  ->
-           cluster.json k8s.master_metrics_* (kubectl exec INSIDE the
-           master pod — the metrics port is usually pod-internal only)
-      ssh: master_metrics_url / master_addr-derived direct GET, then curl
-           on the first cluster node as a fallback.
+    Single source of configuration: global.json master_metrics_url (a
+    complete URL that MUST include the metrics port). No host/port default
+    is baked into the code.
+
+    Probe chain (k8s mode, all executed via the controller):
+      1. translate <svc>.<ns>.svc.cluster.local -> ClusterIP (kubectl svc)
+         and curl it (works when the controller is a cluster node and the
+         Service declares the metrics port)
+      2. kubectl get endpoints <svc> -> targetRef pod name -> kubectl exec
+         the pod and curl localhost:<port>/metrics (zero cluster changes;
+         works even when the port is not exposed by a Service)
+    ssh mode: orchestrator direct GET, then curl on the first cluster node.
 
     Labeled gauge families (per-segment series) are summed; the label-less
     master_total gauge is preferred when present."""
     url = _master_metrics_url(globals_cfg)
+    if "master_metrics_port" in globals_cfg:
+        log("[WARN] global.json master_metrics_port is deprecated and "
+            "ignored; include the port in master_metrics_url instead")
     text = None
     source = ""
     why = ""
@@ -343,10 +332,18 @@ def discover_store_capacity(cluster, globals_cfg):
                     cache[url] = url
             text = _controller_curl_get(cluster, cache[url] or url)
             source = "direct {}".format(cache[url] or url)
-        if not text:
-            text, why = _probe_metrics_via_exec(cluster)
-            if text:
-                source = why
+            if not text:
+                text, why = _probe_metrics_via_exec(cluster, url)
+                if text:
+                    source = why
+        else:
+            why = "master_metrics_url not set in global.json"
+        k8s = cluster.get("k8s") or {}
+        stale = sorted(k for k in k8s if k.startswith("master_metrics_"))
+        if stale:
+            log("[WARN] cluster.json k8s.{} is deprecated and ignored; set "
+                "global.json master_metrics_url (svc DNS form + port) "
+                "instead".format("/".join(stale)))
     else:
         if url:
             text = _http_get_text(url)
@@ -364,11 +361,12 @@ def discover_store_capacity(cluster, globals_cfg):
             if text is None:
                 why = "master metrics unreachable at {}".format(url)
         else:
-            why = "no master_metrics_url/master_addr in global.json"
+            why = "master_metrics_url not set in global.json"
     if not text:
         log("[WARN] store capacity probe failed ({}); pipeline scenarios "
-            "require a store capacity and will FAIL — set store_total_size "
-            "manually or fix the metrics source".format(why or "unknown"))
+            "require a store capacity and will FAIL — set global.json "
+            "store_total_size manually and/or fix master_metrics_url "
+            "(full URL incl. port)".format(why or "unknown"))
         return None
     vals = _parse_prometheus_metrics(text)
     if not any(k in vals for k in _STORE_METRICS):
@@ -483,8 +481,9 @@ def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, batch_size,
         raise RuntimeError(
             "pipeline requires the store capacity to size the write key "
             "space: set global.json 'store_total_size' (e.g. \"20GB\") "
-            "and/or make the master metrics reachable via "
-            "master_metrics_url/master_metrics_port")
+            "and/or set global.json 'master_metrics_url' to the master "
+            "metrics endpoint (full URL including the port, e.g. "
+            "http://<svc>.<ns>.svc.cluster.local:<port>/metrics)")
     usable = int(store * 0.9)
     per = usable // (ds_bytes * writer_count) if ds_bytes and writer_count else 0
     if per < max(1, int(batch_size or 1)):
@@ -800,6 +799,25 @@ def _resolve_k8s_svc(svc, ns, ctx, controller=None):
             log("[WARN] k8s controller diagnostics failed: {}".format(exc))
     return None
 
+
+def _svc_ns_from_host(host):
+    """Parse a k8s Service DNS name -> (svc, ns), else (None, None).
+
+    Accepted forms: <svc>.<ns>.svc.cluster.local / <svc>.<ns>.svc /
+    <svc>.<ns> (2-part names are ambiguous; callers try svc.ns first)."""
+    parts = (host or "").split(".")
+    # <svc>.<ns>.svc.cluster.local (standard k8s service FQDN)
+    if len(parts) >= 4 and parts[-1] == "local" \
+            and parts[-2] == "cluster" and parts[-3] == "svc":
+        return parts[0], parts[1]
+    # <svc>.<ns>.svc
+    if len(parts) >= 3 and parts[-1] == "svc":
+        return parts[0], parts[1]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return None, None
+
+
 def _resolve_host(host, cluster):
     """Resolve one hostname to an IP. Order: already an IP -> kubectl svc
     (for k8s Service DNS forms) -> getaddrinfo -> None (keep original)."""
@@ -810,20 +828,7 @@ def _resolve_host(host, cluster):
         return host          # already an IP
     except ValueError:
         pass
-    # k8s Service DNS forms: <svc>.<ns>.svc.cluster.local / <svc>.<ns>.svc /
-    # <svc>.<ns> (2-part names are tried as svc.ns first, then DNS)
-    parts = host.split(".")
-    svc = ns = None
-    # <svc>.<ns>.svc.cluster.local (standard k8s service FQDN)
-    if len(parts) >= 4 and parts[-1] == "local" \
-            and parts[-2] == "cluster" and parts[-3] == "svc":
-        svc, ns = parts[0], parts[1]
-    # <svc>.<ns>.svc
-    elif len(parts) >= 3 and parts[-1] == "svc":
-        svc, ns = parts[0], parts[1]
-    # <svc>.<ns>
-    elif len(parts) == 2:
-        svc, ns = parts[0], parts[1]
+    svc, ns = _svc_ns_from_host(host)
     if svc:
         k8s = cluster.get("k8s") or {}
         ip = _resolve_k8s_svc(svc, ns, k8s.get("kubecontext", ""),

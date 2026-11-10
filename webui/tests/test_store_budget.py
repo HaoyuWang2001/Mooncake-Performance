@@ -118,17 +118,17 @@ mooncake_vsegment_logical_free_bytes 0
     assert bm._metric_total(v, "missing_metric") is None
 
 
-def test_master_metrics_url():
+def test_master_metrics_url_is_explicit_only():
+    """ONLY global.json master_metrics_url is used: no derivation from
+    master_addr, no baked-in port default."""
     assert bm._master_metrics_url({}) == ""
+    assert bm._master_metrics_url({"master_addr": "10.0.0.7:50051"}) == ""
     assert bm._master_metrics_url(
-        {"master_addr": "10.0.0.7:50051"}) == "http://10.0.0.7:17702/metrics"
-    assert bm._master_metrics_url(
-        {"master_addr": "10.0.0.7:50051", "master_metrics_port": 19000}) == \
-        "http://10.0.0.7:19000/metrics"
+        {"master_addr": "10.0.0.7:50051", "master_metrics_port": 19000}) == ""
     assert bm._master_metrics_url(
         {"master_addr": "10.0.0.7:50051",
-         "master_metrics_url": "http://m:17702/metrics"}) == \
-        "http://m:17702/metrics"
+         "master_metrics_url": "http://m:19000/metrics"}) == \
+        "http://m:19000/metrics"
 
 
 def test_store_capacity_resolution_min_rule():
@@ -159,7 +159,7 @@ def test_discover_store_capacity_auto(monkeypatch):
     text = ("segment_total_capacity_bytes 21474836480\n"
             "segment_allocated_bytes 1073741824\n")
     monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
-    g = {"master_addr": "10.0.0.7:50051"}
+    g = {"master_metrics_url": "http://10.0.0.7:19000/metrics"}
     total = bm.discover_store_capacity(None, g)
     assert total == 21474836480
     assert g["_store_total_auto"] == 21474836480
@@ -172,7 +172,7 @@ def test_discover_store_capacity_auto(monkeypatch):
 
 def test_discover_store_capacity_failure_is_warn_only(monkeypatch, capsys):
     monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: None)
-    g = {"master_addr": "10.0.0.7:50051"}
+    g = {"master_metrics_url": "http://10.0.0.7:19000/metrics"}
     assert bm.discover_store_capacity(None, g) is None
     assert "_store_total_auto" not in g
     assert "store capacity probe failed" in capsys.readouterr().out
@@ -195,7 +195,7 @@ def test_discover_labeled_metrics_sums(monkeypatch):
             "segment_total_capacity_bytes{segment=\"b\"} 12884901888\n"
             "segment_allocated_bytes{segment=\"a\"} 0\n")
     monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
-    g = {"master_addr": "10.0.0.7:50051"}
+    g = {"master_metrics_url": "http://10.0.0.7:19000/metrics"}
     assert bm.discover_store_capacity(None, g) == 193273528320
     assert g["_store_total_auto"] == 193273528320
     # segment fallback/preference: master_total wins above; without it the
@@ -203,68 +203,80 @@ def test_discover_labeled_metrics_sums(monkeypatch):
     text2 = ("segment_total_capacity_bytes{segment=\"a\"} 12884901888\n"
              "segment_total_capacity_bytes{segment=\"b\"} 12884901888\n")
     monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text2)
-    g2 = {"master_addr": "10.0.0.7:50051"}
+    g2 = {"master_metrics_url": "http://10.0.0.7:19000/metrics"}
     assert bm.discover_store_capacity(None, g2) == 2 * 12884901888
 
 
-def test_master_metrics_exec_params_defaults_and_override():
-    k8s_cluster = {"_controller": {"ip": "1.2.3.4"}, "k8s": {}}
-    assert bm._master_metrics_exec_params(k8s_cluster) == {
-        "namespace": "mooncake", "pod_prefix": "mooncake-master",
-        "port": 17702}
-    k8s_cluster["k8s"] = {"master_metrics_namespace": "infra",
-                          "master_metrics_pod": "mc-master",
-                          "master_metrics_port": 19000}
-    assert bm._master_metrics_exec_params(k8s_cluster) == {
-        "namespace": "infra", "pod_prefix": "mc-master", "port": 19000}
-    # ssh cluster: no exec probe
-    assert bm._master_metrics_exec_params({"nodes": {}}) is None
+def test_probe_metrics_via_exec_needs_svc_url(monkeypatch):
+    """The exec fallback derives svc/ns/port from master_metrics_url; a URL
+    without a port or without a svc DNS host cannot drive it (and there is
+    no default to fall back to)."""
+    cluster = {"_controller": {"ip": "1.2.3.4"}, "k8s": {}}
+    calls = []
+    monkeypatch.setattr(bm, "controller_run",
+                        lambda *a, **k: (calls.append(a), ("", 0))[1])
+    got, why = bm._probe_metrics_via_exec(
+        cluster, "http://mooncake-master.mooncake.svc.cluster.local/metrics")
+    assert got is None and "must include the metrics port" in why
+    assert not calls
+    got, why = bm._probe_metrics_via_exec(
+        cluster, "http://10.0.0.7:19000/metrics")
+    assert got is None and "svc DNS form" in why
+    assert not calls
 
 
 def test_probe_metrics_via_exec(monkeypatch):
+    """URL -> endpoints targetRef -> pod name -> kubectl exec curl."""
     text = "master_total_capacity_bytes 193273528320\n"
     calls = []
 
     def fake_run(controller, args, check=True, timeout=None):
         calls.append(list(args))
         a = " ".join(str(x) for x in args)
-        if " get pods " in a or a.startswith("-n mooncake get pods"):
-            return ("mooncake-etcd-0 Running\n"
-                    "mooncake-master-657f88fc6c-vfp4f Running\n"
-                    "mooncake-master-old Terminating\n"), 0
+        if "get" in a and "endpoints" in a:
+            return "mooncake-master-657f88fc6c-vfp4f", 0
         if " exec " in a:
             return text, 0
         return "", 0
 
     monkeypatch.setattr(bm, "controller_run", fake_run)
     cluster = {"_controller": {"ip": "1.2.3.4"}, "k8s": {}}
-    got, src = bm._probe_metrics_via_exec(cluster)
+    url = "http://mooncake-master.mooncake.svc.cluster.local:17702/metrics"
+    got, src = bm._probe_metrics_via_exec(cluster, url)
     assert got == text
-    # kubectl must receive a LITERAL backslash-n in the pods jsonpath — a raw
-    # newline makes real kubectl fail with "unterminated quoted string"
-    # (this exact bug broke the real-cluster probe once; the stub never
-    # parses jsonpath, so only this assertion catches it)
-    pods_argv = " ".join(str(x) for x in calls[0])
-    assert "jsonpath=" in pods_argv
-    assert "\\n" in pods_argv and "\n" not in pods_argv
-    assert src == "kubectl exec mooncake/mooncake-master-657f88fc6c-vfp4f:17702"
-    # exec command targets localhost inside the pod
+    assert src == ("kubectl exec mooncake/mooncake-master-657f88fc6c-vfp4f:17702")
+    # endpoints lookup uses the svc/ns parsed from the URL
+    ep_argv = " ".join(str(x) for x in calls[0])
+    assert "-n mooncake get endpoints mooncake-master" in ep_argv
+    assert "jsonpath=" in ep_argv and "targetRef.name" in ep_argv
+    # exec targets localhost:<url port> inside the pod
     exec_args = [c for c in calls if " exec " in " ".join(str(x) for x in c)]
     assert exec_args and "http://localhost:17702/metrics" in " ".join(
         str(x) for x in exec_args[0])
-    # no matching Running pod -> None + reason
-    def only_terminating(controller, args, check=True, timeout=None):
-        return "mooncake-master-old Terminating\n", 0
-    monkeypatch.setattr(bm, "controller_run", only_terminating)
-    got, why = bm._probe_metrics_via_exec(cluster)
-    assert got is None and "no Running pod" in why
-    # curl failure -> None + reason
+    # no endpoints targetRef -> None + reason
+    monkeypatch.setattr(bm, "controller_run",
+                        lambda *a, **k: ("", 0))
+    got, why = bm._probe_metrics_via_exec(cluster, url)
+    assert got is None and "backing pod" in why
+    # exec curl failure -> None + reason
     def failing_exec(controller, args, check=True, timeout=None):
         a = " ".join(str(x) for x in args)
-        if "get pods" in a:
-            return "mooncake-master-x Running\n", 0
+        if "endpoints" in a:
+            return "mooncake-master-x", 0
         return "000", 1
     monkeypatch.setattr(bm, "controller_run", failing_exec)
-    got, why = bm._probe_metrics_via_exec(cluster)
+    got, why = bm._probe_metrics_via_exec(cluster, url)
     assert got is None and "curl failed" in why
 
+
+def test_no_hardcoded_metrics_defaults():
+    """Regression guard for the hard rule: the code must not bake in a
+    host/port/namespace/pod default for the master metrics probe."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    src = open(os.path.join(root, "benchmark.py"), encoding="utf-8").read()
+    assert "17702" not in src
+    assert "mooncake-master" not in src
+    for key in ("master_metrics_port", "master_metrics_namespace",
+                "master_metrics_pod"):
+        assert 'get("{}"'.format(key) not in src
