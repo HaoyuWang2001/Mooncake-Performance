@@ -57,11 +57,10 @@ configs/basic/
 - **get 族**：循环读取预填数据直至到时
 - **put 族**：以"完整遍历自己 key 分片"为一轮，跑满一轮后客户端清除**自己的**
   key（`batch_remove`，维护动作不计时、不产生 RESULT）再进入下一轮
-- **upsert_from**：计时前用 `put_from` 预填目标 key（首字节刻意翻转以便读校验
-  覆盖生效），duration 模式反复覆盖同一批 key，轮间**不**删除
+- **upsert_from**：插入或覆盖写——首轮遍历创建自己的 key 分片，之后反复
+  覆盖同一批 key，轮间**不**删除
 - **mixed**：put/get 交替，put 侧写满一轮后清空本轮 put key 继续循环
-  （mixed `upsert_from/<读>` 同理不删除，计时前用 `put_from` 预填各线程
-  put 配额内的 key）
+  （mixed `upsert_from/<读>` 同理不删除，get 读取本单元 put 刚写入的 key）
 - 多 client/多线程按 key 分片各清各的，互不干扰
 
 ## target_qps 限速

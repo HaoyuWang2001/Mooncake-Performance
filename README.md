@@ -104,7 +104,7 @@ basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字
   `put_ratio × key_count`（put）/ 余量（get）。
 - 零拷贝接口（put_from / upsert_from / get_into / get_buffer）在场景进程内自动 `register_buffer` 并注销，
   无需额外配置。
-- `upsert_from` 在计时前用 `put_from` 预填目标 key；duration 模式循环覆盖同一批 key，不执行轮间删除。
+- `upsert_from` 为插入或覆盖写：首轮创建 key，duration 模式后续轮次循环覆盖同一批 key，不执行轮间删除。
 - **pipeline 同样由 operation 指定接口**：`writer.operation`（写接口，`put_batch` 等）与
   `reader.operation`（读接口，`get` 等）真实驱动调用（见 3.3）。
 
@@ -140,7 +140,7 @@ writer.count_per_node=2；历史文件名的 `_n{N}` 后缀已随档位目录废
 | `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数；须 ≤ reader 池 cpn×N） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
 | `client` | **双角色部署块（出现即选择 dual 模式）**：`{count_per_node, port_base}`——每节点 client 进程数（总数 = cpn×N，每个进程**同时是 writer+reader**，端口默认 9301，单端口四 endpoint）；出现该块时 writer/reader 块仅提供 operation/线程数等接口参数 | smoke 两用例必填 | 不使用 |
-| `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`/`upsert_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101）；`upsert_from` 要求配置 `key_count > 0` | cpn=1（notify_threads=notify_count） | cpn=1 |
+| `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`/`upsert_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101） | cpn=1（notify_threads=notify_count） | cpn=1 |
 | `reader` | `{count_per_node, operation, num_threads, port_base}`：每节点 reader 数（池 = cpn×N，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / HTTP /notify 端口段（默认 9201） | 见下方档位表 | 恒 1 |
 | `store_count_per_node` | **记录性元数据**：每节点 mooncake store 数（store 由外部部署、master 发现，编排器不管理）；进 CSV `store_count` 列（值如 `N*1`） | 1 | 2 |
 | `data_size` | **必填，数组形式**：逐个 size 循环，每个 size 完整跑一轮写读流水（value.bin 自动按尺寸重建）；单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` | `["8MB"]` | `["3.5MB"]` |

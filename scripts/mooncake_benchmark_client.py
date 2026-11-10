@@ -509,65 +509,12 @@ def _put_check(raw, keys, value, ctx):
     return "OK" if raw == 0 else "ERR:{}".format(raw)
 
 
-def _upsert_prefill_keys(operation, keys, put_ratio):
-    """Return the keys that must exist before a measured upsert_from call."""
-    if operation == "upsert_from":
-        return list(keys)
-    if "/" in operation:
-        put_iface, _ = operation.split("/", 1)
-        if put_iface == "upsert_from":
-            return list(keys[:int(len(keys) * put_ratio)])
-    return []
-
-
 def _split_even(chunk, parts):
     """Even split of a key chunk into `parts` contiguous sub-ranges — the
     exact per-thread ranges the measured basic phase hands to _run_thread."""
     n = max(1, parts)
     return [chunk[t * len(chunk) // n:(t + 1) * len(chunk) // n]
             for t in range(n)]
-
-
-def _mixed_upsert_prefill_keys(op, chunk, num_threads, put_ratio):
-    """Prefill key set for a measured mixed `upsert_from/<read>` run.
-
-    The measured phase spawns one _run_thread per sub-range and each
-    thread's put quota sits at the head of ITS OWN sub-range, so the union
-    of per-thread quotas — NOT the head of the whole chunk — must be
-    prefilled. (Warmup is single-threaded over the full key set and keeps
-    the whole-set head via _upsert_prefill_keys.)"""
-    put_iface = op.split("/", 1)[0]
-    if put_iface != "upsert_from":
-        return []
-    union = []
-    for sub in _split_even(chunk, num_threads):
-        union.extend(sub[:int(len(sub) * put_ratio)])
-    return union
-
-
-def _prefill_upsert_keys(store, keys, value, ctx, label):
-    """Create upsert targets with put_from outside the measured region.
-
-    The first byte is deliberately different from the measured value so a
-    later read validates an actual overwrite rather than an unchanged value.
-    """
-    if not keys:
-        return
-    if ctx is None:
-        raise SystemExit("[ERROR] {} upsert_from prefill has no buffer".format(label))
-    ctx.write_value(value)
-    if value:
-        ctx.ctypes.memset(ctx.ptr, value[0] ^ 0xFF, 1)
-    for i, key in enumerate(keys, 1):
-        ret = store.put_from(key, ctx.ptr, len(value))
-        if ret != 0:
-            raise SystemExit(
-                "[ERROR] {} upsert_from prefill put_from key={} returned {}".format(
-                    label, key, ret))
-        if i % 100 == 0 or i == len(keys):
-            log("{} upsert_from prefill progress ({}/{})".format(
-                label, i, len(keys)))
-    ctx.write_value(value)
 
 
 # --- get family -----------------------------------------------------------
@@ -816,9 +763,9 @@ def run_warmup(args, store, value, ctx=None):
     SAME key_count and data_size as the measured phase, and loops the real
     operation until the warmup duration expires (same cycle semantics as
     duration stress: get loops reads, ordinary put/mixed writes use full
-    passes with self-clear, and upsert_from repeatedly overwrites its existing
-    keys). Pure get-family operations and upsert_from pre-fill their warmup
-    keys outside the measured region; ordinary put remains create-only.
+    passes with self-clear, and upsert_from repeatedly overwrites its
+    existing keys). Pure get-family operations pre-fill their warmup keys
+    outside the measured region; ordinary put remains create-only.
     Warmup runs unpaced (target_qps ignored) and its samples are discarded.
     """
     duration = float(getattr(args, "warmup_duration", 0) or 0)
@@ -838,8 +785,6 @@ def run_warmup(args, store, value, ctx=None):
                 raise SystemExit(
                     "[ERROR] warmup prefill put key={} returned {}".format(
                         key, ret))
-    upsert_keys = _upsert_prefill_keys(op, keys, args.put_ratio)
-    _prefill_upsert_keys(store, upsert_keys, value, ctx, "warmup")
     log("warmup start (duration={}s, keys={}, op={})".format(duration, len(keys), op))
     wargs = copy.copy(args)
     wargs.target_qps = 0  # warmup free-runs; pacing is for measured phase
@@ -884,15 +829,6 @@ def cmd_benchmark(args, store):
         run_warmup(args, store, value, ctx)
     end_idx = args.key_end if args.key_end is not None else len(keys)
     chunk = keys[args.key_start:end_idx]
-    if put_iface == "upsert_from":
-        # measured mixed: per-thread quota heads must be prefilled (see
-        # _mixed_upsert_prefill_keys); pure upsert_from / warmup use the
-        # whole-chunk / whole-set head
-        upsert_keys = _mixed_upsert_prefill_keys(
-            op, chunk, args.num_threads, args.put_ratio)
-    else:
-        upsert_keys = _upsert_prefill_keys(op, chunk, args.put_ratio)
-    _prefill_upsert_keys(store, upsert_keys, value, ctx, "benchmark")
     # Keep CPython's automatic cyclic-GC pauses out of per-operation latency.
     # Reference counting remains active while cyclic GC is disabled.
     gc_was_enabled = gc.isenabled()
@@ -1134,23 +1070,13 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
     notify_pool = ThreadPoolExecutor(max_workers=notify_threads)
     seq = [0]
     # optional per-writer key-space cap (BENCH_KEY_COUNT): the sequence wraps at
-    # key_cap and wrapped batches remove their keys first (delete-before-
-    # write) so puts always create fresh objects — bounding store usage at
-    # writers x key_count x data_size. 0 = unbounded (legacy behaviour).
+    # key_cap; wrapped non-upsert batches remove their keys first
+    # (delete-before-write) so puts always create fresh objects — bounding
+    # store usage at writers x key_count x data_size. upsert_from instead
+    # overwrites the wrapped keys (its own semantics). 0 = unbounded.
     key_cap = int(getattr(args, "key_count", 0) or 0)
     if key_cap and key_cap < batch_keys:
         raise SystemExit("[ERROR] key_count {} < batch_size {}".format(key_cap, batch_keys))
-    if effective_writer_op == "upsert_from":
-        if key_cap <= 0:
-            raise SystemExit(
-                "[ERROR] pipeline upsert_from requires key_count > 0 so the "
-                "entire update keyspace can be prefilled outside measurement")
-        prefill_keys = [
-            "{}*{}*w{}*{:08d}".format(prefix, scenario, writer_id, i)
-            for i in range(key_cap)
-        ]
-        _prefill_upsert_keys(store, prefill_keys, value, ctx,
-                             "pipeline writer w{}".format(writer_id))
     wrapped_logged = [False]
     insufficient_streak = [0]
     # measured-phase stats (warmup writes stay out of the metrics)

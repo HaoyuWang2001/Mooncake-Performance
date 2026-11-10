@@ -13,7 +13,7 @@
 | `put` | `put(key, value, config=ReplicateConfig())` | int（0 成功） | 单 key 写；value 为 bytes-like | ① |
 | `put_batch` | `put_batch(keys, values, config=...)` | int | 整批一次调用，一次写入 batch_size 个 key | ① |
 | `put_from` | `put_from(key, buffer_ptr, size, config=...)` | int | 零拷贝写；buffer 须先 `register_buffer(ptr, size)` | ② |
-| `upsert_from` | `upsert_from(key, buffer_ptr, size, config=...)` | int | 零拷贝覆盖写；benchmark 在计时前用 `put_from` 预填已有 key | ② |
+| `upsert_from` | `upsert_from(key, buffer_ptr, size, config=...)` | int | 零拷贝插入或覆盖写；buffer 须先 `register_buffer(ptr, size)` | ② |
 | `put_parts` | `put_parts(key, *parts, config=...)` | int | 分段写入同一 key（parts 为 1-D bytes-like） | ③ |
 | `batch_put_from` | `batch_put_from(keys, buffer_ptrs, sizes, config=...)` | list[int] | 批量零拷贝写 | ③ |
 | `batch_put_from_multi_buffers` | `(keys, all_buffer_ptrs, all_sizes)` | — | 多 buffer 变体 | 不进基础集 |

@@ -26,7 +26,7 @@ mock/
 | `remove_all(force)` / `batch_remove(keys, force)` | 清理 |
 | `batch_is_exist(keys)` / `is_exist(key)` | 存在性（1/0） |
 | `register_buffer(ptr, size)` / `unregister_buffer(ptr)` | 零拷贝缓冲登记（不校验页对齐） |
-| `put_from(key, ptr, size)` / `upsert_from(key, ptr, size)` | 零拷贝写（mock 中两者同为覆盖写） |
+| `put_from(key, ptr, size)` / `upsert_from(key, ptr, size)` | 零拷贝写（mock 中两者实现相同：插入或覆盖） |
 | `get_into(key, ptr, size)` / `get_buffer(key)` | 零拷贝读 |
 | `close()` | 返回 0 |
 
