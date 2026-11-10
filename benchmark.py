@@ -177,6 +177,69 @@ def build_runs(cfg):
     return [(c, t, ds) for ds in sizes for (c, t) in combos]
 
 
+def _store_total_bytes(globals_cfg):
+    """global.json store_total_size -> bytes, or None when unset (infinite
+    store, legacy unconstrained behaviour)."""
+    v = globals_cfg.get("store_total_size")
+    if v in (None, "", 0):
+        return None
+    return parse_size_bytes(v)
+
+
+def _basic_store_check(globals_cfg, cfg):
+    """basic mode: total key space (key_count x data_size, shared across
+    clients) must be strictly smaller than store_total_size when that is
+    configured; checked per sweep size."""
+    store = _store_total_bytes(globals_cfg)
+    if store is None:
+        return
+    kc = int(cfg.get("key_count", 1000) or 1000)
+    for ds in data_size_list(cfg):
+        ds_bytes = parse_data_size(ds)
+        if kc * ds_bytes >= store:
+            raise RuntimeError(
+                "basic key space {} keys x {}B ({}) = {}B >= "
+                "store_total_size {}B; reduce key_count/data_size or raise "
+                "store_total_size".format(kc, ds_bytes, ds,
+                                          kc * ds_bytes, store))
+
+
+def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, cfg_key_count,
+                         batch_size, ds_label):
+    """Resolve the PER-WRITER key-space cap against store_total_size.
+
+    Returns (per_writer_key_count, auto):
+    - store unset (infinite): explicit key_count passes through; 0/absent
+      stays 0 = unbounded (legacy behaviour)
+    - explicit key_count: writers x key_count x data_size must be STRICTLY
+      smaller than the store, else the scenario fails fast
+    - key_count unset: auto cap = floor(store x 0.9 / data_size / writers)
+      (0.9 = object-metadata + in-flight-batch headroom) and each writer
+      wraps inside its cap with untimed delete-before-write (method a)."""
+    store = _store_total_bytes(globals_cfg)
+    if store is None:
+        return int(cfg_key_count or 0), False
+    if cfg_key_count:
+        need = writer_count * cfg_key_count * ds_bytes
+        if need >= store:
+            raise RuntimeError(
+                "pipeline key space {} writers x {} keys x {}B ({}) = {}B "
+                ">= store_total_size {}B; reduce key_count/data_size or "
+                "raise store_total_size".format(
+                    writer_count, cfg_key_count, ds_bytes, ds_label, need,
+                    store))
+        return int(cfg_key_count), False
+    usable = int(store * 0.9)
+    per = usable // (ds_bytes * writer_count) if ds_bytes and writer_count else 0
+    if per < max(1, int(batch_size or 1)):
+        raise RuntimeError(
+            "pipeline auto key space too small: store_total_size {}B x 0.9 "
+            "/ ({}B x {} writers) = {} keys < batch_size {}; the store is "
+            "too small for this data size".format(
+                store, ds_bytes, writer_count, per, int(batch_size or 1)))
+    return per, True
+
+
 def pipeline_plan(cfg, node_count=1):
     """Derive the writer/reader process plan from a pipeline config.
 
@@ -1988,6 +2051,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
     matrix = getattr(args, "_matrix", None)
     scenario = cfg["scenario"]
+    # store space guard (no-op when store_total_size is unset)
+    _basic_store_check(globals_cfg, cfg)
     cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
     dry = args.dry_run
     op = cfg.get("operation", "")
@@ -2621,6 +2686,22 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   extra="--data-size {}".format(ds), dry_run=dry,
                                   pull_to=local_log_dir, node_name=node_name)
                 current_ds = ds
+            # key-space budget against store_total_size: explicit key_count
+            # is validated strictly; an unset key_count gets an auto
+            # per-writer cap (writers wrap inside it with untimed
+            # delete-before-write, so put samples stay real writes)
+            kc, kc_auto = _pipeline_key_budget(
+                globals_cfg, len(plan["writers"]), parse_data_size(ds),
+                int(cfg.get("key_count", 0) or 0),
+                int(cfg.get("batch_size", 1) or 1), ds)
+            kc_arg = " --key-count {}".format(kc) if kc else ""
+            if kc_auto:
+                cfg.setdefault("_key_space", {})[str(ds)] = kc
+                log("pipeline key space (auto): {} writers x {} keys x {} "
+                    "= {}B of store_total_size {}B (0.9 headroom)".format(
+                        len(plan["writers"]), kc, ds,
+                        len(plan["writers"]) * kc * parse_data_size(ds),
+                        _store_total_bytes(globals_cfg)))
             run_stage(host, node, remote_runner,
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
@@ -2671,11 +2752,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
                     ccmd = ("nohup {}bash {} pipeline {} --client-id {} --role both "
                             "--listen-port {} --writer-operation {} --reader-operation {} "
-                            "--num-threads {} --warmup {} --timeout 300 {} > {} 2>&1 "
+                            "--num-threads {} --warmup {} --timeout 300{} {} > {} 2>&1 "
                             "& echo $!").format(
                         launch_prefix, remote_runner, merged_log, c["id"], c["port"],
-                        writer_op, reader_op, reader_threads, warmup, numa_arg,
-                        nohup_log)
+                        writer_op, reader_op, reader_threads, warmup, kc_arg,
+                        numa_arg, nohup_log)
                     pid = ssh_check_output(rn["ip"], rn, ccmd, dry_run=dry)
                     reader_pids.append((c, pid))
                     writer_pids.append((c, pid))
@@ -2829,10 +2910,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         if numactl_ok.get(w["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
                     wcmd = ("nohup {}bash {} pipeline {} --client-id {} --role writer "
-                            "--listen-port {} --warmup {} --operation {} {} > {} 2>&1 "
+                            "--listen-port {} --warmup {} --operation {}{} {} > {} 2>&1 "
                             "& echo $!").format(
                         launch_prefix, remote_runner, merged_log, w["gid"], w["port"],
-                        warmup, writer_op, numa_arg, nohup_log)
+                        warmup, writer_op, kc_arg, numa_arg, nohup_log)
                     pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
                     writer_pids.append((w, pid))
                     if not dry and pid:
@@ -3218,7 +3299,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
                 "data_size": ds,
                 "batch_size": cfg.get("batch_size", ""),
-                "key_count": cfg.get("key_count", "") or "",
+                # effective per-writer cap: auto-computed value when
+                # store_total_size drove the budget, else the config value
+                "key_count": (cfg.get("_key_space", {}).get(str(ds))
+                              or cfg.get("key_count", "") or ""),
                 "duration": cfg.get("duration", ""),
                 "warmup_duration": cfg.get("warmup", {}).get("duration", ""),
                 "writer_count": "N*{}".format(w_cpn),
