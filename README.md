@@ -404,7 +404,10 @@ k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口
     "image": "<含 mooncake SDK 的镜像>",
     "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl",
     "controller_workspace": "/tmp/Mooncake-Performance",
-    "pod_workspace": "/tmp/Mooncake-Performance"
+    "pod_workspace": "/tmp/Mooncake-Performance",
+    "master_metrics_namespace": "mooncake",
+    "master_metrics_pod": "mooncake-master",
+    "master_metrics_port": 17702
   }
 }
 ```
@@ -419,6 +422,12 @@ k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口
   `controller.kubeconfig` 留空 = `ssh_user` 的 `$HOME/.kube/config`，非默认位置时填绝对路径
   （`echo $KUBECONFIG` / `ls $HOME/.kube/config`）。启动时会打印 controller/kubectl/
   kubeconfig/context 诊断信息。
+- `master_metrics_namespace` / `master_metrics_pod` / `master_metrics_port`（可选）：store 容量
+  自动探测参数——在 master pod 内执行 `kubectl exec ... -- curl localhost:<port>/metrics`。
+  默认 `mooncake` / `mooncake-master`（pod 名**前缀**匹配）/ `17702`，部署不同则修改。
+  探测优先级：`global.json master_metrics_url`（直连，经 controller）> 本组参数（exec，k8s 默认路径）。
+  metrics 端口通常仅 pod 内可达（controller 节点不使用集群 DNS，且常无对应 Service）；label
+  多序列（per-segment）按 SUM 聚合、`master_total_capacity_bytes` 优先。
 - `controller_workspace`（宿主机）与 `pod_workspace`（容器）分离；各自自动建立
   `scripts/ data/ logs/`（宿主机另有 `pods/` 存放渲染后的 YAML）。
 - `venvs` 可留空；`global.venv` 也留空时容器内默认 `python3`。

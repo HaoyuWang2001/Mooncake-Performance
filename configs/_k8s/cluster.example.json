@@ -1,5 +1,5 @@
 {
-  "_note": "k8s 通道 cluster 配置模板（复制为 configs/_k8s/cluster.json 使用，gitignored）。cluster 只包含 controller（执行 kubectl 的入口）；工作 pod 由 benchmark 脚本按场景自动创建。controller.ip=127.0.0.1 时直接本地跑 kubectl（便于 minikube 测试），其他 IP 走 SSH。namespace 由用户固定指定：启动前必须不存在，由编排器创建；运行结束/异常后删除。 非交互 SSH 下建议 controller.kubectl 填绝对路径（controller 上 `command -v kubectl`）；controller.kubeconfig 留空 = ssh_user 的 $HOME/.kube/config，非默认位置时填绝对路径（`echo $KUBECONFIG` / `ls $HOME/.kube/config`）。",
+  "_note": "k8s 通道 cluster 配置模板（复制为 configs/_k8s/cluster.json 使用，gitignored）。cluster 只包含 controller（执行 kubectl 的入口）；工作 pod 由 benchmark 脚本按场景自动创建。controller.ip=127.0.0.1 时直接本地跑 kubectl（便于 minikube 测试），其他 IP 走 SSH。namespace 由用户固定指定：启动前必须不存在，由编排器创建；运行结束/异常后删除。 非交互 SSH 下建议 controller.kubectl 填绝对路径（controller 上 `command -v kubectl`）；controller.kubeconfig 留空 = ssh_user 的 $HOME/.kube/config，非默认位置时填绝对路径（`echo $KUBECONFIG` / `ls $HOME/.kube/config`）。 master_metrics_*（可选）：store 容量探测参数——在 master pod 内执行 curl 抓 metrics；master_metrics_namespace 默认 mooncake，master_metrics_pod 为 pod 名前缀（默认 mooncake-master，匹配 mooncake-master-<hash>），master_metrics_port 默认 17702；部署不同则按实际修改。",
   "venvs": {},
   "controller": {
     "ip": "127.0.0.1",
@@ -16,6 +16,9 @@
     "image": "<REPLACE-WITH-YOUR-BENCHMARK-IMAGE>",
     "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl",
     "controller_workspace": "/tmp/Mooncake-Performance",
-    "pod_workspace": "/tmp/Mooncake-Performance"
+    "pod_workspace": "/tmp/Mooncake-Performance",
+    "master_metrics_namespace": "mooncake",
+    "master_metrics_pod": "mooncake-master",
+    "master_metrics_port": 17702
   }
 }
