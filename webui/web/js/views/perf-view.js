@@ -47,6 +47,13 @@ function _perfApplyChecked(roots, set) {
   (roots || []).forEach(walk);
 }
 
+/* 目录勾选级联：勾选=收编整棵子树；取消=清空整棵子树。修复子项被
+   逐一勾选后目录变 indeterminate、取消目录却残留子项的问题。 */
+function _perfSetSubtree(node, v) {
+  node.checked = v;
+  (node.children || []).forEach(c => _perfSetSubtree(c, v));
+}
+
 /* 是否需要拉取日志：running 必拉；从 running 变为终态的那一次也必须拉，
    否则快速结束的 run 会因首次空日志把 logEof 置 true 而永远跳过。 */
 function _perfShouldFetchLog(prevStatus, status, logEof) {
@@ -67,7 +74,7 @@ const SelNode = {
       <el-checkbox v-if="node.isDir"
                    :model-value="node.checked"
                    :indeterminate="!node.checked && hasSel"
-                   @update:model-value="v => { node.checked = v; }" />
+                   @update:model-value="setSubtree" />
       <el-checkbox v-else
                    :model-value="node.checked || parentSel"
                    :disabled="parentSel"
@@ -98,7 +105,7 @@ const SelNode = {
       const walk = (n) => n.checked || (n.children || []).some(walk);
       return walk(props.node);
     });
-    return { open, toggle, hasSel };
+    return { open, toggle, hasSel, setSubtree: (v) => _perfSetSubtree(props.node, v) };
   },
 };
 
@@ -212,11 +219,11 @@ const PerfView = {
       <div class="cur-run">
         <div class="cr-row">
           <span class="cr-item cr-grow">
-            <span class="cr-k">id</span>
+            <span class="cr-k">id:</span>
             <span class="cr-v mono" :title="meta.id || ''">{{ meta.id || "-" }}</span>
           </span>
           <span class="cr-item cr-w-status">
-            <span class="cr-k">状态</span>
+            <span class="cr-k">状态:</span>
             <span class="cr-v">
               <el-tag v-if="meta.stopping && meta.status === 'running'" type="warning" size="small">stopping（清理中）</el-tag>
               <el-tag v-else-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
@@ -224,29 +231,31 @@ const PerfView = {
             </span>
           </span>
           <span class="cr-item cr-w-elapsed">
-            <span class="cr-k">耗时</span>
+            <span class="cr-k">耗时:</span>
             <span class="cr-v">{{ meta.id && meta.elapsed !== undefined ? Math.round(meta.elapsed) + "s" : "-" }}</span>
           </span>
           <span class="cr-item cr-w-rc">
-            <span class="cr-k">rc</span>
+            <span class="cr-k">rc:</span>
             <span class="cr-v">{{ (meta.rc === null || meta.rc === undefined) ? "-" : meta.rc }}</span>
           </span>
         </div>
         <div class="cr-row">
-          <span class="cr-item cr-grow">
-            <span class="cr-k">命令</span>
+          <span class="cr-item cr-w-cmd">
+            <span class="cr-k">命令:</span>
             <span class="cr-v mono" :title="meta.cmd || ''">{{ meta.cmd || "-" }}</span>
           </span>
-          <span class="cr-item cr-grow">
-            <span class="cr-k">产物</span>
+          <span class="cr-item cr-w-out">
+            <span class="cr-k">产物:</span>
             <span class="cr-v mono" :title="meta.ts_dir || ''">{{ meta.ts_dir || "-" }}</span>
           </span>
         </div>
       </div>
       <div class="log-toolbar">
         <el-button size="small" @click="copyLog">复制</el-button>
-        <el-button size="small" :type="logWrap ? 'primary' : ''"
-                   @click="logWrap = !logWrap">自动换行</el-button>
+        <span class="log-wrap-toggle">
+          <el-switch v-model="logWrap" size="small" />
+          <span class="log-wrap-label" @click="logWrap = !logWrap">自动换行</span>
+        </span>
         <span class="spacer"></span>
         <el-input v-model="searchQ" size="small" placeholder="搜索日志（高亮+跳转）"
                   clearable style="width: 230px" @keyup.enter="nextMatch" />

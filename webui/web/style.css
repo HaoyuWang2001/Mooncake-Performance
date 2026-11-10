@@ -121,9 +121,13 @@ html, body, #app { height: 100%; margin: 0; }
 .cr-w-status { flex: 0 0 130px; }
 .cr-w-elapsed { flex: 0 0 90px; }
 .cr-w-rc { flex: 0 0 70px; }
+/* 命令/产物是两个关注点：命令占左侧主区，产物靠最右，二者之间留白分隔 */
+.cr-w-cmd { flex: 0 1 56%; }
+.cr-w-out { flex: 0 0 auto; margin-left: auto; max-width: 40%; }
 .cr-k {
   flex: 0 0 auto; white-space: nowrap;
   color: var(--el-text-color-secondary); font-size: 12px;
+  letter-spacing: 0.02em;
 }
 .cr-v {
   min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -133,9 +137,16 @@ html, body, #app { height: 100%; margin: 0; }
 
 /* 日志工具栏 + 固定高度 + 搜索高亮 */
 .log-toolbar {
-  display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+  display: flex; align-items: center; gap: 4px; margin-bottom: 6px;
 }
+/* Element Plus 给相邻按钮默认 12px 左边距，叠加 gap 后过大：统一交给 gap 控制 */
+.log-toolbar .el-button + .el-button { margin-left: 0; }
 .log-toolbar .spacer { flex: 1; }
+.log-wrap-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; }
+.log-wrap-label {
+  font-size: 12px; color: var(--el-text-color-regular);
+  cursor: pointer; user-select: none;
+}
 .log-match-count {
   min-width: 44px; text-align: right; font-size: 12px;
   color: var(--el-text-color-secondary);

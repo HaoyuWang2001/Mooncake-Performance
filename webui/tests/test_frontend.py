@@ -41,6 +41,27 @@ def test_frontend_boot_check():
     assert r.returncode == 0, (r.stdout + r.stderr)
 
 
+def test_config_tree_checkbox_cascades():
+    """目录复选框勾选/取消必须级联整棵子树，而不是只改自身。"""
+    src = open(os.path.join(JS_DIR, "views", "perf-view.js"), encoding="utf-8").read()
+    start = src.index("function _perfSetSubtree(")
+    end = src.index("}", src.index("node.checked = v;", start)) + 1
+    body = src[start:end]
+    assert "node.checked = v;" in body
+    assert "(node.children || []).forEach" in body
+    assert 'setSubtree: (v) => _perfSetSubtree(props.node, v)' in src
+    # 目录复选框绑定级联处理器；不能再直接写 node.checked = v
+    assert '@update:model-value="setSubtree"' in src
+
+
+def test_log_wrap_uses_switch():
+    """自动换行是开关型控件（el-switch + 文字），不是独立按钮。"""
+    src = open(os.path.join(JS_DIR, "views", "perf-view.js"), encoding="utf-8").read()
+    assert '<el-switch v-model="logWrap"' in src
+    assert 'log-wrap-label' in src
+    assert '>自动换行</el-button>' not in src
+
+
 if __name__ == "__main__":
     test_component_identifiers_declared()
     test_frontend_boot_check()
