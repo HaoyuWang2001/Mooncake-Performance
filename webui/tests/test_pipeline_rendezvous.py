@@ -460,3 +460,79 @@ def test_wait_k8s_deployment_ready_timeout_dumps_evidence(monkeypatch):
     except RuntimeError as exc:
         assert "not ready in 0s" in str(exc) and "2/4" in str(exc)
     assert diag["n"] == 1
+
+
+def test_pipeline_shutdown_skips_dead_client(monkeypatch):
+    """Dead clients must not cost a kubectl-exec round-trip (rc=7 spam)."""
+    calls = {"curl": 0}
+
+    def fake_ssh(ip, node, cmd, dry_run=False, quiet=False):
+        return "DEAD"
+
+    def fake_call(node_entry, port, path, timeout=5, dry=False):
+        calls["curl"] += 1
+        return True
+
+    monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
+    monkeypatch.setattr(bm, "_pipeline_http_call", fake_call)
+    node = {"ip": "10.0.0.1"}
+    assert bm._pipeline_shutdown(None, node, 9301, "59", "dual c1") is False
+    assert calls["curl"] == 0, "dead client must not be probed"
+    # alive client -> probe happens
+    monkeypatch.setattr(bm, "ssh_check_output",
+                        lambda ip, node, cmd, dry_run=False, quiet=False: "ALIVE")
+    assert bm._pipeline_shutdown(None, node, 9301, "59", "dual c1") is True
+    assert calls["curl"] == 1
+    # unknown liveness (ssh error) -> still probe
+    def boom(ip, node, cmd, dry_run=False, quiet=False):
+        raise RuntimeError("ssh down")
+    monkeypatch.setattr(bm, "ssh_check_output", boom)
+    assert bm._pipeline_shutdown(None, node, 9301, "59", "dual c1") is True
+    assert calls["curl"] == 2
+    # no pid -> probe
+    assert bm._pipeline_shutdown(None, node, 9301, "", "x") is True
+
+
+def test_pipeline_http_parallel_results(monkeypatch):
+    """Bounded-parallel POSTs: all-OK, single failure retried once then
+    reported with its label, and shutdown dead-skips count as success."""
+    node = {"ip": "10.0.0.1"}
+
+    # all OK
+    monkeypatch.setattr(bm, "_pipeline_http_call",
+                        lambda n, p, path, timeout=5, dry=False: True)
+    res = bm._pipeline_http_parallel(
+        None, [(node, 9301, "", "c0"), (node, 9302, "", "c1")], "/start")
+    assert [(w, ok) for w, ok, _ in res] == [("c0", True), ("c1", True)]
+
+    # one fails on both attempts -> exactly 2 calls, reported
+    calls = {"n": 0}
+
+    def flaky(n, p, path, timeout=5, dry=False):
+        calls["n"] += 1
+        if p == 9302:
+            raise RuntimeError("boom")
+        return True
+
+    monkeypatch.setattr(bm, "_pipeline_http_call", flaky)
+    monkeypatch.setattr(bm, "_ssh_drop", lambda *a, **k: None)
+    res = bm._pipeline_http_parallel(
+        None, [(node, 9301, "", "c0"), (node, 9302, "", "c1")], "/start")
+    got = {w: (ok, err) for w, ok, err in res}
+    assert got["c0"][0] is True
+    assert got["c1"][0] is False and "boom" in got["c1"][1]
+    assert calls["n"] == 3   # c0 once + c1 twice (one retry)
+
+    # shutdown: dead skip (helper returns False) counts as success
+    monkeypatch.setattr(bm, "_pipeline_shutdown",
+                        lambda *a, **k: False)
+    res = bm._pipeline_http_parallel(
+        None, [(node, 9301, "59", "c0")], "/shutdown")
+    assert res == [("c0", True, "")]
+
+    # dry-run never calls
+    monkeypatch.setattr(bm, "_pipeline_http_call",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    res = bm._pipeline_http_parallel(
+        None, [(node, 9301, "", "c0")], "/start", dry=True)
+    assert res == [("c0", True, "")]

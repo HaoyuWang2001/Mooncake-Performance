@@ -256,6 +256,10 @@ def discover_store_capacity(cluster, globals_cfg):
     node as a fallback. Prints every relevant gauge into the log."""
     url = _master_metrics_url(globals_cfg)
     if not url:
+        log("[WARN] store capacity auto-discovery skipped (no "
+            "master_metrics_url/master_addr in global.json); key space will "
+            "be UNBOUNDED — set store_total_size manually or fix the "
+            "metrics source")
         return None
     text = None
     if cluster is not None and cluster.get("_controller") is not None:
@@ -1844,6 +1848,104 @@ def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
     return str(out).strip() == "200"
 
 
+_PIPELINE_PARALLEL = 8
+
+
+def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False):
+    """POST to many pipeline endpoints with bounded concurrency (default 8).
+
+    The ssh transport keeps ONE cached connection per node and opens one
+    channel per command, so parallel calls are safe; a failed call drops the
+    shared connection (transport behaviour), which would poison sibling
+    calls — each failed item therefore gets ONE reconnect retry.
+
+    items: [(node_entry, port, pid, what)]. /start items must return HTTP
+    200; /shutdown items count a dead-skip as success. Returns
+    [(what, ok, err)] in item order."""
+    if dry or not items:
+        return [(what, True, "") for _n, _p, _pid, what in items]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run(item):
+        node_entry, port, pid, what = item
+        err = ""
+        for _attempt in (0, 1):
+            try:
+                if path == "/shutdown":
+                    _pipeline_shutdown(cluster, node_entry, port, pid, what)
+                    return what, True, ""
+                ok = _pipeline_http_call(node_entry, port, path,
+                                         timeout=timeout, dry=dry)
+                if ok:
+                    return what, True, ""
+                err = "non-200"
+            except Exception as exc:
+                err = str(exc)
+            try:
+                _ssh_drop(node_entry)   # reconnect before the retry
+            except Exception:
+                pass
+        return what, False, err
+
+    workers = max(1, min(_PIPELINE_PARALLEL, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_run, items))
+
+
+def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry):
+    """Pull per-pod log groups with bounded concurrency. groups:
+    [(node_entry, [remote_files], label)]. Failures are WARN-logged for
+    every group (all pulls are attempted) and the first error is raised at
+    the end — same fail-the-scenario semantics as the old sequential pull."""
+    if dry or not groups:
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(group):
+        node, files, label = group
+        try:
+            pull_stage_logs(node["ip"], node, files, local_log_dir, False)
+            return (label, None)
+        except Exception as exc:
+            return (label, str(exc))
+
+    workers = max(1, min(_PIPELINE_PARALLEL, len(groups)))
+    errs = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for label, err in pool.map(_one, groups):
+            if err:
+                errs.append((label, err))
+                log("[WARN] log pull failed for {}: {}".format(label, err))
+    if errs:
+        raise RuntimeError("log pull failed for {}/{}: {} ({})".format(
+            len(errs), len(groups), errs[0][0], errs[0][1]))
+    return 0
+
+
+def _pipeline_shutdown(cluster, node_entry, port, pid, what):
+    """Send /shutdown to a pipeline process, but SKIP the probe when the
+    process is already dead. At 32-client scale every dead client cost a
+    full kubectl-exec round-trip (rc=7) and ~20s of WARN spam per phase.
+    Returns True when the client was alive (probe attempted), False when
+    skipped."""
+    if pid:
+        try:
+            alive = ssh_check_output(
+                node_entry["ip"], node_entry,
+                "kill -0 {pid} 2>/dev/null && tr '\\0' ' ' < "
+                "/proc/{pid}/cmdline 2>/dev/null | grep -qF {m} && "
+                "echo ALIVE || echo DEAD".format(
+                    pid=pid, m=_marker_probe(_PIPELINE_PID_MARKER)),
+                quiet=True)
+        except Exception:
+            alive = "ALIVE"  # unknown -> still attempt the graceful probe
+        if str(alive).strip() != "ALIVE":
+            log("{}: already exited; skipping /shutdown".format(what))
+            return False
+    _pipeline_http_call(node_entry, port, "/shutdown")
+    return True
+
+
 def _pipeline_barrier(cluster, etcd_endpoints, prefix, expected, timeout_s,
                       what, run_id):
     """Poll etcd until `expected` registrations exist under prefix; raises
@@ -1885,12 +1987,15 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
     rendezvous prefix."""
     log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
     # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
+    _pid_by_obj = {id(e): (pid or "").strip() for e, pid in reader_pids}
     for r in plan["readers"]:
         if "node" not in r:
             continue  # deployment never materialized the pod entries
         try:
             rn = get_node(cluster, r["node"])
-            _pipeline_http_call(rn, r["port"], "/shutdown")
+            _pipeline_shutdown(cluster, rn, r["port"],
+                               _pid_by_obj.get(id(r), ""),
+                               "fail-cleanup " + _pipeline_entry_label(r))
         except Exception as exc:
             log("[WARN] fail-cleanup: {} shutdown failed: {}".format(
                 _pipeline_entry_label(r), exc))
@@ -3001,6 +3106,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "".format(_src, len(plan["writers"]), kc, ds,
                               len(plan["writers"]) * kc * parse_data_size(ds),
                               _store_total_bytes(globals_cfg)))
+            elif not kc:
+                # no store budget and no explicit key_count: unbounded key
+                # space — high write rates can exhaust the store (-200
+                # fail-fast kills every client). Make it loud.
+                log("[WARN] pipeline key space: UNBOUNDED (no store budget) "
+                    "— high write rates can exhaust the store and trigger "
+                    "-200 fail-fast; set store_total_size or fix the "
+                    "master metrics source")
             run_stage(host, node, remote_runner,
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
@@ -3088,15 +3201,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         "({:.1f}s)".format(len(plan["clients"]),
                                            len(plan["clients"]),
                                            time.time() - t0))
-                    for c in plan["clients"]:
-                        cn = get_node(cluster, c["node"])
-                        if not _pipeline_http_call(cn, c["port"], "/start"):
-                            raise RuntimeError(
-                                "pipeline trigger failed: dual c{} /start at "
-                                "{} p{} returned non-200".format(
-                                    c["id"], cn["ip"], c["port"]))
-                    log("pipeline trigger: /start sent to {} dual clients"
-                        "".format(len(plan["clients"])))
+                    _items = [(get_node(cluster, c["node"]), c["port"], "",
+                               "dual c{}".format(c["id"]))
+                              for c in plan["clients"]]
+                    _res = _pipeline_http_parallel(cluster, _items, "/start")
+                    _fail = [r for r in _res if not r[1]]
+                    if _fail:
+                        raise RuntimeError(
+                            "pipeline trigger failed for {}/{} clients: {} "
+                            "({})".format(len(_fail), len(_items),
+                                          _fail[0][0], _fail[0][2]))
+                    log("pipeline trigger: /start sent to {} dual clients "
+                        "(parallel x{})".format(
+                            len(_items), min(_PIPELINE_PARALLEL,
+                                             len(_items))))
                     # writers run INSIDE the clients: after the expected
                     # window (+grace) shut the reader side down so every
                     # client flushes both summaries and exits
@@ -3109,13 +3227,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     while time.time() - t0 < expected_s:
                         _check_stop()
                         time.sleep(min(1.0, expected_s - (time.time() - t0)))
-                    for c in plan["clients"]:
-                        cn = get_node(cluster, c["node"])
-                        try:
-                            _pipeline_http_call(cn, c["port"], "/shutdown")
-                        except Exception as exc:
-                            log("[WARN] dual c{} shutdown: {}".format(
-                                c["id"], exc))
+                    _pid_by_obj = {id(e): (pid or "").strip()
+                                   for e, pid in writer_pids}
+                    _items = [(get_node(cluster, c["node"]), c["port"],
+                               _pid_by_obj.get(id(c), ""),
+                               "dual c{}".format(c["id"]))
+                              for c in plan["clients"]]
+                    for _what, _ok, _err in _pipeline_http_parallel(
+                            cluster, _items, "/shutdown"):
+                        if not _ok:
+                            log("[WARN] {} shutdown: {}".format(_what, _err))
                     for c, pid in writer_pids:
                         if not dry and pid:
                             exited = wait_process_exit(
@@ -3130,14 +3251,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                         base_noext, c["node"], c["id"],
                                         c["port"]),
                                     "dual c{}".format(c["id"]))
+                    _groups = []
                     for c in plan["clients"]:
-                        cn = get_node(cluster, c["node"])
-                        pull_stage_logs(cn["ip"], cn,
+                        _groups.append((get_node(cluster, c["node"]),
                                         ["{}.dual_{}_c{}_p{}.writer.log".format(
                                             base_noext, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.reader.log".format(
                                             base_noext, c["node"], c["id"], c["port"])],
-                                        local_log_dir, dry)
+                                        "dual c{}".format(c["id"])))
+                    _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
             else:
                 # Step 1: start all readers (one process per reader). Each reader
                 # binds its HTTP /notify server and SELF-REGISTERS into etcd
@@ -3254,15 +3376,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
                         "".format(len(plan["writers"]), len(plan["writers"]),
                                   time.time() - t0))
-                    for w in plan["writers"]:
-                        wn = get_node(cluster, w["node"])
-                        if not _pipeline_http_call(wn, w["port"], "/start"):
-                            raise RuntimeError(
-                                "pipeline trigger failed: writer w{} /start at "
-                                "{} p{} returned non-200".format(
-                                    w["gid"], wn["ip"], w["port"]))
-                    log("pipeline trigger: /start sent to {} writers".format(
-                        len(plan["writers"])))
+                    _items = [(get_node(cluster, w["node"]), w["port"], "",
+                               "writer w{}".format(w["gid"]))
+                              for w in plan["writers"]]
+                    _res = _pipeline_http_parallel(cluster, _items, "/start")
+                    _fail = [r for r in _res if not r[1]]
+                    if _fail:
+                        raise RuntimeError(
+                            "pipeline trigger failed for {}/{} writers: {} "
+                            "({})".format(len(_fail), len(_items),
+                                          _fail[0][0], _fail[0][2]))
+                    log("pipeline trigger: /start sent to {} writers "
+                        "(parallel x{})".format(
+                            len(_items), min(_PIPELINE_PARALLEL,
+                                             len(_items))))
                 # Step 5: wait for all writers to finish (warmup + measured run)
                 warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
                 duration = float(cfg.get("duration", 30))
@@ -3280,23 +3407,25 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                 "{}.writer_{}_w{}.log.exitrc".format(
                                     base_noext, w["node"], w["gid"]),
                                 "writer w{}".format(w["gid"]))
-                for w in plan["writers"]:
-                    wn = get_node(cluster, w["node"])
-                    pull_stage_logs(wn["ip"], wn,
-                                    ["{}.writer_{}_w{}.log".format(
-                                        base_noext, w["node"], w["gid"])],
-                                    local_log_dir, dry)
+                _groups = [(get_node(cluster, w["node"]),
+                            ["{}.writer_{}_w{}.log".format(
+                                base_noext, w["node"], w["gid"])],
+                            "writer w{}".format(w["gid"]))
+                           for w in plan["writers"]]
+                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
                 # Step 6: shutdown readers via their /shutdown endpoint (k8s:
                 # direct pod IP; ssh: loopback curl on the reader's node) and
                 # wait for their final logs
-                for r in plan["readers"]:
-                    rn = get_node(cluster, r["node"])
-                    if not dry:
-                        try:
-                            _pipeline_http_call(rn, r["port"], "/shutdown")
-                        except Exception as exc:
-                            log("[WARN] reader r{} shutdown: {}".format(
-                                r["index"], exc))
+                _pid_by_obj = {id(e): (pid or "").strip()
+                               for e, pid in reader_pids}
+                _items = [(get_node(cluster, r["node"]), r["port"],
+                           _pid_by_obj.get(id(r), ""),
+                           "reader r{}".format(r["index"]))
+                          for r in plan["readers"]]
+                for _what, _ok, _err in _pipeline_http_parallel(
+                        cluster, _items, "/shutdown", dry=dry):
+                    if not _ok:
+                        log("[WARN] {} shutdown: {}".format(_what, _err))
                 for r, pid in reader_pids:
                     if not dry and pid:
                         exited = wait_process_exit(
@@ -3311,12 +3440,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                     base_noext, r["node"], r["index"],
                                     r["port"]),
                                 "reader r{}".format(r["index"]))
-                for r in plan["readers"]:
-                    rn = get_node(cluster, r["node"])
-                    pull_stage_logs(rn["ip"], rn,
-                                    ["{}.reader_{}_r{}_p{}.log".format(
-                                        base_noext, r["node"], r["index"], r["port"])],
-                                    local_log_dir, dry)
+                _groups = [(get_node(cluster, r["node"]),
+                            ["{}.reader_{}_r{}_p{}.log".format(
+                                base_noext, r["node"], r["index"], r["port"])],
+                            "reader r{}".format(r["index"]))
+                           for r in plan["readers"]]
+                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
             # Step 7: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
