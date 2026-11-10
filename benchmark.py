@@ -1892,6 +1892,36 @@ def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False):
         return list(pool.map(_run, items))
 
 
+def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry):
+    """Pull per-pod log groups with bounded concurrency. groups:
+    [(node_entry, [remote_files], label)]. Failures are WARN-logged for
+    every group (all pulls are attempted) and the first error is raised at
+    the end — same fail-the-scenario semantics as the old sequential pull."""
+    if dry or not groups:
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(group):
+        node, files, label = group
+        try:
+            pull_stage_logs(node["ip"], node, files, local_log_dir, False)
+            return (label, None)
+        except Exception as exc:
+            return (label, str(exc))
+
+    workers = max(1, min(_PIPELINE_PARALLEL, len(groups)))
+    errs = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for label, err in pool.map(_one, groups):
+            if err:
+                errs.append((label, err))
+                log("[WARN] log pull failed for {}: {}".format(label, err))
+    if errs:
+        raise RuntimeError("log pull failed for {}/{}: {} ({})".format(
+            len(errs), len(groups), errs[0][0], errs[0][1]))
+    return 0
+
+
 def _pipeline_shutdown(cluster, node_entry, port, pid, what):
     """Send /shutdown to a pipeline process, but SKIP the probe when the
     process is already dead. At 32-client scale every dead client cost a
@@ -3221,14 +3251,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                         base_noext, c["node"], c["id"],
                                         c["port"]),
                                     "dual c{}".format(c["id"]))
+                    _groups = []
                     for c in plan["clients"]:
-                        cn = get_node(cluster, c["node"])
-                        pull_stage_logs(cn["ip"], cn,
+                        _groups.append((get_node(cluster, c["node"]),
                                         ["{}.dual_{}_c{}_p{}.writer.log".format(
                                             base_noext, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.reader.log".format(
                                             base_noext, c["node"], c["id"], c["port"])],
-                                        local_log_dir, dry)
+                                        "dual c{}".format(c["id"])))
+                    _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
             else:
                 # Step 1: start all readers (one process per reader). Each reader
                 # binds its HTTP /notify server and SELF-REGISTERS into etcd
@@ -3376,12 +3407,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                 "{}.writer_{}_w{}.log.exitrc".format(
                                     base_noext, w["node"], w["gid"]),
                                 "writer w{}".format(w["gid"]))
-                for w in plan["writers"]:
-                    wn = get_node(cluster, w["node"])
-                    pull_stage_logs(wn["ip"], wn,
-                                    ["{}.writer_{}_w{}.log".format(
-                                        base_noext, w["node"], w["gid"])],
-                                    local_log_dir, dry)
+                _groups = [(get_node(cluster, w["node"]),
+                            ["{}.writer_{}_w{}.log".format(
+                                base_noext, w["node"], w["gid"])],
+                            "writer w{}".format(w["gid"]))
+                           for w in plan["writers"]]
+                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
                 # Step 6: shutdown readers via their /shutdown endpoint (k8s:
                 # direct pod IP; ssh: loopback curl on the reader's node) and
                 # wait for their final logs
@@ -3409,12 +3440,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                     base_noext, r["node"], r["index"],
                                     r["port"]),
                                 "reader r{}".format(r["index"]))
-                for r in plan["readers"]:
-                    rn = get_node(cluster, r["node"])
-                    pull_stage_logs(rn["ip"], rn,
-                                    ["{}.reader_{}_r{}_p{}.log".format(
-                                        base_noext, r["node"], r["index"], r["port"])],
-                                    local_log_dir, dry)
+                _groups = [(get_node(cluster, r["node"]),
+                            ["{}.reader_{}_r{}_p{}.log".format(
+                                base_noext, r["node"], r["index"], r["port"])],
+                            "reader r{}".format(r["index"]))
+                           for r in plan["readers"]]
+                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
             # Step 7: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.

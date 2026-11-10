@@ -203,6 +203,11 @@ store 节点列表），实际通信仍经 master 发现 store。
   自动计算 per-writer 上限 `floor(store × 0.9 / data_size / writers)` 并经 `--key-count` 注入（每 size 重算），writer
   写满自己的 key 段后回绕——**未计时 `batch_remove` 旧 key 再写**（方法 a），put 性能样本始终是真实写入；CSV
   `key_count` 列记录实际生效值。不设 store_total_size = 无穷大（不约束，长跑会耗尽 store 触发 -200 fail-fast）；
+- **规模行为（32-client 实测）**：/start 触发、/shutdown 关闭、日志拉取均为**有界并行**
+  （并发 8；单次失败自动重连重试一次），32 客户端下三段合计从 ~3 分钟降至 ~10 秒，同时消除
+  writer 起跑的墙钟时延差；`/shutdown` 探测前先查 pid（marker 校验），已死客户端直接跳过
+  （避免逐客户端 rc=7 超时与 WARN 刷屏）；store 预算缺失（自动发现被跳过）与无界 key 空间
+  都会在日志中**显式 WARN**；
 - **k8s 通道（pipeline 已支持）**：每角色一个 **Deployment**（`benchmark-deployment.yaml.tpl`
   渲染；pod=进程、replicas=count_per_node×N、`topologySpreadConstraints` maxSkew=1 软均匀
   分布、Recreate 不自动补副本）；pod 内仍 `sleep infinity` + `kubectl exec` 启动进程（脚本经
