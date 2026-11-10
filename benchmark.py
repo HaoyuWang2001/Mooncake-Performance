@@ -177,13 +177,153 @@ def build_runs(cfg):
     return [(c, t, ds) for ds in sizes for (c, t) in combos]
 
 
-def _store_total_bytes(globals_cfg):
-    """global.json store_total_size -> bytes, or None when unset (infinite
-    store, legacy unconstrained behaviour)."""
-    v = globals_cfg.get("store_total_size")
-    if v in (None, "", 0):
+_STORE_METRICS = (
+    "segment_total_capacity_bytes",
+    "segment_allocated_bytes",
+    "master_total_capacity_bytes",
+    "master_allocated_bytes",
+    "mooncake_vsegment_logical_capacity_bytes",
+    "mooncake_vsegment_logical_free_bytes",
+)
+
+
+def _master_metrics_url(globals_cfg):
+    """Master Prometheus metrics URL: explicit master_metrics_url wins; else
+    derived from master_addr's host + master_metrics_port (default 17702).
+    Empty string when neither is configured (auto-discovery skipped)."""
+    url = (globals_cfg.get("master_metrics_url") or "").strip()
+    if url:
+        return url
+    master = (globals_cfg.get("master_addr") or "").strip()
+    if not master:
+        return ""
+    host = master.split(":")[0]
+    try:
+        port = int(globals_cfg.get("master_metrics_port", 17702) or 17702)
+    except (TypeError, ValueError):
+        port = 17702
+    return "http://{}:{}/metrics".format(host, port)
+
+
+def _parse_prometheus_metrics(text):
+    """Prometheus text exposition -> {metric_name: float}. Label sets are
+    stripped from the name; comments/blanks ignored."""
+    vals = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        toks = line.split()
+        if len(toks) < 2:
+            continue
+        name = toks[0].split("{", 1)[0]
+        try:
+            vals[name] = float(toks[1])
+        except ValueError:
+            continue
+    return vals
+
+
+def _http_get_text(url, timeout=5):
+    """Orchestrator-direct GET (ssh mode). Returns text or None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except Exception:
         return None
-    return parse_size_bytes(v)
+
+
+def _controller_curl_get(cluster, url, timeout=5):
+    """GET executed ON the controller (k8s mode). Returns text or None."""
+    c = cluster["_controller"]
+    cmd = "curl -s --max-time {}".format(int(max(1, timeout)))
+    cmd += " " + shlex.quote(url)
+    try:
+        out, rc = controller_exec(c, cmd)
+    except Exception:
+        return None
+    return out if rc == 0 and out.strip() else None
+
+
+def discover_store_capacity(cluster, globals_cfg):
+    """Fetch the master's Prometheus metrics and record the store TOTAL
+    capacity for the key-space budget (explicit store_total_size still
+    wins). Failure only WARNs (falls back to the unconstrained behaviour).
+
+    k8s: curl via the controller (svc DNS resolved first, cached like the
+    etcd path); ssh: orchestrator direct, then curl on the first cluster
+    node as a fallback. Prints every relevant gauge into the log."""
+    url = _master_metrics_url(globals_cfg)
+    if not url:
+        return None
+    text = None
+    if cluster is not None and cluster.get("_controller") is not None:
+        cache = cluster.setdefault("_metrics_resolved", {})
+        if url not in cache:
+            try:
+                cache[url] = _resolve_k8s_addr(url, cluster)
+            except Exception:
+                cache[url] = url
+        text = _controller_curl_get(cluster, cache[url] or url)
+    else:
+        text = _http_get_text(url)
+        if text is None and cluster:
+            for name in (cluster.get("nodes") or {}):
+                n = get_node(cluster, name)
+                try:
+                    text = ssh_check_output(
+                        n["ip"], n, "curl -s --max-time 5 {}".format(
+                            shlex.quote(url)), quiet=True)
+                except Exception:
+                    text = None
+                break
+    if not text:
+        log("[WARN] store capacity auto-discovery failed (master metrics "
+            "unreachable: {}); set store_total_size manually if you need "
+            "the key-space budget".format(url))
+        return None
+    vals = _parse_prometheus_metrics(text)
+    if not any(k in vals for k in _STORE_METRICS):
+        log("[WARN] store capacity auto-discovery: no known capacity gauges "
+            "at {} (got {} metrics); set store_total_size manually".format(
+                url, len(vals)))
+        return None
+    printed = []
+    for k in _STORE_METRICS:
+        if k in vals:
+            printed.append("{}={:.0f} ({:.2f} GiB)".format(
+                k, vals[k], vals[k] / 1024.0 ** 3))
+    log("[benchmark] store metrics ({}): {}".format(url, ", ".join(printed)))
+    total = vals.get("segment_total_capacity_bytes")
+    if total is None:
+        total = vals.get("master_total_capacity_bytes")
+    if total is None:
+        total = vals.get("mooncake_vsegment_logical_capacity_bytes")
+    if not total:
+        log("[WARN] store capacity auto-discovery: total capacity gauge "
+            "missing; set store_total_size manually")
+        return None
+    globals_cfg["_store_total_auto"] = int(total)
+    allocated = vals.get("segment_allocated_bytes")
+    free = (total - allocated) if allocated is not None else None
+    log("[benchmark] store capacity (auto): total={:.2f} GiB{}".format(
+        total / 1024.0 ** 3,
+        "" if free is None else ", free={:.2f} GiB".format(free / 1024.0 ** 3)))
+    return int(total)
+
+
+def _store_total_bytes(globals_cfg):
+    """Store total size for the key-space budget: explicit store_total_size
+    wins; otherwise the auto-discovered master-metrics total; otherwise None
+    (infinite store, legacy unconstrained behaviour)."""
+    v = globals_cfg.get("store_total_size")
+    if v not in (None, "", 0):
+        return parse_size_bytes(v)
+    auto = globals_cfg.get("_store_total_auto")
+    if auto:
+        return int(auto)
+    return None
 
 
 def _basic_store_check(globals_cfg, cfg):
@@ -2854,11 +2994,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             kc_arg = " --key-count {}".format(kc) if kc else ""
             if kc_auto:
                 cfg.setdefault("_key_space", {})[str(ds)] = kc
-                log("pipeline key space (auto): {} writers x {} keys x {} "
-                    "= {}B of store_total_size {}B (0.9 headroom)".format(
-                        len(plan["writers"]), kc, ds,
-                        len(plan["writers"]) * kc * parse_data_size(ds),
-                        _store_total_bytes(globals_cfg)))
+                _src = ("manual" if globals_cfg.get("store_total_size")
+                        not in (None, "", 0) else "auto-metrics")
+                log("pipeline key space (auto, store source={}): {} writers "
+                    "x {} keys x {} = {}B of store {}B (0.9 headroom)"
+                    "".format(_src, len(plan["writers"]), kc, ds,
+                              len(plan["writers"]) * kc * parse_data_size(ds),
+                              _store_total_bytes(globals_cfg)))
             run_stage(host, node, remote_runner,
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
@@ -4066,6 +4208,13 @@ def main(args, cfg_paths):
             log("[WARN] k8s controller info: {}".format(exc))
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
+    # store capacity: auto-discover from the master metrics when
+    # store_total_size is not set manually (explicit config always wins)
+    if globals_cfg.get("store_total_size") in (None, "", 0):
+        try:
+            discover_store_capacity(cluster, globals_cfg)
+        except Exception as exc:
+            log("[WARN] store capacity auto-discovery: {}".format(exc))
     # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
     # run prefix is also wiped per scenario/size; this covers the rest)
     try:

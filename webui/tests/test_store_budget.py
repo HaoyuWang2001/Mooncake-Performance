@@ -78,3 +78,66 @@ def test_pipeline_key_budget_auto():
         raise AssertionError("should raise")
     except RuntimeError as exc:
         assert "too small" in str(exc)
+
+
+def test_parse_prometheus_metrics():
+    text = """# HELP segment_total_capacity_bytes total
+# TYPE segment_total_capacity_bytes gauge
+segment_total_capacity_bytes 2.147483648e+10
+segment_allocated_bytes{pool="a"} 1073741824
+master_total_capacity_bytes 21474836480
+"""
+    v = bm._parse_prometheus_metrics(text)
+    assert v["segment_total_capacity_bytes"] == 21474836480.0
+    assert v["segment_allocated_bytes"] == 1073741824.0   # labels stripped
+    assert "HELP" not in v
+
+
+def test_master_metrics_url():
+    assert bm._master_metrics_url({}) == ""
+    assert bm._master_metrics_url(
+        {"master_addr": "10.0.0.7:50051"}) == "http://10.0.0.7:17702/metrics"
+    assert bm._master_metrics_url(
+        {"master_addr": "10.0.0.7:50051", "master_metrics_port": 19000}) == \
+        "http://10.0.0.7:19000/metrics"
+    assert bm._master_metrics_url(
+        {"master_addr": "10.0.0.7:50051",
+         "master_metrics_url": "http://m:17702/metrics"}) == \
+        "http://m:17702/metrics"
+
+
+def test_store_total_precedence():
+    # explicit wins over auto
+    g = {"store_total_size": "5GB", "_store_total_auto": 999 * 1024 ** 3}
+    assert bm._store_total_bytes(g) == 5 * 1024 ** 3
+    # auto used when unset
+    g = {"_store_total_auto": 20 * 1024 ** 3}
+    assert bm._store_total_bytes(g) == 20 * 1024 ** 3
+    # nothing -> None (infinite)
+    assert bm._store_total_bytes({}) is None
+
+
+def test_discover_store_capacity_auto(monkeypatch):
+    text = ("segment_total_capacity_bytes 21474836480\n"
+            "segment_allocated_bytes 1073741824\n")
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
+    g = {"master_addr": "10.0.0.7:50051"}
+    total = bm.discover_store_capacity(None, g)
+    assert total == 21474836480
+    assert g["_store_total_auto"] == 21474836480
+    # budget now uses the auto value and reports the auto formula
+    kc, auto = bm._pipeline_key_budget(g, 4, 8 << 20, 0, 1, "8MB")
+    assert auto is True and kc == 576
+    # explicit config still wins after discovery
+    g["store_total_size"] = "1GB"
+    assert bm._store_total_bytes(g) == 1024 ** 3
+
+
+def test_discover_store_capacity_failure_is_warn_only(monkeypatch, capsys):
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: None)
+    g = {"master_addr": "10.0.0.7:50051"}
+    assert bm.discover_store_capacity(None, g) is None
+    assert "_store_total_auto" not in g
+    assert "auto-discovery failed" in capsys.readouterr().out
+    # unset -> infinite behaviour preserved
+    assert bm._store_total_bytes(g) is None
