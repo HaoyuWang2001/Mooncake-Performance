@@ -141,3 +141,12 @@ def test_discover_store_capacity_failure_is_warn_only(monkeypatch, capsys):
     assert "auto-discovery failed" in capsys.readouterr().out
     # unset -> infinite behaviour preserved
     assert bm._store_total_bytes(g) is None
+
+
+def test_discover_skip_is_explicit_warn(monkeypatch, capsys):
+    """No metrics source configured -> loud WARN (a silent skip hid a real
+    store-exhaustion incident)."""
+    g = {}   # no master_addr / master_metrics_url / store_total_size
+    assert bm.discover_store_capacity(None, g) is None
+    out = capsys.readouterr().out
+    assert "auto-discovery skipped" in out and "UNBOUNDED" in out

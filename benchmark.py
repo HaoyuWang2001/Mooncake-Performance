@@ -256,6 +256,10 @@ def discover_store_capacity(cluster, globals_cfg):
     node as a fallback. Prints every relevant gauge into the log."""
     url = _master_metrics_url(globals_cfg)
     if not url:
+        log("[WARN] store capacity auto-discovery skipped (no "
+            "master_metrics_url/master_addr in global.json); key space will "
+            "be UNBOUNDED — set store_total_size manually or fix the "
+            "metrics source")
         return None
     text = None
     if cluster is not None and cluster.get("_controller") is not None:
@@ -3001,6 +3005,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "".format(_src, len(plan["writers"]), kc, ds,
                               len(plan["writers"]) * kc * parse_data_size(ds),
                               _store_total_bytes(globals_cfg)))
+            elif not kc:
+                # no store budget and no explicit key_count: unbounded key
+                # space — high write rates can exhaust the store (-200
+                # fail-fast kills every client). Make it loud.
+                log("[WARN] pipeline key space: UNBOUNDED (no store budget) "
+                    "— high write rates can exhaust the store and trigger "
+                    "-200 fail-fast; set store_total_size or fix the "
+                    "master metrics source")
             run_stage(host, node, remote_runner,
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
