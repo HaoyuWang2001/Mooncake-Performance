@@ -550,3 +550,52 @@ def test_loader_strips_pipeline_key_count(tmp_path, capsys):
     b = tmp_path / "b.json"
     b.write_text('{"scenario": "basic", "key_count": 500}', encoding="utf-8")
     assert bm.load_scenario_config(str(b))["key_count"] == 500
+
+
+def test_deployment_states_jsonpath_has_no_raw_newline(monkeypatch):
+    """wait_k8s_deployment_ready's pod-states jsonpath must carry a LITERAL
+    backslash-n (raw newline -> real kubectl 'unterminated quoted string' ->
+    the fast-fail silently degrades to the 60s timeout)."""
+    c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
+         "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
+                 "controller_workspace": "/cw", "pod_workspace": "/pw"}}
+    captured = {}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "get pods" in a and "jsonpath=" in a:
+            captured["pods"] = a
+        if "availableReplicas" in a:
+            return "0", 0
+        if "spec.replicas" in a:
+            return "1", 0
+        if "get events" in a:
+            return "REASON MESSAGE", 0
+        if "describe" in a:
+            return "Name: d", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    monkeypatch.setattr(bm, "_k8s_deployment_diag", lambda *a, **k: None)
+    try:
+        bm.wait_k8s_deployment_ready(c, "d", "run1", timeout=0, poll=0)
+    except RuntimeError:
+        pass
+    assert "pods" in captured
+    assert "\\n" in captured["pods"], "literal backslash-n required"
+    assert "\n" not in captured["pods"], "raw newline forbidden"
+
+
+def test_benchmark_source_has_no_raw_newline_jsonpaths():
+    """Source-level lint: every jsonpath delimiter in benchmark.py must be
+    written with a DOUBLE backslash in the source (runtime literal \\n).
+    The single-backslash form compiles to a real newline and real kubectl
+    rejects it — this bug bit twice (pipeline nodes + metrics probe)."""
+    import re
+    src_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), "benchmark.py")
+    raw = open(src_path, encoding="utf-8").read()
+    bad = re.findall(r"\{'\\n'\}", raw)
+    assert not bad, (
+        "source contains {'\\n'} (single backslash -> runtime newline); "
+        "write {'\\\\n'} instead: {}".format(bad))

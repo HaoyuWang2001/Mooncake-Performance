@@ -293,7 +293,7 @@ def _probe_metrics_via_exec(cluster):
     out, rc = controller_run(
         c, ["-n", ns, "get", "pods", "-o",
             "jsonpath={range .items[*]}{.metadata.name}{' '}"
-            "{.status.phase}{'\n'}{end}"], check=False)
+            "{.status.phase}{'\\n'}{end}"], check=False)
     if rc != 0:
         return None, "cannot list pods in namespace {!r}: {}".format(
             ns, out.strip()[:200])
@@ -2818,7 +2818,7 @@ def wait_k8s_deployment_ready(cluster, deploy, run_label, timeout=None,
                 "jsonpath={range .items[*]}{.metadata.name}{' '}"
                 "{.status.phase}{' '}"
                 "{range .status.containerStatuses[*]}"
-                "{.state.waiting.reason}{' '}{end}{'\n'}{end}"], check=False)
+                "{.state.waiting.reason}{' '}{end}{'\\n'}{end}"], check=False)
         fatal = []
         for line in states.splitlines():
             toks = line.split()

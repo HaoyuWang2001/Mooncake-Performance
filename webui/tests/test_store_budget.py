@@ -240,6 +240,13 @@ def test_probe_metrics_via_exec(monkeypatch):
     cluster = {"_controller": {"ip": "1.2.3.4"}, "k8s": {}}
     got, src = bm._probe_metrics_via_exec(cluster)
     assert got == text
+    # kubectl must receive a LITERAL backslash-n in the pods jsonpath — a raw
+    # newline makes real kubectl fail with "unterminated quoted string"
+    # (this exact bug broke the real-cluster probe once; the stub never
+    # parses jsonpath, so only this assertion catches it)
+    pods_argv = " ".join(str(x) for x in calls[0])
+    assert "jsonpath=" in pods_argv
+    assert "\\n" in pods_argv and "\n" not in pods_argv
     assert src == "kubectl exec mooncake/mooncake-master-657f88fc6c-vfp4f:17702"
     # exec command targets localhost inside the pod
     exec_args = [c for c in calls if " exec " in " ".join(str(x) for x in c)]
