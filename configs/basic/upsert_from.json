@@ -1,0 +1,4 @@
+{
+  "operation": "upsert_from",
+  "work_mode": "upsert_from"
+}

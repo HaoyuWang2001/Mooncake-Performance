@@ -49,7 +49,7 @@ CLI 的 `--protocol` 可选值为 `tcp / rdma / ub`，优先级最高、可覆�
 
 | 目录 | 说明 |
 | --- | --- |
-| `configs/basic/` | 接口级 benchmark（put/put_batch/put_from、get/get_batch/get_into/get_buffer、mixed `put_iface/get_iface`，各 × local/remote） |
+| `configs/basic/` | 接口级 benchmark（put/put_batch/put_from/upsert_from、get/get_batch/get_into/get_buffer、mixed `put_iface/get_iface`，各 × local/remote） |
 | `configs/basic/demo/` | basic 冒烟用例（simple-*，非主测试，用于打通验证） |
 | `configs/pipeline/` | 精排/召排 pipeline 场景（rank 42 + recall 6 + smoke 2；另 demo 2） |
 | `configs/pipeline/demo/` | pipeline 冒烟用例 |
@@ -78,12 +78,12 @@ demo 冒烟用例（simple-*）均仅包含 `1×1` 一组。
 加载用例时从场景根目录（如 `configs/pipeline/`）沿目录链逐层读取并合并——
 下层补充/覆盖上层（dict 递归深合并、其余类型整体替换），用例文件最后合并、
 永远最优先。`_configs.json` 本身不作为场景运行（收集时自动跳过 `_` 前缀文件）。
-basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字段
+basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字段
 （`scenario/protocol/key_prefix/key_count/data_size/target_qps/duration/warmup`，`duration` 显式默认 0 = 不启用压测模式；`numa_bind` 已移交 global.json）。
 
 | 参数 | 说明 | 测试场景使用值 |
 | --- | --- | --- |
-| `operation` | 使用的 store 接口：`put / put_batch / put_from`（写）或 `get / get_batch / get_into / get_buffer`（读）；mixed 场景为 `"<写接口>/<读接口>"`（如 `put/get`、`put_batch/get_batch`、`put_from/get_buffer`） | 见各场景 |
+| `operation` | 使用的 store 接口：`put / put_batch / put_from / upsert_from`（写）或 `get / get_batch / get_into / get_buffer`（读）；mixed 场景为 `"<写接口>/<读接口>"`（如 `put/get`、`put_batch/get_batch`、`put_from/get_buffer`） | 见各场景 |
 | `data_size` | **必填，数组形式**（如 `["8MB"]` 或 `["128KB", "1MB", "4MB", "8MB"]`）：数组内逐个 size 循环运行（basic 按 params × size 笛卡尔积；pipeline 每个 size 完整跑一轮写读流水）。不同尺寸间自动重建 `value.bin` 并（get 家族）重新预填充 store；运行日志/CSV 行以 size 后缀区分 | basic 默认 `["128KB", "1MB", "4MB", "8MB"]`；pipeline 默认按 work_mode 层供给：rank `["8MB"]`、recall `["3.5MB"]`（rank|recall 层 `_configs.json`，用例可覆盖）；预热 1MB |
 | `key_count` | key 数量 | 正式测量 1000（数据总量 8GB，适配单 store ~12GB 内存限制）；预热场景 100 |
 | `batch_size` | 单个 batch 操作包含的 key 数 | put_batch / get_batch 场景 16；mixed_batch 8 |
@@ -102,8 +102,9 @@ basic 根基座 `configs/basic/_configs.json` 存放 18 个正式场景共用字
 - **mixed 交替语义**：put 与 get **交替执行**（从 put 开始），`put k0, get k0, put k1, get k1, …`；
   每个 get 读取本次 put 刚写入的 key（保证可见性），一侧配额先尽则另一侧连续收尾；配额 =
   `put_ratio × key_count`（put）/ 余量（get）。
-- 零拷贝接口（put_from / get_into / get_buffer）在场景进程内自动 `register_buffer` 并注销，
+- 零拷贝接口（put_from / upsert_from / get_into / get_buffer）在场景进程内自动 `register_buffer` 并注销，
   无需额外配置。
+- `upsert_from` 在计时前用 `put_from` 预填目标 key；duration 模式循环覆盖同一批 key，不执行轮间删除。
 - **pipeline 同样由 operation 指定接口**：`writer.operation`（写接口，`put_batch` 等）与
   `reader.operation`（读接口，`get` 等）真实驱动调用（见 3.3）。
 
@@ -139,7 +140,7 @@ writer.count_per_node=2；历史文件名的 `_n{N}` 后缀已随档位目录废
 | `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数；须 ≤ reader 池 cpn×N） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
 | `client` | **双角色部署块（出现即选择 dual 模式）**：`{count_per_node, port_base}`——每节点 client 进程数（总数 = cpn×N，每个进程**同时是 writer+reader**，端口默认 9301，单端口四 endpoint）；出现该块时 writer/reader 块仅提供 operation/线程数等接口参数 | smoke 两用例必填 | 不使用 |
-| `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101） | cpn=1（notify_threads=notify_count） | cpn=1 |
+| `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`/`upsert_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101）；`upsert_from` 要求配置 `key_count > 0` | cpn=1（notify_threads=notify_count） | cpn=1 |
 | `reader` | `{count_per_node, operation, num_threads, port_base}`：每节点 reader 数（池 = cpn×N，须 ≥ notify_count）/ 读接口（`get`/`get_batch`/`get_into`/`get_buffer`）/ 消费线程数 / HTTP /notify 端口段（默认 9201） | 见下方档位表 | 恒 1 |
 | `store_count_per_node` | **记录性元数据**：每节点 mooncake store 数（store 由外部部署、master 发现，编排器不管理）；进 CSV `store_count` 列（值如 `N*1`） | 1 | 2 |
 | `data_size` | **必填，数组形式**：逐个 size 循环，每个 size 完整跑一轮写读流水（value.bin 自动按尺寸重建）；单 size 写 `["8MB"]`，扫描写 `["512KB", "8MB"]` | `["8MB"]` | `["3.5MB"]` |
@@ -216,7 +217,7 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **warmup 语义**：正式测量前以相同部署形态运行 warmup.duration 秒（notify 带 warmup=1 标记，writer
   不输出 RESULT、reader 照常读取但不记录，SUMMARY 计入 warmup_total）；
 - **operation 角色化**：`writer.operation`（写接口）与 `reader.operation`（读接口）**真实驱动调用**
-  ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`（逐 key 调用），reader 支持
+  ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`、`upsert_from`（逐 key 调用），reader 支持
   `get`/`get_into`/`get_buffer`（逐 key）与 `get_batch`（整批一次调用）；时延样本 = 单次接口调用
   （逐 key 接口每 key 一条、批量接口每批一条，RESULT 行携带 key_count，total/qps 均按 key 计）；
 - **RESULT 行首字段为本地墙钟时间戳**（`HH:MM:SS.micro`，tab 分隔第 2 列）：仅用于性能问题
@@ -252,13 +253,13 @@ python benchmark.py --config-dir configs/pipeline/smoke  # 双角色最小场景
 
 ## 4. 用例矩阵
 
-basic：9 种操作各一个场景（`configs/basic/` 顶层平铺，client 节点由
+basic：10 种操作各一个场景（`configs/basic/` 顶层平铺，client 节点由
 `_configs.json` 的 `client_node` 统一指定，改一处全部生效；CSV `topology`
 列按 client 节点 IP 是否属于 store 节点自动判定 local/remote）：
 
 | 操作族 | 配置 |
 | --- | --- |
-| 写 | put、put_batch、put_from |
+| 写 | put、put_batch、put_from、upsert_from |
 | 读 | get、get_batch、get_into、get_buffer |
 | 混合 | mixed（put/get）、mixed_batch（put_batch/get_batch） |
 
@@ -579,7 +580,7 @@ grep -iE "connect|fail|refuse|timeout" <LOG_FILE>.ylt.log
 
 场景配置按类别放在子目录中：
 
-- `configs/basic/` — 接口级 benchmark（18 个正式场景）
+- `configs/basic/` — 接口级 benchmark（20 个正式场景）
 - `configs/basic/demo/` — 冒烟用例（simple-*，非主测试）
 - `configs/pipeline/` — 精排/召排场景（48 个正式场景）
 - `configs/pipeline/demo/` — 冒烟用例
@@ -590,7 +591,7 @@ basic 场景字段：
 | --- | --- |
 | scenario | 场景名（basic 场景统一为 "basic"，共享同一 key 空间） |
 | work_mode | 业务类型（basic 场景为 operation 名，仅记录） |
-| operation | put / get / put_batch / get_batch / mixed（mixed 配置为 "put/get"） |
+| operation | put / put_batch / put_from / upsert_from / get / get_batch / get_into / get_buffer；mixed 为 "<写>/<读>"（如 "put/get"） |
 | protocol | tcp / ub / rdma（ub 的设备名在 global.json `protocol.ub.device` 中配置） |
 | client_node | client 所在节点（决定 ssh 目标） |
 | key_prefix | key 前缀 |

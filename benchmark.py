@@ -91,7 +91,7 @@ RESULTS_DIR = os.path.join(ROOT, "outputs")
 TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
 # store interface families (mirror scripts/mooncake_benchmark_client.py so the
 # orchestrator can validate operation values and choose staging behaviour)
-PIPELINE_PUT_IFACES = ("put", "put_batch", "put_from")
+PIPELINE_PUT_IFACES = ("put", "put_batch", "put_from", "upsert_from")
 PIPELINE_GET_IFACES = ("get", "get_batch", "get_into", "get_buffer")
 PIPELINE_PUT_BATCH_IFACES = ("put_batch",)
 PIPELINE_GET_BATCH_IFACES = ("get_batch",)

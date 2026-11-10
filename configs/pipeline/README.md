@@ -78,6 +78,7 @@ client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样�
 | `put` | `store.put(key, value)` | 每 key 一次计时调用 | 基础单写 |
 | `put_batch` | `store.put_batch(keys, values)` | 整批一次计时调用 | 批大小 = `batch_size` |
 | `put_from` | `store.put_from(key, ptr, size)` | 每 key 一次计时调用 | 从已注册本地缓冲写入；writer 启动时注册页对齐缓冲（value 写入缓冲为未计时准备），注册失败即退出 |
+| `upsert_from` | `store.upsert_from(key, ptr, size)` | 每 key 一次计时调用 | 零拷贝覆盖写；需配置 `key_count > 0`（或经 store 容量自动推导），writer 计时前用 `put_from` 预填全部 `w<id>` key 空间，测量阶段循环覆盖、不做轮间删除 |
 
 ### reader 块
 

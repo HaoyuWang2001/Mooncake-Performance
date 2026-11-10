@@ -10,17 +10,17 @@ configs/basic/
 ├── _configs.json      # 根基座：全部场景共用默认值（本层唯一公共默认）
 ├── README.md
 ├── demo/              # 冒烟用例（--config-dir configs/basic/demo 运行，自带全字段，不依赖继承）
-└── <operation>_<topo>.json ×18   # 正式场景，仅 3-4 字段
+└── <operation>_<topo>.json ×20   # 正式场景，仅 3-4 字段
 ```
 
 加载时用例继承 `_configs.json`（浅层结构，dict 深合并、用例永远最优先）；
 子目录若再放 `_configs.json` 亦可逐层覆盖（机制同 pipeline）。
 
-## 正式场景矩阵（9 操作 × 2 拓扑 = 18）
+## 正式场景矩阵（10 操作 × 2 拓扑 = 20）
 
 | 操作族 | 文件 |
 | --- | --- |
-| 写 | put_local/remote、put_batch_local/remote、put_from_local/remote |
+| 写 | put_local/remote、put_batch_local/remote、put_from_local/remote、upsert_from_local/remote |
 | 读 | get_local/remote、get_batch_local/remote、get_into_local/remote、get_buffer_local/remote |
 | 混合 | mixed_local/remote（`put/get`）、mixed_batch_local/remote（`put_batch/get_batch`） |
 
@@ -47,7 +47,7 @@ configs/basic/
 
 | 字段 | 必填 | 语义 |
 | --- | --- | --- |
-| `operation` | 是 | `put` / `put_batch` / `put_from` / `get` / `get_batch` / `get_into` / `get_buffer`；mixed 为 `"<写>/<读>"` |
+| `operation` | 是 | `put` / `put_batch` / `put_from` / `upsert_from` / `get` / `get_batch` / `get_into` / `get_buffer`；mixed 为 `"<写>/<读>"` |
 | `client_node` | 是 | cluster.json 节点名（决定拓扑标注） |
 | `work_mode` | 是 | 与 operation 一致的标注（put/get/mixed） |
 | `data_size` | 否 | 覆盖根基座扫掠（单 size 写 `["8MB"]`） |
@@ -57,7 +57,11 @@ configs/basic/
 - **get 族**：循环读取预填数据直至到时
 - **put 族**：以"完整遍历自己 key 分片"为一轮，跑满一轮后客户端清除**自己的**
   key（`batch_remove`，维护动作不计时、不产生 RESULT）再进入下一轮
+- **upsert_from**：计时前用 `put_from` 预填目标 key（首字节刻意翻转以便读校验
+  覆盖生效），duration 模式反复覆盖同一批 key，轮间**不**删除
 - **mixed**：put/get 交替，put 侧写满一轮后清空本轮 put key 继续循环
+  （mixed `upsert_from/<读>` 同理不删除，计时前用 `put_from` 预填各线程
+  put 配额内的 key）
 - 多 client/多线程按 key 分片各清各的，互不干扰
 
 ## target_qps 限速

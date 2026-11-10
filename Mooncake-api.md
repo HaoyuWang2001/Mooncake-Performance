@@ -13,6 +13,7 @@
 | `put` | `put(key, value, config=ReplicateConfig())` | int（0 成功） | 单 key 写；value 为 bytes-like | ① |
 | `put_batch` | `put_batch(keys, values, config=...)` | int | 整批一次调用，一次写入 batch_size 个 key | ① |
 | `put_from` | `put_from(key, buffer_ptr, size, config=...)` | int | 零拷贝写；buffer 须先 `register_buffer(ptr, size)` | ② |
+| `upsert_from` | `upsert_from(key, buffer_ptr, size, config=...)` | int | 零拷贝覆盖写；benchmark 在计时前用 `put_from` 预填已有 key | ② |
 | `put_parts` | `put_parts(key, *parts, config=...)` | int | 分段写入同一 key（parts 为 1-D bytes-like） | ③ |
 | `batch_put_from` | `batch_put_from(keys, buffer_ptrs, sizes, config=...)` | list[int] | 批量零拷贝写 | ③ |
 | `batch_put_from_multi_buffers` | `(keys, all_buffer_ptrs, all_sizes)` | — | 多 buffer 变体 | 不进基础集 |
@@ -45,7 +46,7 @@
 
 - **① 数据面主干（必测）**：`put`、`get`
 - **① 批量语义（必测）**：`put_batch`、`get_batch`
-- **② 零拷贝路径（强烈建议）**：`put_from`、`get_into`（需 `register_buffer`）
+- **② 零拷贝路径（强烈建议）**：`put_from`、`upsert_from`、`get_into`（需 `register_buffer`）
 - **② buffer 协议（建议）**：`get_buffer`（BufferHandle）
 - **③ 语义边界（补齐）**：`put_parts`、`batch_put_from`、`batch_get_into`、`get_into_ranges`
 - **④ 按需**：其余组合/变体
@@ -71,6 +72,6 @@
 |---|---|---|---|
 | put / get | ✅ | writer=put / reader=get | 已支持 |
 | put_batch / get_batch | ✅（含 mixed `put_batch/get_batch`） | writer=put_batch / reader=get_batch | 已支持 |
-| put_from / get_into / get_buffer | ✅ | writer=put_from / reader=get_into、get_buffer | 已支持 |
+| put_from / upsert_from / get_into / get_buffer | ✅ | writer=put_from、upsert_from / reader=get_into、get_buffer | 已支持 |
 | ③ 语义边界接口 | — | — | 计划中 |
 | EngramStore populate/lookup | — | 后续（writer.operation/reader.operation 指定） | 预留 |

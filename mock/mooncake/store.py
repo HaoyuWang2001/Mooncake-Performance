@@ -85,6 +85,9 @@ class MooncakeDistributedStore:
         except KeyError:
             return -1
 
+    def upsert_from(self, k, ptr, size, config=None):
+        return self.put_from(k, ptr, size, config)
+
     def get_into(self, k, ptr, size):
         try:
             size = min(size, self._buffers[ptr])
