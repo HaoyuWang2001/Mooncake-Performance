@@ -28,9 +28,50 @@ import threading
 import time
 
 
+# --- dual-sink logging: console summary + full benchmark.log --------------
+# log()        console (summary) AND the full log file
+# log_detail() the full log file ALWAYS; console only when verbose
+# The full file lives at outputs/<ts>/benchmark.log and receives every
+# per-pod/per-command line, so the WebUI console stays short while every
+# detail remains locatable on disk.
+_DETAIL_FH = None
+
+
+def set_detail_log(path):
+    """Open the full-detail log (outputs/<ts>/benchmark.log, append mode)."""
+    global _DETAIL_FH
+    try:
+        _DETAIL_FH = open(path, "a", encoding="utf-8", buffering=1)
+        _DETAIL_FH.write("# full orchestrator log (console lines + all "
+                         "per-command/per-pod detail)\n")
+    except OSError:
+        _DETAIL_FH = None
+
+
+def close_detail_log():
+    global _DETAIL_FH
+    if _DETAIL_FH is not None:
+        try:
+            _DETAIL_FH.close()
+        except Exception:
+            pass
+        _DETAIL_FH = None
+
+
+def _detail_write(msg):
+    if _DETAIL_FH is not None:
+        try:
+            _DETAIL_FH.write("[{}] [benchmark] {}\n".format(
+                time.strftime("%H:%M:%S"), msg))
+            _DETAIL_FH.flush()
+        except Exception:
+            pass
+
+
 def log(msg):
     print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
           flush=True)
+    _detail_write(msg)
 
 
 # --- verbose logging (CLI --verbose / env MC_BENCH_VERBOSE / WebUI toggle) ---
@@ -47,9 +88,11 @@ def verbose_enabled():
 
 
 def log_detail(msg):
-    """Verbose-only log line (same timestamped format as log())."""
+    """Full-detail line: always to benchmark.log, console only when verbose."""
+    _detail_write(msg)
     if _VERBOSE:
-        log(msg)
+        print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
+              flush=True)
 
 
 # --- cooperative stop (WebUI stop file / Ctrl+C signals) -------------------
@@ -253,12 +296,16 @@ def controller_diagnose(controller):
     return out.strip()
 
 
-def controller_stream(controller, args):
-    """Run kubectl and relay output live; return rc."""
+def controller_stream(controller, args, quiet=False):
+    """Run kubectl and relay output live; return rc. quiet=True discards the
+    child output (it is already captured in the stage log file) so mass
+    operations (e.g. generate-data on 32 pods) do not flood the console."""
     argv = _controller_kubectl_argv(controller, args)
+    sink = subprocess.DEVNULL if quiet else None
     if controller_is_local(controller):
         try:
-            proc = subprocess.Popen(argv, env=_controller_env(controller))
+            proc = subprocess.Popen(argv, env=_controller_env(controller),
+                                    stdout=sink, stderr=sink)
         except FileNotFoundError:
             raise RuntimeError("kubectl not found (controller local)")
         while proc.poll() is None:
@@ -278,7 +325,7 @@ def controller_stream(controller, args):
     if controller.get("kubeconfig"):
         shell = "KUBECONFIG={} {}".format(
             shlex.quote(controller["kubeconfig"]), shell)
-    _, rc = _ssh_exec(controller, shell, relay=True)
+    _, rc = _ssh_exec(controller, shell, relay=not quiet)
     return rc
 
 
@@ -299,7 +346,7 @@ def controller_put(controller, local_files, remote_dir):
     clean_dir = _remote_path(remote_dir)
     for f in local_files:
         base = os.path.basename(f)
-        log("[k8s] upload {} -> {}:{}".format(base, desc,
+        log_detail("[k8s] upload {} -> {}:{}".format(base, desc,
                                               clean_dir.rstrip("/") + "/" + base))
         log_detail("[k8s]   size: {} bytes".format(
             os.path.getsize(f) if os.path.isfile(f) else "?"))
@@ -511,9 +558,9 @@ def _ssh_exec(node, command, relay=False):
 
 def run_ssh(host, node, command, dry_run=False):
     if is_k8s_node(node):
-        log("[k8s] $ {}".format(kubectl_exec_line(node, command)))
+        log_detail("[k8s] $ {}".format(kubectl_exec_line(node, command)))
         if dry_run:
-            log("      (dry-run, skipped)")
+            log_detail("      (dry-run, skipped)")
             return
         rc = controller_stream(node["_controller"],
                                ["-n", node["_ns"], "exec", node["_pod"],
@@ -524,9 +571,9 @@ def run_ssh(host, node, command, dry_run=False):
                 "  (command output was streamed live above this error)"
                 "".format(rc, node["_pod"], command))
         return
-    log("[ssh] {} : {}".format(host, command))
+    log_detail("[ssh] {} : {}".format(host, command))
     if dry_run:
-        log("      (dry-run, skipped)")
+        log_detail("      (dry-run, skipped)")
         return
     _, rc = _ssh_exec(node, command, relay=True)
     if rc != 0:
@@ -539,9 +586,9 @@ def run_ssh(host, node, command, dry_run=False):
 def ssh_check_output(host, node, command, dry_run=False, quiet=False):
     if is_k8s_node(node):
         if not quiet:
-            log("[k8s] $ {}".format(kubectl_exec_line(node, command)))
+            log_detail("[k8s] $ {}".format(kubectl_exec_line(node, command)))
         if dry_run:
-            log("      (dry-run, skipped)")
+            log_detail("      (dry-run, skipped)")
             return ""
         out, rc = controller_run(node["_controller"],
                                  ["-n", node["_ns"], "exec", node["_pod"],
@@ -553,9 +600,9 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
                     out.strip()[-400:] or "<empty>"))
         return out.strip()
     if not quiet:
-        log("[ssh] {} : {}".format(host, command))
+        log_detail("[ssh] {} : {}".format(host, command))
     if dry_run:
-        log("      (dry-run, skipped)")
+        log_detail("      (dry-run, skipped)")
         return ""
     out, rc = _ssh_exec(node, command)
     if rc != 0:
@@ -569,14 +616,14 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
     if is_k8s_node(node):
         c = node["_controller"]
         stage = posixpath.join(node.get("_controller_workspace") or "/tmp", "push-tmp")
-        log("[kcp] -> {} : {}".format(node["_pod"], remote_path))
+        log_detail("[kcp] -> {} : {}".format(node["_pod"], remote_path))
         if dry_run:
-            log("      (dry-run, skipped)")
+            log_detail("      (dry-run, skipped)")
             return
         controller_put(c, local_files, stage)
         for f in local_files:
             staged = posixpath.join(stage, os.path.basename(f))
-            log("[k8s] $ {}".format(
+            log_detail("[k8s] $ {}".format(
                 kubectl_cp_to_line(node, staged, remote_path)))
             out, rc = controller_run(c,
                                      ["-n", node["_ns"], "cp", staged,
@@ -585,9 +632,9 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
             if rc != 0:
                 raise RuntimeError("kubectl cp failed for {}: {}".format(f, out.strip()[:300]))
         return
-    log("[scp] -> {} : {}".format(host, remote_path))
+    log_detail("[scp] -> {} : {}".format(host, remote_path))
     if dry_run:
-        log("      (dry-run, skipped)")
+        log_detail("      (dry-run, skipped)")
         return
     sftp = _ssh_client(node).open_sftp()
     try:
@@ -622,7 +669,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                 dst = local_dir.rstrip("\\/") + os.sep
             else:
                 dst = posixpath.join(stage, os.path.basename(f))
-            log("[k8s] $ {}".format(
+            log_detail("[k8s] $ {}".format(
                 kubectl_cp_from_line(node, f, dst)))
             if dry_run:
                 log_detail("      (dry-run, skipped)")
@@ -639,7 +686,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                     controller_get_file(c, dst, local_dir)
             if rc != 0:
                 raise RuntimeError("kubectl cp pull failed for {}: {}".format(f, out.strip()[:300]))
-        log("[k8s] pulled {} files from pod {} -> {}".format(
+        log_detail("[k8s] pulled {} files from pod {} -> {}".format(
             len(files), node["_pod"], local_dir))
         return
     # SFTP cannot expand remote globs: list matching paths via exec, then
@@ -664,7 +711,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
             sftp.get(f, os.path.join(local_dir, os.path.basename(f)))
     finally:
         sftp.close()
-    log("[ssh] pulled {} files from {} -> {}".format(
+    log_detail("[ssh] pulled {} files from {} -> {}".format(
         len(files), host, local_dir))
 
 

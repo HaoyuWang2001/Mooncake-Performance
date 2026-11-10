@@ -36,9 +36,9 @@ from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    controller_run, controller_stream, get_node, is_k8s_node,
                    kubectl_exec_line, kubectl_prefix, load_json, log,
                    log_detail, parse_data_size, percentile,
-                   request_stop, run_ssh, scp_pull, scp_push, set_stop_file,
-                   set_verbose, ssh_check_output, stop_requested,
-                   verbose_enabled)
+                   close_detail_log, request_stop, run_ssh, scp_pull,
+                   scp_push, set_detail_log, set_stop_file, set_verbose,
+                   ssh_check_output, stop_requested, verbose_enabled)
 
 # profiling matrix core (optional tools: spdiag / perf / bpftrace)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling"))
@@ -385,7 +385,7 @@ def discover_store_capacity(cluster, globals_cfg):
         printed.append("{}{}={}".format(
             k, " ({} series summed)".format(n_series) if n_series > 1 else "",
             _fmt_gib(t)))
-    log("[benchmark] store metrics ({}): {}".format(source, ", ".join(printed)))
+    log_detail("[benchmark] store metrics ({}): {}".format(source, ", ".join(printed)))
     total = _metric_total(vals, "master_total_capacity_bytes")
     if total is None:
         total = _metric_total(vals, "segment_total_capacity_bytes")
@@ -1257,7 +1257,7 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
             yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
             controller_put(c, [local_yaml], yaml_dir)
             remote_yaml = posixpath.join(yaml_dir, pod + ".yaml")
-            log("[k8s] pod manifest: template={} -> {}:{}".format(
+            log_detail("[k8s] pod manifest: template={} -> {}:{}".format(
                 os.path.relpath(_pod_template_path(cluster), ROOT),
                 controller_desc(c), remote_yaml))
             log("[k8s] pod {} create: ns={} image={} labels={{run={}, role={}}}"
@@ -1482,7 +1482,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
         log("[k8s] staging {} files (run={}) -> {}:{}".format(
             len(staged), run_label, controller_desc(c), stage_remote))
         for fname in staged:
-            log("[k8s]   + {}".format(fname))
+            log_detail("[k8s]   + {}".format(fname))
         controller_put(c, [os.path.join(local_stage, f)
                            for f in staged], stage_remote)
     finally:
@@ -1516,7 +1516,7 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
             # k8s: scripts + env.sh are already delivered via ConfigMap
             # (ensure_configmap); the pods mount them read-only at
             # remote_scripts. Only ensure the log dir exists (emptyDir).
-            log("[k8s] pod {}: scripts via configmap (ro at {}), "
+            log_detail("[k8s] pod {}: scripts via configmap (ro at {}), "
                 "log dir {}".format(n.get("_pod", "?"), remote_scripts,
                                     remote_log_dir))
             run_ssh(n["ip"], n, "mkdir -p {}".format(remote_log_dir),
@@ -1737,7 +1737,7 @@ def pull_stage_logs(ip, node, remote_files, local_dir, dry_run):
         try:
             scp_pull(ip, node, f, local_dir, dry_run=False)
         except Exception as exc:
-            log("[WARN] stage log pull {}: {}".format(f, exc))
+            log_detail("[WARN] stage log pull {}: {}".format(f, exc))
 
 
 def format_duration(seconds):
@@ -1788,7 +1788,7 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
     n = get_node(cluster, node_name)
     t0 = time.time()
     where = ("pod {}".format(n["_pod"]) if is_k8s_node(n) else node_name)
-    log("{} ({}, pid {}) running...{}".format(
+    log_detail("{} ({}, pid {}) running...{}".format(
         what, where, pid, _wait_suffix(t0, expected_s)))
     if marker:
         poll_cmd = ("kill -0 {pid} 2>/dev/null && "
@@ -1802,7 +1802,7 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
             n["ip"], n, poll_cmd,
             dry_run=dry_run, quiet=True)
         if alive != "ALIVE":
-            log("{} exited after {} ({:.0f}s)".format(
+            log_detail("{} exited after {} ({:.0f}s)".format(
                 what, format_duration(time.time() - t0), time.time() - t0))
             return True
         time.sleep(1)
@@ -2005,24 +2005,44 @@ def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False):
         return list(pool.map(_run, items))
 
 
-def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry):
+def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry, workers=None):
     """Pull per-pod log groups with bounded concurrency. groups:
-    [(node_entry, [remote_files], label)]. Failures are WARN-logged for
-    every group (all pulls are attempted) and the first error is raised at
-    the end — same fail-the-scenario semantics as the old sequential pull."""
+    [(node_entry, [remote_files], label)].
+
+    Paramiko allows one channel per command on the cached connection but the
+    server caps concurrent sessions (MaxSessions, often 10) — pulling 8+
+    groups at once intermittently kills channels. Concurrency therefore
+    defaults to 4, and each group is VERIFIED locally and retried once after
+    a reconnect; only a still-missing group is reported (WARN + raised at
+    the end, same fail-the-scenario semantics as the sequential pull)."""
     if dry or not groups:
         return 0
     from concurrent.futures import ThreadPoolExecutor
 
+    def _missing(group):
+        _node, files, _label = group
+        return [f for f in files
+                if not os.path.exists(os.path.join(
+                    local_log_dir, os.path.basename(f)))]
+
     def _one(group):
         node, files, label = group
-        try:
-            pull_stage_logs(node["ip"], node, files, local_log_dir, False)
-            return (label, None)
-        except Exception as exc:
-            return (label, str(exc))
+        for _attempt in (0, 1):
+            try:
+                pull_stage_logs(node["ip"], node, files, local_log_dir, False)
+            except Exception:
+                pass
+            missing = _missing(group)
+            if not missing:
+                return (label, None)
+            try:
+                _ssh_drop(node)
+            except Exception:
+                pass
+        return (label, "missing: " + ", ".join(
+            os.path.basename(f) for f in _missing(group)))
 
-    workers = max(1, min(_PIPELINE_PARALLEL, len(groups)))
+    workers = max(1, min(workers or 4, len(groups)))
     errs = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for label, err in pool.map(_one, groups):
@@ -2176,7 +2196,7 @@ def _record_pids(host, node, pids_file, label, cfg_name, node_name,
 
 def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False,
                           pids_file=None, cfg_name=None, node_name=None,
-                          marker="mooncake_benchmark_client"):
+                          marker="mooncake_benchmark_client", quiet=False):
     """run_ssh variant for long-blocking commands (e.g. the basic benchmark
     stage): logs ONE 'running...' line (expected duration + ETA when
     expected_s is given). rc!=0 raises like run_ssh. ssh nodes run over the
@@ -2188,11 +2208,11 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     .state ledger under cfg_name — so a crashed orchestrator still leaves a
     killable trail."""
     if is_k8s_node(node):
-        log("[k8s] $ {}".format(kubectl_exec_line(node, command)))
+        log_detail("[k8s] $ {}".format(kubectl_exec_line(node, command)))
     else:
-        log("[ssh] {} : {}".format(host, command))
+        log_detail("[ssh] {} : {}".format(host, command))
     if dry_run:
-        log("      (dry-run, skipped)")
+        log_detail("      (dry-run, skipped)")
         return
     if stop_requested():
         raise StopRequested()
@@ -2204,7 +2224,7 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
                 holder["rc"] = controller_stream(
                     node["_controller"],
                     ["-n", node["_ns"], "exec", node["_pod"],
-                     "--", "bash", "-c", command])
+                     "--", "bash", "-c", command], quiet=quiet)
             except StopRequested:
                 holder["stop"] = True
             except Exception as exc:
@@ -2214,7 +2234,8 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         th = threading.Thread(target=_run, daemon=True)
         th.start()
         t0 = time.time()
-        log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
+        (log_detail if quiet else log)(
+            "{} running...{}".format(label, _wait_suffix(t0, expected_s)))
         recorded = False
         while th.is_alive():
             if stop_requested():
@@ -2231,9 +2252,11 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
     else:
         client = _ssh_client(node)
         stdin, stdout, stderr = client.exec_command(command)
+        _relay = not quiet
         chan = stdout.channel
         t0 = time.time()
-        log("{} running...{}".format(label, _wait_suffix(t0, expected_s)))
+        (log_detail if quiet else log)(
+            "{} running...{}".format(label, _wait_suffix(t0, expected_s)))
         recorded = False
         while not chan.exit_status_ready():
             if stop_requested():
@@ -2243,7 +2266,7 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
                     pass
                 _ssh_drop(node)
                 raise StopRequested()
-            _drain_chan(chan, True, [])
+            _drain_chan(chan, _relay, [])
             if not recorded and pids_file:
                 if _record_pids(host, node, pids_file, label, cfg_name,
                                 node_name, marker):
@@ -2252,11 +2275,11 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
         grace = time.time() + 5
         while (chan.recv_ready() or chan.recv_stderr_ready()
                 or not chan.eof_received) and time.time() < grace:
-            _drain_chan(chan, True, [])
+            _drain_chan(chan, _relay, [])
             time.sleep(0.05)
-        _drain_chan(chan, True, [])
+        _drain_chan(chan, _relay, [])
         rc = chan.recv_exit_status()
-    log("{} done rc={} elapsed={:.1f}s".format(
+    (log_detail if quiet else log)("{} done rc={} elapsed={:.1f}s".format(
         label, rc, time.time() - t0))
     if rc != 0:
         raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
@@ -2420,7 +2443,8 @@ def reap_state_entries(cluster):
 
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
-              dry_run=False, pull_to=None, cfg_name=None, node_name=None):
+              dry_run=False, pull_to=None, cfg_name=None, node_name=None,
+              quiet=False):
     _check_stop()
     remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
     command = "bash {} {} {}".format(runner, mode, remote_log)
@@ -2429,7 +2453,7 @@ def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
     run_ssh_with_progress(
         host, node, command, label=log_prefix, dry_run=dry_run,
         pids_file=remote_log + ".pids", cfg_name=cfg_name or log_prefix,
-        node_name=node_name)
+        node_name=node_name, quiet=quiet)
     if pull_to is not None:
         pull_stage_logs(host, node, [remote_log], pull_to, dry_run)
     if not dry_run:
@@ -2451,7 +2475,7 @@ def echo_cpu_bindings(cfg_name, local_log_dir):
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     if "cpu binding: " in line:
-                        log("{}: [{}] {}".format(
+                        log_detail("{}: [{}] {}".format(
                             cfg_name, os.path.basename(path),
                             line.strip()))
                         # merged basic logs carry one line per client — no break
@@ -2883,7 +2907,7 @@ def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
         yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
         controller_put(c, [local_yaml], yaml_dir)
         remote_yaml = posixpath.join(yaml_dir, deploy + ".yaml")
-        log("[k8s] deployment manifest: template={} -> {}:{}".format(
+        log_detail("[k8s] deployment manifest: template={} -> {}:{}".format(
             os.path.relpath(_deployment_template_path(cluster), ROOT),
             controller_desc(c), remote_yaml))
         log("[k8s] deployment {} create: ns={} role={} replicas={} image={}"
@@ -3202,9 +3226,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         for ds in sizes:
             if ds != current_ds:
                 # data_size changed: (re)build value.bin at this size on every
-                # node that runs a writer or reader
+                # node that runs a writer or reader. Per-pod work goes to the
+                # full log; the console gets ONE aggregate line.
                 ds_bytes = parse_data_size(ds)
                 check_cmd = value_check_cmd(cluster_session["BENCH_REMOTE_DATA_DIR"], scenario, ds_bytes)
+                _gen, _cached, _t0 = 0, 0, time.time()
                 for node_name in involved_nodes:
                     n = get_node(cluster, node_name)
                     data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
@@ -3212,7 +3238,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         run_stage(n["ip"], n, remote_runner,
                                   "generate-data", remote_log_dir, cfg_name,
                                   extra="--data-size {}".format(ds), dry_run=dry,
-                                  pull_to=local_log_dir, node_name=node_name)
+                                  pull_to=local_log_dir, node_name=node_name,
+                                  quiet=True)
+                        _gen += 1
+                    else:
+                        _cached += 1
+                log("value.bin ({}): {}/{} pods ready (generated {}, cached "
+                    "{}, {:.1f}s)".format(
+                        ds, _gen + _cached, len(involved_nodes), _gen, _cached,
+                        time.time() - _t0))
                 current_ds = ds
             # cap precomputed at scenario validation (see the key-space
             # preview block); always injected — the client's BENCH_KEY_COUNT
@@ -3291,6 +3325,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+                log("launched {} dual clients".format(len(plan["clients"])))
                 # barriers: every client registered BOTH roles, then trigger
                 if not dry:
                     t0 = time.time()
@@ -3342,6 +3377,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             cluster, _items, "/shutdown"):
                         if not _ok:
                             log("[WARN] {} shutdown: {}".format(_what, _err))
+                    _w_t0, _w_exited = time.time(), 0
                     for c, pid in writer_pids:
                         if not dry and pid:
                             exited = wait_process_exit(
@@ -3350,12 +3386,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                 60, dry_run=dry, expected_s=60,
                                 marker=_PIPELINE_PID_MARKER)
                             if exited:
+                                _w_exited += 1
                                 _check_exitrc(
                                     cluster, c["node"],
                                     "{}.dual_{}_c{}_p{}.writer.log.exitrc".format(
                                         base_noext, c["node"], c["id"],
                                         c["port"]),
                                     "dual c{}".format(c["id"]))
+                    if not dry:
+                        log("clients exited: {}/{} ({:.1f}s)".format(
+                            _w_exited, len(writer_pids), time.time() - _w_t0))
                     _groups = []
                     for c in plan["clients"]:
                         _groups.append((get_node(cluster, c["node"]),
@@ -3365,6 +3405,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                             base_noext, c["node"], c["id"], c["port"])],
                                         "dual c{}".format(c["id"])))
                     _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+                    log("logs: {} files / {} pods pulled".format(
+                        sum(len(f) for _n, f, _l in _groups), len(_groups)))
             else:
                 # Step 1: start all readers (one process per reader). Each reader
                 # binds its HTTP /notify server and SELF-REGISTERS into etcd
@@ -3410,6 +3452,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+                log("launched {} readers".format(len(plan["readers"])))
                 # Step 2: etcd barrier — wait for the FULL reader pool to
                 # self-register before any writer starts (readers that fail to
                 # boot surface here as a timeout with the missing list)
@@ -3467,6 +3510,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+                log("launched {} writers".format(len(plan["writers"])))
                 # Step 4: etcd barrier — every writer registered (= reader list
                 # pulled from etcd + HTTP /start server bound), then TRIGGER the
                 # run: POST /start to each writer (k8s: direct pod IP; ssh:
@@ -3498,6 +3542,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # Step 5: wait for all writers to finish (warmup + measured run)
                 warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
                 duration = float(cfg.get("duration", 30))
+                _wt0, _wex = time.time(), 0
                 for w, pid in writer_pids:
                     if not dry and pid:
                         exited = wait_process_exit(
@@ -3507,17 +3552,23 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             expected_s=warmup_duration + duration,
                             marker=_PIPELINE_PID_MARKER)
                         if exited:
+                            _wex += 1
                             _check_exitrc(
                                 cluster, w["node"],
                                 "{}.writer_{}_w{}.log.exitrc".format(
                                     base_noext, w["node"], w["gid"]),
                                 "writer w{}".format(w["gid"]))
+                if not dry:
+                    log("writers exited: {}/{} ({:.1f}s)".format(
+                        _wex, len(writer_pids), time.time() - _wt0))
                 _groups = [(get_node(cluster, w["node"]),
                             ["{}.writer_{}_w{}.log".format(
                                 base_noext, w["node"], w["gid"])],
                             "writer w{}".format(w["gid"]))
                            for w in plan["writers"]]
                 _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+                log("logs: {} files / {} pods pulled".format(
+                    sum(len(f) for _n, f, _l in _groups), len(_groups)))
                 # Step 6: shutdown readers via their /shutdown endpoint (k8s:
                 # direct pod IP; ssh: loopback curl on the reader's node) and
                 # wait for their final logs
@@ -3531,6 +3582,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         cluster, _items, "/shutdown", dry=dry):
                     if not _ok:
                         log("[WARN] {} shutdown: {}".format(_what, _err))
+                _rt0, _rex = time.time(), 0
                 for r, pid in reader_pids:
                     if not dry and pid:
                         exited = wait_process_exit(
@@ -3539,18 +3591,24 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             60, dry_run=dry, expected_s=60,
                             marker=_PIPELINE_PID_MARKER)
                         if exited:
+                            _rex += 1
                             _check_exitrc(
                                 cluster, r["node"],
                                 "{}.reader_{}_r{}_p{}.log.exitrc".format(
                                     base_noext, r["node"], r["index"],
                                     r["port"]),
                                 "reader r{}".format(r["index"]))
+                if not dry:
+                    log("readers exited: {}/{} ({:.1f}s)".format(
+                        _rex, len(reader_pids), time.time() - _rt0))
                 _groups = [(get_node(cluster, r["node"]),
                             ["{}.reader_{}_r{}_p{}.log".format(
                                 base_noext, r["node"], r["index"], r["port"])],
                             "reader r{}".format(r["index"]))
                            for r in plan["readers"]]
                 _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+                log("logs: {} files / {} pods pulled".format(
+                    sum(len(f) for _n, f, _l in _groups), len(_groups)))
             # Step 7: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
@@ -4539,7 +4597,12 @@ def main(args, cfg_paths):
         n += 1
     if not args.dry_run:
         os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
+        # full-detail log: every per-command/per-pod line goes here; the
+        # console (WebUI) keeps the summary + verbose adds detail to it
+        set_detail_log(os.path.join(ts_dir, "benchmark.log"))
+        atexit.register(close_detail_log)
         log("results root: {}".format(ts_dir))
+        log("full log: {}".format(os.path.join(ts_dir, "benchmark.log")))
     if args.mode == "k8s":
         k8s_workspace_dirs(cluster, dry_run=args.dry_run)
         k8s_prerun(cluster, dry_run=args.dry_run)
