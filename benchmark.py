@@ -1848,6 +1848,50 @@ def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
     return str(out).strip() == "200"
 
 
+_PIPELINE_PARALLEL = 8
+
+
+def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False):
+    """POST to many pipeline endpoints with bounded concurrency (default 8).
+
+    The ssh transport keeps ONE cached connection per node and opens one
+    channel per command, so parallel calls are safe; a failed call drops the
+    shared connection (transport behaviour), which would poison sibling
+    calls — each failed item therefore gets ONE reconnect retry.
+
+    items: [(node_entry, port, pid, what)]. /start items must return HTTP
+    200; /shutdown items count a dead-skip as success. Returns
+    [(what, ok, err)] in item order."""
+    if dry or not items:
+        return [(what, True, "") for _n, _p, _pid, what in items]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run(item):
+        node_entry, port, pid, what = item
+        err = ""
+        for _attempt in (0, 1):
+            try:
+                if path == "/shutdown":
+                    _pipeline_shutdown(cluster, node_entry, port, pid, what)
+                    return what, True, ""
+                ok = _pipeline_http_call(node_entry, port, path,
+                                         timeout=timeout, dry=dry)
+                if ok:
+                    return what, True, ""
+                err = "non-200"
+            except Exception as exc:
+                err = str(exc)
+            try:
+                _ssh_drop(node_entry)   # reconnect before the retry
+            except Exception:
+                pass
+        return what, False, err
+
+    workers = max(1, min(_PIPELINE_PARALLEL, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_run, items))
+
+
 def _pipeline_shutdown(cluster, node_entry, port, pid, what):
     """Send /shutdown to a pipeline process, but SKIP the probe when the
     process is already dead. At 32-client scale every dead client cost a
@@ -3127,15 +3171,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         "({:.1f}s)".format(len(plan["clients"]),
                                            len(plan["clients"]),
                                            time.time() - t0))
-                    for c in plan["clients"]:
-                        cn = get_node(cluster, c["node"])
-                        if not _pipeline_http_call(cn, c["port"], "/start"):
-                            raise RuntimeError(
-                                "pipeline trigger failed: dual c{} /start at "
-                                "{} p{} returned non-200".format(
-                                    c["id"], cn["ip"], c["port"]))
-                    log("pipeline trigger: /start sent to {} dual clients"
-                        "".format(len(plan["clients"])))
+                    _items = [(get_node(cluster, c["node"]), c["port"], "",
+                               "dual c{}".format(c["id"]))
+                              for c in plan["clients"]]
+                    _res = _pipeline_http_parallel(cluster, _items, "/start")
+                    _fail = [r for r in _res if not r[1]]
+                    if _fail:
+                        raise RuntimeError(
+                            "pipeline trigger failed for {}/{} clients: {} "
+                            "({})".format(len(_fail), len(_items),
+                                          _fail[0][0], _fail[0][2]))
+                    log("pipeline trigger: /start sent to {} dual clients "
+                        "(parallel x{})".format(
+                            len(_items), min(_PIPELINE_PARALLEL,
+                                             len(_items))))
                     # writers run INSIDE the clients: after the expected
                     # window (+grace) shut the reader side down so every
                     # client flushes both summaries and exits
@@ -3150,16 +3199,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         time.sleep(min(1.0, expected_s - (time.time() - t0)))
                     _pid_by_obj = {id(e): (pid or "").strip()
                                    for e, pid in writer_pids}
-                    for c in plan["clients"]:
-                        cn = get_node(cluster, c["node"])
-                        try:
-                            _pipeline_shutdown(
-                                cluster, cn, c["port"],
-                                _pid_by_obj.get(id(c), ""),
-                                "dual c{}".format(c["id"]))
-                        except Exception as exc:
-                            log("[WARN] dual c{} shutdown: {}".format(
-                                c["id"], exc))
+                    _items = [(get_node(cluster, c["node"]), c["port"],
+                               _pid_by_obj.get(id(c), ""),
+                               "dual c{}".format(c["id"]))
+                              for c in plan["clients"]]
+                    for _what, _ok, _err in _pipeline_http_parallel(
+                            cluster, _items, "/shutdown"):
+                        if not _ok:
+                            log("[WARN] {} shutdown: {}".format(_what, _err))
                     for c, pid in writer_pids:
                         if not dry and pid:
                             exited = wait_process_exit(
@@ -3298,15 +3345,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
                         "".format(len(plan["writers"]), len(plan["writers"]),
                                   time.time() - t0))
-                    for w in plan["writers"]:
-                        wn = get_node(cluster, w["node"])
-                        if not _pipeline_http_call(wn, w["port"], "/start"):
-                            raise RuntimeError(
-                                "pipeline trigger failed: writer w{} /start at "
-                                "{} p{} returned non-200".format(
-                                    w["gid"], wn["ip"], w["port"]))
-                    log("pipeline trigger: /start sent to {} writers".format(
-                        len(plan["writers"])))
+                    _items = [(get_node(cluster, w["node"]), w["port"], "",
+                               "writer w{}".format(w["gid"]))
+                              for w in plan["writers"]]
+                    _res = _pipeline_http_parallel(cluster, _items, "/start")
+                    _fail = [r for r in _res if not r[1]]
+                    if _fail:
+                        raise RuntimeError(
+                            "pipeline trigger failed for {}/{} writers: {} "
+                            "({})".format(len(_fail), len(_items),
+                                          _fail[0][0], _fail[0][2]))
+                    log("pipeline trigger: /start sent to {} writers "
+                        "(parallel x{})".format(
+                            len(_items), min(_PIPELINE_PARALLEL,
+                                             len(_items))))
                 # Step 5: wait for all writers to finish (warmup + measured run)
                 warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
                 duration = float(cfg.get("duration", 30))
@@ -3335,17 +3387,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # wait for their final logs
                 _pid_by_obj = {id(e): (pid or "").strip()
                                for e, pid in reader_pids}
-                for r in plan["readers"]:
-                    rn = get_node(cluster, r["node"])
-                    if not dry:
-                        try:
-                            _pipeline_shutdown(
-                                cluster, rn, r["port"],
-                                _pid_by_obj.get(id(r), ""),
-                                "reader r{}".format(r["index"]))
-                        except Exception as exc:
-                            log("[WARN] reader r{} shutdown: {}".format(
-                                r["index"], exc))
+                _items = [(get_node(cluster, r["node"]), r["port"],
+                           _pid_by_obj.get(id(r), ""),
+                           "reader r{}".format(r["index"]))
+                          for r in plan["readers"]]
+                for _what, _ok, _err in _pipeline_http_parallel(
+                        cluster, _items, "/shutdown", dry=dry):
+                    if not _ok:
+                        log("[WARN] {} shutdown: {}".format(_what, _err))
                 for r, pid in reader_pids:
                     if not dry and pid:
                         exited = wait_process_exit(
