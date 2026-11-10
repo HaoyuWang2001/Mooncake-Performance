@@ -99,15 +99,73 @@ html, body, #app { height: 100%; margin: 0; }
   margin: 2px 0 4px;
 }
 .runbox .rb-clean-hint b { color: var(--el-color-danger); }
+.runbox .rb-btn-row { gap: 8px; }
+.runbox .rb-btn-row .spacer { flex: 1; }
+.runbox .rb-run-hint {
+  font-size: 12px; color: var(--el-color-danger); margin: 2px 0 6px;
+  line-height: 1.4;
+}
 
-/* 运行框：已选配置（目录/文件分开展示，过滤合并后） */
+/* 当前 RUN：两行表格（超宽省略 + title 悬浮） */
+.cur-run {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px; margin-bottom: 10px;
+}
+.cr-row {
+  display: flex; align-items: center; gap: 18px;
+  padding: 7px 12px; min-width: 0;
+}
+.cr-row + .cr-row { border-top: 1px solid var(--el-border-color-lighter); }
+.cr-item { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cr-grow { flex: 1 1 0; }
+.cr-w-status { flex: 0 0 130px; }
+.cr-w-elapsed { flex: 0 0 90px; }
+.cr-w-rc { flex: 0 0 70px; }
+.cr-k {
+  flex: 0 0 auto; white-space: nowrap;
+  color: var(--el-text-color-secondary); font-size: 12px;
+}
+.cr-v {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 12.5px;
+}
+.cr-v.mono { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; }
+
+/* 日志工具栏 + 固定高度 + 搜索高亮 */
+.log-toolbar {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+}
+.log-toolbar .spacer { flex: 1; }
+.log-match-count {
+  min-width: 44px; text-align: right; font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.logview.log-fixed { height: 480px; min-height: 480px; }
+.logview.log-nowrap { white-space: pre; word-break: normal; }
+.logview .ln-mark {
+  background: var(--el-color-warning-light-5);
+  color: var(--el-color-warning-dark-2);
+  border-radius: 2px;
+}
+.logview .ln-cur-match { background: var(--el-color-warning-light-8); }
+
+/* 运行框：已选配置（目录/文件上下堆叠，过滤合并后） */
 .runbox .rb-selected {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  margin: 4px 0 8px; padding: 8px 10px;
+  display: grid; grid-template-columns: 1fr; gap: 6px;
+  margin: 2px 0 8px; padding: 8px 10px;
   border: 1px solid var(--el-border-color-light);
   border-radius: 8px; background: var(--el-fill-color-lighter);
-  max-height: 160px; overflow-y: auto;
+  max-height: 180px; overflow-y: auto;
 }
+.runbox .rb-sel-head {
+  display: flex; align-items: center; gap: 8px; padding: 5px 0 0;
+}
+.runbox .rb-sel-head .rb-label { margin-right: 2px; }
+.runbox .rb-image {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--el-text-color-regular);
+}
+.runbox .rb-label-inline { width: auto; margin-left: 12px; }
 .runbox .rb-sel-col { min-width: 0; }
 .runbox .rb-sel-title {
   font-size: 12.5px; font-weight: 600; color: var(--el-text-color-secondary);

@@ -118,21 +118,6 @@ const PerfView = {
           <el-radio-button value="ssh">真机</el-radio-button>
           <el-radio-button value="k8s">k8s</el-radio-button>
         </el-radio-group>
-        <el-button size="small" @click="cfgDialog = true">配置选择</el-button>
-        <el-button size="small" @click="clearSel">清空</el-button>
-      </div>
-      <div class="rb-selected">
-        <div class="rb-sel-col">
-          <div class="rb-sel-title">目录 <span class="rb-sel-count">{{ selected.dirs.length }}</span></div>
-          <div v-if="!selected.dirs.length" class="rb-sel-empty">—</div>
-          <div v-for="d in selected.dirs" :key="d" class="rb-sel-path" :title="d">{{ d }}</div>
-        </div>
-        <div class="rb-sel-col">
-          <div class="rb-sel-title">文件 <span class="rb-sel-count">{{ selected.files.length }}</span></div>
-          <div v-if="!selected.files.length" class="rb-sel-empty">—</div>
-          <div v-for="f in selected.files" :key="f" class="rb-sel-path" :title="f">{{ f }}</div>
-        </div>
-        <div class="rb-sel-note">目录先执行、文件后执行；已被目录收编的文件不重复列出</div>
       </div>
       <div class="rb-row">
         <span class="rb-label">cluster</span>
@@ -156,7 +141,25 @@ const PerfView = {
       </div>
       <div v-if="mode === 'k8s'" class="rb-row" style="margin-top: 2px">
         <span class="rb-label">image</span>
-        <span :title="clusterImage" style="font-family: monospace; color: #606266">{{ clusterImage || "-" }}</span>
+        <span :title="clusterImage" class="rb-image">{{ clusterImage || "-" }}</span>
+      </div>
+      <div class="rb-sel-head">
+        <span class="rb-label">配置选择</span>
+        <el-button size="small" @click="cfgDialog = true">选择配置</el-button>
+        <el-button size="small" @click="clearSel">清空</el-button>
+      </div>
+      <div class="rb-selected">
+        <div class="rb-sel-col">
+          <div class="rb-sel-title">目录 <span class="rb-sel-count">{{ selected.dirs.length }}</span></div>
+          <div v-if="!selected.dirs.length" class="rb-sel-empty">—</div>
+          <div v-for="d in selected.dirs" :key="d" class="rb-sel-path" :title="d">{{ d }}</div>
+        </div>
+        <div class="rb-sel-col">
+          <div class="rb-sel-title">文件 <span class="rb-sel-count">{{ selected.files.length }}</span></div>
+          <div v-if="!selected.files.length" class="rb-sel-empty">—</div>
+          <div v-for="f in selected.files" :key="f" class="rb-sel-path" :title="f">{{ f }}</div>
+        </div>
+        <div class="rb-sel-note">目录先执行、文件后执行；已被目录收编的文件不重复列出</div>
       </div>
       <div class="rb-row">
         <span class="rb-label">选项</span>
@@ -164,25 +167,29 @@ const PerfView = {
         <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
         <el-checkbox v-model="flags.noPlot">no-plot</el-checkbox>
         <el-checkbox v-model="flags.verbose" title="详细日志：上传路径、逐文件拉取、kubectl 命令、pod 详情">verbose</el-checkbox>
-        <el-select v-model="flags.protocol" size="small" style="width: 110px; margin-left: 12px">
-          <el-option label="(协议=配置值)" value=""></el-option>
+        <span class="rb-label rb-label-inline">协议</span>
+        <el-select v-model="flags.protocol" size="small" style="width: 130px">
+          <el-option label="配置值" value=""></el-option>
           <el-option label="tcp" value="tcp"></el-option>
           <el-option label="rdma" value="rdma"></el-option>
           <el-option label="ub" value="ub"></el-option>
         </el-select>
       </div>
-      <div class="rb-row">
+      <div class="rb-row rb-btn-row">
         <el-button type="primary" size="default" style="width: 110px" :loading="starting"
-                   :disabled="!hasSelection || busy || cleaning || starting"
+                   :disabled="!!runHint || busy || cleaning || starting"
                    @click="startRun">RUN</el-button>
-        <el-button type="danger" size="default" style="width: 110px" :loading="cleaning"
+        <el-button type="warning" size="default" style="width: 110px"
+                   :loading="stopLoading"
+                   :disabled="meta.status !== 'running' || stopLoading"
+                   @click="stop">{{ stopLoading ? "STOP..." : "STOP" }}</el-button>
+        <span class="spacer"></span>
+        <el-button type="danger" plain size="default" style="width: 110px"
+                   :loading="cleaning"
                    :disabled="busy || cleaning || starting"
                    @click="cleanup">CLEAN-UP</el-button>
-        <el-button type="warning" size="default" style="width: 110px"
-                   :loading="stopping || meta.stopping"
-                   :disabled="meta.status !== 'running' || meta.stopping"
-                   @click="stop">{{ meta.stopping ? "STOP..." : "STOP" }}</el-button>
       </div>
+      <div v-if="runHint" class="rb-run-hint">{{ runHint }}</div>
       <div class="rb-clean-hint">
         <b>危险</b>：clean-up 删除远端残留——k8s：配置的 namespace（pods/configmaps）
         与 controller workspace；SSH：cluster.json 所有节点的 remote_dir；
@@ -202,34 +209,64 @@ const PerfView = {
           <el-button size="small" @click="drawerOpen = true">历史</el-button>
         </div>
       </template>
-      <el-descriptions :column="4" size="small" border style="margin-bottom: 10px">
-        <el-descriptions-item label="id">{{ meta.id || "-" }}</el-descriptions-item>
-        <el-descriptions-item label="状态">
-          <el-tag v-if="meta.stopping && meta.status === 'running'" type="warning" size="small">stopping（清理中）</el-tag>
-          <el-tag v-else-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
-          <span v-else>-</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="耗时">
-          {{ meta.id && meta.elapsed !== undefined ? Math.round(meta.elapsed) + "s" : "-" }}
-        </el-descriptions-item>
-        <el-descriptions-item label="rc">
-          {{ (meta.rc === null || meta.rc === undefined) ? "-" : meta.rc }}
-        </el-descriptions-item>
-        <el-descriptions-item label="命令" :span="3">
-          <span style="font-family: monospace; font-size: 12px">{{ meta.cmd || "-" }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="产物">
-          <span v-if="meta.ts_dir" style="font-family: monospace; font-size: 12px">{{ meta.ts_dir }}</span>
-          <span v-else>-</span>
-        </el-descriptions-item>
-      </el-descriptions>
-      <div class="logview log-lg" ref="logEl" :style="{ height: logH + 'px' }">
-        <div v-for="(ln, i) in logLines" :key="i" :class="ln.cls">{{ ln.text }}</div>
-        <div v-if="!logLines.length && !meta.id" class="hint" style="padding: 40px; text-align: center">
-          尚未运行——配置完成后点击「运行测试」
+      <div class="cur-run">
+        <div class="cr-row">
+          <span class="cr-item cr-grow">
+            <span class="cr-k">id</span>
+            <span class="cr-v mono" :title="meta.id || ''">{{ meta.id || "-" }}</span>
+          </span>
+          <span class="cr-item cr-w-status">
+            <span class="cr-k">状态</span>
+            <span class="cr-v">
+              <el-tag v-if="meta.stopping && meta.status === 'running'" type="warning" size="small">stopping（清理中）</el-tag>
+              <el-tag v-else-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
+              <span v-else>-</span>
+            </span>
+          </span>
+          <span class="cr-item cr-w-elapsed">
+            <span class="cr-k">耗时</span>
+            <span class="cr-v">{{ meta.id && meta.elapsed !== undefined ? Math.round(meta.elapsed) + "s" : "-" }}</span>
+          </span>
+          <span class="cr-item cr-w-rc">
+            <span class="cr-k">rc</span>
+            <span class="cr-v">{{ (meta.rc === null || meta.rc === undefined) ? "-" : meta.rc }}</span>
+          </span>
+        </div>
+        <div class="cr-row">
+          <span class="cr-item cr-grow">
+            <span class="cr-k">命令</span>
+            <span class="cr-v mono" :title="meta.cmd || ''">{{ meta.cmd || "-" }}</span>
+          </span>
+          <span class="cr-item cr-grow">
+            <span class="cr-k">产物</span>
+            <span class="cr-v mono" :title="meta.ts_dir || ''">{{ meta.ts_dir || "-" }}</span>
+          </span>
         </div>
       </div>
-      <drag-handle v-model="logH" :min="200" :max="1600" persist="mcweb-log-h"></drag-handle>
+      <div class="log-toolbar">
+        <el-button size="small" @click="copyLog">复制</el-button>
+        <el-button size="small" :type="logWrap ? 'primary' : ''"
+                   @click="logWrap = !logWrap">自动换行</el-button>
+        <span class="spacer"></span>
+        <el-input v-model="searchQ" size="small" placeholder="搜索日志（高亮+跳转）"
+                  clearable style="width: 230px" @keyup.enter="nextMatch" />
+        <el-button size="small" :disabled="!matchCount" @click="prevMatch">↑</el-button>
+        <el-button size="small" :disabled="!matchCount" @click="nextMatch">↓</el-button>
+        <span v-if="searchQ" class="log-match-count">{{ matchCount ? (matchIdx + 1) + "/" + matchCount : "0/0" }}</span>
+      </div>
+      <div class="logview log-fixed" ref="logEl" :class="{ 'log-nowrap': !logWrap }">
+        <div v-for="(ln, i) in logLines" :key="i"
+             :class="[ln.cls, { 'ln-cur-match': i === curMatchLine }]">
+          <template v-if="searchQ && hasHit(ln.text)">
+            <span v-for="(seg, j) in lineSegs(ln.text)" :key="j"
+                  :class="{ 'ln-mark': seg.hit }">{{ seg.t }}</span>
+          </template>
+          <template v-else>{{ ln.text }}</template>
+        </div>
+        <div v-if="!logLines.length && !meta.id" class="hint" style="padding: 40px; text-align: center">
+          尚未运行——配置完成后点击 RUN
+        </div>
+      </div>
     </el-card>
 
     <!-- 配置选择弹窗 -->
@@ -412,7 +449,10 @@ const PerfView = {
     const logRem = Vue.ref("");
     const logEof = Vue.ref(true);
     const logEl = Vue.ref(null);
-    const logH = Vue.ref(loadHeight("mcweb-log-h", 460));
+    // 日志高度固定（禁止拖动）：不再使用 loadHeight/drag-handle
+    const logWrap = Vue.ref(true);        // 自动换行（默认开，与既有 pre-wrap 一致）
+    const searchQ = Vue.ref("");          // 日志搜索词
+    const matchIdx = Vue.ref(0);          // 当前命中序号
     const runs = Vue.ref([]);
     const stopping = Vue.ref(false);
     const drawerOpen = Vue.ref(false);
@@ -424,6 +464,20 @@ const PerfView = {
       const sch = store.status.scheduler;
       return !!(sch && ["executing", "stopping"].includes(sch.state));
     });
+
+    // RUN 阻塞原因（小字提示问题点）；busy 类状态不提示
+    const runHint = Vue.computed(() => {
+      if (busy.value || starting.value || cleaning.value) return "";
+      if (!hasSelection.value) return "未选择配置：先打开「选择配置」勾选文件或目录";
+      if (!flags.cluster) return "未选择 cluster 配置";
+      if (!flags.global) return "未选择 global 配置";
+      if (!flags.profile) return "未选择 profile 配置";
+      return "";
+    });
+    // STOP 的 loading/文案只在「仍在运行且停止中」时生效——后端 run.stopping
+    // 在完成时不重置，若直接绑定会永远停在 STOP...（本次修复点）
+    const stopLoading = Vue.computed(() =>
+      stopping.value || (!!meta.value.stopping && meta.value.status === "running"));
 
     const viewingHistory = Vue.computed(() =>
       !!(currentId.value && meta.value.id && meta.value.id !== currentId.value));
@@ -451,6 +505,80 @@ const PerfView = {
       if (wasBottom) Vue.nextTick(() => {
         if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
       });
+    }
+
+    // ---- 日志搜索/复制（命中行高亮 + 跳转）----
+    const matchLines = Vue.computed(() => {
+      const q = searchQ.value.trim().toLowerCase();
+      if (!q) return [];
+      const hits = [];
+      logLines.value.forEach((ln, i) => {
+        if (ln.text.toLowerCase().includes(q)) hits.push(i);
+      });
+      return hits;
+    });
+    const matchCount = Vue.computed(() => matchLines.value.length);
+    const curMatchLine = Vue.computed(() =>
+      matchCount.value ? matchLines.value[matchIdx.value % matchCount.value] : -1);
+
+    function hasHit(text) {
+      const q = searchQ.value.trim().toLowerCase();
+      return !!q && text.toLowerCase().includes(q);
+    }
+    function lineSegs(text) {
+      const q = searchQ.value.trim();
+      if (!q) return [{ t: text, hit: false }];
+      const lower = text.toLowerCase(), lq = q.toLowerCase();
+      const out = [];
+      let pos = 0;
+      for (;;) {
+        const at = lower.indexOf(lq, pos);
+        if (at < 0) {
+          if (pos < text.length) out.push({ t: text.slice(pos), hit: false });
+          break;
+        }
+        if (at > pos) out.push({ t: text.slice(pos, at), hit: false });
+        out.push({ t: text.slice(at, at + q.length), hit: true });
+        pos = at + q.length;
+      }
+      return out.length ? out : [{ t: text, hit: false }];
+    }
+    function scrollToCurMatch() {
+      Vue.nextTick(() => {
+        const el = logEl.value, idx = curMatchLine.value;
+        if (!el || idx < 0 || !el.children[idx]) return;
+        el.children[idx].scrollIntoView({ block: "center" });
+      });
+    }
+    function nextMatch() {
+      if (!matchCount.value) return;
+      matchIdx.value = (matchIdx.value + 1) % matchCount.value;
+      scrollToCurMatch();
+    }
+    function prevMatch() {
+      if (!matchCount.value) return;
+      matchIdx.value = (matchIdx.value - 1 + matchCount.value) % matchCount.value;
+      scrollToCurMatch();
+    }
+    Vue.watch(searchQ, () => { matchIdx.value = 0; scrollToCurMatch(); });
+    async function copyLog() {
+      const text = logLines.value.map(l => l.text).join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        ElementPlus.ElMessage.success("日志已复制");
+      } catch (e) {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          ElementPlus.ElMessage.success("日志已复制");
+        } catch (e2) {
+          ElementPlus.ElMessage.error("复制失败: " + e2.message);
+        }
+      }
     }
 
     function viewRun(id, live) {
@@ -555,7 +683,9 @@ const PerfView = {
 
     return { mode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
              flags, warnings, starting, cleaning, busy, clusterImage, clearSel, startRun, cleanup,
-             meta, logLines, logEl, logH, runs, stopping, drawerOpen, viewingHistory,
-             statusType, stop, gotoResults, onHistoryClick };
+             meta, logLines, logEl, runs, stopping, drawerOpen, viewingHistory,
+             statusType, stop, gotoResults, onHistoryClick,
+             runHint, stopLoading, logWrap, searchQ, matchCount, matchIdx, curMatchLine,
+             hasHit, lineSegs, nextMatch, prevMatch, copyLog };
   },
 };
