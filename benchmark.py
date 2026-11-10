@@ -1516,8 +1516,14 @@ def _wait_suffix(t0, expected_s):
 
 
 def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
-                      expected_s=None):
-    """Poll `kill -0 PID` until the remote process exits or times out.
+                      expected_s=None, marker=None):
+    """Poll the remote process until it exits or times out.
+
+    marker: when given, `kill -0` alone is not trusted — a container's pid
+    namespace recycles freed pids almost immediately (the polling execs
+    themselves can grab them), so ALIVE additionally requires the pid's
+    cmdline to contain the marker. The probe string is shell-split ("" concat)
+    so the checker never matches its own /proc cmdline.
 
     Logs ONE 'running...' line at start (with the expected duration and ETA
     wall time when expected_s is given) and one result line at the end
@@ -1525,10 +1531,16 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
     n = get_node(cluster, node_name)
     t0 = time.time()
     log("{} (pid {}) running...{}".format(what, pid, _wait_suffix(t0, expected_s)))
+    if marker:
+        poll_cmd = ("kill -0 {pid} 2>/dev/null && "
+                    "tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null | "
+                    "grep -qF {m} && echo ALIVE || echo DEAD").format(
+                        pid=pid, m=_marker_probe(marker))
+    else:
+        poll_cmd = "kill -0 {pid} 2>/dev/null && echo ALIVE || echo DEAD".format(pid=pid)
     for _ in range(int(timeout_s)):
         alive = ssh_check_output(
-            n["ip"], n,
-            "kill -0 {} 2>/dev/null && echo ALIVE || echo DEAD".format(pid),
+            n["ip"], n, poll_cmd,
             dry_run=dry_run, quiet=True)
         if alive != "ALIVE":
             log("{} exited after {} ({:.0f}s)".format(
@@ -1630,6 +1642,35 @@ def _etcd_delete_prefix(cluster, endpoints, prefix, timeout=5):
     return bench_etcd.kv_delete_prefix(endpoints, prefix, timeout)
 
 
+# runner-script marker for pid liveness probes. Embedded in shell commands
+# SPLIT ("" concatenation) so the probing process's own /proc cmdline can
+# never match itself when a container's pid namespace recycles the freed pid.
+_PIPELINE_PID_MARKER = "run_benchmark_pipeline.sh"
+
+
+def _marker_probe(marker):
+    return marker[:len(marker) // 2] + '""' + marker[len(marker) // 2:]
+
+
+def _check_exitrc(cluster, node_name, exitrc_path, what):
+    """Read back the runner's exit-code file ($LOG.exitrc, written by
+    run_benchmark_pipeline.sh after the client exits). A background client
+    that died with an error must FAIL the scenario — otherwise the run
+    reports OK with truncated/garbage metrics (store exhaustion killed
+    every client mid-measurement exactly this way)."""
+    if not exitrc_path:
+        return
+    n = get_node(cluster, node_name)
+    out = ssh_check_output(
+        n["ip"], n, "cat {} 2>/dev/null || true".format(exitrc_path),
+        quiet=True)
+    rc = out.strip()
+    if rc and rc != "0":
+        raise RuntimeError(
+            "{} exited with rc={} (client error — see {} in the pulled "
+            "logs)".format(what, rc, os.path.basename(exitrc_path)))
+
+
 def _pipeline_wipe_etcd(cluster, globals_cfg):
     """Best-effort wipe of the whole mcbench/ rendezvous tree (single active
     benchmark per cluster assumption). No-op when etcd is unconfigured."""
@@ -1709,7 +1750,8 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
         if pid:
             try:
                 wait_process_exit(cluster, r["node"], pid,
-                                  _pipeline_entry_label(r), 30)
+                                  _pipeline_entry_label(r), 30,
+                                  marker=_PIPELINE_PID_MARKER)
             except Exception:
                 pass
     # 3. kill any still-alive writers/readers
@@ -1955,10 +1997,13 @@ def reap_state_entries(cluster):
             removed.append(e)  # already gone -> just drop the stale row
             continue
         try:
+            # marker probe is shell-split ("" concat): the reap poll's own
+            # /proc cmdline must never match itself on a recycled pid
+            _m = e.get("marker") or "mooncake_benchmark_client"
             marker = ssh_check_output(
                 ip, node,
                 "tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null | grep -cF {m} || true".format(
-                    pid=pid, m=shlex.quote(e.get("marker") or "mooncake_benchmark_client")),
+                    pid=pid, m=_marker_probe(_m)),
                 quiet=True)
         except Exception:
             marker = "0"
@@ -2795,8 +2840,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     # writers run INSIDE the clients: after the expected
                     # window (+grace) shut the reader side down so every
                     # client flushes both summaries and exits
-                    expected_s = float(cfg.get("warmup", {}).get("duration", 0) or 0) \
-                        + float(cfg.get("duration", 30)) + 10.0
+                    warmup_s = (float(cfg.get("warmup", {}).get("duration", 0) or 0)
+                                if warmup == "true" else 0.0)
+                    expected_s = warmup_s + float(cfg.get("duration", 30)) + 10.0
                     log("pipeline dual: waiting {:.0f}s for writer phases, "
                         "then /shutdown".format(expected_s))
                     t0 = time.time()
@@ -2812,9 +2858,18 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                 c["id"], exc))
                     for c, pid in writer_pids:
                         if not dry and pid:
-                            wait_process_exit(cluster, c["node"], pid,
-                                              "dual c{}".format(c["id"]),
-                                              60, dry_run=dry, expected_s=60)
+                            exited = wait_process_exit(
+                                cluster, c["node"], pid,
+                                "dual c{}".format(c["id"]),
+                                60, dry_run=dry, expected_s=60,
+                                marker=_PIPELINE_PID_MARKER)
+                            if exited:
+                                _check_exitrc(
+                                    cluster, c["node"],
+                                    "{}.dual_{}_c{}_p{}.log.exitrc".format(
+                                        base_noext, c["node"], c["id"],
+                                        c["port"]),
+                                    "dual c{}".format(c["id"]))
                     for c in plan["clients"]:
                         cn = get_node(cluster, c["node"])
                         pull_stage_logs(cn["ip"], cn,
@@ -2952,10 +3007,18 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 duration = float(cfg.get("duration", 30))
                 for w, pid in writer_pids:
                     if not dry and pid:
-                        wait_process_exit(cluster, w["node"], pid,
-                                          "writer w{}".format(w["gid"]),
-                                          int(warmup_duration + duration) + 300, dry_run=dry,
-                                          expected_s=warmup_duration + duration)
+                        exited = wait_process_exit(
+                            cluster, w["node"], pid,
+                            "writer w{}".format(w["gid"]),
+                            int(warmup_duration + duration) + 300, dry_run=dry,
+                            expected_s=warmup_duration + duration,
+                            marker=_PIPELINE_PID_MARKER)
+                        if exited:
+                            _check_exitrc(
+                                cluster, w["node"],
+                                "{}.writer_{}_w{}.log.exitrc".format(
+                                    base_noext, w["node"], w["gid"]),
+                                "writer w{}".format(w["gid"]))
                 for w in plan["writers"]:
                     wn = get_node(cluster, w["node"])
                     pull_stage_logs(wn["ip"], wn,
@@ -2975,9 +3038,18 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                 r["index"], exc))
                 for r, pid in reader_pids:
                     if not dry and pid:
-                        wait_process_exit(cluster, r["node"], pid,
-                                          "reader r{} (port {})".format(r["index"], r["port"]),
-                                          60, dry_run=dry, expected_s=60)
+                        exited = wait_process_exit(
+                            cluster, r["node"], pid,
+                            "reader r{} (port {})".format(r["index"], r["port"]),
+                            60, dry_run=dry, expected_s=60,
+                            marker=_PIPELINE_PID_MARKER)
+                        if exited:
+                            _check_exitrc(
+                                cluster, r["node"],
+                                "{}.reader_{}_r{}_p{}.log.exitrc".format(
+                                    base_noext, r["node"], r["index"],
+                                    r["port"]),
+                                "reader r{}".format(r["index"]))
                 for r in plan["readers"]:
                     rn = get_node(cluster, r["node"])
                     pull_stage_logs(rn["ip"], rn,
@@ -4012,8 +4084,9 @@ def main(args, cfg_paths):
                     [sys.executable, plot_script, "--log", log_dir],
                     check=False)
                 if proc.returncode != 0:
-                    log("[WARN] auto-plot failed (rc={}); figures skipped. "
-                        "Is matplotlib installed? (pip install matplotlib)".format(
+                    log("[WARN] auto-plot failed (rc={}); figures skipped — "
+                        "see the traceback above (plotter crash). If "
+                        "matplotlib is missing: pip install matplotlib".format(
                             proc.returncode))
             except Exception as exc:
                 log("[WARN] auto-plot failed: {}".format(exc))

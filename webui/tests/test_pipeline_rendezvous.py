@@ -270,3 +270,83 @@ def test_pipeline_http_call_always_loops_back_via_node(monkeypatch):
     monkeypatch.setattr(bm, "ssh_check_output",
                         lambda ip, node, cmd, dry_run=False, quiet=False: "503")
     assert bm._pipeline_http_call(ssh_node, 9201, "/shutdown") is False
+
+
+def test_marker_probe_shell_split():
+    """The pid-liveness marker probe must be shell-split so the probing
+    process's own /proc cmdline never matches itself on a recycled pid."""
+    probe = bm._marker_probe("run_benchmark_pipeline.sh")
+    assert '""' in probe
+    # bash concatenates the "" away -> same fixed string for grep -F
+    assert probe.replace('""', "") == "run_benchmark_pipeline.sh"
+
+
+def test_wait_process_exit_marker_poll_cmd(monkeypatch):
+    captured = {}
+
+    def fake_ssh(ip, node, cmd, dry_run=False, quiet=False):
+        captured["cmd"] = cmd
+        return "DEAD"
+
+    monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
+    cluster = {"nodes": {"n1": {"ip": "10.0.0.1"}}}
+    ok = bm.wait_process_exit(cluster, "n1", "59", "dual c1", 2,
+                              marker=bm._PIPELINE_PID_MARKER)
+    assert ok is True
+    assert "/proc/59/cmdline" in captured["cmd"]
+    assert '""' in captured["cmd"], "marker must be split to avoid self-match"
+    assert captured["cmd"].count("run_benchmark_pipeline.sh") == 0, (
+        "raw marker must not appear (only the split form)")
+    # without marker: plain kill -0 poll
+    bm.wait_process_exit(cluster, "n1", "59", "x", 2)
+    assert "/proc/" not in captured["cmd"]
+
+
+def test_check_exitrc(monkeypatch):
+    def mk(ret):
+        def fake_ssh(ip, node, cmd, dry_run=False, quiet=False):
+            return ret
+        return fake_ssh
+    cluster = {"nodes": {"n1": {"ip": "10.0.0.1"}}}
+    monkeypatch.setattr(bm, "ssh_check_output", mk("0"))
+    bm._check_exitrc(cluster, "n1", "/tmp/x.log.exitrc", "dual c0")  # ok
+    monkeypatch.setattr(bm, "ssh_check_output", mk(""))
+    bm._check_exitrc(cluster, "n1", "/tmp/x.log.exitrc", "dual c0")  # no file
+    monkeypatch.setattr(bm, "ssh_check_output", mk("1"))
+    try:
+        bm._check_exitrc(cluster, "n1", "/tmp/x.log.exitrc", "dual c0")
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "rc=1" in str(exc) and "x.log.exitrc" in str(exc)
+
+
+def test_parse_result_file_dual_mixed_log(tmp_path):
+    """Dual logs mix writer (no qw field) and reader (qw field) RESULT rows:
+    qws is a SUBSEQUENCE of lats and must carry its own time axis."""
+    pytest.importorskip("matplotlib")
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "plot_latency",
+        os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))),
+            "scripts", "plot_latency.py"))
+    pl = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(pl)
+    lines = []
+    # 3 writer rows (7 fields with ts) + 2 reader rows (8 fields with qw)
+    for i in range(3):
+        lines.append("RESULT\t10:00:0{}.000000\tpipeline_write\tk{}\t"
+                     "0.5\tOK\t1".format(i, i))
+    lines.append("RESULT\t10:00:03.000000\tpipeline_read\tk0\t0.7\tOK\t0.9\t1")
+    lines.append("RESULT\t10:00:04.000000\tpipeline_read\tk1\t0.8\tOK\t0.4\t1")
+    lines.append("RESULT\t10:00:05.000000\tpipeline_write\tk9\t0.6\tERR:-200\t1")
+    f = tmp_path / "dual.log"
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    lats, qws, times, counts, qw_times = pl.parse_result_file(str(f))
+    assert len(lats) == 5 and len(times) == 5          # OK rows only (3w+2r)
+    assert len(qws) == 2 and len(qw_times) == 2        # reader rows only
+    assert qw_times == sorted(qw_times)
+    assert counts.get("ERR:-200") == 1
+    # the queue-wait pair is internally consistent (the old bug passed the
+    # 4-element times with the 2-element qws -> np.interp crash)
+    assert len(qw_times) == len(qws)

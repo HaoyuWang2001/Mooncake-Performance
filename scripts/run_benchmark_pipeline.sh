@@ -62,4 +62,9 @@ print_client_env "mode=$MODE"
 MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
 "$PYTHON" "$CLIENT" --mode "$MODE" "$@" \
   > "$LOG_FILE" 2>&1
-exit "$?"
+rc=$?
+# exit-code ledger: the orchestrator reads $LOG_FILE.exitrc after waiting
+# for a backgrounded client — a non-zero rc must FAIL the scenario instead
+# of silently reporting OK with truncated metrics
+echo "$rc" > "$LOG_FILE.exitrc"
+exit "$rc"

@@ -66,7 +66,7 @@ def parse_result_file(path):
     in seconds-since-midnight (midnight wraparound folded forward), or None
     when the log predates timestamps. status_counts maps status -> line count.
     """
-    lats, qws, times, counts = [], [], [], {}
+    lats, qws, times, counts, qw_times = [], [], [], {}, []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.startswith("RESULT\t"):
@@ -91,15 +91,20 @@ def parse_result_file(path):
             if len(parts) > 6 + off and op == "pipeline_read":
                 try:
                     qws.append(float(parts[5 + off]))
+                    if off:
+                        qw_times.append(ts_to_seconds(parts[1]))
                 except ValueError:
                     pass
     if lats and times and len(times) != len(lats):
         times = None  # 混合行（部分带 ts）不可靠 → 回退 index 轴
+    if qws and qw_times and len(qw_times) != len(qws):
+        qw_times = None
     if times:
         # 多线程 flush 序非严格单调：按时间排序；跨午夜回绕折叠为单调
         order = sorted(range(len(lats)), key=lambda i: times[i])
         lats = [lats[i] for i in order]
         if qws and len(qws) == len(lats):
+            # 纯 reader 日志：行集相同，沿用同一排序
             qws = [qws[i] for i in order]
         folded = []
         prev = None
@@ -111,7 +116,22 @@ def parse_result_file(path):
         times = folded
     else:
         times = None
-    return lats, qws, times, counts
+    # queue-wait 独立时间轴：dual 日志把 writer（无 qw 字段）与 reader
+    # （带 qw）行混在一个文件里，qws 是 lats 的子序列——必须按 reader
+    # 行自身的时间排序，不能借用全量 times（长度错配曾使次轴
+    # np.interp 直接崩溃）
+    if qw_times:
+        qorder = sorted(range(len(qws)), key=lambda i: qw_times[i])
+        qws = [qws[i] for i in qorder]
+        qfolded = []
+        prev = None
+        for t in (qw_times[i] for i in qorder):
+            if prev is not None and t < prev:
+                t += 86400
+            qfolded.append(t)
+            prev = t
+        qw_times = qfolded
+    return lats, qws, times, counts, qw_times
 
 
 def _fmt_hms(seconds, base):
@@ -127,6 +147,10 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
     times: wall-clock seconds per sample (None -> request#i axis). When
     include_outliers is False the sample list must already be trimmed.
     """
+    if times and len(times) != len(vals):
+        # defensive: a mismatched time axis would misalign every sample
+        # (and crash the request#i secondary axis) -> fall back to index
+        times = None
     n = len(vals)
     fig, ax = plt.subplots(figsize=(12, 6))
     if times:
@@ -221,7 +245,7 @@ def _trim_times(times, vals, threshold):
 
 
 def process_file(path, args):
-    lats, qws, times, counts = parse_result_file(path)
+    lats, qws, times, counts, qw_times = parse_result_file(path)
     out_dir = args.out or os.path.dirname(os.path.abspath(path))
     stem = os.path.splitext(os.path.basename(path))[0]
     status_note = "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "no RESULT"
@@ -243,10 +267,12 @@ def process_file(path, args):
         _emit_plots(stem, "latency", lats, times, out_dir, threshold,
                     f"{len(lats)} OK samples")
     if qws and args.type in ("both", "queue-wait"):
-        # queue_wait 阈值独立按自身分布计算，避免被时延离群值牵连
+        # queue_wait 阈值独立按自身分布计算，避免被时延离群值牵连；
+        # 时间轴用 qw 自己的 reader 行时间（dual 混合日志下与全量
+        # times 长度不同）
         qw_threshold = threshold if args.outlier else \
             max(round(percentile(sorted(qws), 0.99) * 10), 1)
-        _emit_plots(stem, "queue-wait", qws, times, out_dir, qw_threshold,
+        _emit_plots(stem, "queue-wait", qws, qw_times, out_dir, qw_threshold,
                     f"{len(qws)} samples")
 
 
