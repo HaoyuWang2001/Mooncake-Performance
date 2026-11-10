@@ -519,8 +519,10 @@ def run_ssh(host, node, command, dry_run=False):
                                ["-n", node["_ns"], "exec", node["_pod"],
                                 "--", "bash", "-c", command])
         if rc != 0:
-            raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
-                rc, node["_pod"], command))
+            raise RuntimeError(
+                "kubectl exec failed (rc={}) on {}: {}\n"
+                "  (command output was streamed live above this error)"
+                "".format(rc, node["_pod"], command))
         return
     log("[ssh] {} : {}".format(host, command))
     if dry_run:
@@ -528,8 +530,10 @@ def run_ssh(host, node, command, dry_run=False):
         return
     _, rc = _ssh_exec(node, command, relay=True)
     if rc != 0:
-        raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
-            rc, host, command))
+        raise RuntimeError(
+            "ssh command failed (rc={}) on {}: {}\n"
+            "  (command output was streamed live above this error)"
+            "".format(rc, host, command))
 
 
 def ssh_check_output(host, node, command, dry_run=False, quiet=False):
@@ -543,8 +547,10 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
                                  ["-n", node["_ns"], "exec", node["_pod"],
                                   "--", "bash", "-c", command], check=False)
         if rc != 0:
-            raise RuntimeError("kubectl exec failed (rc={}) on {}: {}".format(
-                rc, node["_pod"], command))
+            raise RuntimeError(
+                "kubectl exec failed (rc={}) on {}: {}\n  output: {}".format(
+                    rc, node["_pod"], command,
+                    out.strip()[-400:] or "<empty>"))
         return out.strip()
     if not quiet:
         log("[ssh] {} : {}".format(host, command))
@@ -553,8 +559,9 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
         return ""
     out, rc = _ssh_exec(node, command)
     if rc != 0:
-        raise RuntimeError("ssh command failed (rc={}) on {}: {}".format(
-            rc, host, command))
+        raise RuntimeError(
+            "ssh command failed (rc={}) on {}: {}\n  output: {}".format(
+                rc, host, command, out.strip()[-400:] or "<empty>"))
     return out.strip()
 
 
