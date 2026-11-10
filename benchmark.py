@@ -1530,7 +1530,9 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
     (exited / timeout); per-poll ssh commands are not logged."""
     n = get_node(cluster, node_name)
     t0 = time.time()
-    log("{} (pid {}) running...{}".format(what, pid, _wait_suffix(t0, expected_s)))
+    where = ("pod {}".format(n["_pod"]) if is_k8s_node(n) else node_name)
+    log("{} ({}, pid {}) running...{}".format(
+        what, where, pid, _wait_suffix(t0, expected_s)))
     if marker:
         poll_cmd = ("kill -0 {pid} 2>/dev/null && "
                     "tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null | "
@@ -1547,8 +1549,11 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
                 what, format_duration(time.time() - t0), time.time() - t0))
             return True
         time.sleep(1)
-    log("[WARN] {} (pid {}) still running after {} ({}s timeout)".format(
-        what, pid, format_duration(timeout_s), timeout_s))
+    log("[WARN] {} ({}, pid {}) still running after {} ({}s timeout)".format(
+        what, where, pid, format_duration(timeout_s), timeout_s))
+    if is_k8s_node(n):
+        _log_pod_state(cluster, node_name, "wait timeout {}s".format(
+            int(timeout_s)))
     return False
 
 
@@ -1652,7 +1657,7 @@ def _marker_probe(marker):
     return marker[:len(marker) // 2] + '""' + marker[len(marker) // 2:]
 
 
-def _check_exitrc(cluster, node_name, exitrc_path, what):
+def _check_exitrc(cluster, node_name, exitrc_path, what, pod_name=None):
     """Read back the runner's exit-code file ($LOG.exitrc, written by
     run_benchmark_pipeline.sh after the client exits). A background client
     that died with an error must FAIL the scenario — otherwise the run
@@ -1666,6 +1671,8 @@ def _check_exitrc(cluster, node_name, exitrc_path, what):
         quiet=True)
     rc = out.strip()
     if rc and rc != "0":
+        _log_pod_state(cluster, pod_name or node_name,
+                       "client exited rc={}".format(rc))
         raise RuntimeError(
             "{} exited with rc={} (client error — see {} in the pulled "
             "logs)".format(what, rc, os.path.basename(exitrc_path)))
@@ -1739,6 +1746,8 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
     log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
     # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
     for r in plan["readers"]:
+        if "node" not in r:
+            continue  # deployment never materialized the pod entries
         try:
             rn = get_node(cluster, r["node"])
             _pipeline_http_call(rn, r["port"], "/shutdown")
@@ -2306,6 +2315,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 # pod was Ready; the benchmark command failed -> keep pod and
                 # namespace for troubleshooting (STOP / --clean-up tears down)
                 cluster["_k8s_keep_ns"] = True
+                _k8s_scene_dump(cluster)
                 _k8s_debug_hints(cluster, involved_nodes, cfg_name)
             else:
                 cleanup_pods(cluster, involved_nodes, dry)
@@ -3230,6 +3240,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # pods were Ready (or rolled out); keep Deployments + pods +
                 # namespace for troubleshooting (STOP / --clean-up tears down)
                 cluster["_k8s_keep_ns"] = True
+                _k8s_scene_dump(cluster)
                 _k8s_debug_hints(cluster, involved_nodes, cfg_name)
             else:
                 cleanup_pods(cluster, involved_nodes, dry)
@@ -3247,6 +3258,54 @@ def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
     ensure_k8s_pod (one per config); k8s pipeline pods live in per-role
     Deployments created inside run_pipeline_scenario."""
     return
+
+
+def _k8s_scene_dump(cluster):
+    """Best-effort: dump the WHOLE namespace state into the orchestrator log
+    on any k8s scenario failure — pod list and events are what diagnostics
+    are read from downstream (the log is what gets shared for analysis)."""
+    c = cluster.get("_controller")
+    if c is None:
+        return
+    try:
+        ns = k8s_settings(cluster)["namespace"]
+        view = " ".join(kubectl_prefix(
+            {"_ctx": c.get("_ctx", ""), "_ns": ns}))
+        log("[k8s] scene: {} get pods -o wide".format(view))
+        out, rc = controller_run(c, ["-n", ns, "get", "pods", "-o", "wide"],
+                                 check=False)
+        if rc == 0 and out.strip():
+            log("[k8s] scene pods:\n{}".format(out.strip()))
+        log("[k8s] scene: {} get events --sort-by=.lastTimestamp".format(view))
+        events = _k8s_all_events(c, ns)
+        if events:
+            log("[k8s] scene events (tail):\n{}".format("\n".join(events)))
+    except Exception as exc:
+        log("[WARN] k8s scene dump failed: {}".format(exc))
+
+
+def _log_pod_state(cluster, node_name, why):
+    """Best-effort pod describe tail when a k8s client dies or times out
+    (container restarts / OOMKilled / Last State live only there)."""
+    c = cluster.get("_controller")
+    if c is None:
+        return
+    try:
+        n = get_node(cluster, node_name)
+    except Exception:
+        return
+    if not is_k8s_node(n):
+        return
+    try:
+        ns = n.get("_ns") or k8s_settings(cluster)["namespace"]
+        out, rc = controller_run(
+            c, ["-n", ns, "describe", "pod", n["_pod"]], check=False)
+        if rc == 0 and out.strip():
+            lines = out.strip().splitlines()
+            log("[k8s] pod {} state ({}; tail):\n{}".format(
+                n["_pod"], why, "\n".join(lines[-25:])))
+    except Exception:
+        pass
 
 
 def _k8s_debug_hints(cluster, involved_nodes, cfg_name):
