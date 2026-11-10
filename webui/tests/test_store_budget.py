@@ -52,12 +52,24 @@ def test_pipeline_key_budget_formula():
     # 20GB store, 4 writers, 8MB data: int(20GiB*0.9) // (8MiB*4) = 576
     assert bm._pipeline_key_budget({"store_total_size": "20GB"},
                                    4, 8 << 20, 1, "8MB") == 576
-    # auto-discovered total works the same way
+    # probed (B) alone works the same way
     assert bm._pipeline_key_budget({"_store_total_auto": 20 * 1024 ** 3},
                                    4, 8 << 20, 1, "8MB") == 576
     # 20GB / 32 writers / 8MB = 72 (the 16-node rank_smoke shape)
     assert bm._pipeline_key_budget({"store_total_size": "20GB"},
                                    32, 8 << 20, 1, "8MB") == 72
+    # min rule: A=20GB + B=100GB -> cap from 20GB
+    assert bm._pipeline_key_budget(
+        {"store_total_size": "20GB", "_store_total_auto": 100 * 1024 ** 3},
+        4, 8 << 20, 1, "8MB") == 576
+    # min rule: A=100GB + B=20GB -> cap from B (20GB)
+    assert bm._pipeline_key_budget(
+        {"store_total_size": "100GB", "_store_total_auto": 20 * 1024 ** 3},
+        4, 8 << 20, 1, "8MB") == 576
+    # min rule: A=10GB + B=20GB -> cap from 10GB (part of the cluster)
+    assert bm._pipeline_key_budget(
+        {"store_total_size": "10GB", "_store_total_auto": 20 * 1024 ** 3},
+        4, 8 << 20, 1, "8MB") == 288
 
 
 def test_pipeline_key_budget_too_small():
@@ -95,14 +107,27 @@ def test_master_metrics_url():
         "http://m:17702/metrics"
 
 
-def test_store_total_precedence():
-    # explicit wins over auto
-    g = {"store_total_size": "5GB", "_store_total_auto": 999 * 1024 ** 3}
-    assert bm._store_total_bytes(g) == 5 * 1024 ** 3
-    # auto used when unset
-    g = {"_store_total_auto": 20 * 1024 ** 3}
-    assert bm._store_total_bytes(g) == 20 * 1024 ** 3
-    # nothing -> None (infinite)
+def test_store_capacity_resolution_min_rule():
+    """A=configured, B=probed: effective = min(A, B); single source stands;
+    neither -> None. Source labels drive the startup log line."""
+    # A only
+    a, b, eff, src = bm._store_capacity_resolution({"store_total_size": "5GB"})
+    assert (a, b, eff, src) == (5 * 1024 ** 3, None, 5 * 1024 ** 3,
+                                "configured")
+    # B only
+    a, b, eff, src = bm._store_capacity_resolution(
+        {"_store_total_auto": 20 * 1024 ** 3})
+    assert (a, b, eff, src) == (None, 20 * 1024 ** 3, 20 * 1024 ** 3, "probed")
+    # both: A < B -> A   ("use part of the cluster")
+    a, b, eff, src = bm._store_capacity_resolution(
+        {"store_total_size": "5GB", "_store_total_auto": 20 * 1024 ** 3})
+    assert eff == 5 * 1024 ** 3 and src == "min(configured,probed)"
+    # both: A > B -> B   ("use the whole cluster capacity, capped by reality")
+    a, b, eff, src = bm._store_capacity_resolution(
+        {"store_total_size": "50GB", "_store_total_auto": 20 * 1024 ** 3})
+    assert eff == 20 * 1024 ** 3 and src == "min(configured,probed)"
+    # neither
+    assert bm._store_capacity_resolution({}) == (None, None, None, "none")
     assert bm._store_total_bytes({}) is None
 
 
@@ -114,9 +139,9 @@ def test_discover_store_capacity_auto(monkeypatch):
     total = bm.discover_store_capacity(None, g)
     assert total == 21474836480
     assert g["_store_total_auto"] == 21474836480
-    # budget now uses the auto value
+    # budget now uses the probed value
     assert bm._pipeline_key_budget(g, 4, 8 << 20, 1, "8MB") == 576
-    # explicit config still wins after discovery
+    # small configured budget caps the probed capacity (min rule)
     g["store_total_size"] = "1GB"
     assert bm._store_total_bytes(g) == 1024 ** 3
 

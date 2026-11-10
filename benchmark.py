@@ -317,17 +317,43 @@ def discover_store_capacity(cluster, globals_cfg):
     return int(total)
 
 
-def _store_total_bytes(globals_cfg):
-    """Store total size for the key-space budget: explicit store_total_size
-    wins; otherwise the auto-discovered master-metrics total; otherwise None
-    (infinite store, legacy unconstrained behaviour)."""
+def _fmt_gib(n):
+    """Human byte size for logs (None -> '<unset>')."""
+    if n is None:
+        return "<unset>"
+    return "{:.2f} GiB".format(n / 1024.0 ** 3)
+
+
+def _store_capacity_resolution(globals_cfg):
+    """Resolve the store capacity used for key-space budgets.
+
+    A = global.json store_total_size (operator's allowed budget)
+    B = probed master-metrics total (segment_total_capacity_bytes)
+
+    effective = min(A, B) when both are known — A>B means "use the whole
+    cluster capacity", A<B means "only use part of it"; a single source
+    stands alone; None when neither is available (pipeline then FAILs).
+
+    Returns (a_bytes, b_bytes, effective_bytes, source_label)."""
+    a = None
     v = globals_cfg.get("store_total_size")
     if v not in (None, "", 0):
-        return parse_size_bytes(v)
-    auto = globals_cfg.get("_store_total_auto")
-    if auto:
-        return int(auto)
-    return None
+        a = parse_size_bytes(v)
+    b = globals_cfg.get("_store_total_auto")
+    b = int(b) if b else None
+    if a is not None and b is not None:
+        return a, b, min(a, b), "min(configured,probed)"
+    if a is not None:
+        return a, b, a, "configured"
+    if b is not None:
+        return a, b, b, "probed"
+    return None, None, None, "none"
+
+
+def _store_total_bytes(globals_cfg):
+    """Effective store capacity for key-space budgets (min rule; None when
+    unknown)."""
+    return _store_capacity_resolution(globals_cfg)[2]
 
 
 def _basic_store_check(globals_cfg, cfg):
@@ -363,13 +389,13 @@ def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, batch_size,
     writable amount cannot be derived and an unbounded run would exhaust
     the store (observed: hidden 1000-key default -> 250GB attempted).
     """
-    store = _store_total_bytes(globals_cfg)
+    store = _store_total_bytes(globals_cfg)   # effective (min rule)
     if store is None:
         raise RuntimeError(
             "pipeline requires the store capacity to size the write key "
-            "space: set global.json 'store_total_size' (e.g. \"20GB\") or "
-            "configure master_metrics_url/master_metrics_port for "
-            "auto-discovery")
+            "space: set global.json 'store_total_size' (e.g. \"20GB\") "
+            "and/or make the master metrics reachable via "
+            "master_metrics_url/master_metrics_port")
     usable = int(store * 0.9)
     per = usable // (ds_bytes * writer_count) if ds_bytes and writer_count else 0
     if per < max(1, int(batch_size or 1)):
@@ -2926,6 +2952,27 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         os.makedirs(local_log_dir, exist_ok=True)
     log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
         cfg_name, op, topology, cfg["protocol"], host))
+    # ---- key-space budget, resolved BEFORE any cluster resource is touched
+    # (configmap/deployment/staging): a missing store source or a too-small
+    # store fails in seconds with zero leftovers. One cap per sweep size.
+    sizes = data_size_list(cfg)
+    _a, _b, _eff, _src = _store_capacity_resolution(globals_cfg)
+    _caps = {}
+    for _ds in sizes:
+        _caps[_ds] = _pipeline_key_budget(
+            globals_cfg, len(plan["writers"]), parse_data_size(_ds),
+            int(cfg.get("batch_size", 1) or 1), _ds)
+    cfg["_key_space"] = {str(_ds): _kc for _ds, _kc in _caps.items()}
+    log("pipeline key space (store source={}, configured={}, probed={}, "
+        "effective={}):".format(_src, _fmt_gib(_a), _fmt_gib(_b),
+                                _fmt_gib(_eff)))
+    for _ds in sizes:
+        _kc = _caps[_ds]
+        log("    {}: {} writers x {} keys = {} (of {} effective, "
+            "0.9 headroom)".format(
+                _ds, len(plan["writers"]), _kc,
+                _fmt_gib(len(plan["writers"]) * _kc * parse_data_size(_ds)),
+                _fmt_gib(_eff)))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     scenario_params.update({
         "BENCH_WRITER_COUNT": str(len(plan["writers"])),
@@ -3053,7 +3100,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     numa_topo[node_name] = {0: "0"}
                     numactl_ok[node_name] = False
                 numa_counter[node_name] = 0
-        sizes = data_size_list(cfg)
         warmup = "false" if args.no_warmup else "true"
         reader_threads = plan["reader_threads"]
         log("scenario {} (pipeline, {}): N={}, writers={}, readers={}, "
@@ -3079,24 +3125,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   extra="--data-size {}".format(ds), dry_run=dry,
                                   pull_to=local_log_dir, node_name=node_name)
                 current_ds = ds
-            # key-space budget against store_total_size: explicit key_count
-            # is validated strictly; an unset key_count gets an auto
-            # per-writer cap (writers wrap inside it with untimed
-            # delete-before-write, so put samples stay real writes)
-            kc = _pipeline_key_budget(
-                globals_cfg, len(plan["writers"]), parse_data_size(ds),
-                int(cfg.get("batch_size", 1) or 1), ds)
-            # always inject the derived cap (never 0) — the client's
-            # BENCH_KEY_COUNT env default (1000) must never decide the space
+            # cap precomputed at scenario validation (see the key-space
+            # preview block); always injected — the client's BENCH_KEY_COUNT
+            # env default (1000) must never decide the write space
+            kc = _caps[ds]
             kc_arg = " --key-count {}".format(kc)
-            cfg.setdefault("_key_space", {})[str(ds)] = kc
-            _src = ("manual" if globals_cfg.get("store_total_size")
-                    not in (None, "", 0) else "auto-metrics")
-            log("pipeline key space (store source={}): {} writers x {} keys "
-                "x {} = {}B of store {}B (0.9 headroom)".format(
-                    _src, len(plan["writers"]), kc, ds,
-                    len(plan["writers"]) * kc * parse_data_size(ds),
-                    _store_total_bytes(globals_cfg)))
             run_stage(host, node, remote_runner,
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
@@ -4347,13 +4380,17 @@ def main(args, cfg_paths):
             log("[WARN] k8s controller info: {}".format(exc))
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
-    # store capacity: auto-discover from the master metrics when
-    # store_total_size is not set manually (explicit config always wins)
-    if globals_cfg.get("store_total_size") in (None, "", 0):
-        try:
-            discover_store_capacity(cluster, globals_cfg)
-        except Exception as exc:
-            log("[WARN] store capacity auto-discovery: {}".format(exc))
+    # store capacity: ALWAYS probe the master metrics (B) — even when
+    # store_total_size (A) is set — so the effective capacity can follow the
+    # min(A, B) rule. Probe failure only WARNs (A still stands).
+    try:
+        discover_store_capacity(cluster, globals_cfg)
+    except Exception as exc:
+        log("[WARN] store capacity auto-discovery: {}".format(exc))
+    _a, _b, _eff, _src = _store_capacity_resolution(globals_cfg)
+    log("[benchmark] store capacity: configured={}, probed={}, "
+        "effective={} ({})".format(
+            _fmt_gib(_a), _fmt_gib(_b), _fmt_gib(_eff), _src))
     # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
     # run prefix is also wiped per scenario/size; this covers the rest)
     try:
