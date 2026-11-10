@@ -53,9 +53,14 @@ client 进程 = 1 writer + 1 reader（单端口四 endpoint）；notify 抽样�
 （进 CSV `store_count` 列，store 由外部部署）。qps 为单节点语义：每 client =
 节点速率 / cpn。
 
-**key 空间**：smoke 用例不设 `key_count`——当 global.json 配置了 `store_total_size`
-时由编排器自动计算 per-writer 上限 `floor(store × 0.9 / data_size / writers)` 并
-注入（写满回绕，先删后写）；未配置 store_total_size 则不约束（长跑注意 -200）。
+**key 空间**：smoke 用例不设 `key_count`——store 总量默认**自动从 master metrics 发现**
+（`segment_total_capacity_bytes`；也可在 global.json 显式 `store_total_size` 覆盖，失败回退
+无限），由编排器自动计算 per-writer 上限 `floor(store × 0.9 / data_size / writers)` 并
+注入（写满回绕，先删后写）。
+
+**日志分离**：dual client 的 writer/reader 输出写入两个日志
+（`*.dual_<node>_c<id>_p<port>.writer.log` / `.reader.log`），CSV 与 latency/queue-wait
+绘图按角色分开，不再混在一起。
 
 ## writer 块
 
