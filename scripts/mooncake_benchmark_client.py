@@ -1539,9 +1539,17 @@ def _pipeline_reader(args, store):
 
 # --------------------------------------------------------------------------
 
-def _emit_reader_summary(args, results, num_threads, meas_duration):
+def _emit_reader_summary(args, results, num_threads, meas_duration, out=None):
     """Flush the reader-side SUMMARY + RESULT rows (shared by the pure
-    reader process and the dual-role client)."""
+    reader process and the dual-role client).
+
+    out: optional writable stream. The dual-role client writes reader output
+    to a SEPARATE log (MC_READER_LOG) so writer and reader samples never
+    share a file — logs and latency/queue-wait plots stay role-separated."""
+    def _w(text):
+        stream = out if out is not None else sys.stdout
+        stream.write(text)
+        stream.flush()
     data_size = parse_size(args.data_size)
     # split off warmup items: processed (store reads warmed up) but not
     # part of the measured metrics; counts are key-based (r[5] = key_count)
@@ -1581,11 +1589,13 @@ def _emit_reader_summary(args, results, num_threads, meas_duration):
         "max_depth": _PipelineNotifyHandler.qmax,
         "data_size": data_size,
     }
-    emit("SUMMARY", summary)
+    if out is not None:
+        _w("SUMMARY\t{}\n".format(json.dumps(summary)))
+    else:
+        emit("SUMMARY", summary)
     for opname, k, lat, status, qw, kc, ts in measured:
-        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\t{:.6f}\t{}\n".format(
+        _w("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\t{:.6f}\t{}\n".format(
             ts, opname, k, lat, status, qw, kc))
-    sys.stdout.flush()
 
 
 def _pipeline_dual(args, store):
@@ -1710,7 +1720,22 @@ def _pipeline_dual(args, store):
     log("pipeline dual client done (reader items={})".format(len(results)))
     if rctx is not None:
         rctx.teardown(store)
-    _emit_reader_summary(args, results, num_threads, meas_duration)
+    # reader output → its own log (writer rows stay on stdout / main log)
+    reader_log = (os.environ.get("MC_READER_LOG") or "").strip()
+    out_stream = None
+    if reader_log:
+        try:
+            out_stream = open(reader_log, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            log("[WARN] cannot open MC_READER_LOG {}; reader output -> stdout"
+                "".format(reader_log))
+            out_stream = None
+    try:
+        _emit_reader_summary(args, results, num_threads, meas_duration,
+                             out=out_stream)
+    finally:
+        if out_stream is not None:
+            out_stream.close()
     if writer_error:
         raise SystemExit("[ERROR] dual {}: writer phase failed: {}"
                          "".format(my_id, writer_error[0]))

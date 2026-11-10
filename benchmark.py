@@ -3033,7 +3033,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # fail-path (graceful /shutdown + kill + pull) just works ----
                 for c in plan["clients"]:
                     rn = get_node(cluster, c["node"])
-                    merged_log = "{}.dual_{}_c{}_p{}.log".format(
+                    # writer and reader output NEVER share a file: logs and
+                    # per-role latency/queue-wait plots stay separated
+                    merged_log = "{}.dual_{}_c{}_p{}.writer.log".format(
+                        base_noext, c["node"], c["id"], c["port"])
+                    reader_log = "{}.dual_{}_c{}_p{}.reader.log".format(
                         base_noext, c["node"], c["id"], c["port"])
                     nohup_log = merged_log.replace(".log", ".nohup")
                     numa_arg = ""
@@ -3049,13 +3053,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         numa_arg = "--cpu-bind {}".format(cl)
                         if numactl_ok.get(c["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                    ccmd = ("nohup {}bash {} pipeline {} --client-id {} --role both "
-                            "--listen-port {} --writer-operation {} --reader-operation {} "
-                            "--num-threads {} --warmup {} --timeout 300{} {} > {} 2>&1 "
-                            "& echo $!").format(
-                        launch_prefix, remote_runner, merged_log, c["id"], c["port"],
-                        writer_op, reader_op, reader_threads, warmup, kc_arg,
-                        numa_arg, nohup_log)
+                    ccmd = ("MC_READER_LOG={rlog} nohup {p}bash {runner} pipeline "
+                            "{log} --client-id {cid} --role both --listen-port {port} "
+                            "--writer-operation {wop} --reader-operation {rop} "
+                            "--num-threads {thr} --warmup {wu} --timeout 300{kc}{na} "
+                            "> {nohup} 2>&1 & echo $!").format(
+                        rlog=reader_log, p=launch_prefix, runner=remote_runner,
+                        log=merged_log, cid=c["id"], port=c["port"],
+                        wop=writer_op, rop=reader_op, thr=reader_threads,
+                        wu=warmup, kc=kc_arg, na=numa_arg, nohup=nohup_log)
                     pid = ssh_check_output(rn["ip"], rn, ccmd, dry_run=dry)
                     reader_pids.append((c, pid))
                     writer_pids.append((c, pid))
@@ -3120,16 +3126,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             if exited:
                                 _check_exitrc(
                                     cluster, c["node"],
-                                    "{}.dual_{}_c{}_p{}.log.exitrc".format(
+                                    "{}.dual_{}_c{}_p{}.writer.log.exitrc".format(
                                         base_noext, c["node"], c["id"],
                                         c["port"]),
                                     "dual c{}".format(c["id"]))
                     for c in plan["clients"]:
                         cn = get_node(cluster, c["node"])
                         pull_stage_logs(cn["ip"], cn,
-                                        ["{}.dual_{}_c{}_p{}.log".format(
-                                            base_noext, c["node"], c["id"],
-                                            c["port"])],
+                                        ["{}.dual_{}_c{}_p{}.writer.log".format(
+                                            base_noext, c["node"], c["id"], c["port"]),
+                                         "{}.dual_{}_c{}_p{}.reader.log".format(
+                                            base_noext, c["node"], c["id"], c["port"])],
                                         local_log_dir, dry)
             else:
                 # Step 1: start all readers (one process per reader). Each reader
@@ -3321,7 +3328,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         for c in plan["clients"]:
                             if c["node"] == node_name:
                                 nohup_files.append(
-                                    "{}.dual_{}_c{}_p{}.nohup".format(
+                                    "{}.dual_{}_c{}_p{}.writer.nohup".format(
                                         base_noext, c["node"], c["id"], c["port"]))
                     else:
                         for r in plan["readers"]:
@@ -3789,18 +3796,26 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 if not m:
                     continue
                 reader_files[int(m.group(2))] = (m.group(1), p)
-            # dual-role logs: ONE file per client carries BOTH the writer
-            # and the reader rows (role split by op filter)
-            dual_files = {}   # id -> (nodename, path)
+            # dual-role logs: writer and reader output are SEPARATE files
+            # (*.writer.log / *.reader.log); legacy mixed logs (single
+            # *.log) still parse — role split by op filter
+            dual_writer_files = {}   # id -> (nodename, path)
+            dual_reader_files = {}   # id -> (nodename, path)
             for p in sorted(glob.glob(os.path.join(
                     local_log_dir, "{}.{}.dual_*.log".format(name, run_name)))):
                 base = os.path.basename(p)
                 if ".ylt." in base:
                     continue
-                m = re.search(r"\.dual_(.+)_c(\d+)_p(\d+)\.log$", base)
-                if not m:
+                m = re.search(r"\.dual_(.+)_c(\d+)_p(\d+)\.(writer|reader)\.log$",
+                              base)
+                if m:
+                    target = (dual_reader_files if m.group(4) == "reader"
+                              else dual_writer_files)
+                    target[int(m.group(2))] = (m.group(1), p)
                     continue
-                dual_files[int(m.group(2))] = (m.group(1), p)
+                m = re.search(r"\.dual_(.+)_c(\d+)_p(\d+)\.log$", base)
+                if m:
+                    dual_writer_files[int(m.group(2))] = (m.group(1), p)
             for gid in sorted(writer_files):
                 nodename, f = writer_files[gid]
                 agg = parse_benchmark_log(f, op_filter="pipeline_write")
@@ -3836,34 +3851,39 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                                  (f for _n, f in reader_files.values()),
                                  "pipeline_read", ds_bytes))
                 rows.append(row)
-            # dual-role rows: writer metrics + reader metrics per client log
-            for cid in sorted(dual_files):
-                nodename, f = dual_files[cid]
+            # dual-role rows: writer metrics from the writer log, reader
+            # metrics from the reader log (legacy mixed logs fall back)
+            for cid in sorted(dual_writer_files):
+                nodename, f = dual_writer_files[cid]
                 agg = parse_benchmark_log(f, op_filter="pipeline_write")
                 row = base_row("writer", "c{}".format(cid), nodename, ds)
                 metrics_into(row, agg, ds_bytes)
                 rows.append(row)
+            for cid in sorted(dual_reader_files or dual_writer_files):
+                nodename, f = (dual_reader_files.get(cid)
+                               or dual_writer_files[cid])
                 agg = parse_benchmark_log(f, op_filter="pipeline_read")
                 row = base_row("reader", "c{}".format(cid), nodename, ds)
                 metrics_into(row, agg, ds_bytes, with_queue=True)
                 rows.append(row)
-            if dual_files:
+            if dual_writer_files:
                 agg = parse_benchmark_log(
-                    [f for _n, f in dual_files.values()],
+                    [f for _n, f in dual_writer_files.values()],
                     op_filter="pipeline_write")
                 row = base_row("writer", "TOTAL", "", ds)
                 metrics_into(row, agg, ds_bytes,
                              throughput_mb=busy_throughput_mb(
-                                 (f for _n, f in dual_files.values()),
+                                 (f for _n, f in dual_writer_files.values()),
                                  "pipeline_write", ds_bytes))
                 rows.append(row)
+                reader_src = dual_reader_files or dual_writer_files
                 agg = parse_benchmark_log(
-                    [f for _n, f in dual_files.values()],
+                    [f for _n, f in reader_src.values()],
                     op_filter="pipeline_read")
                 row = base_row("reader", "TOTAL", "", ds)
                 metrics_into(row, agg, ds_bytes, with_queue=True,
                              throughput_mb=busy_throughput_mb(
-                                 (f for _n, f in dual_files.values()),
+                                 (f for _n, f in reader_src.values()),
                                  "pipeline_read", ds_bytes))
                 rows.append(row)
     else:
