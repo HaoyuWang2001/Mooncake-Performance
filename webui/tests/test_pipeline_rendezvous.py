@@ -350,3 +350,113 @@ def test_parse_result_file_dual_mixed_log(tmp_path):
     # the queue-wait pair is internally consistent (the old bug passed the
     # 4-element times with the 2-element qws -> np.interp crash)
     assert len(qw_times) == len(qws)
+
+
+def test_wait_k8s_deployment_ready_success(monkeypatch):
+    c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
+         "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
+                 "controller_workspace": "/cw", "pod_workspace": "/pw"}}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "availableReplicas" in a:
+            return "4", 0
+        if "spec.replicas" in a:
+            return "4", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    bm.wait_k8s_deployment_ready(c, "d", "run1", timeout=5, poll=0)
+
+
+def test_wait_k8s_deployment_ready_fails_fast_on_pod_fatal(monkeypatch):
+    c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
+         "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
+                 "controller_workspace": "/cw", "pod_workspace": "/pw"}}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "availableReplicas" in a:
+            return "2", 0
+        if "spec.replicas" in a:
+            return "4", 0
+        if a.startswith("-n mc-test get pods"):
+            return "mc-p0 Running Error waiting\\nmc-p1 Pending \\n", 0
+        if "get events" in a:
+            return "10s Warning FailedScheduling pod/mc-p1 0/2 nodes available", 0
+        if "describe" in a:
+            return "Name: d", 0
+        return "", 0
+
+    diag = {"n": 0}
+    monkeypatch.setattr(bm, "controller_run", fake)
+    monkeypatch.setattr(bm, "_k8s_deployment_diag",
+                        lambda *a, **k: diag.__setitem__("n", diag["n"] + 1))
+    start = __import__("time").time()
+    try:
+        bm.wait_k8s_deployment_ready(c, "d", "run1", timeout=60, poll=0)
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "failed to start" in str(exc)
+        assert "Error" in str(exc) or "FailedScheduling" in str(exc)
+    assert __import__("time").time() - start < 5, "must fail fast, not wait 60s"
+    assert diag["n"] == 1, "evidence dump must run exactly once"
+
+
+def test_wait_k8s_deployment_ready_fails_fast_on_events_only(monkeypatch):
+    c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
+         "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
+                 "controller_workspace": "/cw", "pod_workspace": "/pw"}}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "availableReplicas" in a:
+            return "0", 0
+        if "spec.replicas" in a:
+            return "1", 0
+        if a.startswith("-n mc-test get pods"):
+            return "mc-p0 Pending \\n", 0
+        if "get events" in a:
+            return "1s Warning ErrImageNeverPull pod/mc-p0 image never pulled", 0
+        if "describe" in a:
+            return "Name: d", 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    monkeypatch.setattr(bm, "_k8s_deployment_diag", lambda *a, **k: None)
+    try:
+        bm.wait_k8s_deployment_ready(c, "d", "run1", timeout=60, poll=0)
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "ErrImageNeverPull" in str(exc)
+
+
+def test_wait_k8s_deployment_ready_timeout_dumps_evidence(monkeypatch):
+    c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
+         "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
+                 "controller_workspace": "/cw", "pod_workspace": "/pw"}}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "availableReplicas" in a:
+            return "2", 0
+        if "spec.replicas" in a:
+            return "4", 0
+        if "get events" in a:
+            return "REASON MESSAGE", 0
+        if a.startswith("-n mc-test get pods"):
+            return "mc-p0 Running \\n", 0
+        if "describe" in a:
+            return "Name: d", 0
+        return "", 0
+
+    diag = {"n": 0}
+    monkeypatch.setattr(bm, "controller_run", fake)
+    monkeypatch.setattr(bm, "_k8s_deployment_diag",
+                        lambda *a, **k: diag.__setitem__("n", diag["n"] + 1))
+    try:
+        bm.wait_k8s_deployment_ready(c, "d", "run1", timeout=0, poll=0)
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "not ready in 0s" in str(exc) and "2/4" in str(exc)
+    assert diag["n"] == 1

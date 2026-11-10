@@ -2370,6 +2370,114 @@ def _render_deployment_yaml(cluster, ts, cfg_name, role, replicas):
     return deploy, run_label, text
 
 
+# Deployment rollout budget. Kept at 60s (user decision); fatal pod states
+# are detected within ~3s by the fast-fail poll below, so the timeout is
+# only a backstop for slow-but-healthy clusters.
+_K8S_DEPLOYMENT_TIMEOUT_S = 60
+
+
+def _k8s_all_events(controller, ns, limit=40):
+    """Namespace events (tail), sorted by time — includes pod-level reasons
+    (FailedScheduling / ErrImageNeverPull / CreateContainerError) that the
+    deployment describe never shows."""
+    out, rc = controller_run(
+        controller, ["-n", ns, "get", "events",
+                     "--sort-by=.lastTimestamp"], check=False)
+    if rc != 0 or not out.strip():
+        return []
+    lines = [ln.rstrip() for ln in out.strip().splitlines() if ln.strip()]
+    return lines[-limit:]
+
+
+def _k8s_fatal_event_lines(events):
+    """Free-text event lines carrying a fatal reason."""
+    return [ln for ln in events
+            if any(r in ln for r in _K8S_FATAL_EVENTS)]
+
+
+def _k8s_deployment_diag(controller, ns, run_label, deploy):
+    """Failure evidence dump — the three pieces you need to diagnose a failed
+    rollout: pod list (which pod sits on which node, in what phase),
+    namespace events (the REAL reason), and the deployment describe tail."""
+    view = " ".join(kubectl_prefix({"_ctx": controller.get("_ctx", ""),
+                                    "_ns": ns}))
+    log("[k8s] diagnose pods:   {}".format(view + " get pods -o wide"))
+    out, rc = controller_run(
+        controller, ["-n", ns, "get", "pods", "-l", "run=" + run_label,
+                     "-o", "wide"], check=False)
+    if rc == 0 and out.strip():
+        log("[k8s] pods (run={}):\n{}".format(run_label, out.strip()))
+    log("[k8s] diagnose events: {}".format(
+        view + " get events --sort-by=.lastTimestamp"))
+    events = _k8s_all_events(controller, ns)
+    if events:
+        log("[k8s] namespace events (tail):\n{}".format("\n".join(events)))
+    _log_deployment_events(controller, ns, deploy)
+
+
+def wait_k8s_deployment_ready(cluster, deploy, run_label, timeout=None,
+                              poll=3.0):
+    """Poll the Deployment rollout; fail FAST on fatal pod states/events
+    (ErrImageNeverPull / ImagePullBackOff / CreateContainer* /
+    CrashLoopBackOff / FailedScheduling) instead of blind-waiting the whole
+    timeout. Every failure path dumps the pod list + namespace events +
+    deployment describe via _k8s_deployment_diag."""
+    if timeout is None:
+        timeout = _K8S_DEPLOYMENT_TIMEOUT_S
+    c = cluster["_controller"]
+    ns = k8s_settings(cluster)["namespace"]
+    deadline = time.time() + timeout
+    avail, want = 0, 0
+    while True:
+        out, _ = controller_run(
+            c, ["-n", ns, "get", "deployment", deploy, "-o",
+                "jsonpath={.status.availableReplicas}"], check=False)
+        try:
+            avail = int(out.strip() or 0)
+        except ValueError:
+            avail = 0
+        out, _ = controller_run(
+            c, ["-n", ns, "get", "deployment", deploy, "-o",
+                "jsonpath={.spec.replicas}"], check=False)
+        try:
+            want = int(out.strip() or 0)
+        except ValueError:
+            want = 0
+        if want and avail >= want:
+            return
+        states, _ = controller_run(
+            c, ["-n", ns, "get", "pods", "-l", "run=" + run_label, "-o",
+                "jsonpath={range .items[*]}{.metadata.name}{' '}"
+                "{.status.phase}{' '}"
+                "{range .status.containerStatuses[*]}"
+                "{.state.waiting.reason}{' '}{end}{'\n'}{end}"], check=False)
+        fatal = []
+        for line in states.splitlines():
+            toks = line.split()
+            if any(t in _K8S_FATAL_WAITING for t in toks):
+                fatal.append(line.strip())
+        events = _k8s_all_events(c, ns)
+        fatal_events = _k8s_fatal_event_lines(events)
+        if fatal or fatal_events:
+            _k8s_deployment_diag(c, ns, run_label, deploy)
+            reason = ""
+            if fatal:
+                reason = next((t for t in fatal[0].split()
+                               if t in _K8S_FATAL_WAITING), "")
+            if not reason and fatal_events:
+                reason = next((r for r in _K8S_FATAL_EVENTS
+                               if r in fatal_events[0]), "")
+            raise RuntimeError(
+                "deployment {}: pods failed to start (reason={}; evidence "
+                "above)".format(deploy, reason or "unknown"))
+        if time.time() >= deadline:
+            _k8s_deployment_diag(c, ns, run_label, deploy)
+            raise RuntimeError(
+                "deployment {} not ready in {}s ({}/{} replicas available; "
+                "evidence above)".format(deploy, int(timeout), avail, want))
+        time.sleep(poll)
+
+
 def _log_deployment_events(controller, ns, deploy):
     """Best-effort: dump the tail of `kubectl describe deployment`."""
     try:
@@ -2420,13 +2528,7 @@ def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
     finally:
         shutil.rmtree(local_dir, ignore_errors=True)
     t0 = time.time()
-    out, rc = controller_run(
-        c, ["-n", ns, "rollout", "status", "deployment/" + deploy,
-            "--timeout=60s"], check=False)
-    if rc != 0:
-        _log_deployment_events(c, ns, deploy)
-        raise RuntimeError("deployment {} not ready in 60s: {}".format(
-            deploy, out.strip()[:400]))
+    wait_k8s_deployment_ready(cluster, deploy, run_label)
     log("[k8s] deployment {} ready (role={}, replicas={}, elapsed={:.1f}s)"
         "".format(deploy, role, replicas, time.time() - t0))
     return deploy, run_label
@@ -2599,112 +2701,112 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     # k8s: ConfigMap (scripts + shared env.sh) must exist before pods mount it
     ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
-    if is_k8s:
-        # ---- per-role Deployments (pod = process): replicas = cpn x N ----
-        _k8s = k8s_settings(cluster)
-        _run_label = k8s_run_label(ts, cfg_name)
-        for role, entries, base in _pipeline_k8s_roles(plan):
-            ensure_k8s_deployment(cluster, ts, cfg_name, role,
-                                  len(entries), dry)
-            if dry:
-                pods = ["{}-{}-{:03d}".format(_run_label, role, i)
-                        for i in range(len(entries))]
-            else:
-                pods = _k8s_deployment_pods(cluster, _run_label, role)
-                if len(pods) < len(entries):
-                    raise RuntimeError(
-                        "deployment role={} has {}/{} pods (run={})".format(
-                            role, len(pods), len(entries), _run_label))
-            for entry, pod in zip(entries, pods):
-                entry["node"] = pod
-                # every pod has its own network namespace: ALL pods of a
-                # role listen on the SAME port
-                entry["port"] = base
-                ip = "0.0.0.0" if dry else _k8s_pod_ip(
-                    cluster["_controller"], _k8s["namespace"], pod)
-                cluster.setdefault("nodes", {})[pod] = {
-                    "kind": "k8s-pod", "_pod": pod, "_ns": _k8s["namespace"],
-                    "_ctx": cluster["_controller"].get("_ctx", ""),
-                    "_controller": cluster["_controller"],
-                    "_controller_workspace": _k8s["controller_workspace"],
-                    "_run_label": _run_label, "_role": role,
-                    "ip": ip, "fabric_ip": ip}
-        involved_nodes = []
-        for e in plan["writers"] + plan["readers"]:
-            if e["node"] not in involved_nodes:
-                involved_nodes.append(e["node"])
-        primary_node_name = (plan["writers"] or plan["readers"])[0]["node"]
-        node = get_node(cluster, primary_node_name)
-        host = node["ip"]
-        if plan.get("dual"):
-            log("[k8s] pipeline pods ready: {} dual clients "
-                "(N={}, spread maxSkew=1, run={})".format(
-                    len(plan["clients"]), n_nodes, _run_label))
-        else:
-            log("[k8s] pipeline pods ready: {} writers + {} readers "
-                "(N={}, spread maxSkew=1, run={})".format(
-                    len(plan["writers"]), len(plan["readers"]),
-                    n_nodes, _run_label))
-    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   remote_scripts, remote_log_dir, dry)
     reader_pids = []
     writer_pids = []
     profile_sess = None  # profiling session (started at Step 1 or Step 3)
-    # optional NUMA binding: per node, round-robin the node's client
-    # processes (readers launched first, then writers) across its NUMA nodes.
-    # Resolution: case/layer explicit value > global.json ("numa_bind",
-    # default true) > code default true; explicit false disables.
-    numa_bind = cfg.get("numa_bind")
-    if numa_bind is None:
-        numa_bind = globals_cfg.get("numa_bind")
-    numa_bind = True if numa_bind is None else bool(numa_bind)
-    # per-client core count (NUMA-aware sharding). When set it takes
-    # precedence over plain numa round-robin: each client process gets a
-    # consecutive cpu_shard-core slice of its NUMA node's allowed pool
-    # (exclude_cpus subtracted here), wrapping when the pool is smaller
-    # than clients x shard.
-    cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
-    if cpu_shard > 0 and not numa_bind:
-        numa_bind = True  # sharding needs the NUMA topology probes
-    if is_k8s and (numa_bind or cpu_shard > 0):
-        # containers do not do numactl: binding disabled for pipeline pods
-        numa_bind = False
-        cpu_shard = 0
-        log("k8s pipeline pods: numa/cpu binding disabled (containers)")
-    # numactl policy: membind (strict, default) | preferred | off, and
-    # strict/auto behavior when numactl is missing on a node
-    membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
-    numa_node_count = {}
-    numa_counter = {}
-    shard_ordinals = {}  # (node, numa) -> next slice ordinal
-    numa_topo = {}       # node_name -> {numa_idx: cpulist}
-    numactl_ok = {}      # node_name -> numactl usable
-
-    def shard_ordinal(node_name, numa):
-        key = (node_name, numa)
-        idx = shard_ordinals.get(key, 0)
-        shard_ordinals[key] = idx + 1
-        return idx
-
-    if numa_bind:
-        for node_name in involved_nodes:
-            n = get_node(cluster, node_name)
-            if not dry:
-                k, topo = probe_numa_topology(n["ip"], n)
-                numa_node_count[node_name] = k
-                numa_topo[node_name] = topo
-                numactl_ok[node_name] = probe_numactl(n["ip"], n)
-                if not numactl_ok[node_name]:
-                    numa_node_check(node_name, numa_strict)
-            else:
-                # dry-run: no ssh probing (the old count-only probe failed
-                # on dry-run's empty result); commands print without
-                # binding args
-                numa_node_count[node_name] = 1
-                numa_topo[node_name] = {0: "0"}
-                numactl_ok[node_name] = False
-            numa_counter[node_name] = 0
     try:
+        if is_k8s:
+            # ---- per-role Deployments (pod = process): replicas = cpn x N ----
+            _k8s = k8s_settings(cluster)
+            _run_label = k8s_run_label(ts, cfg_name)
+            for role, entries, base in _pipeline_k8s_roles(plan):
+                ensure_k8s_deployment(cluster, ts, cfg_name, role,
+                                      len(entries), dry)
+                if dry:
+                    pods = ["{}-{}-{:03d}".format(_run_label, role, i)
+                            for i in range(len(entries))]
+                else:
+                    pods = _k8s_deployment_pods(cluster, _run_label, role)
+                    if len(pods) < len(entries):
+                        raise RuntimeError(
+                            "deployment role={} has {}/{} pods (run={})".format(
+                                role, len(pods), len(entries), _run_label))
+                for entry, pod in zip(entries, pods):
+                    entry["node"] = pod
+                    # every pod has its own network namespace: ALL pods of a
+                    # role listen on the SAME port
+                    entry["port"] = base
+                    ip = "0.0.0.0" if dry else _k8s_pod_ip(
+                        cluster["_controller"], _k8s["namespace"], pod)
+                    cluster.setdefault("nodes", {})[pod] = {
+                        "kind": "k8s-pod", "_pod": pod, "_ns": _k8s["namespace"],
+                        "_ctx": cluster["_controller"].get("_ctx", ""),
+                        "_controller": cluster["_controller"],
+                        "_controller_workspace": _k8s["controller_workspace"],
+                        "_run_label": _run_label, "_role": role,
+                        "ip": ip, "fabric_ip": ip}
+            involved_nodes = []
+            for e in plan["writers"] + plan["readers"]:
+                if e["node"] not in involved_nodes:
+                    involved_nodes.append(e["node"])
+            primary_node_name = (plan["writers"] or plan["readers"])[0]["node"]
+            node = get_node(cluster, primary_node_name)
+            host = node["ip"]
+            if plan.get("dual"):
+                log("[k8s] pipeline pods ready: {} dual clients "
+                    "(N={}, spread maxSkew=1, run={})".format(
+                        len(plan["clients"]), n_nodes, _run_label))
+            else:
+                log("[k8s] pipeline pods ready: {} writers + {} readers "
+                    "(N={}, spread maxSkew=1, run={})".format(
+                        len(plan["writers"]), len(plan["readers"]),
+                        n_nodes, _run_label))
+        deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
+                       remote_scripts, remote_log_dir, dry)
+        # optional NUMA binding: per node, round-robin the node's client
+        # processes (readers launched first, then writers) across its NUMA nodes.
+        # Resolution: case/layer explicit value > global.json ("numa_bind",
+        # default true) > code default true; explicit false disables.
+        numa_bind = cfg.get("numa_bind")
+        if numa_bind is None:
+            numa_bind = globals_cfg.get("numa_bind")
+        numa_bind = True if numa_bind is None else bool(numa_bind)
+        # per-client core count (NUMA-aware sharding). When set it takes
+        # precedence over plain numa round-robin: each client process gets a
+        # consecutive cpu_shard-core slice of its NUMA node's allowed pool
+        # (exclude_cpus subtracted here), wrapping when the pool is smaller
+        # than clients x shard.
+        cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
+        if cpu_shard > 0 and not numa_bind:
+            numa_bind = True  # sharding needs the NUMA topology probes
+        if is_k8s and (numa_bind or cpu_shard > 0):
+            # containers do not do numactl: binding disabled for pipeline pods
+            numa_bind = False
+            cpu_shard = 0
+            log("k8s pipeline pods: numa/cpu binding disabled (containers)")
+        # numactl policy: membind (strict, default) | preferred | off, and
+        # strict/auto behavior when numactl is missing on a node
+        membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
+        numa_node_count = {}
+        numa_counter = {}
+        shard_ordinals = {}  # (node, numa) -> next slice ordinal
+        numa_topo = {}       # node_name -> {numa_idx: cpulist}
+        numactl_ok = {}      # node_name -> numactl usable
+
+        def shard_ordinal(node_name, numa):
+            key = (node_name, numa)
+            idx = shard_ordinals.get(key, 0)
+            shard_ordinals[key] = idx + 1
+            return idx
+
+        if numa_bind:
+            for node_name in involved_nodes:
+                n = get_node(cluster, node_name)
+                if not dry:
+                    k, topo = probe_numa_topology(n["ip"], n)
+                    numa_node_count[node_name] = k
+                    numa_topo[node_name] = topo
+                    numactl_ok[node_name] = probe_numactl(n["ip"], n)
+                    if not numactl_ok[node_name]:
+                        numa_node_check(node_name, numa_strict)
+                else:
+                    # dry-run: no ssh probing (the old count-only probe failed
+                    # on dry-run's empty result); commands print without
+                    # binding args
+                    numa_node_count[node_name] = 1
+                    numa_topo[node_name] = {0: "0"}
+                    numactl_ok[node_name] = False
+                numa_counter[node_name] = 0
         sizes = data_size_list(cfg)
         warmup = "false" if args.no_warmup else "true"
         reader_threads = plan["reader_threads"]
@@ -3148,15 +3250,22 @@ def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
 
 
 def _k8s_debug_hints(cluster, involved_nodes, cfg_name):
-    """Print copy-pasteable debug commands for kept pods (post-ready fail)."""
+    """Print copy-pasteable debug commands for the kept scene. When pods were
+    materialized: per-pod exec/describe hints. When the failure happened
+    BEFORE materialization (e.g. a failed Deployment rollout) pods have no
+    node entries yet — fall back to namespace-level commands so the kept
+    scene is still inspectable (pods/events/deployments)."""
     k8s = k8s_settings(cluster)
     ns = k8s["namespace"]
+    view = " ".join(kubectl_prefix(
+        {"_ctx": cluster["_controller"].get("_ctx", ""), "_ns": ns}))
+    printed = False
     for name in involved_nodes:
         n = get_node(cluster, name)
         if not is_k8s_node(n) or not n.get("_pod"):
             continue
+        printed = True
         pod = n["_pod"]
-        view = " ".join(kubectl_prefix(n))
         log("[k8s][DEBUG] scenario {} failed; pod {} kept for troubleshooting"
             "".format(cfg_name, pod))
         log("[k8s][DEBUG]   {} exec -it {} -- bash".format(view, pod))
@@ -3164,6 +3273,14 @@ def _k8s_debug_hints(cluster, involved_nodes, cfg_name):
         log("[k8s][DEBUG]   {} exec {} -- bash -c {}".format(
             view, pod, shlex.quote(
                 "ls -lt {}/logs | head".format(k8s["pod_workspace"]))))
+    if not printed:
+        log("[k8s][DEBUG] scenario {} failed before pods became ready; "
+            "namespace {} kept for troubleshooting".format(cfg_name, ns))
+        log("[k8s][DEBUG]   {} get pods -o wide".format(view))
+        log("[k8s][DEBUG]   {} get events --sort-by=.lastTimestamp"
+            "".format(view))
+        for deploy in (cluster.get("_k8s_deployments") or []):
+            log("[k8s][DEBUG]   {} describe deployment {}".format(view, deploy))
     log("[k8s][DEBUG] cleanup: STOP / --clean-up deletes namespace {}; "
         "next run auto-reaps it".format(ns))
 
