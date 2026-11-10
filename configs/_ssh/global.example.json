@@ -15,6 +15,7 @@
     }
   },
   "local_buffer_size": 1073741824,
+  "store_total_size": "",
   "tenant_id": "default",
   "random_seed": 42,
   "remote_dir": "/tmp/mooncake_bench",

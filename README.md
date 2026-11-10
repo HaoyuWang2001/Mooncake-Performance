@@ -194,6 +194,11 @@ store 节点列表），实际通信仍经 master 发现 store。
   /shutdown 后双份 SUMMARY；writer 的 notify 抽样**排除自身 reader**（校验
   notify ≤ client 数-1；如 rank_smoke 的 1写10读需 N≥6）；一份日志同时产出 writer 与
   reader 两组指标行（instance=c{id}）；
+- **store 空间约束（store_total_size）**：global.json 设定 store 总容量后，pipeline 的 key 空间按下列规则规划——显式
+  `key_count`：`writers × key_count × data_size` 必须**严格小于** store，否则该 config 直接 FAIL；缺省 `key_count`：
+  自动计算 per-writer 上限 `floor(store × 0.9 / data_size / writers)` 并经 `--key-count` 注入（每 size 重算），writer
+  写满自己的 key 段后回绕——**未计时 `batch_remove` 旧 key 再写**（方法 a），put 性能样本始终是真实写入；CSV
+  `key_count` 列记录实际生效值。不设 store_total_size = 无穷大（不约束，长跑会耗尽 store 触发 -200 fail-fast）；
 - **k8s 通道（pipeline 已支持）**：每角色一个 **Deployment**（`benchmark-deployment.yaml.tpl`
   渲染；pod=进程、replicas=count_per_node×N、`topologySpreadConstraints` maxSkew=1 软均匀
   分布、Recreate 不自动补副本）；pod 内仍 `sleep infinity` + `kubectl exec` 启动进程（脚本经
@@ -438,6 +443,7 @@ device plugin 按集群自行维护。
 | protocol.ub.device | ub 设备名；`"auto"`（或空）= 运行期 `urma_admin` 自动探测首个 `bonding_dev_*`；也可显式指定（如 `bonding_dev_0`），显式时不再探测 |
 | mooncake_store_nodes | store 节点名列表（取自 cluster.json 的 nodes），可多个；仅用于指标行 local/remote 拓扑标注 |
 | local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size；支持字节数（number）或字符串（如 `"1GB"`，1024 进制） |
+| store_total_size | **mooncake store 总空间约束**：字符串（`"20GB"`，1024 进制）或字节数；**缺省 = 无穷大**（不约束）。设定后：basic 校验 `key_count × data_size < store`、pipeline 显式 key_count 校验 `writers × key_count × data_size < store`（严格小于，超限该 config 直接 FAIL 带算式明细）；pipeline **缺省 key_count 时自动计算** per-writer 上限 `floor(store × 0.9 / data_size / writers)`（0.9 = 对象元数据+在途批次余量），writer 写满后回绕（先删后写，put 样本始终真实写入） |
 | tenant_id | 租户标识，默认 "default" |
 | data_seed | 数据生成固定随机种子 |
 | remote_dir | **仅 SSH 通道**：服务器端脚本/配置根目录 |
