@@ -404,10 +404,7 @@ k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口
     "image": "<含 mooncake SDK 的镜像>",
     "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl",
     "controller_workspace": "/tmp/Mooncake-Performance",
-    "pod_workspace": "/tmp/Mooncake-Performance",
-    "master_metrics_namespace": "mooncake",
-    "master_metrics_pod": "mooncake-master",
-    "master_metrics_port": 17702
+    "pod_workspace": "/tmp/Mooncake-Performance"
   }
 }
 ```
@@ -422,12 +419,14 @@ k8s 形态下 `cluster.json` **只描述 controller**（执行 kubectl 的入口
   `controller.kubeconfig` 留空 = `ssh_user` 的 `$HOME/.kube/config`，非默认位置时填绝对路径
   （`echo $KUBECONFIG` / `ls $HOME/.kube/config`）。启动时会打印 controller/kubectl/
   kubeconfig/context 诊断信息。
-- `master_metrics_namespace` / `master_metrics_pod` / `master_metrics_port`（可选）：store 容量
-  自动探测参数——在 master pod 内执行 `kubectl exec ... -- curl localhost:<port>/metrics`。
-  默认 `mooncake` / `mooncake-master`（pod 名**前缀**匹配）/ `17702`，部署不同则修改。
-  探测优先级：`global.json master_metrics_url`（直连，经 controller）> 本组参数（exec，k8s 默认路径）。
-  metrics 端口通常仅 pod 内可达（controller 节点不使用集群 DNS，且常无对应 Service）；label
-  多序列（per-segment）按 SUM 聚合、`master_total_capacity_bytes` 优先。
+- store 容量探测只认 `global.json master_metrics_url`（完整 URL 且**必须带端口**，推荐 svc DNS
+  形式，如 `http://mooncake-master.mooncake.svc.cluster.local:<port>/metrics`）；代码不内置任何
+  host/port 默认值，不配置即跳过探测（pipeline 场景需改用 `store_total_size`）。k8s 模式经
+  controller 依次尝试：① `kubectl get svc` 把 svc DNS 翻成 ClusterIP 后直连（controller 是集群
+  节点且 Service 声明了该端口时可用）② `kubectl get endpoints <svc>` 取 `targetRef.name` 定位
+  后端 pod，再 `kubectl exec` 进 pod 内 `curl localhost:<port>/metrics`（零集群改动，端口未通过
+  Service 暴露时也可用）。ssh 模式编排器直连、失败回退首个节点 ssh curl。label 多序列
+  （per-segment）按 SUM 聚合、`master_total_capacity_bytes` 优先。
 - `controller_workspace`（宿主机）与 `pod_workspace`（容器）分离；各自自动建立
   `scripts/ data/ logs/`（宿主机另有 `pods/` 存放渲染后的 YAML）。
 - `venvs` 可留空；`global.venv` 也留空时容器内默认 `python3`。
@@ -473,8 +472,7 @@ STOP/Ctrl+C 或 `--clean-up` 收场；下次运行会自动回收遗留 namespac
 | mooncake_store_nodes | store 节点名列表（取自 cluster.json 的 nodes），可多个；仅用于指标行 local/remote 拓扑标注 |
 | local_buffer_size | client 本地传输暂存缓冲，建议 ≥ num_threads × data_size；支持字节数（number）或字符串（如 `"1GB"`，1024 进制） |
 | store_total_size | **mooncake store 总空间约束**（可选）：字符串（`"20GB"`，1024 进制）或字节数。探测恒执行（B = master metrics 的 `segment_total_capacity_bytes`）；**两者都有时 effective = min(A, B)**（A>B 用满集群、A<B 只用部分），单源直用，双缺则 pipeline 场景 FAIL。pipeline 的 per-writer 上限 = `floor(effective × 0.9 / data_size / writers)`（0.9 = 对象元数据+在途批次余量）；basic 的 `key_count × data_size` 校验同样用 effective |
-| master_metrics_url | **可选**：mooncake master 的 Prometheus metrics 完整 URL（如 `http://mooncake-master.mooncake.svc.cluster.local:17702/metrics`）；k8s 模式经 controller curl（svc DNS 自动解析），ssh 模式编排器直连、失败回退首个节点 ssh curl |
-| master_metrics_port | **可选**：未配 `master_metrics_url` 时，用 `master_addr` 的 host + 本端口拼 metrics URL，默认 `17702` |
+| master_metrics_url | **可选**：mooncake master 的 Prometheus metrics **完整 URL，必须带端口**（如 `http://mooncake-master.mooncake.svc.cluster.local:17702/metrics`）。不配置 = 跳过探测（pipeline 需 `store_total_size`）。k8s 模式经 controller：svc DNS 翻 ClusterIP 直连，失败则 endpoints 定位后端 pod 后 `kubectl exec` 内网 curl；ssh 模式编排器直连、失败回退首个节点 ssh curl。不内置 host/port 默认值 |
 | tenant_id | 租户标识，默认 "default" |
 | data_seed | 数据生成固定随机种子 |
 | remote_dir | **仅 SSH 通道**：服务器端脚本/配置根目录 |
