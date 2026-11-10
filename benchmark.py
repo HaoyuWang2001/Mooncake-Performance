@@ -1848,6 +1848,30 @@ def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
     return str(out).strip() == "200"
 
 
+def _pipeline_shutdown(cluster, node_entry, port, pid, what):
+    """Send /shutdown to a pipeline process, but SKIP the probe when the
+    process is already dead. At 32-client scale every dead client cost a
+    full kubectl-exec round-trip (rc=7) and ~20s of WARN spam per phase.
+    Returns True when the client was alive (probe attempted), False when
+    skipped."""
+    if pid:
+        try:
+            alive = ssh_check_output(
+                node_entry["ip"], node_entry,
+                "kill -0 {pid} 2>/dev/null && tr '\\0' ' ' < "
+                "/proc/{pid}/cmdline 2>/dev/null | grep -qF {m} && "
+                "echo ALIVE || echo DEAD".format(
+                    pid=pid, m=_marker_probe(_PIPELINE_PID_MARKER)),
+                quiet=True)
+        except Exception:
+            alive = "ALIVE"  # unknown -> still attempt the graceful probe
+        if str(alive).strip() != "ALIVE":
+            log("{}: already exited; skipping /shutdown".format(what))
+            return False
+    _pipeline_http_call(node_entry, port, "/shutdown")
+    return True
+
+
 def _pipeline_barrier(cluster, etcd_endpoints, prefix, expected, timeout_s,
                       what, run_id):
     """Poll etcd until `expected` registrations exist under prefix; raises
@@ -1889,12 +1913,15 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
     rendezvous prefix."""
     log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
     # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
+    _pid_by_obj = {id(e): (pid or "").strip() for e, pid in reader_pids}
     for r in plan["readers"]:
         if "node" not in r:
             continue  # deployment never materialized the pod entries
         try:
             rn = get_node(cluster, r["node"])
-            _pipeline_http_call(rn, r["port"], "/shutdown")
+            _pipeline_shutdown(cluster, rn, r["port"],
+                               _pid_by_obj.get(id(r), ""),
+                               "fail-cleanup " + _pipeline_entry_label(r))
         except Exception as exc:
             log("[WARN] fail-cleanup: {} shutdown failed: {}".format(
                 _pipeline_entry_label(r), exc))
@@ -3121,10 +3148,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     while time.time() - t0 < expected_s:
                         _check_stop()
                         time.sleep(min(1.0, expected_s - (time.time() - t0)))
+                    _pid_by_obj = {id(e): (pid or "").strip()
+                                   for e, pid in writer_pids}
                     for c in plan["clients"]:
                         cn = get_node(cluster, c["node"])
                         try:
-                            _pipeline_http_call(cn, c["port"], "/shutdown")
+                            _pipeline_shutdown(
+                                cluster, cn, c["port"],
+                                _pid_by_obj.get(id(c), ""),
+                                "dual c{}".format(c["id"]))
                         except Exception as exc:
                             log("[WARN] dual c{} shutdown: {}".format(
                                 c["id"], exc))
@@ -3301,11 +3333,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # Step 6: shutdown readers via their /shutdown endpoint (k8s:
                 # direct pod IP; ssh: loopback curl on the reader's node) and
                 # wait for their final logs
+                _pid_by_obj = {id(e): (pid or "").strip()
+                               for e, pid in reader_pids}
                 for r in plan["readers"]:
                     rn = get_node(cluster, r["node"])
                     if not dry:
                         try:
-                            _pipeline_http_call(rn, r["port"], "/shutdown")
+                            _pipeline_shutdown(
+                                cluster, rn, r["port"],
+                                _pid_by_obj.get(id(r), ""),
+                                "reader r{}".format(r["index"]))
                         except Exception as exc:
                             log("[WARN] reader r{} shutdown: {}".format(
                                 r["index"], exc))

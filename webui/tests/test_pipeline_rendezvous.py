@@ -460,3 +460,34 @@ def test_wait_k8s_deployment_ready_timeout_dumps_evidence(monkeypatch):
     except RuntimeError as exc:
         assert "not ready in 0s" in str(exc) and "2/4" in str(exc)
     assert diag["n"] == 1
+
+
+def test_pipeline_shutdown_skips_dead_client(monkeypatch):
+    """Dead clients must not cost a kubectl-exec round-trip (rc=7 spam)."""
+    calls = {"curl": 0}
+
+    def fake_ssh(ip, node, cmd, dry_run=False, quiet=False):
+        return "DEAD"
+
+    def fake_call(node_entry, port, path, timeout=5, dry=False):
+        calls["curl"] += 1
+        return True
+
+    monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
+    monkeypatch.setattr(bm, "_pipeline_http_call", fake_call)
+    node = {"ip": "10.0.0.1"}
+    assert bm._pipeline_shutdown(None, node, 9301, "59", "dual c1") is False
+    assert calls["curl"] == 0, "dead client must not be probed"
+    # alive client -> probe happens
+    monkeypatch.setattr(bm, "ssh_check_output",
+                        lambda ip, node, cmd, dry_run=False, quiet=False: "ALIVE")
+    assert bm._pipeline_shutdown(None, node, 9301, "59", "dual c1") is True
+    assert calls["curl"] == 1
+    # unknown liveness (ssh error) -> still probe
+    def boom(ip, node, cmd, dry_run=False, quiet=False):
+        raise RuntimeError("ssh down")
+    monkeypatch.setattr(bm, "ssh_check_output", boom)
+    assert bm._pipeline_shutdown(None, node, 9301, "59", "dual c1") is True
+    assert calls["curl"] == 2
+    # no pid -> probe
+    assert bm._pipeline_shutdown(None, node, 9301, "", "x") is True
