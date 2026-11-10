@@ -37,44 +37,33 @@ def test_basic_store_check():
         pass
 
 
-def test_pipeline_key_budget_unset_store():
-    # infinite store: passthrough; unset key_count stays unbounded (0)
-    assert bm._pipeline_key_budget({}, 4, 8 << 20, 0, 1, "8MB") == (0, False)
-    assert bm._pipeline_key_budget({}, 4, 8 << 20, 500, 1, "8MB") == (500, False)
-
-
-def test_pipeline_key_budget_explicit_strict():
-    glb = {"store_total_size": "1GB"}
-    # 4 writers x 200 keys x 1MB = 800MB < 1GB -> ok
-    assert bm._pipeline_key_budget(glb, 4, 1 << 20, 200, 1, "1MB") == (200, False)
-    # 4 x 300 x 1MB = 1200MB >= 1GB -> fail
+def test_pipeline_key_budget_requires_store():
+    """No store source -> HARD error (pipeline sizes its write space purely
+    from the store capacity; an unbounded run exhausts the store)."""
     try:
-        bm._pipeline_key_budget(glb, 4, 1 << 20, 300, 1, "1MB")
+        bm._pipeline_key_budget({}, 4, 8 << 20, 1, "8MB")
         raise AssertionError("should raise")
     except RuntimeError as exc:
-        assert "1200" in str(exc) or "1GB" not in str(exc)
-    # strictness: exact fit (need == store) also fails ("must be greater")
-    try:
-        bm._pipeline_key_budget({"store_total_size": 1 << 30}, 4, 1 << 20, 256, 1, "1MB")
-        raise AssertionError("exact fit must fail")
-    except RuntimeError:
-        pass
+        assert "store_total_size" in str(exc)
+        assert "master_metrics" in str(exc)
 
 
-def test_pipeline_key_budget_auto():
-    # 20GB store, 4 writers, 8MB data:
-    # int(20GiB*0.9) // (8MiB*4) = 576
-    kc, auto = bm._pipeline_key_budget({"store_total_size": "20GB"},
-                                       4, 8 << 20, 0, 1, "8MB")
-    assert auto is True and kc == 576
-    # explicit key_count still wins over auto when it fits
-    kc, auto = bm._pipeline_key_budget({"store_total_size": "20GB"},
-                                       4, 8 << 20, 100, 1, "8MB")
-    assert auto is False and kc == 100
-    # auto floor below batch_size -> store too small
+def test_pipeline_key_budget_formula():
+    # 20GB store, 4 writers, 8MB data: int(20GiB*0.9) // (8MiB*4) = 576
+    assert bm._pipeline_key_budget({"store_total_size": "20GB"},
+                                   4, 8 << 20, 1, "8MB") == 576
+    # auto-discovered total works the same way
+    assert bm._pipeline_key_budget({"_store_total_auto": 20 * 1024 ** 3},
+                                   4, 8 << 20, 1, "8MB") == 576
+    # 20GB / 32 writers / 8MB = 72 (the 16-node rank_smoke shape)
+    assert bm._pipeline_key_budget({"store_total_size": "20GB"},
+                                   32, 8 << 20, 1, "8MB") == 72
+
+
+def test_pipeline_key_budget_too_small():
     try:
         bm._pipeline_key_budget({"store_total_size": "32MB"},
-                                4, 8 << 20, 0, 1, "8MB")
+                                4, 8 << 20, 1, "8MB")
         raise AssertionError("should raise")
     except RuntimeError as exc:
         assert "too small" in str(exc)
@@ -125,9 +114,8 @@ def test_discover_store_capacity_auto(monkeypatch):
     total = bm.discover_store_capacity(None, g)
     assert total == 21474836480
     assert g["_store_total_auto"] == 21474836480
-    # budget now uses the auto value and reports the auto formula
-    kc, auto = bm._pipeline_key_budget(g, 4, 8 << 20, 0, 1, "8MB")
-    assert auto is True and kc == 576
+    # budget now uses the auto value
+    assert bm._pipeline_key_budget(g, 4, 8 << 20, 1, "8MB") == 576
     # explicit config still wins after discovery
     g["store_total_size"] = "1GB"
     assert bm._store_total_bytes(g) == 1024 ** 3
@@ -149,4 +137,4 @@ def test_discover_skip_is_explicit_warn(monkeypatch, capsys):
     g = {}   # no master_addr / master_metrics_url / store_total_size
     assert bm.discover_store_capacity(None, g) is None
     out = capsys.readouterr().out
-    assert "auto-discovery skipped" in out and "UNBOUNDED" in out
+    assert "auto-discovery skipped" in out and "will FAIL" in out

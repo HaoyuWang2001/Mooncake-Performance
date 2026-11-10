@@ -257,9 +257,9 @@ def discover_store_capacity(cluster, globals_cfg):
     url = _master_metrics_url(globals_cfg)
     if not url:
         log("[WARN] store capacity auto-discovery skipped (no "
-            "master_metrics_url/master_addr in global.json); key space will "
-            "be UNBOUNDED — set store_total_size manually or fix the "
-            "metrics source")
+            "master_metrics_url/master_addr in global.json); pipeline "
+            "scenarios require a store capacity and will FAIL — set "
+            "store_total_size manually or fix the metrics source")
         return None
     text = None
     if cluster is not None and cluster.get("_controller") is not None:
@@ -284,8 +284,8 @@ def discover_store_capacity(cluster, globals_cfg):
                 break
     if not text:
         log("[WARN] store capacity auto-discovery failed (master metrics "
-            "unreachable: {}); set store_total_size manually if you need "
-            "the key-space budget".format(url))
+            "unreachable: {}); pipeline scenarios will FAIL — set "
+            "store_total_size manually".format(url))
         return None
     vals = _parse_prometheus_metrics(text)
     if not any(k in vals for k in _STORE_METRICS):
@@ -348,40 +348,38 @@ def _basic_store_check(globals_cfg, cfg):
                                           kc * ds_bytes, store))
 
 
-def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, cfg_key_count,
-                         batch_size, ds_label):
-    """Resolve the PER-WRITER key-space cap against store_total_size.
+def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, batch_size,
+                         ds_label):
+    """Derive the PER-WRITER key-space cap purely from the store capacity.
 
-    Returns (per_writer_key_count, auto):
-    - store unset (infinite): explicit key_count passes through; 0/absent
-      stays 0 = unbounded (legacy behaviour)
-    - explicit key_count: writers x key_count x data_size must be STRICTLY
-      smaller than the store, else the scenario fails fast
-    - key_count unset: auto cap = floor(store x 0.9 / data_size / writers)
-      (0.9 = object-metadata + in-flight-batch headroom) and each writer
-      wraps inside its cap with untimed delete-before-write (method a)."""
+    Pipeline mode has NO key_count parameter: the writable key space is
+    always floor(store x 0.9 / data_size / writers), where `store` comes
+    from global.json store_total_size (explicit) or the master-metrics
+    auto-discovery. 0.9 covers object metadata + in-flight batches. Each
+    writer wraps inside its cap (put family: untimed delete-before-write;
+    upsert_from: prefill once, then overwrite).
+
+    Missing store source is a HARD error: without a store capacity the
+    writable amount cannot be derived and an unbounded run would exhaust
+    the store (observed: hidden 1000-key default -> 250GB attempted).
+    """
     store = _store_total_bytes(globals_cfg)
     if store is None:
-        return int(cfg_key_count or 0), False
-    if cfg_key_count:
-        need = writer_count * cfg_key_count * ds_bytes
-        if need >= store:
-            raise RuntimeError(
-                "pipeline key space {} writers x {} keys x {}B ({}) = {}B "
-                ">= store_total_size {}B; reduce key_count/data_size or "
-                "raise store_total_size".format(
-                    writer_count, cfg_key_count, ds_bytes, ds_label, need,
-                    store))
-        return int(cfg_key_count), False
+        raise RuntimeError(
+            "pipeline requires the store capacity to size the write key "
+            "space: set global.json 'store_total_size' (e.g. \"20GB\") or "
+            "configure master_metrics_url/master_metrics_port for "
+            "auto-discovery")
     usable = int(store * 0.9)
     per = usable // (ds_bytes * writer_count) if ds_bytes and writer_count else 0
     if per < max(1, int(batch_size or 1)):
         raise RuntimeError(
-            "pipeline auto key space too small: store_total_size {}B x 0.9 "
-            "/ ({}B x {} writers) = {} keys < batch_size {}; the store is "
-            "too small for this data size".format(
-                store, ds_bytes, writer_count, per, int(batch_size or 1)))
-    return per, True
+            "pipeline key space too small: store {}B x 0.9 / ({}B x {} "
+            "writers) = {} keys < batch_size {}; the store is too small "
+            "for this data size ({})".format(
+                store, ds_bytes, writer_count, per,
+                int(batch_size or 1), ds_label))
+    return per
 
 
 def pipeline_plan(cfg, node_count=1):
@@ -2876,12 +2874,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         raise RuntimeError("notify_count={} exceeds reader count {} "
                            "(reader.count_per_node x N)".format(
                                plan["notify_count"], len(plan["readers"])))
-    # optional per-writer key-space cap: must hold at least one full batch
-    key_count = int(cfg.get("key_count", 0) or 0)
-    if key_count and key_count < int(cfg.get("batch_size", 1)):
-        raise RuntimeError(
-            "key_count={} must be >= batch_size={}".format(
-                key_count, cfg.get("batch_size", 1)))
+    # pipeline has NO key_count: the per-writer key space is derived from
+    # the store capacity (see _pipeline_key_budget); a leftover field in a
+    # scenario is stripped by the loader with a WARN
     # duration is mandatory for pipeline: it is the measurement window for
     # qps/throughput on both writer and reader rows
     cfg_duration = cfg.get("duration", None)
@@ -2942,10 +2937,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         "BENCH_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
         "BENCH_DURATION": str(cfg.get("duration", 30)),
         "BENCH_BATCH_SIZE": str(cfg.get("batch_size", 1)),
-        # key_count (optional): per-writer key-space cap — when set the writer
-        # wraps its sequence with delete-before-write, bounding store usage at
-        # writers x key_count x data_size; empty = unbounded (legacy behaviour)
-        "BENCH_KEY_COUNT": str(cfg.get("key_count", "") or ""),
         # clear basic-only vars that are meaningless for pipeline
         "BENCH_OPERATION": "",
         "BENCH_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
@@ -3092,28 +3083,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             # is validated strictly; an unset key_count gets an auto
             # per-writer cap (writers wrap inside it with untimed
             # delete-before-write, so put samples stay real writes)
-            kc, kc_auto = _pipeline_key_budget(
+            kc = _pipeline_key_budget(
                 globals_cfg, len(plan["writers"]), parse_data_size(ds),
-                int(cfg.get("key_count", 0) or 0),
                 int(cfg.get("batch_size", 1) or 1), ds)
-            kc_arg = " --key-count {}".format(kc) if kc else ""
-            if kc_auto:
-                cfg.setdefault("_key_space", {})[str(ds)] = kc
-                _src = ("manual" if globals_cfg.get("store_total_size")
-                        not in (None, "", 0) else "auto-metrics")
-                log("pipeline key space (auto, store source={}): {} writers "
-                    "x {} keys x {} = {}B of store {}B (0.9 headroom)"
-                    "".format(_src, len(plan["writers"]), kc, ds,
-                              len(plan["writers"]) * kc * parse_data_size(ds),
-                              _store_total_bytes(globals_cfg)))
-            elif not kc:
-                # no store budget and no explicit key_count: unbounded key
-                # space — high write rates can exhaust the store (-200
-                # fail-fast kills every client). Make it loud.
-                log("[WARN] pipeline key space: UNBOUNDED (no store budget) "
-                    "— high write rates can exhaust the store and trigger "
-                    "-200 fail-fast; set store_total_size or fix the "
-                    "master metrics source")
+            # always inject the derived cap (never 0) — the client's
+            # BENCH_KEY_COUNT env default (1000) must never decide the space
+            kc_arg = " --key-count {}".format(kc)
+            cfg.setdefault("_key_space", {})[str(ds)] = kc
+            _src = ("manual" if globals_cfg.get("store_total_size")
+                    not in (None, "", 0) else "auto-metrics")
+            log("pipeline key space (store source={}): {} writers x {} keys "
+                "x {} = {}B of store {}B (0.9 headroom)".format(
+                    _src, len(plan["writers"]), kc, ds,
+                    len(plan["writers"]) * kc * parse_data_size(ds),
+                    _store_total_bytes(globals_cfg)))
             run_stage(host, node, remote_runner,
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
@@ -4170,6 +4153,13 @@ def load_scenario_config(cfg_path):
                 "(cluster-oriented: count_per_node x N on every cluster node); "
                 "remove the field from the config".format(role))
             blk.pop("client_nodes", None)
+    # pipeline has no key_count: the writable key space is derived from the
+    # store capacity; a leftover field is ignored (basic keeps key_count)
+    if merged.get("scenario") == "pipeline" and "key_count" in merged:
+        log("[WARN] pipeline key_count is removed and ignored — the write "
+            "key space is derived from the store capacity "
+            "(store_total_size / master metrics); remove the field")
+        merged.pop("key_count", None)
     return merged
 
 

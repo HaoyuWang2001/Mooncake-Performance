@@ -536,3 +536,17 @@ def test_pipeline_http_parallel_results(monkeypatch):
     res = bm._pipeline_http_parallel(
         None, [(node, 9301, "", "c0")], "/start", dry=True)
     assert res == [("c0", True, "")]
+
+
+def test_loader_strips_pipeline_key_count(tmp_path, capsys):
+    """pipeline has no key_count: a leftover field is WARNed and removed;
+    basic configs keep it."""
+    p = tmp_path / "p.json"
+    p.write_text('{"scenario": "pipeline", "duration": 10, "key_count": 500}',
+                 encoding="utf-8")
+    merged = bm.load_scenario_config(str(p))
+    assert "key_count" not in merged
+    assert "key_count is removed and ignored" in capsys.readouterr().out
+    b = tmp_path / "b.json"
+    b.write_text('{"scenario": "basic", "key_count": 500}', encoding="utf-8")
+    assert bm.load_scenario_config(str(b))["key_count"] == 500
