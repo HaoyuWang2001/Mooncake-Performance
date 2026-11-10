@@ -423,9 +423,12 @@ device plugin 按集群自行维护。
 **k8s 失败处理**：启动时单独打印镜像名；创建 ns 后给出 `get pods` 命令、pod 创建后
 给出 `describe` 命令、Ready 后给出 `exec` 命令。pod 60s 内未 Ready 会识别
 `ErrImageNeverPull`/`ImagePullBackOff`/`CreateContainerError`/`FailedScheduling`
-等事件并立即报错终止。pod 正常启动但 benchmark 命令失败时，保留 pod 与 namespace、
-打印排查命令并进入等待（不自动退出）：按 STOP/Ctrl+C 或 `--clean-up` 收场；
-下次运行会自动回收遗留 namespace。
+等事件并立即报错终止。**Deployment rollout（pipeline）同样秒级快速失败**：每 3s 轮询
+pod 致命状态与 namespace 事件，失败或 60s 超时都 dump **证据三件套**——`get pods -o wide`
++ `get events --sort-by=.lastTimestamp`（pod 级事件承载真实原因）+ `describe deployment`，
+并给出可直接复制的排查命令。**任何失败（含部署失败）都保留现场**：pod、Deployment 与
+namespace 全部保留，打印 exec/describe/events 命令并进入等待（不自动退出）：按
+STOP/Ctrl+C 或 `--clean-up` 收场；下次运行会自动回收遗留 namespace。
 
 ### 7.2 configs/global.json（业务无关全局超参）
 
