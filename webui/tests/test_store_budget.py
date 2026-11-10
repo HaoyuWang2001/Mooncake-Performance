@@ -89,9 +89,33 @@ segment_allocated_bytes{pool="a"} 1073741824
 master_total_capacity_bytes 21474836480
 """
     v = bm._parse_prometheus_metrics(text)
-    assert v["segment_total_capacity_bytes"] == 21474836480.0
-    assert v["segment_allocated_bytes"] == 1073741824.0   # labels stripped
+    assert v["segment_total_capacity_bytes"] == [21474836480.0]
+    assert v["segment_allocated_bytes"] == [1073741824.0]  # labels stripped
     assert "HELP" not in v
+
+
+def test_parse_labeled_series_summed():
+    """Real-cluster shape: a LABELED family (per-segment) must keep every
+    series and aggregate by SUM — a per-name dedup parsed it to the last
+    series (0) and lost the capacity entirely."""
+    text = """master_allocated_bytes 0
+master_total_capacity_bytes 193273528320
+segment_allocated_bytes{segment="a:1"} 0
+segment_allocated_bytes{segment="b:2"} 0
+segment_total_capacity_bytes{segment="a:1"} 12884901888
+segment_total_capacity_bytes{segment="b:2"} 12884901888
+segment_total_capacity_bytes{segment="c:3"} 0
+segment_total_capacity_bytes{segment="d:4"} 0
+mooncake_vsegment_logical_capacity_bytes 0
+mooncake_vsegment_logical_free_bytes 0
+"""
+    v = bm._parse_prometheus_metrics(text)
+    assert len(v["segment_total_capacity_bytes"]) == 4
+    assert bm._metric_total(v, "segment_total_capacity_bytes") == \
+        2 * 12884901888
+    assert bm._metric_total(v, "master_total_capacity_bytes") == 193273528320
+    assert bm._metric_total(v, "segment_allocated_bytes") == 0
+    assert bm._metric_total(v, "missing_metric") is None
 
 
 def test_master_metrics_url():
@@ -151,7 +175,7 @@ def test_discover_store_capacity_failure_is_warn_only(monkeypatch, capsys):
     g = {"master_addr": "10.0.0.7:50051"}
     assert bm.discover_store_capacity(None, g) is None
     assert "_store_total_auto" not in g
-    assert "auto-discovery failed" in capsys.readouterr().out
+    assert "store capacity probe failed" in capsys.readouterr().out
     # unset -> infinite behaviour preserved
     assert bm._store_total_bytes(g) is None
 
@@ -162,4 +186,78 @@ def test_discover_skip_is_explicit_warn(monkeypatch, capsys):
     g = {}   # no master_addr / master_metrics_url / store_total_size
     assert bm.discover_store_capacity(None, g) is None
     out = capsys.readouterr().out
-    assert "auto-discovery skipped" in out and "will FAIL" in out
+    assert "store capacity probe failed" in out and "will FAIL" in out
+
+
+def test_discover_labeled_metrics_sums(monkeypatch):
+    text = ("master_total_capacity_bytes 193273528320\n"
+            "segment_total_capacity_bytes{segment=\"a\"} 12884901888\n"
+            "segment_total_capacity_bytes{segment=\"b\"} 12884901888\n"
+            "segment_allocated_bytes{segment=\"a\"} 0\n")
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
+    g = {"master_addr": "10.0.0.7:50051"}
+    assert bm.discover_store_capacity(None, g) == 193273528320
+    assert g["_store_total_auto"] == 193273528320
+    # segment fallback/preference: master_total wins above; without it the
+    # labeled series are summed
+    text2 = ("segment_total_capacity_bytes{segment=\"a\"} 12884901888\n"
+             "segment_total_capacity_bytes{segment=\"b\"} 12884901888\n")
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text2)
+    g2 = {"master_addr": "10.0.0.7:50051"}
+    assert bm.discover_store_capacity(None, g2) == 2 * 12884901888
+
+
+def test_master_metrics_exec_params_defaults_and_override():
+    k8s_cluster = {"_controller": {"ip": "1.2.3.4"}, "k8s": {}}
+    assert bm._master_metrics_exec_params(k8s_cluster) == {
+        "namespace": "mooncake", "pod_prefix": "mooncake-master",
+        "port": 17702}
+    k8s_cluster["k8s"] = {"master_metrics_namespace": "infra",
+                          "master_metrics_pod": "mc-master",
+                          "master_metrics_port": 19000}
+    assert bm._master_metrics_exec_params(k8s_cluster) == {
+        "namespace": "infra", "pod_prefix": "mc-master", "port": 19000}
+    # ssh cluster: no exec probe
+    assert bm._master_metrics_exec_params({"nodes": {}}) is None
+
+
+def test_probe_metrics_via_exec(monkeypatch):
+    text = "master_total_capacity_bytes 193273528320\n"
+    calls = []
+
+    def fake_run(controller, args, check=True, timeout=None):
+        calls.append(list(args))
+        a = " ".join(str(x) for x in args)
+        if " get pods " in a or a.startswith("-n mooncake get pods"):
+            return ("mooncake-etcd-0 Running\n"
+                    "mooncake-master-657f88fc6c-vfp4f Running\n"
+                    "mooncake-master-old Terminating\n"), 0
+        if " exec " in a:
+            return text, 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake_run)
+    cluster = {"_controller": {"ip": "1.2.3.4"}, "k8s": {}}
+    got, src = bm._probe_metrics_via_exec(cluster)
+    assert got == text
+    assert src == "kubectl exec mooncake/mooncake-master-657f88fc6c-vfp4f:17702"
+    # exec command targets localhost inside the pod
+    exec_args = [c for c in calls if " exec " in " ".join(str(x) for x in c)]
+    assert exec_args and "http://localhost:17702/metrics" in " ".join(
+        str(x) for x in exec_args[0])
+    # no matching Running pod -> None + reason
+    def only_terminating(controller, args, check=True, timeout=None):
+        return "mooncake-master-old Terminating\n", 0
+    monkeypatch.setattr(bm, "controller_run", only_terminating)
+    got, why = bm._probe_metrics_via_exec(cluster)
+    assert got is None and "no Running pod" in why
+    # curl failure -> None + reason
+    def failing_exec(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "get pods" in a:
+            return "mooncake-master-x Running\n", 0
+        return "000", 1
+    monkeypatch.setattr(bm, "controller_run", failing_exec)
+    got, why = bm._probe_metrics_via_exec(cluster)
+    assert got is None and "curl failed" in why
+

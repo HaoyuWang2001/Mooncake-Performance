@@ -206,8 +206,13 @@ def _master_metrics_url(globals_cfg):
 
 
 def _parse_prometheus_metrics(text):
-    """Prometheus text exposition -> {metric_name: float}. Label sets are
-    stripped from the name; comments/blanks ignored."""
+    """Prometheus text exposition -> {metric_name: [values...]}.
+
+    Label sets are stripped from the name; a LABELED family (e.g. the
+    per-segment gauges, one series per segment) keeps EVERY series value so
+    callers can aggregate correctly. (Keeping only the last value parsed a
+    labeled family to 0 — real incident: segment_total_capacity_bytes has
+    dozens of series, most zero.)"""
     vals = {}
     for line in (text or "").splitlines():
         line = line.strip()
@@ -218,10 +223,19 @@ def _parse_prometheus_metrics(text):
             continue
         name = toks[0].split("{", 1)[0]
         try:
-            vals[name] = float(toks[1])
+            vals.setdefault(name, []).append(float(toks[1]))
         except ValueError:
             continue
     return vals
+
+
+def _metric_total(vals, name):
+    """Aggregate a gauge family: label-less gauges have one series (the
+    value itself); labeled families (per segment) are summed."""
+    series = vals.get(name)
+    if not series:
+        return None
+    return sum(series)
 
 
 def _http_get_text(url, timeout=5):
@@ -246,74 +260,149 @@ def _controller_curl_get(cluster, url, timeout=5):
     return out if rc == 0 and out.strip() else None
 
 
+def _master_metrics_exec_params(cluster):
+    """Exec-probe parameters from cluster.json's k8s section (k8s mode
+    only). Defaults match the reference deployment; override per cluster:
+      k8s.master_metrics_namespace  (default "mooncake")
+      k8s.master_metrics_pod        (pod name PREFIX, default "mooncake-master")
+      k8s.master_metrics_port       (default 17702)"""
+    if cluster is None or cluster.get("_controller") is None:
+        return None
+    k8s = cluster.get("k8s") or {}
+    return {
+        "namespace": str(k8s.get("master_metrics_namespace") or "mooncake"),
+        "pod_prefix": str(k8s.get("master_metrics_pod") or "mooncake-master"),
+        "port": int(k8s.get("master_metrics_port", 17702) or 17702),
+    }
+
+
+def _probe_metrics_via_exec(cluster):
+    """curl the metrics INSIDE the master pod via kubectl exec.
+
+    The metrics port is typically pod-internal only: the controller node
+    does not use cluster DNS (so Service names do not resolve there) and no
+    Service may expose the port at all. kubectl exec needs zero cluster
+    changes. Returns (text, source_label) or (None, reason)."""
+    params = _master_metrics_exec_params(cluster)
+    if params is None:
+        return None, "not a k8s cluster"
+    c = cluster["_controller"]
+    ns = params["namespace"]
+    prefix = params["pod_prefix"]
+    port = params["port"]
+    out, rc = controller_run(
+        c, ["-n", ns, "get", "pods", "-o",
+            "jsonpath={range .items[*]}{.metadata.name}{' '}"
+            "{.status.phase}{'\n'}{end}"], check=False)
+    if rc != 0:
+        return None, "cannot list pods in namespace {!r}: {}".format(
+            ns, out.strip()[:200])
+    pod = ""
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith(prefix) \
+                and parts[1] == "Running":
+            pod = parts[0]
+            break
+    if not pod:
+        return None, ("no Running pod with prefix {!r} in namespace {!r}"
+                      .format(prefix, ns))
+    out, rc = controller_run(
+        c, ["-n", ns, "exec", pod, "--", "curl", "-s", "--max-time", "5",
+            "http://localhost:{}/metrics".format(port)], check=False)
+    if rc != 0 or not out.strip():
+        return None, "kubectl exec curl failed (rc={}): {}".format(
+            rc, out.strip()[:200])
+    return out, "kubectl exec {}/{}:{}".format(ns, pod, port)
+
+
 def discover_store_capacity(cluster, globals_cfg):
     """Fetch the master's Prometheus metrics and record the store TOTAL
-    capacity for the key-space budget (explicit store_total_size still
-    wins). Failure only WARNs (falls back to the unconstrained behaviour).
+    capacity (B) for the key-space budget. Failure only WARNs.
 
-    k8s: curl via the controller (svc DNS resolved first, cached like the
-    etcd path); ssh: orchestrator direct, then curl on the first cluster
-    node as a fallback. Prints every relevant gauge into the log."""
+    Probe chain:
+      k8s: global.json master_metrics_url (direct, via controller)  ->
+           cluster.json k8s.master_metrics_* (kubectl exec INSIDE the
+           master pod — the metrics port is usually pod-internal only)
+      ssh: master_metrics_url / master_addr-derived direct GET, then curl
+           on the first cluster node as a fallback.
+
+    Labeled gauge families (per-segment series) are summed; the label-less
+    master_total gauge is preferred when present."""
     url = _master_metrics_url(globals_cfg)
-    if not url:
-        log("[WARN] store capacity auto-discovery skipped (no "
-            "master_metrics_url/master_addr in global.json); pipeline "
-            "scenarios require a store capacity and will FAIL — set "
-            "store_total_size manually or fix the metrics source")
-        return None
     text = None
+    source = ""
+    why = ""
     if cluster is not None and cluster.get("_controller") is not None:
-        cache = cluster.setdefault("_metrics_resolved", {})
-        if url not in cache:
-            try:
-                cache[url] = _resolve_k8s_addr(url, cluster)
-            except Exception:
-                cache[url] = url
-        text = _controller_curl_get(cluster, cache[url] or url)
-    else:
-        text = _http_get_text(url)
-        if text is None and cluster:
-            for name in (cluster.get("nodes") or {}):
-                n = get_node(cluster, name)
+        if url:
+            cache = cluster.setdefault("_metrics_resolved", {})
+            if url not in cache:
                 try:
-                    text = ssh_check_output(
-                        n["ip"], n, "curl -s --max-time 5 {}".format(
-                            shlex.quote(url)), quiet=True)
+                    cache[url] = _resolve_k8s_addr(url, cluster)
                 except Exception:
-                    text = None
-                break
+                    cache[url] = url
+            text = _controller_curl_get(cluster, cache[url] or url)
+            source = "direct {}".format(cache[url] or url)
+        if not text:
+            text, why = _probe_metrics_via_exec(cluster)
+            if text:
+                source = why
+    else:
+        if url:
+            text = _http_get_text(url)
+            source = url
+            if text is None and cluster:
+                for name in (cluster.get("nodes") or {}):
+                    n = get_node(cluster, name)
+                    try:
+                        text = ssh_check_output(
+                            n["ip"], n, "curl -s --max-time 5 {}".format(
+                                shlex.quote(url)), quiet=True)
+                    except Exception:
+                        text = None
+                    break
+            if text is None:
+                why = "master metrics unreachable at {}".format(url)
+        else:
+            why = "no master_metrics_url/master_addr in global.json"
     if not text:
-        log("[WARN] store capacity auto-discovery failed (master metrics "
-            "unreachable: {}); pipeline scenarios will FAIL — set "
-            "store_total_size manually".format(url))
+        log("[WARN] store capacity probe failed ({}); pipeline scenarios "
+            "require a store capacity and will FAIL — set store_total_size "
+            "manually or fix the metrics source".format(why or "unknown"))
         return None
     vals = _parse_prometheus_metrics(text)
     if not any(k in vals for k in _STORE_METRICS):
-        log("[WARN] store capacity auto-discovery: no known capacity gauges "
-            "at {} (got {} metrics); set store_total_size manually".format(
-                url, len(vals)))
+        log("[WARN] store capacity probe: no known capacity gauges from {} "
+            "(got {} metric names); set store_total_size manually".format(
+                source, len(vals)))
         return None
     printed = []
     for k in _STORE_METRICS:
-        if k in vals:
-            printed.append("{}={:.0f} ({:.2f} GiB)".format(
-                k, vals[k], vals[k] / 1024.0 ** 3))
-    log("[benchmark] store metrics ({}): {}".format(url, ", ".join(printed)))
-    total = vals.get("segment_total_capacity_bytes")
+        t = _metric_total(vals, k)
+        if t is None:
+            continue
+        n_series = len(vals[k])
+        printed.append("{}{}={}".format(
+            k, " ({} series summed)".format(n_series) if n_series > 1 else "",
+            _fmt_gib(t)))
+    log("[benchmark] store metrics ({}): {}".format(source, ", ".join(printed)))
+    total = _metric_total(vals, "master_total_capacity_bytes")
     if total is None:
-        total = vals.get("master_total_capacity_bytes")
-    if total is None:
-        total = vals.get("mooncake_vsegment_logical_capacity_bytes")
+        total = _metric_total(vals, "segment_total_capacity_bytes")
     if not total:
-        log("[WARN] store capacity auto-discovery: total capacity gauge "
-            "missing; set store_total_size manually")
+        total = _metric_total(vals, "mooncake_vsegment_logical_capacity_bytes")
+    if not total:
+        log("[WARN] store capacity probe: total capacity gauge missing in "
+            "{}; set store_total_size manually".format(source))
         return None
     globals_cfg["_store_total_auto"] = int(total)
-    allocated = vals.get("segment_allocated_bytes")
+    allocated = _metric_total(vals, "segment_allocated_bytes")
+    if allocated is None:
+        allocated = _metric_total(vals, "master_allocated_bytes")
     free = (total - allocated) if allocated is not None else None
-    log("[benchmark] store capacity (auto): total={:.2f} GiB{}".format(
-        total / 1024.0 ** 3,
-        "" if free is None else ", free={:.2f} GiB".format(free / 1024.0 ** 3)))
+    log("[benchmark] store capacity (probed): total={}{}".format(
+        _fmt_gib(total),
+        "" if free is None else ", free={}".format(_fmt_gib(free))))
     return int(total)
 
 
