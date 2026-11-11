@@ -19,7 +19,10 @@ if ROOT not in sys.path:
 
 DATA_DIR = os.path.join(WEBUI_DIR, "data")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
+INSTANCES_DIR = os.path.join(DATA_DIR, "instances")
 BACKUP_DIR = os.path.join(WEBUI_DIR, "backups")
+# 删除的实例记录进回收站（与 outputs 回收站同处 gitignored backups/）
+INSTANCES_TRASH_DIR = os.path.join(BACKUP_DIR, "instances-trash")
 STATIC_DIR = os.path.join(WEBUI_DIR, "web")        # 磁盘目录 web/，URL 前缀 /static/
 SCHED_DIR = os.path.join(ROOT, "schedule")
 API_MD = os.path.join(WEBUI_DIR, "API.md")
@@ -36,4 +39,5 @@ MAX_TEXT_CHUNK = 512 * 1024
 TS_RE = re.compile(r"^[0-9A-Za-z._-]+$")
 
 os.makedirs(RUNS_DIR, exist_ok=True)
+os.makedirs(INSTANCES_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
