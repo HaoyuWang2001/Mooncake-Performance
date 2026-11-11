@@ -158,14 +158,26 @@ def _generate_openapi():
     paths["/api/config"].update(_put("Save config (backup + validate)"))
     paths["/api/config/validate"] = _post("Validate config content without saving")
     paths["/api/run"] = _post("Launch benchmark run (mode: ssh/k8s)")
-    paths["/api/run"]["post"]["responses"]["409"] = {"description": "Slot busy"}
+    paths["/api/run"]["post"]["responses"]["409"] = {"description": "Shared resource conflict / same instance running / scheduler executing"}
     paths["/api/cleanup"] = _post("Standalone clean-up (k8s namespace/workspace or SSH remote_dir)")
-    paths["/api/cleanup"]["post"]["responses"]["409"] = {"description": "Slot busy"}
+    paths["/api/cleanup"]["post"]["responses"]["409"] = {"description": "Shared resource conflict / scheduler executing"}
     paths["/api/runs"] = _p("Run history (max 60)")
     paths["/api/runs/{id}"] = _p("Run metadata by id")
     paths["/api/runs/{id}/log"] = _p("Incremental log fetch by byte offset")
-    paths["/api/runs/{id}/log"]["get"]["parameters"] = [_q("offset", "integer", False, 0)]
+    paths["/api/runs/{id}/log"]["get"]["parameters"] = [
+        _q("offset", "integer", False, 0),
+        _q("stream", default="all")]
     paths["/api/runs/{id}/stop"] = _post("Stop a run (cross-platform kill + remote reap)")
+    paths["/api/instances"] = _p("List instances (instance = reusable form snapshot)")
+    paths["/api/instances"].update(_post("Create instance (does NOT start it)"))
+    paths["/api/instances"]["post"]["responses"]["409"] = {"description": "Conflict"}
+    paths["/api/instances/{iid}"] = _p("Instance detail + its runs")
+    paths["/api/instances/{iid}"].update(_delete("Delete instance record (keeps runs/logs)"))
+    paths["/api/instances/{iid}/run"] = _post("Run this instance (guard-checked)")
+    paths["/api/instances/{iid}/run"]["post"]["responses"]["409"] = {
+        "description": "Running or shared resource conflict"}
+    paths["/api/instances/{iid}/stop"] = _post("Stop this instance's active run")
+    paths["/api/instances/{iid}/rename"] = _post("Rename instance")
     paths["/api/outputs"] = _p("List output runs")
     paths["/api/outputs/{ts}/tree"] = _p("File tree of one output run")
     paths["/api/outputs/{ts}"] = _delete("Delete run result (moved to trash)")

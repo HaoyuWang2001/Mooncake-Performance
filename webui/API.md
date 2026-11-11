@@ -21,6 +21,7 @@
 {"version":"1.0","platform":"posix","python":"3.12.3","root":"/path/Mooncake-Performance",
  "paths":{"outputs":"outputs","runs":"webui/data/runs"},
  "active_run":{"id":"r20261029-223001-001","status":"running",...} | null,
+ "active_runs":[{"id":"r...","status":"running",...}, ...],   // 所有活跃 run（多实例并发）
  "scheduler":{"id":"s20261029-223005-002","state":"waiting",...} | null}
 ```
 
@@ -91,7 +92,20 @@ selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files
 任一为空、或包含其他 work_mode，父任务即失败。两个 benchmark 并发执行，日志带角色前缀，
 结果写入同一 `outputs/<run>/rank` 与 `outputs/<run>/recall`；共享 `profile` 与通用运行选项。
 → `201` 意义上返回 `{"run":{"id":"r...","status":"running","cmd":"..."},"warnings":[]}`
-槽位被占 → `409 {"error":"benchmark run r... is still active ..."}`
+共享资源冲突 → `409 {"error":"shared resource in use by instance ..."}`（见「实例管理」并发规则）。
+
+> WebUI 性能测试页不再直接调用 /api/run：它先「创建实例」（`POST /api/instances`，
+> 只存表单快照不运行），再由实例卡片/详情页触发运行。`/api/run` 保留给脚本/CLI 式调用。
+
+### 并发规则（多实例）
+多个实例可同时运行，但共享资源的组合会被拒绝（409，错误信息标明占用实例与资源）：
+- k8s：`(controller.ip, kubecontext, namespace)` 相同 → 冲突（同一批 pod/Deployment）
+- SSH：节点 IP 集合相交 → 冲突（端口段 9101/9201/9301+ 与共享 value.bin）
+- global：etcd 端点相交、`master_addr` 相同、`master_metrics_url` host 相同 → 冲突
+  （rendezvous `mcbench/` 前缀会被互清；同 store 容量会被双方同时按 0.9× 预算打爆）
+- 同一实例已有活跃 run → 409；scheduler 任务执行中 → 409
+- 不同集群 + 不同栈（etcd/master）→ 可真正并行；每个 run 使用独立
+  `webui/data/runs/<id>.state` 台账（Rank+Recall 子任务为 `<id>.state.rank|recall`）
 
 ### POST /api/cleanup
 standalone clean-up（不跑场景；不需要 profile）：
@@ -102,7 +116,7 @@ standalone clean-up（不跑场景；不需要 profile）：
 - k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
 - SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
 - 本地 `outputs/` 与 run 日志保留；不可恢复；
-- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- 受并发守卫约束：与活跃 run 共享集群/等栈时 409；scheduler 任务执行中 → 409；
 - → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
 ### GET /api/runs
@@ -118,7 +132,7 @@ standalone clean-up（不跑场景；不需要 profile）：
 - k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
 - SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
 - 本地 `outputs/` 与 run 日志保留；不可恢复；
-- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- 受并发守卫约束：与活跃 run 共享集群/等栈时 409；scheduler 任务执行中 → 409；
 - → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
 ### GET /api/runs/{id}
@@ -133,12 +147,14 @@ standalone clean-up（不跑场景；不需要 profile）：
 - k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
 - SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
 - 本地 `outputs/` 与 run 日志保留；不可恢复；
-- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- 受并发守卫约束：与活跃 run 共享集群/等栈时 409；scheduler 任务执行中 → 409；
 - → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
-### GET /api/runs/{id}/log?offset=0
+### GET /api/runs/{id}/log?offset=0&stream=all|rank|recall
 增量日志：`{"offset":<新字节偏移>,"size":<总字节>,"content":"<新增文本>","eof":bool}`
 单次最多 512KB；`offset` 为字节偏移（首次传 0，之后传上次返回值）。
+`stream=rank|recall` 只返回组合实例（Rank+Recall 并行）对应子任务的行并剥离
+`[rank] `/`[recall] ` 前缀；分页始终停在行边界（跨块残行留到下一页），默认 `all` 为原始日志。
 
 ### POST /api/runs/{id}/stop
 **优雅停止**：写 `webui/data/runs/<id>.stop` 并向进程组发送 SIGINT/CTRL_BREAK，
@@ -147,6 +163,45 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 （环境变量 `MCWEB_STOP_GRACE` 可调），超时后强制 kill；后台线程再做一次兜底清理。
 停止期间 `status` 仍为 `running` 且 `stopping=true`，完成后变 `stopped`。
 → `{"ok":true,"run":{...stopping:true}}`（已结束的 run 调用也返回 ok）
+
+---
+
+## 实例管理（instances）
+
+实例 = 一份表单快照（`selector` + `flags`，与 POST /api/run 同构）构成的可复用测试定义；
+创建本身**不运行**。每次运行产生一个 run（`meta.instance` 指回实例），日志/停止/守卫沿用 run 机制。
+
+### POST /api/instances
+```json
+{"name": "rank-8mb（可空=自动命名）", "selector": {...}, "flags": {...}}
+```
+校验与 POST /api/run 相同（配置存在性、launch_mode 规则），但不占用运行槽。
+→ `{"instance":{"id":"i...","name":...,"status":"created","launch_mode":"single","mode":"k8s",
+   "flags":{...},"selection":{"dirs":[],"files":[]},"last_run":null}}`
+
+### GET /api/instances
+`{"instances":[<instance summary>, ...]}`（新→旧）。`status` 派生自活跃 run 或最近持久化 run
+（`created|running|stopping|done|failed|stopped`），`last_run` 含 `id/status/rc/elapsed/ts_dir/cmd`。
+
+### GET /api/instances/{iid}
+`{"instance":<summary>,"runs":[<run meta>, ...]}`（该实例全部运行记录）。
+
+### POST /api/instances/{iid}/run
+启动该实例的一次运行（表单快照 → benchmark argv）。守卫/冲突语义同 `POST /api/run`。
+→ `{"run":{...},"warnings":[]}`；同实例已在运行或共享资源冲突 → 409。
+
+### POST /api/instances/{iid}/stop
+停止该实例当前的活跃 run（优雅停止语义同 `POST /api/runs/{id}/stop`）；未在运行 → 409。
+
+### POST /api/instances/{iid}/rename
+```json
+{"name": "新名称"}
+```
+→ `{"instance":<summary>}`。
+
+### DELETE /api/instances/{iid}
+删除实例记录（移入 `webui/backups/instances-trash/`）；运行记录/日志/outputs **保留**。
+运行中 → 409。
 
 ---
 
