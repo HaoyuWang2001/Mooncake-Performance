@@ -183,25 +183,65 @@ def api_run_get(handler, query, rid):
     return run.to_dict()
 
 
+def _read_log_page(path, offset, stream):
+    """One page of a run log, optionally filtered to one combined-run stream.
+
+    stream=all  -> raw text page (legacy behaviour)
+    stream=rank|recall -> only lines carrying the "[rank] "/"[recall] "
+        prefix written by scripts/run_rank_recall.py; the prefix is stripped.
+
+    Pages always end on a line boundary (a trailing partial line is left for
+    the next page) so filtered pagination never drops or duplicates lines.
+    """
+    size = os.path.getsize(path)
+    offset = max(0, min(offset, size))
+    with open(path, "rb") as f:
+        f.seek(offset)
+        buf = f.read(MAX_TEXT_CHUNK)
+        # a page must contain at least one whole line (unless EOF): extend
+        # when the chunk has no newline at all (very long line / tiny chunk)
+        while (offset + len(buf) < size and b"\n" not in buf
+               and len(buf) < 4 * 1024 * 1024):
+            more = f.read(MAX_TEXT_CHUNK)
+            if not more:
+                break
+            buf += more
+    consumed = len(buf)
+    if offset + consumed < size:
+        nl = buf.rfind(b"\n")
+        if nl >= 0:
+            buf = buf[:nl + 1]
+            consumed = len(buf)
+    eof = offset + consumed >= size
+    text = buf.decode("utf-8", errors="replace")
+    if stream in ("rank", "recall"):
+        if not eof and b"\n" not in buf:
+            # pathological >4MB single line: never emit a truncated prefixed
+            # line (would be lost/duplicated); skip this page's bytes
+            text = ""
+        else:
+            prefix = "[{}] ".format(stream)
+            kept = [ln[len(prefix):] for ln in text.splitlines()
+                    if ln.startswith(prefix)]
+            text = ("\n".join(kept) + "\n") if kept else ""
+    return {"offset": offset + consumed, "size": size,
+            "content": text, "eof": eof}
+
+
 def api_run_log(handler, query, rid):
     run = runmgr.MGR.get_run(rid)
     if run is None:
         raise ApiError(404, "no such run: {}".format(rid))
+    stream = (query.get("stream", ["all"])[0] or "all").lower()
+    if stream not in ("all", "rank", "recall"):
+        raise ApiError(400, "stream must be all|rank|recall")
     try:
         offset = int(query.get("offset", ["0"])[0])
     except ValueError:
         offset = 0
     if not os.path.isfile(run.log_path):
         return {"offset": 0, "size": 0, "content": "", "eof": True}
-    size = os.path.getsize(run.log_path)
-    offset = max(0, min(offset, size))
-    with open(run.log_path, "rb") as f:
-        f.seek(offset)
-        chunk = f.read(MAX_TEXT_CHUNK)
-    new_off = offset + len(chunk)
-    return {"offset": new_off, "size": size,
-            "content": chunk.decode("utf-8", errors="replace"),
-            "eof": new_off >= size}
+    return _read_log_page(run.log_path, offset, stream)
 
 
 def api_run_stop(handler, query, rid):
