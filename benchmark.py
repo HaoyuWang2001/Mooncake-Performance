@@ -1723,26 +1723,57 @@ def numa_node_check(node_name, numa_strict):
 
 
 def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
+    """Pull every <cfg>.* file from each involved node. Retried ONCE (with a
+    reconnect) because scp_pull now verifies byte sizes: a channel killed
+    mid-transfer raises instead of silently leaving a truncated local log,
+    and a single retry recovers the common transient case."""
     pulled_ips = set()
     for node_name in involved_nodes:
         n = get_node(cluster, node_name)
         if n["ip"] in pulled_ips:
             continue
         pulled_ips.add(n["ip"])
-        scp_pull(n["ip"], n, "{}/{}.*".format(remote_log_dir, cfg_name),
-                 local_log_dir, dry_run=dry_run)
+        remote_glob = "{}/{}.*".format(remote_log_dir, cfg_name)
+        last_exc = None
+        for attempt in (0, 1):
+            try:
+                scp_pull(n["ip"], n, remote_glob, local_log_dir, dry_run=dry_run)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if dry_run:
+                    break
+                if attempt == 0:
+                    try:
+                        _ssh_drop(n)   # reconnect before the retry
+                    except Exception:
+                        pass
+        if last_exc is not None:
+            raise last_exc
 
 
 def pull_stage_logs(ip, node, remote_files, local_dir, dry_run):
     """Incremental pull of just-finished stage log(s) so previous stages are
-    locally readable while later (long) stages run; never raises."""
+    locally readable while later (long) stages run. Each file is retried once
+    (size-verified by scp_pull); still failing files only WARN — the
+    authoritative full pull happens later via pull_logs/_pipeline_pull_parallel."""
     if dry_run or not remote_files:
         return
     for f in remote_files:
-        try:
-            scp_pull(ip, node, f, local_dir, dry_run=False)
-        except Exception as exc:
-            log_detail("[WARN] stage log pull {}: {}".format(f, exc))
+        for attempt in (0, 1):
+            try:
+                scp_pull(ip, node, f, local_dir, dry_run=False)
+                break
+            except Exception as exc:
+                if attempt == 0:
+                    try:
+                        _ssh_drop(node)
+                    except Exception:
+                        pass
+                    continue
+                log_detail("[WARN] stage log pull {}: {}".format(f, exc))
+
 
 
 def format_duration(seconds):

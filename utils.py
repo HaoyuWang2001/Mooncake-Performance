@@ -644,6 +644,37 @@ def scp_push(host, node, local_files, remote_path, dry_run=False):
         sftp.close()
 
 
+def _remove_partial(path):
+    """Drop a local file that may be a truncated transfer result."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _verify_pulled_size(remote_size, local_path, remote_name, where):
+    """A file counts as pulled only when its local size matches the remote
+    size. A truncated/partial transfer is removed and raised so callers can
+    re-pull (or fail) instead of silently keeping a cut log — the actual
+    truncation incident this guards against: an SFTP channel killed mid-file
+    left a half log that an existence-only check accepted."""
+    try:
+        local_size = os.path.getsize(local_path)
+    except OSError:
+        local_size = -1
+    try:
+        want = int(remote_size)
+    except (TypeError, ValueError):
+        # remote size unknown -> do not fail the pull on that alone
+        return
+    if want != local_size:
+        _remove_partial(local_path)
+        raise RuntimeError(
+            "pull size mismatch from {}: {} (remote {}B, local {}B); "
+            "partial local file removed".format(
+                where, remote_name, want, local_size))
+
+
 def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
     if is_k8s_node(node):
         # kubectl cp does NOT expand globs: list matching paths via exec,
@@ -667,25 +698,35 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         for f in files:
             if controller_is_local(c):
                 dst = local_dir.rstrip("\\/") + os.sep
+                local_file = os.path.join(local_dir, os.path.basename(f))
             else:
                 dst = posixpath.join(stage, os.path.basename(f))
+                local_file = os.path.join(local_dir, os.path.basename(f))
             log_detail("[k8s] $ {}".format(
                 kubectl_cp_from_line(node, f, dst)))
             if dry_run:
                 log_detail("      (dry-run, skipped)")
                 continue
-            if controller_is_local(c):
-                out, rc = controller_run(
-                    c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f),
-                        dst], check=False)
-            else:
-                out, rc = controller_run(
-                    c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f), dst],
-                    check=False)
-                if rc == 0:
-                    controller_get_file(c, dst, local_dir)
+            try:
+                if controller_is_local(c):
+                    out, rc = controller_run(
+                        c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f),
+                            dst], check=False)
+                else:
+                    out, rc = controller_run(
+                        c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f), dst],
+                        check=False)
+                    if rc == 0:
+                        controller_get_file(c, dst, local_dir)
+            except Exception:
+                _remove_partial(local_file)
+                raise
             if rc != 0:
+                _remove_partial(local_file)
                 raise RuntimeError("kubectl cp pull failed for {}: {}".format(f, out.strip()[:300]))
+            remote_size = ssh_check_output(
+                host, node, "stat -c %s {}".format(shlex.quote(f)), quiet=True)
+            _verify_pulled_size(remote_size, local_file, f, node["_pod"])
         log_detail("[k8s] pulled {} files from pod {} -> {}".format(
             len(files), node["_pod"], local_dir))
         return
@@ -708,7 +749,13 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
     try:
         for f in files:
             log_detail("[scp] <- {} : {}".format(host, f))
-            sftp.get(f, os.path.join(local_dir, os.path.basename(f)))
+            dst = os.path.join(local_dir, os.path.basename(f))
+            try:
+                sftp.get(f, dst)
+            except Exception:
+                _remove_partial(dst)
+                raise
+            _verify_pulled_size(sftp.stat(f).st_size, dst, f, host)
     finally:
         sftp.close()
     log_detail("[ssh] pulled {} files from {} -> {}".format(
