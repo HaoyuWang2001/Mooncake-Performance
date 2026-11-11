@@ -1,6 +1,97 @@
-/* Mooncake-Performance WebUI — 自定义补充样式（主体视觉来自 Element Plus） */
+/* Mooncake-Performance WebUI — 自定义补充样式（主体视觉来自 Element Plus）
+ *
+ * 设计 token（webui-design skill）
+ * 颜色优先 var(--el-*)，其次 --mc-*；除本文件 token 定义外禁止散落 hex。
+ * EP 样式为运行时注入，主色覆盖用 :root:root 高特异性确保生效。
+ * ============================================================ */
+:root {
+  --mc-font-ui: system-ui, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --mc-font-mono: 'Cascadia Code', Consolas, 'Courier New', monospace;
+  --mc-space-1: 4px; --mc-space-2: 8px; --mc-space-3: 12px;
+  --mc-space-4: 16px; --mc-space-5: 20px; --mc-space-6: 24px;
+  --mc-radius: 4px;
+  --mc-overlay: rgba(0, 0, 0, 0.7);
+  --mc-img-bg: #ffffff;
+  --mc-term-bg: #12171b;
+  --mc-term-fg: #d6dde3;
+  --mc-term-muted: #8391a0;
+  --mc-term-error: #ff8f9c;
+  --mc-term-hit-bg: #f2d27a;
+  --mc-term-hit-fg: #12171b;
+  --mc-term-cur-bg: rgba(14, 116, 144, 0.32);
+  color-scheme: light;
+}
 
-html, body, #app { height: 100%; margin: 0; }
+/* 主色：深青技术色系（与 Services-Deployment 一致）。
+ * :root:root (0,2,0) 压过 EP 运行时注入的 :root (0,1,0)，无需 JS 分支。 */
+:root:root {
+  --el-color-primary: #0e7490;
+  --el-color-primary-light-3: #569eb1;
+  --el-color-primary-light-5: #87bac8;
+  --el-color-primary-light-7: #b7d5de;
+  --el-color-primary-light-8: #cfe3e9;
+  --el-color-primary-light-9: #e7f1f4;
+  --el-color-primary-dark-2: #0b5d73;
+}
+
+:root:root.dark {
+  --el-color-primary: #27b3c9;
+  --el-color-primary-light-3: #218393;
+  --el-color-primary-light-5: #1e646f;
+  --el-color-primary-light-7: #1a444a;
+  --el-color-primary-light-8: #183438;
+  --el-color-primary-light-9: #162426;
+  --el-color-primary-dark-2: #52c2d4;
+  --mc-term-bg: #0c1115;
+  --mc-term-fg: #d6dde3;
+  --mc-term-muted: #7d8a94;
+  --mc-term-hit-bg: #e8c96a;
+  --mc-term-hit-fg: #0c1115;
+  --mc-term-cur-bg: rgba(39, 179, 201, 0.28);
+  color-scheme: dark;
+}
+
+html, body, #app {
+  height: 100%; margin: 0;
+  font-family: var(--mc-font-ui);
+}
+
+/* ---- 通用工具类（webui-design skill） ---- */
+.mc-page { display: flex; flex-direction: column; gap: var(--mc-space-4); }
+.mc-mono { font-family: var(--mc-font-mono); }
+.mc-num { font-variant-numeric: tabular-nums; }
+.mc-muted { color: var(--el-text-color-secondary); font-size: 12px; }
+.mc-label { color: var(--el-text-color-secondary); font-size: 13px; }
+.mc-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mc-space-2); }
+.mc-page-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: var(--mc-space-4);
+}
+.mc-page-head .title {
+  margin: 0; font-size: 16px; font-weight: 600; line-height: 24px;
+  color: var(--el-text-color-primary);
+}
+.mc-page-head .desc {
+  margin: var(--mc-space-1) 0 0; font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.mc-page-head .actions {
+  display: flex; align-items: center; gap: var(--mc-space-2); flex-shrink: 0;
+}
+
+/* 按钮按压反馈（克制、可被 reduced-motion 关闭） */
+@media (prefers-reduced-motion: no-preference) {
+  .el-button:not(.is-disabled):active { transform: scale(0.97); }
+}
+.el-button:focus-visible, .el-menu-item:focus-visible,
+.inst-card:focus-visible, .run-item:focus-visible, .inst-tab:focus-visible {
+  outline: 2px solid var(--el-color-primary); outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .el-button, .inst-card, .run-item, .inst-tab, .pane, .pane-head {
+    transition: none !important;
+  }
+}
 
 .layout { height: 100%; }
 .aside {
@@ -11,14 +102,19 @@ html, body, #app { height: 100%; margin: 0; }
   overflow: hidden;
 }
 .brand {
-  font-weight: 600;
-  font-size: 15px;
-  padding: 16px 20px 10px;
+  display: flex; align-items: center; gap: var(--mc-space-2);
+  font-weight: 600; font-size: 14px;
+  padding: var(--mc-space-4) var(--mc-space-5) var(--mc-space-3);
   color: var(--el-text-color-primary);
   white-space: nowrap;
+  border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .brand span { color: var(--el-color-primary); }
-.badges { padding: 0 16px 10px; display: flex; flex-direction: column; gap: 6px; }
+.brand-mark {
+  width: 8px; height: 8px; border-radius: 2px;
+  background: var(--el-color-primary); flex-shrink: 0;
+}
+.badges { padding: 0 var(--mc-space-4) var(--mc-space-2); display: flex; flex-direction: column; gap: var(--mc-space-1); }
 .badge-line {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--el-text-color-secondary);
@@ -35,32 +131,37 @@ html, body, #app { height: 100%; margin: 0; }
 .menu { border-right: none; flex: 1; overflow-y: auto; }
 .aside-footer {
   border-top: 1px solid var(--el-border-color-light);
-  padding: 10px 16px;
+  padding: var(--mc-space-3) var(--mc-space-4);
   display: flex; align-items: center; justify-content: space-between;
 }
 
-.main { background: var(--el-bg-color-page); overflow-y: auto; }
+.main { background: var(--el-bg-color-page); overflow-y: auto; padding: var(--mc-space-4); }
 .page { max-width: 1500px; }
 .header-row {
-  display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: var(--mc-space-3);
+  margin-bottom: var(--mc-space-4); flex-wrap: wrap;
 }
 .header-row .hint { color: var(--el-text-color-secondary); font-size: 13px; }
 .header-row .spacer { flex: 1; }
 
-/* ---- 日志视图 ---- */
+/* ---- 日志/终端视图（亮暗双主题恒深底，保证可读性） ---- */
 .logview {
-  background: var(--el-fill-color-darker);
+  background: var(--mc-term-bg);
+  color: var(--mc-term-fg);
   border: 1px solid var(--el-border-color);
-  border-radius: var(--el-border-radius-base);
-  padding: 10px 12px;
-  font: 12px/1.5 "Cascadia Mono", Consolas, "Courier New", monospace;
+  border-radius: var(--mc-radius);
+  padding: var(--mc-space-3) var(--mc-space-4);
+  font: 13px/1.6 var(--mc-font-mono);
   white-space: pre-wrap; word-break: break-all;
   overflow: auto;
 }
-.logview .ln-err { color: var(--el-color-error); }
+.logview > div {
+  content-visibility: auto; contain-intrinsic-size: auto 21px;
+}
+.logview .ln-err { color: var(--mc-term-error); }
 .logview .ln-warn { color: var(--el-color-warning); }
 .logview .ln-ok { color: var(--el-color-success); }
-.logview .ln-dim { color: var(--el-text-color-secondary); }
+.logview .ln-dim { color: var(--mc-term-muted); }
 .log-lg {
   min-height: 200px;
   overflow-y: auto;
@@ -91,7 +192,7 @@ html, body, #app { height: 100%; margin: 0; }
 .runbox .rb-spacer { flex: 1; }
 .runbox .rb-files { flex: 1; display: flex; align-items: center; gap: 14px;
                     flex-wrap: wrap; font-size: 13px; }
-.runbox .rb-seg { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+.runbox .rb-seg { font-family: var(--mc-font-mono); font-size: 13px; }
 .runbox .rb-k { color: var(--el-color-primary); margin-right: 6px; font-weight: 600; }
 .runbox .rb-note { color: var(--el-text-color-secondary); font-size: 12px; }
 .runbox .rb-clean-hint {
@@ -131,9 +232,9 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .cr-v {
   min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; font-size: 12.5px;
+  white-space: nowrap; font-size: 13px;
 }
-.cr-v.mono { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; }
+.cr-v.mono { font-family: var(--mc-font-mono); }
 
 /* 日志工具栏 + 固定高度 + 搜索高亮 */
 .log-toolbar {
@@ -154,11 +255,10 @@ html, body, #app { height: 100%; margin: 0; }
 .logview.log-fixed { height: 480px; min-height: 480px; }
 .logview.log-nowrap { white-space: pre; word-break: normal; }
 .logview .ln-mark {
-  background: var(--el-color-warning-light-5);
-  color: var(--el-color-warning-dark-2);
+  background: var(--mc-term-hit-bg); color: var(--mc-term-hit-fg);
   border-radius: 2px;
 }
-.logview .ln-cur-match { background: var(--el-color-warning-light-8); }
+.logview .ln-cur-match { background: var(--mc-term-cur-bg); }
 
 /* 运行框：已选配置（目录/文件上下堆叠，过滤合并后） */
 .runbox .rb-selected {
@@ -173,18 +273,18 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .runbox .rb-sel-head .rb-label { margin-right: 2px; }
 .runbox .rb-image {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--mc-font-mono);
   color: var(--el-text-color-regular);
 }
 .runbox .rb-label-inline { width: auto; margin-left: 12px; }
 .runbox .rb-sel-col { min-width: 0; }
 .runbox .rb-sel-title {
-  font-size: 12.5px; font-weight: 600; color: var(--el-text-color-secondary);
+  font-size: 13px; font-weight: 600; color: var(--el-text-color-secondary);
   margin-bottom: 4px;
 }
 .runbox .rb-sel-count { color: var(--el-color-primary); }
 .runbox .rb-sel-path {
-  font: 12px/1.6 "Cascadia Mono", Consolas, monospace;
+  font: 12px/1.6 var(--mc-font-mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .runbox .rb-sel-empty { font-size: 12px; color: var(--el-text-color-placeholder); }
@@ -195,7 +295,7 @@ html, body, #app { height: 100%; margin: 0; }
   .runbox .rb-selected { grid-template-columns: 1fr; }
 }
 .general-item { padding: 3px 8px; border-radius: 5px; cursor: pointer;
-                font-size: 13px; font-family: "Cascadia Mono", Consolas, monospace; }
+                font-size: 13px; font-family: var(--mc-font-mono); }
 .general-item:hover { background: var(--el-fill-color); }
 .cfg-tree { max-height: 560px; overflow: auto; }
 .cfg-row { display: flex; align-items: center; gap: 6px; padding: 2px 0;
@@ -207,7 +307,7 @@ html, body, #app { height: 100%; margin: 0; }
 .cfg-row .tgl { display: inline-block; width: 14px; cursor: pointer;
                 color: var(--el-text-color-secondary); flex: none; }
 .cfg-row .tgl-dot::before { content: "·"; }
-.editor textarea { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+.editor textarea { font-family: var(--mc-font-mono); font-size: 13px; }
 
 /* ---- 运行结果 ---- */
 .run-item {
@@ -281,14 +381,14 @@ html, body, #app { height: 100%; margin: 0; }
   border-radius: 10px;
   box-shadow: var(--el-box-shadow-light);
 }
-.float-bar .fb-id { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
-.float-bar .fb-elapsed { color: var(--el-text-color-secondary); font-size: 12.5px; }
+.float-bar .fb-id { font-family: var(--mc-font-mono); font-size: 13px; }
+.float-bar .fb-elapsed { color: var(--el-text-color-secondary); font-size: 13px; }
 .float-bar .fb-spacer { flex: 1; }
 
 /* ---- 结果框全屏（teleport 蒙版 + 居中大框） ---- */
 .fs-mask {
   position: fixed; inset: 0; z-index: 2000;
-  background: rgba(0, 0, 0, 0.7);
+  background: var(--mc-overlay);
   display: flex; align-items: center; justify-content: center;
 }
 .fs-box { width: 92%; height: 88vh; display: flex; overflow: hidden; }
@@ -305,13 +405,13 @@ html, body, #app { height: 100%; margin: 0; }
 .imgbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .imgwrap { position: relative; flex: 1; min-height: 0; overflow: hidden; }
 .imgwrap img { position: absolute; left: 50%; top: 50%;
-               max-width: none; max-height: none; background: #fff; border-radius: 6px; }
+               max-width: none; max-height: none; background: var(--mc-img-bg); border-radius: 6px; }
 .imgwrap img.can-drag { cursor: grab; }
 .imgwrap img.dragging { cursor: grabbing; }
-.pane-body img { max-width: 100%; background: #fff; border-radius: 6px; }
+.pane-body img { max-width: 100%; background: var(--mc-img-bg); border-radius: 6px; }
 .pane-body .txt {
   background: var(--el-fill-color-darker); border-radius: 6px; padding: 10px;
-  font: 12px/1.5 "Cascadia Mono", Consolas, monospace;
+  font: 12px/1.5 var(--mc-font-mono);
   white-space: pre-wrap; word-break: break-all;
 }
 /* 长日志分页加载条：滚动到内容底部时出现「加载更多」 */
@@ -321,7 +421,7 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .pane-body .json {
   background: var(--el-fill-color-darker); border-radius: 6px; padding: 10px;
-  font: 12px/1.5 "Cascadia Mono", Consolas, monospace;
+  font: 12px/1.5 var(--mc-font-mono);
   white-space: pre; overflow: auto;
 }
 
@@ -334,21 +434,21 @@ html, body, #app { height: 100%; margin: 0; }
 .apidoc {
   background: var(--el-fill-color-darker); border: 1px solid var(--el-border-color);
   border-radius: var(--el-border-radius-base); padding: 16px;
-  font: 12.5px/1.6 "Cascadia Mono", Consolas, monospace;
+  font: 13px/1.6 var(--mc-font-mono);
   white-space: pre-wrap; max-height: 78vh; overflow: auto;
 }
 
 /* ---- spdiag 打点树 ---- */
 .sdtree { display: flex; flex-direction: column; height: 100%; min-height: 300px; }
 .sdtree-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
-.sdtree-meta { font-size: 12.5px; color: var(--el-text-color-secondary); }
-.sdtree-dim { color: var(--el-text-color-secondary); font-size: 12.5px; padding: 2px 0; }
+.sdtree-meta { font-size: 13px; color: var(--el-text-color-secondary); }
+.sdtree-dim { color: var(--el-text-color-secondary); font-size: 13px; padding: 2px 0; }
 .sdtree-scroll { flex: 1; overflow: auto; border: 1px solid var(--el-border-color-lighter);
                  border-radius: var(--el-border-radius-base); }
 .sdtree-canvas { padding: 14px; transform-origin: top left; width: max-content; min-width: 100%; }
 .sdtree-empty { padding: 30px; color: var(--el-text-color-secondary); }
 .sdtree-inv { margin-top: 10px; border-top: 1px dashed var(--el-border-color); }
-.mono { font-family: "Cascadia Mono", Consolas, monospace; }
+.mono { font-family: var(--mc-font-mono); }
 
 .sdt-box { border: 1px solid var(--el-border-color); border-radius: 8px;
            padding: 8px 10px; background: var(--el-bg-color); margin: 4px 0; }
@@ -380,7 +480,7 @@ html, body, #app { height: 100%; margin: 0; }
 .newcfg-hint { font-size: 12px; color: var(--el-text-color-secondary); margin-bottom: 8px; }
 .newcfg-hint code {
   background: var(--el-fill-color); padding: 0 4px; border-radius: 3px;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px;
+  font-family: var(--mc-font-mono); font-size: 11.5px;
 }
 
 /* ---- 性能测试页 ---- */
@@ -400,7 +500,7 @@ html, body, #app { height: 100%; margin: 0; }
 .inst-card:hover { border-color: var(--el-color-primary-light-5); }
 .inst-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .inst-name {
-  font-weight: 600; font-size: 13.5px; max-width: 40%;
+  font-weight: 600; font-size: 14px; max-width: 40%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .inst-id { font-size: 12px; color: var(--el-text-color-secondary); }
@@ -424,7 +524,7 @@ html, body, #app { height: 100%; margin: 0; }
 }
 .inst-tab {
   display: flex; align-items: center; gap: 8px; padding: 6px 12px;
-  font-size: 12.5px; color: var(--el-text-color-regular);
+  font-size: 13px; color: var(--el-text-color-regular);
   background: var(--el-fill-color-light);
   border: 1px solid var(--el-border-color-lighter); border-bottom: none;
   border-radius: 8px 8px 0 0; cursor: pointer; max-width: 260px;
