@@ -8,6 +8,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from benchmark import scenario_paths
 from scripts.run_rank_recall import _child_env, _pump, partition_configs
 from webui.backend.routers.runs import _build_run_argv
 from webui.backend.routers.outputs import api_outputs
@@ -43,6 +44,17 @@ def test_log_pump_survives_character_not_encodable_by_console():
 
     assert raw.getvalue().decode("gbk") == \
         "[rank] bad replacement: \\ufffd\n"
+
+
+def test_parallel_local_logs_stay_in_nested_child_result_dir():
+    child_result = os.path.join(ROOT, "outputs", "parent-rank-recall", "rank")
+    paths = scenario_paths(
+        {"_pod_workspace": "/tmp/Mooncake-Performance"},
+        "parent-rank-recall-rank", "rank_smoke", child_result)
+
+    assert paths[2] == \
+        "/tmp/Mooncake-Performance/logs/parent-rank-recall-rank"
+    assert paths[-1] == os.path.join(child_result, "logs", "rank_smoke")
 
 
 def test_dual_webui_command():
