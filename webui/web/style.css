@@ -493,11 +493,13 @@ html, body, #app {
 /* ---- 实例卡片列表（性能测试页） ---- */
 .inst-list { display: flex; flex-direction: column; gap: 10px; }
 .inst-card {
-  border: 1px solid var(--el-border-color-lighter); border-radius: 8px;
-  padding: 10px 12px; background: var(--el-fill-color-blank);
-  display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--el-border-color-lighter); border-radius: var(--mc-radius);
+  padding: var(--mc-space-3) var(--mc-space-4); background: var(--el-fill-color-blank);
+  display: flex; flex-direction: column; gap: var(--mc-space-2);
+  transition: border-color 150ms ease-out;
 }
 .inst-card:hover { border-color: var(--el-color-primary-light-5); }
+.inst-empty { padding: var(--mc-space-5) 0; }
 .inst-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .inst-name {
   font-weight: 600; font-size: 14px; max-width: 40%;

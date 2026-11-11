@@ -119,8 +119,17 @@ function _perfCollectSel(node, acc) {
 const PerfView = {
   template: `
   <div class="page">
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">性能测试</h1>
+        <p class="desc">配置后创建实例（创建不运行）；在下方卡片单独运行、停止、删除，日志与产物在「实例详情」查看。实例可反复运行。</p>
+      </div>
+      <div class="actions">
+        <el-button size="small" @click="drawerOpen = true">历史运行</el-button>
+      </div>
+    </div>
     <el-card shadow="never" class="runbox">
-      <template #header><b>运行</b></template>
+      <template #header><b>实例模板</b></template>
       <div class="rb-row">
         <el-radio-group v-model="mode" size="small" @change="onModeChange">
           <el-radio-button value="ssh">真机</el-radio-button>
@@ -234,15 +243,22 @@ const PerfView = {
         </el-select>
       </div>
       <div class="rb-row rb-btn-row">
-        <el-button type="primary" size="default" style="width: 130px" :loading="creating"
-                   :disabled="!!runHint || creating || cleaning"
-                   @click="createInstance">创建实例</el-button>
+        <el-tooltip :disabled="!runHint" :content="runHint" placement="top">
+          <span>
+            <el-button type="primary" size="default" style="width: 130px" :loading="creating"
+                       :disabled="!!runHint || creating || cleaning"
+                       @click="createInstance">创建实例</el-button>
+          </span>
+        </el-tooltip>
         <span class="spacer"></span>
-        <el-button type="danger" plain size="default" style="width: 110px"
-                   :loading="cleaning"
-                   :disabled="cleaning || creating || schedulerBusy || launchMode === 'rank_recall'"
-                   :title="launchMode === 'rank_recall' ? '并行模式请切回单任务后按 namespace 分别清理' : ''"
-                   @click="cleanup">CLEAN-UP</el-button>
+        <el-tooltip :disabled="!cleanupHint" :content="cleanupHint" placement="top">
+          <span>
+            <el-button type="danger" plain size="default" style="width: 110px"
+                       :loading="cleaning"
+                       :disabled="cleaning || creating || schedulerBusy || launchMode === 'rank_recall'"
+                       @click="cleanup">清理远端</el-button>
+          </span>
+        </el-tooltip>
       </div>
       <div v-if="runHint" class="rb-run-hint">{{ runHint }}</div>
       <div class="rb-clean-hint">
@@ -259,28 +275,40 @@ const PerfView = {
         <div class="header-row" style="margin: 0">
           <b>实例（{{ instances.length }}）</b>
           <span class="spacer"></span>
-          <el-button size="small" :loading="instLoading" @click="loadInstances">刷新</el-button>
-          <el-button size="small" @click="drawerOpen = true">历史</el-button>
+          <el-tooltip content="刷新实例列表" placement="top">
+            <el-button size="small" circle :loading="instLoading"
+                       aria-label="刷新实例列表" @click="loadInstances">
+              <el-icon><component is="Refresh"/></el-icon>
+            </el-button>
+          </el-tooltip>
         </div>
       </template>
-      <div v-if="!instances.length" class="hint" style="padding: 30px; text-align: center">
-        还没有实例——配置完成后点击「创建实例」
+      <div v-if="!instances.length" class="inst-empty">
+        <el-empty description="还没有实例" :image-size="72">
+          <el-button type="primary" size="small" @click="scrollToForm">打开选择配置</el-button>
+        </el-empty>
       </div>
-      <div class="inst-list">
+      <div v-else v-loading="instLoading" class="inst-list">
         <div v-for="it in instances" :key="it.id" class="inst-card">
           <div class="inst-head">
             <span class="inst-name" :title="it.name">{{ it.name }}</span>
             <el-tag size="small" :type="it.launch_mode === 'rank_recall' ? 'warning' : 'info'">
               {{ it.launch_mode === 'rank_recall' ? 'Rank+Recall' : '单任务' }}
             </el-tag>
-            <el-tag size="small" :type="it.stopping ? 'warning' : statusType(it.status)">
-              {{ it.stopping && it.status === 'running' ? 'stopping' : it.status }}
-            </el-tag>
+            <el-popover v-if="it.status === 'running' && it.stopping" placement="top"
+                        :width="300" trigger="hover" :show-after="150"
+                        content="正在优雅停止：先通知客户端清理并回收远端进程，宽限期内完成；超时后才会强制结束。">
+              <template #reference>
+                <el-tag size="small" type="warning">停止中</el-tag>
+              </template>
+            </el-popover>
+            <el-tag v-else size="small" :type="statusType(it.status)">{{ statusText(it.status) }}</el-tag>
             <span class="spacer"></span>
             <span class="inst-id mono">{{ it.id }}</span>
           </div>
           <div class="inst-meta">
-            <span><b>mode</b> {{ it.mode }}</span>
+            <span><b>创建</b> <span :title="fmtTimeAbs(it.created)">{{ fmtTimeRel(it.created) }}</span></span>
+            <span><b>模式</b> {{ it.mode === 'k8s' ? 'k8s' : '真机' }}</span>
             <template v-if="it.launch_mode !== 'rank_recall'">
               <span><b>cluster</b> {{ it.flags.cluster || "-" }}</span>
               <span><b>global</b> {{ it.flags.global || "-" }}</span>
@@ -292,20 +320,24 @@ const PerfView = {
             <span><b>配置</b> 目录 {{ it.selection.dirs.length }} / 文件 {{ it.selection.files.length }}</span>
           </div>
           <div v-if="it.last_run" class="inst-meta">
-            <span><b>最近运行</b> {{ it.last_run.id }}</span>
-            <span><b>耗时</b> {{ Math.round(it.last_run.elapsed || 0) }}s</span>
-            <span><b>rc</b> {{ (it.last_run.rc === null || it.last_run.rc === undefined) ? "-" : it.last_run.rc }}</span>
+            <span><b>最近运行</b> <span class="mc-mono">{{ it.last_run.id }}</span></span>
+            <span><b>耗时</b> <span class="mc-num">{{ Math.round(it.last_run.elapsed || 0) }}s</span></span>
+            <span><b>rc</b> <span class="mc-num">{{ (it.last_run.rc === null || it.last_run.rc === undefined) ? "-" : it.last_run.rc }}</span></span>
             <span v-if="it.last_run.ts_dir">
               <b>产物</b>
               <a href="#" class="mono inst-link" @click.prevent="openResults(it.last_run.ts_dir)">{{ it.last_run.ts_dir }}</a>
             </span>
           </div>
           <div class="inst-actions">
-            <el-button size="small" type="primary"
-                       :loading="!!it._running"
-                       :disabled="it.status === 'running' || schedulerBusy"
-                       @click="runInstance(it)">运行</el-button>
-            <el-button size="small" type="warning" v-if="it.status === 'running'"
+            <el-tooltip :disabled="!instanceRunHint(it)" :content="instanceRunHint(it)" placement="top">
+              <span>
+                <el-button size="small" type="primary" plain
+                           :loading="!!it._running"
+                           :disabled="it.status === 'running' || schedulerBusy"
+                           @click="runInstance(it)">运行</el-button>
+              </span>
+            </el-tooltip>
+            <el-button size="small" type="warning" plain v-if="it.status === 'running'"
                        :loading="!!it._stopping"
                        :disabled="!!it._stopping"
                        @click="stopInstance(it)">停止</el-button>
@@ -313,7 +345,7 @@ const PerfView = {
                        :disabled="it.status === 'running'"
                        @click="deleteInstance(it)">删除</el-button>
             <span class="spacer"></span>
-            <el-button size="small" @click="openInstance(it)">详情</el-button>
+            <el-button size="small" link type="primary" @click="openInstance(it)">详情</el-button>
           </div>
         </div>
       </div>
@@ -340,7 +372,7 @@ const PerfView = {
         <el-table-column prop="id" label="id" width="180" show-overflow-tooltip></el-table-column>
         <el-table-column label="状态" width="88">
           <template #default="scope">
-            <el-tag :type="statusType(scope.row.status)" size="small">{{ scope.row.status }}</el-tag>
+            <el-tag :type="statusType(scope.row.status)" size="small">{{ statusText(scope.row.status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="rc" label="rc" width="56"></el-table-column>
@@ -480,6 +512,24 @@ const PerfView = {
       return !!(sch && ["executing", "stopping"].includes(sch.state));
     });
 
+    const cleanupHint = Vue.computed(() => {
+      if (launchMode.value === "rank_recall")
+        return "并行模式请切回单任务后按 namespace 分别清理";
+      if (schedulerBusy.value)
+        return "定时任务执行中，先停止调度后再清理";
+      return "";
+    });
+
+    function instanceRunHint(it) {
+      if (it.status === "running") return "该实例正在运行，先停止再运行";
+      if (schedulerBusy.value) return "定时任务执行中，暂不能启动实例";
+      return "";
+    }
+
+    function scrollToForm() {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
     // 创建实例前的前置提示（只校验表单，实例可随时创建，不占运行槽）
     const runHint = Vue.computed(() => {
       if (!hasSelection.value) return "未选择配置：先打开「选择配置」勾选文件或目录";
@@ -496,11 +546,6 @@ const PerfView = {
       if (!flags.profile) return "未选择 profile 配置";
       return "";
     });
-
-    function statusType(s) {
-      return { running: "primary", done: "success", failed: "danger",
-               stopped: "warning", aborted: "warning" }[s] || "info";
-    }
 
     // ---- 实例管理（创建=快照，不运行；运行/停止/删除/详情各自独立）----
     function _instFlags() {
@@ -586,10 +631,9 @@ const PerfView = {
 
     async function deleteInstance(it) {
       try {
-        await ElementPlus.ElMessageBox.confirm(
-          "删除实例「" + it.name + "」？\n运行记录、日志与 outputs 保留（不可恢复仅实例记录）。",
-          "删除实例", { type: "warning", confirmButtonText: "删除",
-                       cancelButtonText: "取消" });
+        await confirmDanger(
+          "删除实例「" + it.name + "」？运行记录、日志与 outputs 保留，仅实例记录移入回收站。",
+          "删除实例");
       } catch (e) { return; }
       try {
         await api("DELETE", "/api/instances/" + it.id);
@@ -682,7 +726,9 @@ const PerfView = {
 
     return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection,
              modeCandidates, onModeChange, flags, warnings, creating, cleaning,
-             clusterImage, clearSel, runHint, schedulerBusy, statusType,
+             clusterImage, clearSel, runHint, cleanupHint, schedulerBusy,
+             statusType, statusText, fmtTimeRel, fmtTimeAbs,
+             instanceRunHint, scrollToForm,
              instances, instLoading, loadInstances, createInstance, runInstance,
              stopInstance, deleteInstance, openInstance, openResults,
              runs, drawerOpen, onHistoryClick, cleanup };

@@ -10,6 +10,7 @@ const vm = require("vm");
 
 const jsDir = path.resolve(__dirname, "..", "web", "js");
 const files = [
+  "status.js",
   "spdiag.js",
   "views/config-view.js",
   "views/perf-view.js",

@@ -68,7 +68,7 @@ def test_perf_page_is_instance_management():
     src = open(os.path.join(JS_DIR, "views", "perf-view.js"),
                encoding="utf-8").read()
     assert "创建实例" in src
-    assert "CLEAN-UP" in src
+    assert "清理远端" in src and '@click="cleanup"' in src
     assert ">RUN</el-button>" not in src
     assert "当前 RUN" not in src
     assert 'v-for="it in instances"' in src
@@ -105,6 +105,17 @@ def test_missing_file_falls_back_to_detail_csv():
     assert "function _defaultDetail(files)" in src
     assert 'f === "rank/benchmark_detail.csv"' in src
     assert "已自动展示 benchmark_detail.csv" in src
+
+
+def test_shared_status_module():
+    """状态中文化、相对时间与危险确认统一在 status.js。"""
+    src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()
+    for key in ("running", "done", "failed", "stopped", "created"):
+        assert key in src
+    assert "运行中" in src and "已完成" in src and "未运行" in src
+    assert "function statusText" in src and "function statusType" in src
+    assert "function fmtTimeRel" in src and "function confirmDanger" in src
+    assert "confirmButtonClass: \"el-button--danger\"" in src
 
 
 if __name__ == "__main__":
