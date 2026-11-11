@@ -1,7 +1,7 @@
 {
   "work_mode": "recall",
   "base_qps": 35,
-  "traffic_mode": "pulse",
+  "traffic_mode": "balanced",
   "qps_multiple": 1,
   "notify_count": 1,
   "client": {

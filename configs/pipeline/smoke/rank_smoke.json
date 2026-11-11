@@ -1,7 +1,7 @@
 {
   "work_mode": "rank",
   "base_qps": 105,
-  "traffic_mode": "pulse",
+  "traffic_mode": "balanced",
   "qps_multiple": 1,
   "notify_count": 10,
   "client": {
