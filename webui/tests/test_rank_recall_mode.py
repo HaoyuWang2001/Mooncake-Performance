@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import sys
@@ -7,7 +8,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from scripts.run_rank_recall import _child_env, partition_configs
+from scripts.run_rank_recall import _child_env, _pump, partition_configs
 from webui.backend.routers.runs import _build_run_argv
 from webui.backend.routers.outputs import api_outputs
 from webui.backend.common import ApiError
@@ -20,11 +21,28 @@ def test_partition_uses_inherited_work_mode():
 
 
 def test_children_have_isolated_namespace_ledgers():
-    rank = _child_env("rank")["MC_BENCH_STATE_FILE"]
-    recall = _child_env("recall")["MC_BENCH_STATE_FILE"]
+    rank_env = _child_env("rank")
+    recall_env = _child_env("recall")
+    rank = rank_env["MC_BENCH_STATE_FILE"]
+    recall = recall_env["MC_BENCH_STATE_FILE"]
     assert rank.endswith(".state.rank")
     assert recall.endswith(".state.recall")
     assert rank != recall
+    assert rank_env["PYTHONUTF8"] == "1"
+    assert rank_env["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_log_pump_survives_character_not_encodable_by_console():
+    class Proc:
+        stdout = io.StringIO("bad replacement: \ufffd\n")
+
+    raw = io.BytesIO()
+    console = io.TextIOWrapper(raw, encoding="gbk", errors="strict")
+    _pump("rank", Proc(), console)
+    console.flush()
+
+    assert raw.getvalue().decode("gbk") == \
+        "[rank] bad replacement: \\ufffd\n"
 
 
 def test_dual_webui_command():

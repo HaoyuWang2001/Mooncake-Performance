@@ -83,11 +83,21 @@ def _child_argv(args, work_mode, files, parent):
     return argv
 
 
-def _pump(label, proc):
+def _stream_safe_text(stream, text):
+    """Keep log forwarding alive when the console cannot encode a character."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return text
+    return text.encode(encoding, errors="backslashreplace").decode(encoding)
+
+
+def _pump(label, proc, output=None):
+    output = output or sys.stdout
     try:
         for line in iter(proc.stdout.readline, ""):
-            sys.stdout.write("[{}] {}".format(label, line))
-            sys.stdout.flush()
+            text = _stream_safe_text(output, "[{}] {}".format(label, line))
+            output.write(text)
+            output.flush()
     finally:
         if proc.stdout:
             proc.stdout.close()
@@ -99,6 +109,11 @@ def _child_env(work_mode):
     # delete it during startup.
     env = dict(os.environ)
     env["MC_BENCH_STATE_FILE"] = os.path.join(ROOT, ".state." + work_mode)
+    # The parent decodes both child pipes as UTF-8.  Make that contract
+    # explicit on Windows too, where redirected Python stdio otherwise uses
+    # the active ANSI code page (commonly GBK/CP936).
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
