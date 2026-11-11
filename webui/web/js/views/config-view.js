@@ -36,6 +36,12 @@ const CfgNode = {
 const ConfigView = {
   template: `
   <div class="page">
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">配置维护</h1>
+        <p class="desc">编辑 cluster/global/profile 与测试场景配置；保存前自动校验并备份，运行框的配置选择来自此处。</p>
+      </div>
+    </div>
     <el-row :gutter="14">
       <el-col :span="8">
         <el-card shadow="never" style="margin-bottom: 14px">

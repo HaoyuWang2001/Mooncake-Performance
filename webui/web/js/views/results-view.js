@@ -148,6 +148,18 @@ async function _loadMore(pane) {
   }
 }
 
+/* 数字列判定：整列非空值均为数字（含负号/小数）则右对齐 + tabular-nums。 */
+function _csvIsNumeric(rows, key) {
+  let seen = false;
+  for (const r of rows || []) {
+    const v = (r[key] === null || r[key] === undefined) ? "" : String(r[key]).trim();
+    if (!v || v === "-") continue;
+    if (!/^[-+]?\d+(\.\d+)?$/.test(v)) return false;
+    seen = true;
+  }
+  return seen;
+}
+
 /* CSV 列宽按表头显示宽度估算（CJK≈2 个显示单位），保证表头单行显示；
    Element Plus 默认 min-width=90 会把 queue_wait_avg_ms 等长表头挤成两行。 */
 function _csvColWidth(h) {
@@ -243,7 +255,9 @@ const ResPane = {
                 :empty-text="pane.loading ? '加载中…' : '无数据'">
         <el-table-column v-for="(h, i) in pane.headers" :key="i" :label="h"
                          :prop="'c' + i" show-overflow-tooltip
-                         :min-width="csvColWidth(h)"></el-table-column>
+                         :min-width="csvColWidth(h)"
+                         :align="csvIsNumeric(pane.rows, 'c' + i) ? 'right' : 'left'"
+                         :class-name="csvIsNumeric(pane.rows, 'c' + i) ? 'mc-num' : ''"></el-table-column>
       </el-table>
       <pre v-else-if="kindOf(pane) === 'json'" class="json" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
       <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
@@ -306,7 +320,7 @@ const ResPane = {
     }
     const dragging = Vue.ref(false);
     return { setAuto, kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
-             csvColWidth: _csvColWidth,
+             csvColWidth: _csvColWidth, csvIsNumeric: _csvIsNumeric,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              loadMore: _loadMore, fmtBytes: _fmtBytes,
              rawUrl: p => "/api/file?path=" +
@@ -317,15 +331,24 @@ const ResPane = {
 const ResultsView = {
   template: `
   <div class="page">
-    <div class="header-row">
-      <span class="hint">点击左侧 run 分配到焦点框（主色描边 + 发光 = 焦点，点框内任意处切换）；框可任意增删/全屏</span>
-      <span class="spacer"></span>
-      <template v-if="panes.length >= 2">
-        <span style="font-size: 13px">同文件锁定</span>
-        <el-switch v-model="lockFile"></el-switch>
-      </template>
-      <el-button size="small" type="primary" plain @click="addPane()">＋ 添加结果框</el-button>
-      <el-button size="small" @click="loadRuns" :loading="loading">刷新</el-button>
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">统计结果</h1>
+        <p class="desc">点击左侧 run 分配到焦点框（主色描边 = 焦点）；同文件锁定便于跨 run 对比 CSV 与图片。</p>
+      </div>
+      <div class="actions">
+        <template v-if="panes.length >= 2">
+          <span class="mc-label">同文件锁定</span>
+          <el-switch v-model="lockFile"></el-switch>
+        </template>
+        <el-button size="small" type="primary" plain @click="addPane()">＋ 添加结果框</el-button>
+        <el-tooltip content="刷新运行结果列表" placement="top">
+          <el-button size="small" circle :loading="loading" aria-label="刷新运行结果列表"
+                     @click="loadRuns">
+            <el-icon><component is="Refresh"/></el-icon>
+          </el-button>
+        </el-tooltip>
+      </div>
     </div>
 
     <el-row :gutter="14">
@@ -348,6 +371,7 @@ const ResultsView = {
                        @click="deleteSelected">删除选中</el-button>
           </div>
           <div class="run-list">
+          <el-empty v-if="!runs.length" :image-size="60" description="还没有运行结果" />
           <div v-for="r in runs" :key="r.ts" class="run-item"
                :class="{ active: isActivePaneTs(r.ts), selected: isSelected(r.ts) }"
                @click="pickRun(r.ts)">

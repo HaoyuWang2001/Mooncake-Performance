@@ -32,6 +32,28 @@ function statusType(s) {
   return _MC_STATUS_TYPE[s] || "info";
 }
 
+const _MC_SCHED_TEXT = {
+  waiting: "等待中",
+  waiting_slot: "等待实例空闲",
+  executing: "执行中",
+  stopping: "停止中",
+  done: "已完成",
+  stopped: "已停止",
+  aborted: "已中止",
+};
+
+function schedulerText(s) {
+  return _MC_SCHED_TEXT[s] || s || "关闭";
+}
+
+function schedulerType(s) {
+  if (s === "executing") return "warning";
+  if (s === "waiting" || s === "waiting_slot") return "primary";
+  if (s === "done") return "success";
+  if (s === "aborted") return "danger";
+  return "info";
+}
+
 function _toEpoch(ts) {
   if (ts === null || ts === undefined || ts === "") return NaN;
   if (typeof ts === "number") return ts;

@@ -236,13 +236,10 @@ const App = {
       if (["waiting", "waiting_slot"].includes(s.state)) return "on";
       return "";
     });
-    const _SCH_STATE = { waiting: "等待中", waiting_slot: "等待实例空闲",
-                         executing: "执行中", stopping: "停止中",
-                         done: "已完成", stopped: "已停止", aborted: "已中止" };
     const schText = computed(() => {
       const s = store.status.scheduler;
       if (!s) return "定时任务：关闭";
-      let t = "定时任务：" + (_SCH_STATE[s.state] || s.state);
+      let t = "定时任务：" + schedulerText(s.state);
       if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state))
         t += "（" + s.next_trigger.slice(-8) + "）";
       return t;

@@ -882,6 +882,13 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   端口/`value.bin` 冲突、`mcbench/` 被互清、store 被双方同时打爆
 - 运行历史与日志持久化于 `webui/data/runs/`；实例定义持久化于 `webui/data/instances/`
   （均 gitignore），删除实例仅移除定义（runs/日志/outputs 保留，定义入 backups 回收站）
+- **界面规范（webui-design skill）**：设计 token 化（`--mc-space/font/radius/term-*`，深青主色亮
+  `#0e7490`/暗 `#27b3c9`）；日志/终端亮暗双主题恒深底；状态文案中文化（运行中/停止中/已完成/
+  失败/已停止/未运行）；危险操作统一 `confirmDanger`（确认键 danger）；每页至多一个 primary 实心
+  按钮（次级 plain、行内 link、刷新 circle+tooltip）；禁用按钮说明原因；空状态 `el-empty` 带下一步；
+  数字列 tabular-nums；相对时间（悬停绝对）；动效 <300ms 且尊重 `prefers-reduced-motion`；
+  仅图标按钮带 `aria-label`。规范文件：`.opencode/skills/webui-design/SKILL.md`（源
+  Services-Deployment，回归 lint：`webui/tests/test_style.py`）
 
 触发模型（混合）：任务显式带 `date`+`time` 则睡到该时刻（已过点立即执行）；
 省略时刻则链式（上一条完成 + `wait_seconds`）。失败按 `on_fail`（continue/abort）。

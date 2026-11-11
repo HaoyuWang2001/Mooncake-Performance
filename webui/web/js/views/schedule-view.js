@@ -5,13 +5,22 @@
 const ScheduleView = {
   template: `
   <div class="page">
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">定时任务</h1>
+        <p class="desc">按计划在指定时刻运行命令；定时任务执行期间不会与运行实例并行（等待实例空闲）。</p>
+      </div>
+    </div>
     <el-row :gutter="14">
       <el-col :span="8">
         <el-card shadow="never" style="margin-bottom: 14px">
           <template #header><b>计划列表</b></template>
           <el-table :data="plans" size="small" highlight-current-row @row-click="onPlanClick">
+            <template #empty>
+              <el-empty :image-size="60" description="暂无计划，在下方输入名称新建" />
+            </template>
             <el-table-column prop="name" label="名称" show-overflow-tooltip></el-table-column>
-            <el-table-column label="任务数" width="70">
+            <el-table-column label="任务数" width="70" class-name="mc-num">
               <template #default="scope">{{ scope.row.tasks ?? "-" }}</template>
             </el-table-column>
             <el-table-column label="首任务" width="150">
@@ -32,15 +41,15 @@ const ScheduleView = {
         </el-card>
 
         <el-card shadow="never">
-          <template #header><b>Scheduler</b></template>
+          <template #header><b>调度器</b></template>
           <div style="margin-bottom: 10px; font-size: 13px">
-            <el-tag :type="schTagType" size="small">{{ sch ? sch.state : "off" }}</el-tag>
-            <span style="margin-left: 8px; font-family: monospace">{{ schText }}</span>
+            <el-tag :type="schTagType" size="small">{{ sch ? schedulerText(sch.state) : "关闭" }}</el-tag>
+            <span style="margin-left: 8px" class="mc-mono">{{ schText }}</span>
           </div>
           <div class="header-row" style="margin: 0">
             <el-button type="primary" size="small" @click="start" :disabled="!currentPlan || currentPlan === 'plan.example.json'"
-                       :loading="starting">启动 Scheduler</el-button>
-            <el-button type="danger" size="small" @click="stop">停止</el-button>
+                       :loading="starting">启动调度</el-button>
+            <el-button type="warning" plain size="small" @click="stop">停止调度</el-button>
           </div>
           <div class="logview log-sm" style="margin-top: 10px">
             <div v-for="(e, i) in schEvents" :key="i">{{ e }}</div>
@@ -87,9 +96,9 @@ const ScheduleView = {
     const schText = Vue.computed(() => {
       const s = sch.value;
       if (!s) return "";
-      let t = s.plan + " · " + s.tasks + " tasks";
+      let t = s.plan + " · " + s.tasks + " 个任务";
       if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state)) t += " · 下一任务 @" + s.next_trigger;
-      if (s.current_task) t += " · 执行中 task " + s.current_task;
+      if (s.current_task) t += " · 执行任务 " + s.current_task;
       if (s.state === "stopping") t += " · 停止中（清理）";
       return t;
     });
@@ -169,7 +178,7 @@ const ScheduleView = {
     Vue.onDeactivated(() => clearInterval(timer));
 
     return { plans, currentPlan, planContent, newName, msg, saving, starting,
-             sch, schTagType, schText, schEvents,
+             sch, schTagType, schText, schEvents, schedulerText,
              loadPlans, onPlanClick, newPlan, syntaxCheck, savePlan, start, stop };
   },
 };
