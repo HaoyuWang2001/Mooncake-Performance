@@ -44,6 +44,7 @@ export MC_URMA_TRANS_MODE=RM                 # URMA 传输模式（RM）
 export MC_OFFLOAD_PUSH=false                 # 关闭 offload push
 export MC_URMA_BONDING_MULTIPATH_ENABLE=on
 export MC_UB_NUMA_AFFINITY_ENABLE=on
+export MC_URMA_SET_BONDING_MODE=on
 # export MC_YLT_LOG_LEVEL=info                  # ylt easylog（coro_rpc 内部事件）级别
 # export MC_YLT_LOG_MAX_FILE_SIZE=52428800      # ylt 单文件上限（50MB）
 # export MC_YLT_LOG_MAX_FILES=3                 # ylt 轮转文件数

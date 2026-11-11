@@ -9,11 +9,11 @@
     "port_base": 9301
   },
   "writer": {
-    "operation": "put_batch",
+    "operation": "upsert_from",
     "notify_threads": 10
   },
   "reader": {
-    "operation": "get",
+    "operation": "get_buffer",
     "num_threads": 1
   },
   "store_count_per_node": 1,
