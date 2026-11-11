@@ -111,7 +111,7 @@ PIPELINE_CSV_HEADER = [
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_threads", "notify_threads",
     "data_size", "key_count", "batch_size", "duration", "warmup_duration",
-    "writer_count", "reader_count", "notify_count", "store_count",
+    "client_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
     "total", "success", "fail", "fail_rate",
     "total_bytes", "wall_s", "qps",
@@ -3972,8 +3972,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 op = (cfg.get("writer", {}) or {}).get("operation", "")
             else:
                 op = (cfg.get("reader", {}) or {}).get("operation", "")
-            w_cpn = (cfg.get("writer", {}) or {}).get("count_per_node", 1)
-            r_cpn = (cfg.get("reader", {}) or {}).get("count_per_node", 1)
+            # client_count = 本行角色对应的客户端进程总数（dual 模式写/读
+            # 两侧都等于 N*count_per_node；分离模式各取各自的规划数）。
+            # 合并了旧的 writer_count/reader_count 两列——role 列已区分角色。
+            client_count = len(plan["writers"] if role == "writer"
+                               else plan["readers"])
             # node 列统一填管理网 IP（解析失败回退节点名）
             try:
                 node_ip = get_node(cluster, nodename)["ip"] if cluster else nodename
@@ -3999,8 +4002,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                               or cfg.get("key_count", "") or ""),
                 "duration": cfg.get("duration", ""),
                 "warmup_duration": cfg.get("warmup", {}).get("duration", ""),
-                "writer_count": "N*{}".format(w_cpn),
-                "reader_count": "N*{}".format(r_cpn),
+                "client_count": client_count,
                 "notify_count": plan["notify_count"],
                 # store count is RECORD-ONLY metadata (stores are deployed
                 # externally and discovered via the master)
@@ -4737,15 +4739,28 @@ def main(args, cfg_paths):
             log("[WARN] auto-plot skipped (no *.log under {})".format(log_dir))
         else:
             plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
+            # Plotting is 100% local (on this orchestrator machine). Cap the
+            # BLAS/OpenMP thread pools: OpenBLAS pre-allocates one buffer per
+            # thread at import, which on Windows can fail with
+            # "OpenBLAS error: Memory allocation still failed" when the commit
+            # limit/pagefile is tight or Python is 32-bit. Plotting gains
+            # nothing from parallel BLAS, so single-thread keeps the footprint
+            # minimal and sidesteps the failure.
+            plot_env = dict(os.environ)
+            for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+                        "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                plot_env[var] = "1"
+            log("[benchmark] plotting locally on this machine (orchestrator): "
+                "{} {} --log {}".format(sys.executable, plot_script, log_dir))
             try:
                 proc = subprocess.run(
                     [sys.executable, plot_script, "--log", log_dir],
-                    check=False)
+                    check=False, env=plot_env)
                 if proc.returncode != 0:
-                    log("[WARN] auto-plot failed (rc={}); figures skipped — "
-                        "see the traceback above (plotter crash). If "
-                        "matplotlib is missing: pip install matplotlib".format(
-                            proc.returncode))
+                    log("[WARN] auto-plot failed (rc={}); figures skipped - "
+                        "see the traceback above (plotter crash). Plotting "
+                        "runs locally; if matplotlib is missing: pip install "
+                        "matplotlib".format(proc.returncode))
             except Exception as exc:
                 log("[WARN] auto-plot failed: {}".format(exc))
     if args.clean_up:

@@ -320,6 +320,11 @@ html, body, #app { height: 100%; margin: 0; }
   white-space: pre; overflow: auto;
 }
 
+/* CSV 预览：表头强制单行（列宽由 results-view 按表头长度估算 min-width） */
+.csv-table th .cell {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* ---- API 文档 ---- */
 .apidoc {
   background: var(--el-fill-color-darker); border: 1px solid var(--el-border-color);

@@ -51,11 +51,19 @@ async function _loadFiles(pane, keepFile) {
     pane.files = r.files;
     let target = "";
     if (keepFile) {
-      // 切换 run：保留之前选中的文件；没有选中则维持不选中
+      // 切换 run：保留之前选中的文件；没有同名文件时自动展示
+      // benchmark_detail.csv（并 toast 提示），再没有才清空
       if (prev && pane.files.includes(prev)) {
         target = prev;
       } else if (prev) {
-        ElementPlus.ElMessage.warning("该 run 无同名文件，已清空选择：" + prev);
+        const fallback = pane.files.find(f => f === "benchmark_detail.csv") || "";
+        target = fallback;
+        if (fallback) {
+          ElementPlus.ElMessage.warning(
+            "该 run 无同名文件（" + prev + "），已自动展示 benchmark_detail.csv");
+        } else {
+          ElementPlus.ElMessage.warning("该 run 无同名文件，已清空选择：" + prev);
+        }
       }
     } else {
       // 新建框 / 结果跳转：沿用默认选中 benchmark_detail.csv
@@ -104,6 +112,14 @@ async function _loadContent(pane) {
   } finally {
     pane.loading = false;
   }
+}
+
+/* CSV 列宽按表头显示宽度估算（CJK≈2 个显示单位），保证表头单行显示；
+   Element Plus 默认 min-width=90 会把 queue_wait_avg_ms 等长表头挤成两行。 */
+function _csvColWidth(h) {
+  let units = 0;
+  for (const ch of String(h || "")) units += (ch.codePointAt(0) > 0x2e7f ? 2 : 1);
+  return Math.max(90, units * 8 + 28);
 }
 
 let _paneUid = 0;
@@ -181,9 +197,11 @@ const ResPane = {
         <img v-else :src="rawUrl(pane)">
       </template>
       <el-table v-else-if="kindOf(pane) === 'csv'" :data="pane.rows" size="small"
-                border style="width: 100%" :empty-text="pane.loading ? '加载中…' : '无数据'">
+                class="csv-table" border style="width: 100%"
+                :empty-text="pane.loading ? '加载中…' : '无数据'">
         <el-table-column v-for="(h, i) in pane.headers" :key="i" :label="h"
-                         :prop="'c' + i" show-overflow-tooltip min-width="90"></el-table-column>
+                         :prop="'c' + i" show-overflow-tooltip
+                         :min-width="csvColWidth(h)"></el-table-column>
       </el-table>
       <pre v-else-if="kindOf(pane) === 'json'" class="json" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
       <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
@@ -237,6 +255,7 @@ const ResPane = {
     }
     const dragging = Vue.ref(false);
     return { setAuto, kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
+             csvColWidth: _csvColWidth,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              rawUrl: p => "/api/file?path=" +
                encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };

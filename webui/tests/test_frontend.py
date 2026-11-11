@@ -62,6 +62,23 @@ def test_log_wrap_uses_switch():
     assert '>自动换行</el-button>' not in src
 
 
+def test_csv_header_single_line_width():
+    """CSV 预览列宽必须按表头长度估算（否则长表头被压成两行）。"""
+    src = open(os.path.join(JS_DIR, "views", "results-view.js"),
+               encoding="utf-8").read()
+    assert "function _csvColWidth(" in src
+    assert ':min-width="csvColWidth(h)"' in src
+    assert "csvColWidth: _csvColWidth" in src
+
+
+def test_missing_file_falls_back_to_detail_csv():
+    """切换 run 时无同名文件 -> 自动展示 benchmark_detail.csv + toast。"""
+    src = open(os.path.join(JS_DIR, "views", "results-view.js"),
+               encoding="utf-8").read()
+    assert 'pane.files.find(f => f === "benchmark_detail.csv")' in src
+    assert "已自动展示 benchmark_detail.csv" in src
+
+
 if __name__ == "__main__":
     test_component_identifiers_declared()
     test_frontend_boot_check()

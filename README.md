@@ -330,11 +330,13 @@ demo/ 另有 2 个传统分离角色冒烟配置。
   - pipeline TOTAL 行：`吞吐 = 各实例忙时吞吐之和`（保留多实例聚合视角）；
 - 每条结果（CSV 行）同时打印本次运行配置的核心参数：`data_size`、`key_count`、
   `batch_size`（put_batch / get_batch 场景）、`put_ratio`（mixed 场景）、`duration`（仅配置时）；
-- **basic 与 pipeline 使用不同 CSV Schema**：basic 29 列（`node` 列填 client 管理网 IP，
+- **basic 与 pipeline 使用不同 CSV Schema**：basic 30 列（`node` 列填 client 管理网 IP，
   含 `num_clients/key_count/put_ratio/target_qps/duration/warmup_duration/ok` 等；pipeline 专属
-  列 role/instance/writer_count/reader_count/notify_*/base_qps/qps_multiple/notify_pipeline/
-  traffic_mode 已移除）；pipeline 保持 40 列（`node` 列同样统一为管理网 IP），
-  每个 writer 与 reader 各一行 + 各聚合（TOTAL）一行；
+  列 role/instance/client_count/notify_*/base_qps/qps_multiple/notify_pipeline/
+  traffic_mode 已移除）；pipeline 42 列（`node` 列同样统一为管理网 IP），
+  每个 writer 与 reader 各一行 + 各聚合（TOTAL）一行。pipeline 的 `client_count` 为
+  **本行角色对应的客户端进程总数**（dual 模式写/读两侧同为 N×count_per_node；分离模式
+  写行取 writer 总数、读行取 reader 总数），已合并旧的 `writer_count`/`reader_count` 两列；
 - **pipeline 多行输出**：每个 writer 一行（指标取 pipeline_write 时延）、全 writer 聚合一行、
   每个 reader 一行（指标取 pipeline_read 时延，含 node/instance/topology 列以区分不同节点与 store
   的通信路径差异）、全 reader 聚合一行；

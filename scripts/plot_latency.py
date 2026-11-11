@@ -29,6 +29,15 @@ import re
 import sys
 from datetime import datetime, timedelta
 
+# OpenBLAS pre-allocates one buffer per thread when numpy is imported; on
+# Windows that can abort with "OpenBLAS error: Memory allocation still
+# failed" under a tight commit limit / 32-bit Python. Plotting needs no
+# parallel BLAS, so default to one thread (must run BEFORE importing numpy;
+# setdefault keeps an explicit user override).
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+             "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 try:
     import matplotlib
 
