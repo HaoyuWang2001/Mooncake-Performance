@@ -20,6 +20,7 @@ import threading
 import time
 from datetime import datetime
 
+from . import conflicts
 from .paths import ROOT, RUNS_DIR
 
 BENCH = os.path.join(ROOT, "benchmark.py")
@@ -119,13 +120,15 @@ class Run(object):
     """One managed benchmark process (or scheduler task placeholder)."""
 
     def __init__(self, rid, kind, cmd, argv, log_path, meta=None,
-                 stop_path=None):
+                 stop_path=None, state_path=None, identities=None):
         self.id = rid
         self.kind = kind              # benchmark
         self.cmd = cmd                # display string
         self.argv = argv
         self.log_path = log_path
         self.stop_path = stop_path
+        self.state_path = state_path  # per-run .state ledger (concurrency)
+        self.identities = identities or []   # not persisted (frozensets)
         self.meta = meta or {}
         self.proc = None
         self.t0 = time.time()
@@ -211,7 +214,8 @@ class SlotBusy(Exception):
 class RunManager(object):
     def __init__(self):
         self.lock = threading.RLock()
-        self.run = None               # newest Run (slot free when not running)
+        self.run = None               # newest Run (compat: last started)
+        self.active = {}              # rid -> Run (status == running)
         self.history = []             # Run objects, newest first
         self.scheduler = None         # Scheduler or None
         self._load_history()
@@ -256,35 +260,66 @@ class RunManager(object):
     # ---------------- benchmark slot ----------------
 
     def slot_busy_reason(self):
-        """Why a new benchmark cannot start right now (None = free)."""
-        r = self.run
-        if r is not None and r.status == "running":
-            return "benchmark run {} is still active (started {}, cmd: {})".format(
-                r.id, datetime.fromtimestamp(r.t0).strftime("%H:%M:%S"), r.cmd)
+        """Why a new benchmark cannot start right now (None = free).
+
+        Benchmark-vs-benchmark conflicts are handled per shared resource in
+        `_check_conflicts` (multiple instances may run concurrently); only an
+        executing scheduler task still blocks unconditionally because its
+        command may touch any cluster."""
         sch = self.scheduler
         if sch is not None and sch.state in ("executing", "stopping"):
             return "scheduler task {} is {} (plan {}, stop it first)".format(
                 sch.current_task, sch.state, sch.plan_path)
         return None
 
-    def start_benchmark(self, argv, meta=None):
+    def _check_conflicts(self, identities, meta):
+        """Raise SlotBusy when the candidate shares a resource with an
+        active run (or the same instance is already running)."""
+        inst = (meta or {}).get("instance")
+        active = {}
+        for rid, r in self.active.items():
+            if inst and (r.meta or {}).get("instance") == inst:
+                raise SlotBusy(
+                    "instance {} already has an active run {}".format(
+                        inst, rid))
+            active[rid] = ((r.meta or {}).get("instance_name") or rid,
+                           r.identities)
+        hit = conflicts.find_conflict(identities, active)
+        if hit:
+            kind, value, rid, label = hit
+            raise SlotBusy(
+                "shared resource in use by instance {!r} (run {}): {} — "
+                "wait for it to finish or pick a different cluster/global"
+                "".format(label, rid, conflicts.describe(kind, value)))
+
+    def start_benchmark(self, argv, meta=None, identities=None):
         with self.lock:
             busy = self.slot_busy_reason()
             if busy:
                 raise SlotBusy(busy)
+            if identities:
+                self._check_conflicts(identities, meta)
             rid = _new_id("r")
             log_path = os.path.join(RUNS_DIR, rid + ".log")
             stop_path = os.path.join(RUNS_DIR, rid + ".stop")
+            state_path = os.path.join(RUNS_DIR, rid + ".state")
             _remove_stop_file(stop_path)
+            try:
+                os.remove(state_path)
+            except OSError:
+                pass
             argv = list(argv) + ["--stop-file", stop_path]
             run = Run(rid, "benchmark", " ".join(argv), list(argv), log_path,
-                      meta, stop_path=stop_path)
+                      meta, stop_path=stop_path, state_path=state_path,
+                      identities=identities)
+            env = dict(os.environ)
+            env["MC_BENCH_STATE_FILE"] = state_path
             try:
                 fh = open(log_path, "wb")
             except OSError as exc:
                 raise SlotBusy("cannot create log file: {}".format(exc))
             try:
-                run.proc = _popen(argv, fh)
+                run.proc = _popen(argv, fh, env=env)
             except Exception as exc:
                 fh.close()
                 run.status = "failed_spawn"
@@ -293,6 +328,7 @@ class RunManager(object):
                 run.save()
                 raise SlotBusy("spawn failed: {}".format(exc))
             self.run = run
+            self.active[rid] = run
             self.history.insert(0, run)
             run.save()
             return run
@@ -335,25 +371,28 @@ class RunManager(object):
         def worker():
             try:
                 import benchmark as bm  # lazy: heavy module
-                cluster_specs = [("configs/cluster.json", None)]
+                base_state = run.state_path or os.path.join(ROOT, ".state")
+                cluster_specs = [("configs/cluster.json", base_state)]
                 try:
                     req = (run.meta or {}).get("request") or {}
                     flags = req.get("flags", {})
                     if flags.get("launch_mode") == "rank_recall":
-                        cluster_specs = [(flags.get("rank_cluster"), "rank"),
-                                         (flags.get("recall_cluster"), "recall")]
+                        # children derive their ledger from the parent's
+                        # MC_BENCH_STATE_FILE: <base>.rank / <base>.recall
+                        cluster_specs = [
+                            (flags.get("rank_cluster"), base_state + ".rank"),
+                            (flags.get("recall_cluster"), base_state + ".recall")]
                     else:
                         cluster_specs = [(flags.get("cluster") or
-                                          cluster_specs[0][0], None)]
+                                          "configs/cluster.json", base_state)]
                 except Exception:
                     pass
                 seen_paths = set()
-                for cluster_path, work_mode in cluster_specs:
+                for cluster_path, state_path in cluster_specs:
                     if not cluster_path or cluster_path in seen_paths:
                         continue
                     seen_paths.add(cluster_path)
-                    bm.STATE_FILE = (os.path.join(ROOT, ".state." + work_mode)
-                                     if work_mode else os.path.join(ROOT, ".state"))
+                    bm.STATE_FILE = state_path
                     full = os.path.join(ROOT, cluster_path)
                     if not os.path.isfile(full):
                         continue
@@ -455,14 +494,13 @@ class RunManager(object):
             # user rule: a running benchmark delays the task, never overlaps
             while not sch.stop_event.is_set():
                 with self.lock:
-                    busy = self.run is not None and self.run.status == "running"
-                    blocker = self.run if busy else None
-                if not busy:
+                    blockers = list(self.active.values())
+                if not blockers:
                     break
                 if sch.state != "waiting_slot":
                     sch.state = "waiting_slot"
-                    sch.log("task {} waits: benchmark run {} still active".format(
-                        idx, blocker.id))
+                    sch.log("task {} waits: benchmark run(s) {} still active"
+                            "".format(idx, ", ".join(r.id for r in blockers)))
                 time.sleep(5)
             if sch.stop_event.is_set():
                 sch.state = "stopped"
@@ -529,8 +567,10 @@ class RunManager(object):
         while True:
             try:
                 with self.lock:
-                    run = self.run
-                    if run is not None and run.status == "running":
+                    for rid, run in list(self.active.items()):
+                        if run.proc is None:
+                            self.active.pop(rid, None)
+                            continue
                         rc = run.proc.poll()
                         if rc is not None:
                             run.rc = rc
@@ -538,6 +578,7 @@ class RunManager(object):
                             run.status = "stopped" if run.stopping else \
                                 ("done" if rc == 0 else "failed")
                             run.save()
+                            self.active.pop(rid, None)
                         else:
                             run.parse_ts_dir()
             except Exception:
@@ -548,9 +589,12 @@ class RunManager(object):
 
     def status(self):
         with self.lock:
+            running = [r for r in self.active.values()
+                       if r.status == "running"]
             return {
-                "active_run": self.run.to_dict() if (
-                    self.run is not None and self.run.status == "running") else None,
+                # compat: newest running run (single-run UI paths)
+                "active_run": running[-1].to_dict() if running else None,
+                "active_runs": [r.to_dict() for r in running],
                 "scheduler": self.scheduler.to_dict() if self.scheduler else None,
             }
 

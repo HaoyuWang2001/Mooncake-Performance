@@ -33,6 +33,16 @@ def test_children_have_isolated_namespace_ledgers():
     assert rank_env["PYTHONIOENCODING"] == "utf-8"
 
 
+def test_children_derive_ledger_from_parent_run(monkeypatch):
+    """WebUI-managed combined run: child ledgers keyed off the run's state
+    file so two concurrent combined runs never share a ledger."""
+    monkeypatch.setenv("MC_BENCH_STATE_FILE", "/tmp/runs/r1.state")
+    rank = _child_env("rank")["MC_BENCH_STATE_FILE"]
+    recall = _child_env("recall")["MC_BENCH_STATE_FILE"]
+    assert rank == "/tmp/runs/r1.state.rank"
+    assert recall == "/tmp/runs/r1.state.recall"
+
+
 def test_log_pump_survives_character_not_encodable_by_console():
     class Proc:
         stdout = io.StringIO("bad replacement: \ufffd\n")

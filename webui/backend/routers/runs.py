@@ -3,7 +3,7 @@
 import os
 import sys
 
-from .. import runmgr
+from .. import conflicts, runmgr
 from ..common import ApiError, read_json_body
 from ..paths import MAX_TEXT_CHUNK, ROOT
 
@@ -143,8 +143,13 @@ def api_cleanup_post(handler, query):
             "scheduler active (plan {}, next task @ {}) - its task may "
             "collide with this cleanup".format(
                 os.path.basename(sch.plan_path), sch.next_trigger))
-    run = runmgr.MGR.start_benchmark(argv, meta={"request": body,
-                                                 "action": "cleanup"})
+    identities = conflicts.run_identities(ROOT, body.get("flags") or {})
+    try:
+        run = runmgr.MGR.start_benchmark(
+            argv, meta={"request": body, "action": "cleanup"},
+            identities=identities)
+    except runmgr.SlotBusy as exc:
+        raise ApiError(409, exc.reason)
     return {"run": run.to_dict(), "warnings": warnings}
 
 
@@ -158,8 +163,10 @@ def api_run_post(handler, query):
             "scheduler active (plan {}, next task @ {}) - its task may "
             "collide with this run".format(
                 os.path.basename(sch.plan_path), sch.next_trigger))
+    identities = conflicts.run_identities(ROOT, body.get("flags") or {})
     try:
-        run = runmgr.MGR.start_benchmark(argv, meta={"request": body})
+        run = runmgr.MGR.start_benchmark(argv, meta={"request": body},
+                                         identities=identities)
     except runmgr.SlotBusy as exc:
         raise ApiError(409, exc.reason)
     return {"run": run.to_dict(), "warnings": warnings}

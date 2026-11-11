@@ -106,9 +106,12 @@ def _pump(label, proc, output=None):
 def _child_env(work_mode):
     # Namespace ledgers must be isolated. Otherwise one child can interpret
     # the other child's freshly-created namespace as a stale previous run and
-    # delete it during startup.
+    # delete it during startup. A WebUI-managed run passes its own per-run
+    # MC_BENCH_STATE_FILE; derive child ledgers from it so two concurrent
+    # combined runs never share a ledger.
     env = dict(os.environ)
-    env["MC_BENCH_STATE_FILE"] = os.path.join(ROOT, ".state." + work_mode)
+    base = env.get("MC_BENCH_STATE_FILE") or os.path.join(ROOT, ".state")
+    env["MC_BENCH_STATE_FILE"] = base + "." + work_mode
     # The parent decodes both child pipes as UTF-8.  Make that contract
     # explicit on Windows too, where redirected Python stdio otherwise uses
     # the active ANSI code page (commonly GBK/CP936).
