@@ -335,27 +335,41 @@ class RunManager(object):
         def worker():
             try:
                 import benchmark as bm  # lazy: heavy module
-                cluster_path = "configs/cluster.json"
+                cluster_specs = [("configs/cluster.json", None)]
                 try:
                     req = (run.meta or {}).get("request") or {}
-                    cluster_path = req.get("flags", {}).get("cluster") or cluster_path
+                    flags = req.get("flags", {})
+                    if flags.get("launch_mode") == "rank_recall":
+                        cluster_specs = [(flags.get("rank_cluster"), "rank"),
+                                         (flags.get("recall_cluster"), "recall")]
+                    else:
+                        cluster_specs = [(flags.get("cluster") or
+                                          cluster_specs[0][0], None)]
                 except Exception:
                     pass
-                full = os.path.join(ROOT, cluster_path)
-                if not os.path.isfile(full):
-                    return
-                with open(full, "r", encoding="utf-8") as f:
-                    cluster = json.load(f)
-                if cluster.get("controller"):
-                    cluster["_controller"] = bm.build_controller(cluster)
-                    try:
-                        bm.k8s_settings(cluster)
-                        bm.reap_k8s_namespaces(cluster)
-                        bm.cleanup_k8s_namespace(cluster, dry_run=False)
-                    except Exception as exc:
-                        sys.stderr.write(
-                            "[webui] k8s cleanup for {}: {}\n".format(run.id, exc))
-                bm.reap_state_entries(cluster)
+                seen_paths = set()
+                for cluster_path, work_mode in cluster_specs:
+                    if not cluster_path or cluster_path in seen_paths:
+                        continue
+                    seen_paths.add(cluster_path)
+                    bm.STATE_FILE = (os.path.join(ROOT, ".state." + work_mode)
+                                     if work_mode else os.path.join(ROOT, ".state"))
+                    full = os.path.join(ROOT, cluster_path)
+                    if not os.path.isfile(full):
+                        continue
+                    with open(full, "r", encoding="utf-8") as f:
+                        cluster = json.load(f)
+                    if cluster.get("controller"):
+                        cluster["_controller"] = bm.build_controller(cluster)
+                        try:
+                            bm.k8s_settings(cluster)
+                            bm.reap_k8s_namespaces(cluster)
+                            bm.cleanup_k8s_namespace(cluster, dry_run=False)
+                        except Exception as exc:
+                            sys.stderr.write(
+                                "[webui] k8s cleanup for {} ({}): {}\n".format(
+                                    run.id, cluster_path, exc))
+                    bm.reap_state_entries(cluster)
             except Exception as exc:
                 sys.stderr.write("[webui] remote cleanup for {}: {}\n".format(
                     run.id, exc))

@@ -125,8 +125,13 @@ const PerfView = {
           <el-radio-button value="ssh">真机</el-radio-button>
           <el-radio-button value="k8s">k8s</el-radio-button>
         </el-radio-group>
+        <span class="rb-label" style="margin-left: 20px">启动方式</span>
+        <el-radio-group v-model="launchMode" size="small">
+          <el-radio-button value="single">单任务</el-radio-button>
+          <el-radio-button value="rank_recall" :disabled="mode !== 'k8s'">Rank + Recall 并行</el-radio-button>
+        </el-radio-group>
       </div>
-      <div class="rb-row">
+      <div v-if="launchMode === 'single'" class="rb-row">
         <span class="rb-label">cluster</span>
         <el-select v-model="flags.cluster" size="small" style="width: 280px" filterable
                    placeholder="选择 cluster 配置">
@@ -146,7 +151,48 @@ const PerfView = {
                      :label="m.path || m" :value="m.path || m"></el-option>
         </el-select>
       </div>
-      <div v-if="mode === 'k8s'" class="rb-row" style="margin-top: 2px">
+      <template v-else>
+        <div class="rb-row">
+          <el-tag size="small" type="primary" style="width: 58px; justify-content: center">rank</el-tag>
+          <span class="rb-label">cluster</span>
+          <el-select v-model="flags.rankCluster" size="small" style="width: 300px" filterable
+                     placeholder="选择 rank cluster">
+            <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
+                       :label="c.path || c" :value="c.path || c"></el-option>
+          </el-select>
+          <span class="rb-label" style="margin-left: 12px">global</span>
+          <el-select v-model="flags.rankGlobal" size="small" style="width: 300px" filterable
+                     placeholder="选择 rank global">
+            <el-option v-for="g in modeCandidates.global" :key="g.path || g"
+                       :label="g.path || g" :value="g.path || g"></el-option>
+          </el-select>
+        </div>
+        <div class="rb-row">
+          <el-tag size="small" type="success" style="width: 58px; justify-content: center">recall</el-tag>
+          <span class="rb-label">cluster</span>
+          <el-select v-model="flags.recallCluster" size="small" style="width: 300px" filterable
+                     placeholder="选择 recall cluster">
+            <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
+                       :label="c.path || c" :value="c.path || c"></el-option>
+          </el-select>
+          <span class="rb-label" style="margin-left: 12px">global</span>
+          <el-select v-model="flags.recallGlobal" size="small" style="width: 300px" filterable
+                     placeholder="选择 recall global">
+            <el-option v-for="g in modeCandidates.global" :key="g.path || g"
+                       :label="g.path || g" :value="g.path || g"></el-option>
+          </el-select>
+        </div>
+        <div class="rb-row">
+          <span class="rb-label">profile</span>
+          <el-select v-model="flags.profile" size="small" style="width: 300px"
+                     placeholder="选择共享 profile 配置">
+            <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
+                       :label="m.path || m" :value="m.path || m"></el-option>
+          </el-select>
+          <span class="rb-sel-note" style="margin-left: 12px">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
+        </div>
+      </template>
+      <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row" style="margin-top: 2px">
         <span class="rb-label">image</span>
         <span :title="clusterImage" class="rb-image">{{ clusterImage || "-" }}</span>
       </div>
@@ -166,7 +212,11 @@ const PerfView = {
           <div v-if="!selected.files.length" class="rb-sel-empty">—</div>
           <div v-for="f in selected.files" :key="f" class="rb-sel-path" :title="f">{{ f }}</div>
         </div>
-        <div class="rb-sel-note">目录先执行、文件后执行；已被目录收编的文件不重复列出</div>
+        <div class="rb-sel-note">
+          {{ launchMode === 'rank_recall'
+             ? '并行模式要求选择中同时包含 rank 与 recall；按有效 work_mode 自动分组'
+             : '目录先执行、文件后执行；已被目录收编的文件不重复列出' }}
+        </div>
       </div>
       <div class="rb-row">
         <span class="rb-label">选项</span>
@@ -193,7 +243,8 @@ const PerfView = {
         <span class="spacer"></span>
         <el-button type="danger" plain size="default" style="width: 110px"
                    :loading="cleaning"
-                   :disabled="busy || cleaning || starting"
+                   :disabled="busy || cleaning || starting || launchMode === 'rank_recall'"
+                   :title="launchMode === 'rank_recall' ? '并行模式请切回单任务后按 namespace 分别清理' : ''"
                    @click="cleanup">CLEAN-UP</el-button>
       </div>
       <div v-if="runHint" class="rb-run-hint">{{ runHint }}</div>
@@ -312,12 +363,15 @@ const PerfView = {
   </div>`,
   setup() {
     const mode = Vue.ref("ssh");
+    const launchMode = Vue.ref("single");
     const cfgDialog = Vue.ref(false);
     const treeRoots = Vue.ref([]);
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
                                  verbose: false, protocol: "", cluster: "",
-                                 global: "", profile: "" });
+                                 global: "", profile: "", rankCluster: "",
+                                 rankGlobal: "", recallCluster: "",
+                                 recallGlobal: "" });
     const warnings = Vue.ref([]);
     const starting = Vue.ref(false);
     const cleaning = Vue.ref(false);
@@ -364,9 +418,14 @@ const PerfView = {
       flags.cluster = _perfPickDefault(c.cluster, "cluster.json");
       flags.global = _perfPickDefault(c.global, "global.json");
       flags.profile = _perfPickDefault(c.profile, "profile.json");
+      flags.rankCluster = _perfPickDefault(c.cluster, "cluster.16node-rank.json");
+      flags.rankGlobal = _perfPickDefault(c.global, "global.rank.json");
+      flags.recallCluster = _perfPickDefault(c.cluster, "cluster.16node-recall.json");
+      flags.recallGlobal = _perfPickDefault(c.global, "global.recall.json");
     }
 
     function onModeChange() {
+      if (mode.value !== "k8s") launchMode.value = "single";
       applyDefaults();
     }
 
@@ -434,12 +493,16 @@ const PerfView = {
       try {
         const r = await api("POST", "/api/run", {
           selector: { dirs: acc.dirs, files: acc.files },
-          flags: { mode: mode.value,
+          flags: { mode: mode.value, launch_mode: launchMode.value,
                    dry_run: flags.dryRun, no_warmup: flags.noWarmup,
                    no_plot: flags.noPlot, verbose: flags.verbose,
                    protocol: flags.protocol || null,
                    cluster: flags.cluster, global: flags.global,
-                   profile: flags.profile },
+                   profile: flags.profile,
+                   rank_cluster: flags.rankCluster,
+                   rank_global: flags.rankGlobal,
+                   recall_cluster: flags.recallCluster,
+                   recall_global: flags.recallGlobal },
         });
         warnings.value = r.warnings || [];
         viewRun(r.run.id, true);
@@ -478,6 +541,14 @@ const PerfView = {
     const runHint = Vue.computed(() => {
       if (busy.value || starting.value || cleaning.value) return "";
       if (!hasSelection.value) return "未选择配置：先打开「选择配置」勾选文件或目录";
+      if (launchMode.value === "rank_recall") {
+        if (!flags.rankCluster) return "未选择 rank cluster 配置";
+        if (!flags.rankGlobal) return "未选择 rank global 配置";
+        if (!flags.recallCluster) return "未选择 recall cluster 配置";
+        if (!flags.recallGlobal) return "未选择 recall global 配置";
+        if (!flags.profile) return "未选择共享 profile 配置";
+        return "";
+      }
       if (!flags.cluster) return "未选择 cluster 配置";
       if (!flags.global) return "未选择 global 配置";
       if (!flags.profile) return "未选择 profile 配置";
@@ -690,7 +761,7 @@ const PerfView = {
     });
     Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
-    return { mode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
+    return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
              flags, warnings, starting, cleaning, busy, clusterImage, clearSel, startRun, cleanup,
              meta, logLines, logEl, runs, stopping, drawerOpen, viewingHistory,
              statusType, stop, gotoResults, onHistoryClick,

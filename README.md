@@ -854,13 +854,19 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   自动去重（取消目录后恢复独立选中）；提交为 `--config-dir a,b` + `-f x,y` 多值形式，目录先执行
 - **运行**：仅观察——状态卡（id/状态/耗时/rc/产物目录）+ 停止按钮 + 编排器日志实时滚动
   （FAIL/ERROR 高亮）+ 历史 runs 表格；运行完毕后手动点击「查看运行结果」跳转结果页
+- **Rank + Recall 并行（k8s）**：启动方式切换为该模式后，分别选择 rank/recall 的
+  cluster 与 global 配置（可对应不同 namespace、etcd/master 服务），配置树中可一次勾选
+  两类测试；父任务按继承后的 `work_mode` 自动分组并同时启动两个 benchmark。统一日志以
+  `[rank]` / `[recall]` 标记，产物收在同一 run 的 `rank/`、`recall/` 子目录；STOP 会同时
+  通知两边并按各自 namespace 清理。该模式要求选择中两类配置均非空
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
   并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
   匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（profiling 指标占位：
   profiling/outliers.json）、文本 tail
 - **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
   再执行（scheduler 等待期允许手动发起 run，响应带 warning）
-- **并发规则**：单一执行槽——benchmark 或 scheduler 任务运行中新 run 请求返回 409
+- **并发规则**：单一执行槽——benchmark（并行模式的父任务仍只占一个槽位）或 scheduler
+  任务运行中新 run 请求返回 409
 - 运行历史与日志持久化于 `webui/data/runs/`（gitignore）
 
 触发模型（混合）：任务显式带 `date`+`time` 则睡到该时刻（已过点立即执行）；

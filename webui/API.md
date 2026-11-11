@@ -64,6 +64,8 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
     "files": ["configs/basic/get.json"] // 可选；文件数组
   },
   "flags": {
+    "mode": "ssh",                         // ssh | k8s
+    "launch_mode": "single",               // single | rank_recall（仅 k8s）
     "dry_run": false, "no_warmup": false, "no_plot": false,
     "verbose": false,                     // 详细日志（上传路径/逐文件拉取/kubectl 命令/pod 详情）
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"
@@ -75,6 +77,19 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
 ```
 selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files 后执行**（CLI 映射为
 `--config-dir a,b` + `-f x,y` 多值形式）。旧 `{type, path}` 格式已移除（400）。
+
+`launch_mode=rank_recall` 时不用单任务的 `cluster/global`，改传以下四项：
+```json
+{
+  "rank_cluster": "configs/_k8s/cluster.16node-rank.json",
+  "rank_global": "configs/_k8s/global.rank.json",
+  "recall_cluster": "configs/_k8s/cluster.16node-recall.json",
+  "recall_global": "configs/_k8s/global.recall.json"
+}
+```
+所选目录/文件会先展开并解析 `_configs.json` 继承，再按有效 `work_mode` 分组；rank 或 recall
+任一为空、或包含其他 work_mode，父任务即失败。两个 benchmark 并发执行，日志带角色前缀，
+结果写入同一 `outputs/<run>/rank` 与 `outputs/<run>/recall`；共享 `profile` 与通用运行选项。
 → `201` 意义上返回 `{"run":{"id":"r...","status":"running","cmd":"..."},"warnings":[]}`
 槽位被占 → `409 {"error":"benchmark run r... is still active ..."}`
 

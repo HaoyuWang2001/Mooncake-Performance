@@ -2495,7 +2495,7 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
 # be cleaned up, even after a crashed or manually killed orchestrator run.
 # ---------------------------------------------------------------------------
 
-STATE_FILE = os.path.join(ROOT, ".state")
+STATE_FILE = os.environ.get("MC_BENCH_STATE_FILE", os.path.join(ROOT, ".state"))
 
 
 def state_append(entries):
@@ -4626,6 +4626,10 @@ def parse_arguments(argv=None):
                              "including demo/; _-prefixed fragments always skipped); "
                              "comma-separated multi values; config-dir entries run "
                              "BEFORE --config files")
+    # Internal orchestration hook used by the WebUI rank+recall launcher.
+    # Keeping it out of --help avoids presenting an implementation detail as
+    # a normal benchmark knob.
+    parser.add_argument("--result-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="verbose logging (upload paths, per-file pulls, "
@@ -4820,13 +4824,29 @@ def main(args, cfg_paths):
         cleanup_cluster(cluster, globals_cfg, dry_run=args.dry_run)
         log("cleanup done")
         return
-    ts = time.strftime("%Y%m%d-%H%M")
-    ts_dir = os.path.join(RESULTS_DIR, ts)
-    n = 1
-    while os.path.exists(ts_dir):
-        ts = "{}-{}".format(time.strftime("%Y%m%d-%H%M"), n)
+    if args.result_dir:
+        ts_dir = os.path.abspath(
+            args.result_dir if os.path.isabs(args.result_dir)
+            else os.path.join(ROOT, args.result_dir))
+        try:
+            inside_outputs = os.path.commonpath([RESULTS_DIR, ts_dir]) == RESULTS_DIR
+        except ValueError:
+            inside_outputs = False
+        if not inside_outputs:
+            sys.exit("[ERROR] --result-dir must be under {}".format(RESULTS_DIR))
+        if os.path.exists(ts_dir):
+            sys.exit("[ERROR] --result-dir already exists: {}".format(ts_dir))
+        # The rendezvous/run identifier must remain unique even though rank
+        # and recall now live below one shared results parent.
+        ts = os.path.relpath(ts_dir, RESULTS_DIR).replace(os.sep, "-")
+    else:
+        ts = time.strftime("%Y%m%d-%H%M")
         ts_dir = os.path.join(RESULTS_DIR, ts)
-        n += 1
+        n = 1
+        while os.path.exists(ts_dir):
+            ts = "{}-{}".format(time.strftime("%Y%m%d-%H%M"), n)
+            ts_dir = os.path.join(RESULTS_DIR, ts)
+            n += 1
     if not args.dry_run:
         os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
         # full-detail log: every per-command/per-pod line goes here; the
