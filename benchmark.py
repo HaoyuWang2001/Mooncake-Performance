@@ -3004,6 +3004,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             plan["writers"] + plan["readers"]
         for entry in pool:
             entry["node"] = node_names[entry["slot"]]
+    # record the REAL cluster-wide process counts for the CSV (client_count);
+    # write_scenario_csv rebuilds a node_count=1 plan, so it cannot derive N.
+    cfg["_writer_count"] = len(plan["writers"])
+    cfg["_reader_count"] = len(plan["readers"])
     if plan["notify_count"] < 1:
         raise RuntimeError("pipeline config requires notify_count >= 1")
     if plan.get("dual"):
@@ -3975,8 +3979,14 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             # client_count = 本行角色对应的客户端进程总数（dual 模式写/读
             # 两侧都等于 N*count_per_node；分离模式各取各自的规划数）。
             # 合并了旧的 writer_count/reader_count 两列——role 列已区分角色。
-            client_count = len(plan["writers"] if role == "writer"
-                               else plan["readers"])
+            # 优先用运行期记录的真实总数（plan here uses node_count=1，不能
+            # 用 len(plan[...]) 代表集群规模）；无运行时退化为 "N*cpn" 描述。
+            role_key = "_writer_count" if role == "writer" else "_reader_count"
+            if cfg.get(role_key) is not None:
+                client_count = int(cfg[role_key])
+            else:
+                role_cfg = (cfg.get(role, {}) or {}) or (cfg.get("client", {}) or {})
+                client_count = "N*{}".format(role_cfg.get("count_per_node", 1))
             # node 列统一填管理网 IP（解析失败回退节点名）
             try:
                 node_ip = get_node(cluster, nodename)["ip"] if cluster else nodename

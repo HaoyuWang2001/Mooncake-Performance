@@ -24,8 +24,17 @@ def test_basic_header_has_no_client_count():
     assert "client_count" not in bm.BASIC_CSV_HEADER
 
 
-def test_client_count_uses_role_plan_totals():
-    """client_count 取该行角色在 plan 中的实际进程总数（dual 两侧一致）。"""
+def test_client_count_uses_runtime_totals():
+    """client_count 取运行期记录的真实集群总数（不是 node_count=1 的 plan）。"""
     src = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
-    assert 'client_count = len(plan["writers"] if role == "writer"' in src
+    assert 'cfg["_writer_count"] = len(plan["writers"])' in src
+    assert 'cfg["_reader_count"] = len(plan["readers"])' in src
+    assert 'role_key = "_writer_count" if role == "writer" else "_reader_count"' in src
+    assert 'client_count = int(cfg[role_key])' in src
+
+
+def test_client_count_numeric_in_pipeline_rows():
+    """运行期有真实计数时 client_count 必须是整数，不能是 'N*1' 字符串。"""
+    src = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
     assert '"client_count": client_count' in src
+    assert "client_count = int(cfg[role_key])" in src
