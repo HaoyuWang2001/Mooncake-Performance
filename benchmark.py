@@ -443,6 +443,130 @@ def _store_total_bytes(globals_cfg):
     return _store_capacity_resolution(globals_cfg)[2]
 
 
+# cleanliness verify: after a remove-keys stage the store should be empty;
+# allocated above this fraction of total capacity is suspicious (metadata
+# overhead keeps a truly-empty store at ~0). WARN by default, FAIL when
+# global.json pipeline.require_clean_store is true.
+_STORE_CLEAN_TOLERANCE = 0.01
+
+
+def _fetch_master_metrics_text(cluster, globals_cfg):
+    """Fetch the master Prometheus text through the same probe chain used by
+    discover_store_capacity (k8s: controller direct curl -> kubectl exec;
+    ssh: orchestrator direct GET -> curl on the first cluster node).
+    Returns (text, source) or (None, None) when the probe is unavailable."""
+    url = _master_metrics_url(globals_cfg)
+    if not url:
+        return None, None
+    if cluster is not None and cluster.get("_controller") is not None:
+        cache = cluster.setdefault("_metrics_resolved", {})
+        if url not in cache:
+            try:
+                cache[url] = _resolve_k8s_addr(url, cluster)
+            except Exception:
+                cache[url] = url
+        text = _controller_curl_get(cluster, cache[url] or url)
+        source = "direct {}".format(cache[url] or url)
+        if not text:
+            text, _why = _probe_metrics_via_exec(cluster, url)
+            source = "exec {}".format(url)
+        return (text or None), (source if text else None)
+    text = _http_get_text(url)
+    source = url
+    if text is None and cluster:
+        for name in (cluster.get("nodes") or {}):
+            n = get_node(cluster, name)
+            try:
+                text = ssh_check_output(
+                    n["ip"], n, "curl -s --max-time 5 {}".format(
+                        shlex.quote(url)), quiet=True)
+            except Exception:
+                text = None
+            if text:
+                break
+    if not text:
+        return None, None
+    return text, source
+
+
+def _store_usage_snapshot(cluster, globals_cfg):
+    """Per-series store usage right now: {allocated, total, pct,
+    seg_alloc, seg_cap, source}. None when the metrics probe is unavailable.
+
+    `seg_alloc`/`seg_cap` are the raw per-series values (one entry per
+    store/segment as exposed by the master) — they are what tells a single
+    store skew (one series near its own capacity) apart from a global
+    watermark (all series high)."""
+    text, source = _fetch_master_metrics_text(cluster, globals_cfg)
+    if text is None:
+        return None
+    vals = _parse_prometheus_metrics(text)
+    total = _metric_total(vals, "master_total_capacity_bytes")
+    if not total:
+        total = _metric_total(vals, "segment_total_capacity_bytes")
+    if not total:
+        total = _metric_total(vals, "mooncake_vsegment_logical_capacity_bytes")
+    allocated = _metric_total(vals, "segment_allocated_bytes")
+    if allocated is None:
+        allocated = _metric_total(vals, "master_allocated_bytes")
+    if total is None and allocated is None:
+        return None
+    total = total or 0.0
+    allocated = allocated or 0.0
+    return {
+        "allocated": allocated,
+        "total": total,
+        "pct": (allocated / total) if total > 0 else 0.0,
+        "seg_alloc": vals.get("segment_allocated_bytes") or [],
+        "seg_cap": vals.get("segment_total_capacity_bytes") or [],
+        "source": source,
+    }
+
+
+def _require_clean_store(globals_cfg):
+    return bool((globals_cfg.get("pipeline") or {}).get(
+        "require_clean_store", False))
+
+
+def _verify_store_clean(cluster, globals_cfg, cfg_name, when):
+    """Log (and optionally FAIL) when the store is not empty after a
+    remove-keys stage. Never raises for a missing probe; raises only when
+    pipeline.require_clean_store is true and allocated exceeds the
+    tolerance."""
+    snap = _store_usage_snapshot(cluster, globals_cfg)
+    if snap is None:
+        log_detail("[verify] {}: store cleanliness check skipped "
+                   "(master_metrics_url unset/unreachable)".format(when))
+        return None
+    nonzero = [(a, snap["seg_cap"][i] if i < len(snap["seg_cap"]) else None)
+               for i, a in enumerate(snap["seg_alloc"]) if a > 0]
+    detail = ", ".join(
+        "seg#{}={}{}".format(
+            i, _fmt_gib(a),
+            "" if c is None else " ({:.0f}% of {})".format(
+                (a / c * 100.0) if c else 0.0, _fmt_gib(c)))
+        for i, (a, c) in enumerate(nonzero[:8]))
+    msg = ("[verify] {}: store after remove allocated={} / total={} "
+           "({:.1f}%), nonzero segments={}/{}".format(
+               when, _fmt_gib(snap["allocated"]), _fmt_gib(snap["total"]),
+               snap["pct"] * 100.0, len(nonzero), len(snap["seg_alloc"])))
+    if detail:
+        msg += ": " + detail
+    if snap["pct"] > _STORE_CLEAN_TOLERANCE:
+        if _require_clean_store(globals_cfg):
+            raise RuntimeError(
+                "{} — store is NOT clean after remove-keys ({:.1f}% > {:.0f}% "
+                "tolerance); pipeline.require_clean_store=true. Check for "
+                "leftover objects / in-flight handles before rerunning"
+                "".format(msg, snap["pct"] * 100.0,
+                           _STORE_CLEAN_TOLERANCE * 100.0))
+        log("[WARN] " + msg + " — store not fully empty after remove-keys; "
+            "set pipeline.require_clean_store=true to hard-fail instead")
+    else:
+        log(msg)
+    return snap
+
+
 def _basic_store_check(globals_cfg, cfg):
     """basic mode: total key space (key_count x data_size, shared across
     clients) must be strictly smaller than store_total_size when that is
@@ -2172,13 +2296,15 @@ def _pipeline_entry_label(entry):
 
 def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
                           involved_nodes, remote_log_dir, cfg_name, local_log_dir,
-                          etcd_endpoints=None, run_id=None):
+                          etcd_endpoints=None, run_id=None,
+                          remove_host=None, remove_node=None, remove_runner=None,
+                          globals_cfg=None):
     """Best-effort cleanup after a pipeline scenario failure, so remote logs
     (including the reader SUMMARY/RESULT that is only flushed at exit) are
     preserved for diagnosis and ports are freed. Every step is guarded so the
     original exception is never masked. Order: graceful reader shutdown ->
-    wait for exit -> kill stragglers -> pull all logs -> wipe the etcd
-    rendezvous prefix."""
+    wait for exit -> kill stragglers -> store remove-all (so a failed run
+    leaves no residue) -> pull all logs -> wipe the etcd rendezvous prefix."""
     log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
     # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
     _pid_by_obj = {id(e): (pid or "").strip() for e, pid in reader_pids}
@@ -2209,12 +2335,28 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
     for r, pid in reader_pids:
         if pid:
             _kill_remote_process(cluster, r["node"], pid)
-    # 4. pull every log of this scenario (stage logs + reader/writer + nohup)
+    # 4. best-effort store remove-all: a FAILED run must not leave objects
+    # behind (the success path removes at config end; without this, residue
+    # only clears on the NEXT run's pre-launch remove). Runs after the
+    # clients are dead so no writer can re-create keys mid-sweep.
+    if remove_host and remove_node and remove_runner:
+        try:
+            run_stage(remove_host, get_node(cluster, remove_node),
+                      remove_runner, "remove-keys", remote_log_dir, cfg_name,
+                      extra="--scope full", dry_run=False,
+                      node_name=remove_node)
+            log("[FAIL] fail-cleanup: store remove-all issued")
+            if globals_cfg is not None:
+                _verify_store_clean(cluster, globals_cfg, cfg_name,
+                                    "fail cleanup")
+        except Exception as exc:
+            log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
+    # 5. pull every log of this scenario (stage logs + reader/writer + nohup)
     try:
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
     except Exception as exc:
         log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
-    # 5. wipe this run's etcd rendezvous prefix
+    # 6. wipe this run's etcd rendezvous prefix
     if etcd_endpoints and run_id:
         try:
             _etcd_delete_prefix(cluster, etcd_endpoints,
@@ -3324,6 +3466,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                       "remove-keys", remote_log_dir, cfg_name,
                       extra="--scope full", dry_run=dry, pull_to=local_log_dir,
                       node_name=primary_node_name)
+            if not dry:
+                _verify_store_clean(cluster, globals_cfg, cfg_name,
+                                    "{} start".format(ds))
             # fresh rendezvous state per size iteration (stale registrations
             # from a previous size must never leak into this one)
             reader_pids = []
@@ -3721,6 +3866,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
         command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
+        if not dry:
+            _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
         pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
         echo_cpu_bindings(cfg_name, local_log_dir)
         # All pipeline processes exited naturally -> drop their ledger rows.
@@ -3744,7 +3891,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
                                   involved_nodes, remote_log_dir, cfg_name,
                                   local_log_dir, etcd_endpoints=etcd_endpoints,
-                                  run_id=run_id)
+                                  run_id=run_id,
+                                  remove_host=locals().get("host"),
+                                  remove_node=locals().get("primary_node_name"),
+                                  remove_runner=locals().get("remote_runner"),
+                                  globals_cfg=globals_cfg)
             # 复核台账：已死删行、杀不死的保留待下次 reap
             reap_state_entries(cluster)
             if profile_sess is not None:
@@ -4761,6 +4912,7 @@ def main(args, cfg_paths):
                      "{}/final.remove-keys.log*".format(
                          sweep_remove["remote_log_dir"]),
                      os.path.join(ts_dir, "logs"), dry_run=False)
+            _verify_store_clean(cluster, globals_cfg, "final", "sweep end")
             log("sweep-end remove-keys -> {}".format(
                 os.path.join(ts_dir, "logs", "final.remove-keys.log")))
         except Exception as exc:

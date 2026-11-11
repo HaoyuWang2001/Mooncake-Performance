@@ -304,3 +304,56 @@ def test_pipeline_key_space_ratio_rejects_bad_values():
             raise AssertionError("should raise for {!r}".format(bad))
         except RuntimeError as exc:
             assert "key_space_ratio" in str(exc)
+
+
+def test_store_usage_snapshot_parses_per_segment(monkeypatch):
+    text = ("master_total_capacity_bytes 1000000000\n"
+            "segment_allocated_bytes{segment=\"a\"} 5000\n"
+            "segment_allocated_bytes{segment=\"b\"} 0\n"
+            "segment_total_capacity_bytes{segment=\"a\"} 600000000\n"
+            "segment_total_capacity_bytes{segment=\"b\"} 400000000\n")
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
+    snap = bm._store_usage_snapshot(
+        None, {"master_metrics_url": "http://m:1/metrics"})
+    assert snap["allocated"] == 5000
+    assert snap["total"] == 1000000000
+    assert snap["seg_alloc"] == [5000.0, 0.0]
+    assert snap["seg_cap"] == [600000000.0, 400000000.0]
+    # no url -> unavailable
+    assert bm._store_usage_snapshot(None, {}) is None
+
+
+def test_verify_store_clean_warn_by_default(monkeypatch, capsys):
+    text = ("master_total_capacity_bytes 1000000\n"
+            "segment_allocated_bytes{segment=\"a\"} 50000\n")
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
+    snap = bm._verify_store_clean(
+        None, {"master_metrics_url": "http://m:1/metrics"}, "cfg", "start")
+    assert snap is not None
+    out = capsys.readouterr().out
+    assert "not fully empty" in out and "[WARN]" in out
+
+
+def test_verify_store_clean_fails_when_required(monkeypatch):
+    text = "master_total_capacity_bytes 1000000\n" \
+           "segment_allocated_bytes{segment=\"a\"} 50000\n"
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
+    try:
+        bm._verify_store_clean(
+            None, {"master_metrics_url": "http://m:1/metrics",
+                   "pipeline": {"require_clean_store": True}}, "cfg", "start")
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "NOT clean" in str(exc)
+
+
+def test_verify_store_clean_ok_when_empty(monkeypatch, capsys):
+    text = ("master_total_capacity_bytes 1000000\n"
+            "segment_allocated_bytes{segment=\"a\"} 0\n")
+    monkeypatch.setattr(bm, "_http_get_text", lambda url, timeout=5: text)
+    bm._verify_store_clean(
+        None, {"master_metrics_url": "http://m:1/metrics"}, "cfg", "start")
+    out = capsys.readouterr().out
+    assert "store after remove allocated=" in out
+    assert "not fully empty" not in out
+

@@ -17,7 +17,8 @@
   "local_buffer_size": 1073741824,
   "_pipeline_comment": "pipeline 可选调优：key_space_ratio = 可写 key 空间占 effective store 的比例（默认 0.9，必须 0<r<1，越小越安全）；require_clean_store=true 时 remove-keys 后 store 仍非空会直接失败（默认仅 WARN，用于排查跨 run 残留）。",
   "pipeline": {
-    "key_space_ratio": 0.9
+    "key_space_ratio": 0.9,
+    "require_clean_store": false
   },
   "store_total_size": "",
   "tenant_id": "default",
