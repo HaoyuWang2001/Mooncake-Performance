@@ -55,11 +55,38 @@ def test_config_tree_checkbox_cascades():
 
 
 def test_log_wrap_uses_switch():
-    """自动换行是开关型控件（el-switch + 文字），不是独立按钮。"""
-    src = open(os.path.join(JS_DIR, "views", "perf-view.js"), encoding="utf-8").read()
+    """自动换行是开关型控件（el-switch + 文字），不是独立按钮（实例详情页）。"""
+    src = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+               encoding="utf-8").read()
     assert '<el-switch v-model="logWrap"' in src
-    assert 'log-wrap-label' in src
-    assert '>自动换行</el-button>' not in src
+    assert "log-wrap-label" in src
+    assert ">自动换行</el-button>" not in src
+
+
+def test_perf_page_is_instance_management():
+    """性能测试页：运行框只剩「创建实例」+ CLEAN-UP，下方是实例卡片列表。"""
+    src = open(os.path.join(JS_DIR, "views", "perf-view.js"),
+               encoding="utf-8").read()
+    assert "创建实例" in src
+    assert "CLEAN-UP" in src
+    assert ">RUN</el-button>" not in src
+    assert "当前 RUN" not in src
+    assert 'v-for="it in instances"' in src
+    assert "runInstance(it)" in src and "stopInstance(it)" in src
+    assert "deleteInstance(it)" in src and "openInstance(it)" in src
+    assert "/api/instances" in src and "/run" in src and "/stop" in src
+
+
+def test_instance_detail_tabs_and_split_log():
+    """实例详情页：浏览器式页签 + 组合实例 rank/recall 上下分屏 + 跳转结果。"""
+    src = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+               encoding="utf-8").read()
+    assert "inst-tabs" in src and "closeTab" in src
+    assert 'stream="rank"' in src and 'stream="recall"' in src
+    assert 'stream="all"' in src and "合并日志" in src
+    assert "跳转至结果详情" in src
+    # nested ts_dir -> top-level parent output (results view lists rank/recall)
+    assert "return rel.split(\"/\")[0];" in src
 
 
 def test_csv_header_single_line_width():

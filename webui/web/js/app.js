@@ -19,7 +19,7 @@ async function api(method, url, body) {
 
 /* ---------------- 全局共享状态 ---------------- */
 /* ---------------- 视图页签持久化（浏览器刷新后停留在当前页签） ---------------- */
-const VIEW_KEYS = ["perf", "results", "config", "schedule"];
+const VIEW_KEYS = ["perf", "instances", "results", "config", "schedule"];
 function loadInitialView() {
   try {
     const v = localStorage.getItem("mcweb-view");
@@ -28,12 +28,27 @@ function loadInitialView() {
   return "config";
 }
 
+function _loadInstanceTabs() {
+  try {
+    const raw = sessionStorage.getItem("mcweb-instance-tabs");
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter(x => typeof x === "string") : [];
+  } catch (e) { return []; }
+}
+
 const store = reactive({
-  view: loadInitialView(),       // 当前视图：config | run | results | schedule | api
-  status: { active_run: null, scheduler: null },   // /api/status 轮询结果
+  view: loadInitialView(),       // 当前视图：perf | instances | results | config | schedule
+  status: { active_run: null, active_runs: [], scheduler: null },  // /api/status 轮询结果
   resultsTarget: null,          // 跳转 results 时聚焦的 outputs/<ts>
+  instancesOpen: _loadInstanceTabs(),   // 实例详情页已打开的实例（浏览器式页签）
+  instancesTarget: null,        // 当前激活的实例详情
   cfgTree: null,                // /api/configs 缓存（config 视图刷新）
 });
+
+watch(() => store.instancesOpen, v => {
+  try { sessionStorage.setItem("mcweb-instance-tabs", JSON.stringify(v)); }
+  catch (e) { /* ignore */ }
+}, { deep: true });
 
 watch(() => store.view, v => {
   try { localStorage.setItem("mcweb-view", v); } catch (e) { /* ignore */ }
@@ -146,6 +161,7 @@ const App = {
       </div>
       <el-menu :default-active="store.view" class="menu" @select="go">
         <el-menu-item index="perf">性能测试</el-menu-item>
+        <el-menu-item index="instances">实例详情</el-menu-item>
         <el-menu-item index="results">统计结果</el-menu-item>
         <el-menu-item index="config">配置维护</el-menu-item>
         <el-menu-item index="schedule">定时任务</el-menu-item>
@@ -164,7 +180,8 @@ const App = {
     </el-main>
   </el-container>`,
   setup() {
-    const VIEWS = { perf: "perf-view", results: "results-view",
+    const VIEWS = { perf: "perf-view", instances: "instance-view",
+                    results: "results-view",
                     config: "config-view", schedule: "schedule-view" };
     const viewComp = computed(() => VIEWS[store.view] || "config-view");
     function go(v) {
@@ -216,6 +233,8 @@ for (const [iconName, iconComp] of Object.entries(ElementPlusIconsVue || {})) {
 }
 app.component("perf-view", PerfView);
 app.component("sel-node", SelNode);
+app.component("instance-view", InstanceView);
+app.component("instance-log-pane", InstanceLogPane);
 app.component("config-view", ConfigView);
 app.component("cfg-node", CfgNode);
 app.component("results-view", ResultsView);
