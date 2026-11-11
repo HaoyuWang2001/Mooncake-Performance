@@ -518,34 +518,24 @@ html, body, #app {
 .inst-actions { display: flex; align-items: center; gap: 8px; }
 .inst-actions .spacer { flex: 1; }
 
-/* ---- 实例详情：浏览器式页签 + 日志上下分屏 ---- */
-.inst-tabs {
-  display: flex; align-items: flex-end; gap: 4px; margin-bottom: 10px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-  overflow-x: auto;
+/* ---- 实例详情：el-tabs card 作为页签条（内容在下方单独渲染） + 日志分屏 ---- */
+.inst-tabs { margin-bottom: var(--mc-space-3); }
+.inst-tabs .el-tabs__header { margin-bottom: 0; }
+.inst-tabs .el-tabs__content { display: none; }
+.inst-tabs .it-label {
+  display: inline-flex; align-items: center; gap: var(--mc-space-1);
 }
-.inst-tab {
-  display: flex; align-items: center; gap: 8px; padding: 6px 12px;
-  font-size: 13px; color: var(--el-text-color-regular);
-  background: var(--el-fill-color-light);
-  border: 1px solid var(--el-border-color-lighter); border-bottom: none;
-  border-radius: 8px 8px 0 0; cursor: pointer; max-width: 260px;
+.inst-tabs .it-name {
+  max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.inst-tab .it-name {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.inst-tab.active {
-  color: var(--el-color-primary); background: var(--el-bg-color);
-  font-weight: 600;
-}
-.inst-tab .it-close { color: var(--el-text-color-secondary); }
-.inst-tab .it-close:hover { color: var(--el-color-danger); }
-.inst-detail-head .inst-actions { margin-top: 10px; }
-.ilog-split { display: flex; flex-direction: column; gap: 12px; }
+.inst-desc { margin-top: var(--mc-space-3); }
+.inst-detail-head .inst-actions { margin-top: var(--mc-space-3); }
+.ilog-split { display: flex; flex-direction: column; gap: var(--mc-space-3); }
 .ilog-pane { display: flex; flex-direction: column; min-width: 0; }
 .ilog-head {
   font-size: 12px; font-weight: 600;
-  color: var(--el-text-color-secondary); margin-bottom: 4px;
+  color: var(--el-text-color-secondary); margin-bottom: var(--mc-space-1);
 }
 .ilog-view { height: 300px; min-height: 220px; }
-.ilog-progress { font-size: 11px; }
+.ilog-progress { font-size: 12px; }

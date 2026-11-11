@@ -2,11 +2,6 @@
 /* 实例详情视图：浏览器式页签（可同时打开多个实例）+ 实例信息 + 操作 +
    日志查看。组合实例（Rank+Recall 并行）日志按 rank/recall 上下分屏展示。 */
 
-function _instStatusType(s) {
-  return { running: "primary", done: "success", failed: "danger",
-           stopped: "warning", aborted: "warning", created: "info" }[s] || "info";
-}
-
 function _instResultsTarget(tsDir) {
   const rel = String(tsDir || "").replace(/^outputs[\\/]/, "");
   return rel.split("/")[0];
@@ -35,7 +30,7 @@ const InstanceLogPane = {
                 clearable style="width: 210px" @keyup.enter="nextMatch" />
       <el-button size="small" :disabled="!matchCount" @click="prevMatch">↑</el-button>
       <el-button size="small" :disabled="!matchCount" @click="nextMatch">↓</el-button>
-      <span v-if="searchQ" class="log-match-count">{{ matchCount ? (matchIdx + 1) + "/" + matchCount : "0/0" }}</span>
+      <span v-if="searchQ" class="log-match-count mc-num">{{ matchCount ? (matchIdx + 1) + "/" + matchCount : "0/0" }}</span>
     </div>
     <div class="logview ilog-view" ref="logEl" :class="{ 'log-nowrap': !logWrap }">
       <div v-for="(ln, i) in lines" :key="i"
@@ -213,18 +208,23 @@ const InstanceView = {
   name: "InstanceView",
   template: `
   <div class="page">
-    <div class="inst-tabs" v-if="tabs.length">
-      <div v-for="iid in tabs" :key="iid" class="inst-tab"
-           :class="{ active: iid === active }" @click="activate(iid)">
-        <span class="it-name">{{ nameOf(iid) }}</span>
-        <span class="it-close" title="关闭" @click.stop="closeTab(iid)">×</span>
-      </div>
-    </div>
+    <el-tabs v-if="tabs.length" :model-value="active" type="card" closable
+             class="inst-tabs" @tab-click="(p) => activate(p.paneName)"
+             @tab-remove="closeTab">
+      <el-tab-pane v-for="iid in tabs" :key="iid" :name="iid" :label="nameOf(iid)" lazy>
+        <template #label>
+          <span class="it-label">
+            <span class="badge-dot" :class="tabDot(iid)" aria-hidden="true"></span>
+            <span class="it-name">{{ nameOf(iid) }}</span>
+          </span>
+        </template>
+      </el-tab-pane>
+    </el-tabs>
 
     <el-card v-if="!tabs.length" shadow="never">
-      <div class="hint" style="padding: 40px; text-align: center">
-        在「性能测试」页的实例卡片点击「详情」打开；可同时打开多个实例
-      </div>
+      <el-empty description="还没有打开实例详情" :image-size="80">
+        <el-button type="primary" size="small" @click="goPerf">去性能测试页选择实例</el-button>
+      </el-empty>
     </el-card>
 
     <template v-else-if="detail">
@@ -234,36 +234,52 @@ const InstanceView = {
           <el-tag size="small" :type="detail.instance.launch_mode === 'rank_recall' ? 'warning' : 'info'">
             {{ detail.instance.launch_mode === 'rank_recall' ? 'Rank+Recall' : '单任务' }}
           </el-tag>
-          <el-tag size="small" :type="detail.instance.stopping ? 'warning' : stType(detail.instance.status)">
-            {{ detail.instance.stopping && detail.instance.status === 'running' ? 'stopping' : detail.instance.status }}
+          <el-popover v-if="detail.instance.status === 'running' && detail.instance.stopping"
+                      placement="top" :width="300" trigger="hover" :show-after="150"
+                      content="正在优雅停止：先通知客户端清理并回收远端进程，宽限期内完成；超时后才会强制结束。">
+            <template #reference><el-tag size="small" type="warning">停止中</el-tag></template>
+          </el-popover>
+          <el-tag v-else size="small" :type="statusType(detail.instance.status)">
+            {{ statusText(detail.instance.status) }}
           </el-tag>
           <span class="spacer"></span>
-          <span class="inst-id mono">{{ detail.instance.id }}</span>
+          <span class="inst-id mc-mono">{{ detail.instance.id }}</span>
         </div>
-        <div class="inst-meta">
-          <span><b>mode</b> {{ detail.instance.mode }}</span>
-          <template v-if="detail.instance.launch_mode !== 'rank_recall'">
-            <span><b>cluster</b> {{ detail.instance.flags.cluster || "-" }}</span>
-            <span><b>global</b> {{ detail.instance.flags.global || "-" }}</span>
+        <el-descriptions :column="2" size="small" border class="inst-desc">
+          <el-descriptions-item label="模式">{{ detail.instance.mode === 'k8s' ? 'k8s' : '真机' }}</el-descriptions-item>
+          <el-descriptions-item label="配置">
+            目录 {{ detail.instance.selection.dirs.length }} / 文件 {{ detail.instance.selection.files.length }}
+          </el-descriptions-item>
+          <el-descriptions-item label="cluster" :span="2">
+            <span class="mc-mono">{{ pairCluster }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="global" :span="2">
+            <span class="mc-mono">{{ pairGlobal }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="profile" :span="2">
+            <span class="mc-mono">{{ detail.instance.flags.profile || "-" }}</span>
+          </el-descriptions-item>
+          <template v-if="latestRun">
+            <el-descriptions-item label="最近运行"><span class="mc-mono">{{ latestRun.id }}</span></el-descriptions-item>
+            <el-descriptions-item label="状态">
+              <el-tag size="small" :type="statusType(latestRun.status)">{{ statusText(latestRun.status) }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="耗时"><span class="mc-num">{{ Math.round(latestRun.elapsed || 0) }}s</span></el-descriptions-item>
+            <el-descriptions-item label="返回码"><span class="mc-num">{{ (latestRun.rc === null || latestRun.rc === undefined) ? "-" : latestRun.rc }}</span></el-descriptions-item>
+            <el-descriptions-item label="产物" :span="2">
+              <span class="mc-mono">{{ latestRun.ts_dir || "-" }}</span>
+            </el-descriptions-item>
           </template>
-          <template v-else>
-            <span><b>rank</b> {{ detail.instance.flags.rank_cluster || "-" }} / {{ detail.instance.flags.rank_global || "-" }}</span>
-            <span><b>recall</b> {{ detail.instance.flags.recall_cluster || "-" }} / {{ detail.instance.flags.recall_global || "-" }}</span>
-          </template>
-          <span><b>profile</b> {{ detail.instance.flags.profile || "-" }}</span>
-          <span><b>配置</b> 目录 {{ detail.instance.selection.dirs.length }} / 文件 {{ detail.instance.selection.files.length }}</span>
-        </div>
-        <div class="inst-meta" v-if="latestRun">
-          <span><b>最近运行</b> {{ latestRun.id }}</span>
-          <span><b>耗时</b> {{ Math.round(latestRun.elapsed || 0) }}s</span>
-          <span><b>rc</b> {{ (latestRun.rc === null || latestRun.rc === undefined) ? "-" : latestRun.rc }}</span>
-          <span v-if="latestRun.ts_dir"><b>产物</b> <span class="mono">{{ latestRun.ts_dir }}</span></span>
-        </div>
+        </el-descriptions>
         <div class="inst-actions">
-          <el-button size="small" type="primary" :loading="busyRun"
-                     :disabled="detail.instance.status === 'running' || schedulerBusy"
-                     @click="run">运行</el-button>
-          <el-button size="small" type="warning" v-if="detail.instance.status === 'running'"
+          <el-tooltip :disabled="!runHint" :content="runHint" placement="top">
+            <span>
+              <el-button size="small" type="primary" :loading="busyRun"
+                         :disabled="detail.instance.status === 'running' || schedulerBusy"
+                         @click="run">运行</el-button>
+            </span>
+          </el-tooltip>
+          <el-button size="small" type="warning" plain v-if="detail.instance.status === 'running'"
                      :loading="busyStop" :disabled="busyStop" @click="stop">停止</el-button>
           <el-button size="small" type="danger" plain
                      :disabled="detail.instance.status === 'running'" @click="remove">删除</el-button>
@@ -272,7 +288,7 @@ const InstanceView = {
           <el-checkbox v-if="isCombined" v-model="merged" style="margin-right: 12px">
             合并日志
           </el-checkbox>
-          <el-button size="small" type="success" plain
+          <el-button size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      @click="gotoResults">跳转至结果详情</el-button>
         </div>
@@ -292,9 +308,9 @@ const InstanceView = {
                            :ticket="ticket"></instance-log-pane>
       </el-card>
       <el-card v-else shadow="never" style="margin-top: 12px">
-        <div class="hint" style="padding: 24px; text-align: center">
-          该实例尚未运行——点击「运行」启动
-        </div>
+        <el-empty description="该实例尚未运行" :image-size="72">
+          <el-button type="primary" size="small" :disabled="schedulerBusy" @click="run">运行</el-button>
+        </el-empty>
       </el-card>
     </template>
   </div>`,
@@ -305,6 +321,7 @@ const InstanceView = {
     const busyStop = Vue.ref(false);
     const merged = Vue.ref(false);
     const ticket = Vue.ref(0);
+    const instIndex = Vue.ref({});
     let timer = null;
 
     const tabs = Vue.computed(() => store.instancesOpen || []);
@@ -319,8 +336,46 @@ const InstanceView = {
     function nameOf(iid) {
       if (detail.value && detail.value.instance.id === iid)
         return detail.value.instance.name;
-      return iid;
+      const it = instIndex.value[iid];
+      return (it && it.name) || iid;
     }
+    function tabDot(iid) {
+      const it = instIndex.value[iid];
+      const st = it && it.status;
+      if (st === "running") return "on";
+      if (st === "stopping") return "exec";
+      if (st === "done") return "ok";
+      if (st === "failed" || st === "failed_spawn") return "err";
+      return "";
+    }
+    async function loadNames() {
+      try {
+        const r = await api("GET", "/api/instances");
+        const idx = {};
+        for (const it of r.instances || []) idx[it.id] = it;
+        instIndex.value = idx;
+      } catch (e) { /* ignore */ }
+    }
+    function goPerf() { store.view = "perf"; }
+
+    const runHint = Vue.computed(() => {
+      if (!detail.value) return "";
+      if (detail.value.instance.status === "running") return "该实例正在运行，先停止再运行";
+      if (schedulerBusy.value) return "定时任务执行中，暂不能启动实例";
+      return "";
+    });
+    const pairCluster = Vue.computed(() => {
+      const f = (detail.value && detail.value.instance.flags) || {};
+      return detail.value && detail.value.instance.launch_mode === "rank_recall"
+        ? "rank " + (f.rank_cluster || "-") + " ｜ recall " + (f.recall_cluster || "-")
+        : (f.cluster || "-");
+    });
+    const pairGlobal = Vue.computed(() => {
+      const f = (detail.value && detail.value.instance.flags) || {};
+      return detail.value && detail.value.instance.launch_mode === "rank_recall"
+        ? "rank " + (f.rank_global || "-") + " ｜ recall " + (f.recall_global || "-")
+        : (f.global || "-");
+    });
     async function load() {
       const iid = active.value;
       if (!iid) { detail.value = null; return; }
@@ -376,9 +431,8 @@ const InstanceView = {
     async function remove() {
       const iid = active.value; if (!iid) return;
       try {
-        await ElementPlus.ElMessageBox.confirm(
-          "删除实例？运行记录、日志与 outputs 保留。", "删除实例",
-          { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+        await confirmDanger("删除实例？运行记录、日志与 outputs 保留，仅实例记录移入回收站。",
+                            "删除实例");
       } catch (e) { return; }
       try {
         await api("DELETE", "/api/instances/" + iid);
@@ -422,13 +476,15 @@ const InstanceView = {
 
     Vue.watch(active, () => { merged.value = false; });
     Vue.onActivated(() => {
+      loadNames();
       load();
       timer = setInterval(load, 2000);
     });
     Vue.onDeactivated(() => { clearInterval(timer); });
 
     return { tabs, active, detail, busyRun, busyStop, merged, ticket,
-             latestRun, isCombined, schedulerBusy, nameOf, activate, closeTab,
-             run, stop, remove, rename, gotoResults, stType: _instStatusType };
+             latestRun, isCombined, schedulerBusy, runHint, pairCluster,
+             pairGlobal, nameOf, tabDot, goPerf, activate, closeTab,
+             statusType, statusText, run, stop, remove, rename, gotoResults };
   },
 };
