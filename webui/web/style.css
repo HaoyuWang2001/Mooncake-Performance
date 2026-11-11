@@ -109,7 +109,7 @@ html, body, #app {
   white-space: nowrap;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
-.brand span { color: var(--el-color-primary); }
+.brand span span { color: var(--el-color-primary); }
 .brand-mark {
   width: 8px; height: 8px; border-radius: 2px;
   background: var(--el-color-primary); flex-shrink: 0;

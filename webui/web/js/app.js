@@ -148,28 +148,43 @@ const App = {
   template: `
   <el-container class="layout">
     <el-aside width="210px" class="aside">
-      <div class="brand">Mooncake<span>-Performance</span></div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>Mooncake<span>-Performance</span></span>
+      </div>
       <div class="badges">
-        <div class="badge-line" title="benchmark 执行槽">
+        <div class="badge-line" :title="runTitle">
           <span class="badge-dot" :class="runDot"></span>
           <span>{{ runText }}</span>
         </div>
-        <div class="badge-line" title="scheduler 状态">
+        <div class="badge-line" title="定时任务状态">
           <span class="badge-dot" :class="schDot"></span>
           <span>{{ schText }}</span>
         </div>
       </div>
       <el-menu :default-active="store.view" class="menu" @select="go">
-        <el-menu-item index="perf">性能测试</el-menu-item>
-        <el-menu-item index="instances">实例详情</el-menu-item>
-        <el-menu-item index="results">统计结果</el-menu-item>
-        <el-menu-item index="config">配置维护</el-menu-item>
-        <el-menu-item index="schedule">定时任务</el-menu-item>
+        <el-menu-item index="perf">
+          <el-icon><component is="Monitor"/></el-icon><span>性能测试</span>
+        </el-menu-item>
+        <el-menu-item index="instances">
+          <el-icon><component is="List"/></el-icon><span>实例详情</span>
+        </el-menu-item>
+        <el-menu-item index="results">
+          <el-icon><component is="DataAnalysis"/></el-icon><span>统计结果</span>
+        </el-menu-item>
+        <el-menu-item index="config">
+          <el-icon><component is="Setting"/></el-icon><span>配置维护</span>
+        </el-menu-item>
+        <el-menu-item index="schedule">
+          <el-icon><component is="Clock"/></el-icon><span>定时任务</span>
+        </el-menu-item>
       </el-menu>
       <div class="aside-footer">
-        <el-button size="small" circle @click="toggleDark" :title="theme.dark ? '切换到亮色' : '切换到暗色'">
-          <el-icon><component :is="theme.dark ? 'Sunny' : 'Moon'"/></el-icon>
-        </el-button>
+        <el-tooltip :content="theme.dark ? '切换到亮色' : '切换到暗色'" placement="top">
+          <el-button size="small" circle aria-label="切换主题" @click="toggleDark">
+            <el-icon><component :is="theme.dark ? 'Sunny' : 'Moon'"/></el-icon>
+          </el-button>
+        </el-tooltip>
         <el-link type="primary" :underline="false" href="/docs" target="_blank">API 文档</el-link>
       </div>
     </el-aside>
@@ -192,10 +207,27 @@ const App = {
       });
     }
 
-    const runDot = computed(() => store.status.active_run ? "on" : "");
+    const _activeRuns = computed(() => store.status.active_runs
+      || (store.status.active_run ? [store.status.active_run] : []));
+    const runDot = computed(() => {
+      const runs = _activeRuns.value;
+      if (!runs.length) return "";
+      return runs.some(r => r.stopping) ? "exec" : "on";
+    });
     const runText = computed(() => {
-      const r = store.status.active_run;
-      return r ? "run: " + r.id + " (" + Math.round(r.elapsed) + "s)" : "run: 空闲";
+      const runs = _activeRuns.value;
+      if (!runs.length) return "运行实例：空闲";
+      if (runs.length === 1) {
+        return "运行实例：" + (runs[0].stopping ? "停止中" : "运行中")
+          + "（" + Math.round(runs[0].elapsed) + "s）";
+      }
+      return "运行实例：" + runs.length + " 个";
+    });
+    const runTitle = computed(() => {
+      const runs = _activeRuns.value;
+      if (!runs.length) return "当前没有运行中的实例";
+      return runs.map(r => r.id + "：" + r.status
+        + (r.stopping ? "（停止中）" : "")).join("\n");
     });
     const schDot = computed(() => {
       const s = store.status.scheduler;
@@ -204,12 +236,15 @@ const App = {
       if (["waiting", "waiting_slot"].includes(s.state)) return "on";
       return "";
     });
+    const _SCH_STATE = { waiting: "等待中", waiting_slot: "等待实例空闲",
+                         executing: "执行中", stopping: "停止中",
+                         done: "已完成", stopped: "已停止", aborted: "已中止" };
     const schText = computed(() => {
       const s = store.status.scheduler;
-      if (!s) return "scheduler: 关闭";
-      let t = "scheduler: " + s.state;
+      if (!s) return "定时任务：关闭";
+      let t = "定时任务：" + (_SCH_STATE[s.state] || s.state);
       if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state))
-        t += " @" + s.next_trigger.slice(-8);
+        t += "（" + s.next_trigger.slice(-8) + "）";
       return t;
     });
 
@@ -221,7 +256,8 @@ const App = {
     onMounted(() => { pollStatus(); timer = setInterval(pollStatus, 3000); });
     onUnmounted(() => clearInterval(timer));
 
-    return { store, theme, toggleDark, go, viewComp, runDot, runText, schDot, schText };
+    return { store, theme, toggleDark, go, viewComp,
+             runDot, runText, runTitle, schDot, schText };
   },
 };
 
