@@ -34,11 +34,56 @@ def _build_run_argv(body):
         argv += ["--config-dir", ",".join(dirs)]
     if files:
         argv += ["-f", ",".join(files)]
+    launch_mode = flags.get("launch_mode") or "single"
+    if launch_mode not in ("single", "rank_recall"):
+        raise ApiError(400, "flags.launch_mode must be 'single' or 'rank_recall'")
     # mode: "ssh" (default) or "k8s" -> adds --ssh / --k8s to the benchmark argv
     mode = flags.get("mode") or "ssh"
     if mode not in ("ssh", "k8s"):
         raise ApiError(400, "flags.mode must be 'ssh' or 'k8s'")
     mode_dir = "configs/_k8s" if mode == "k8s" else "configs/_ssh"
+    if launch_mode == "rank_recall":
+        if mode != "k8s":
+            raise ApiError(400, "rank_recall launch mode currently requires k8s")
+        # Fail before occupying the benchmark slot when the selection does not
+        # actually contain one inherited rank config and one recall config.
+        try:
+            from scripts.run_rank_recall import partition_configs
+            partition_configs([os.path.join(ROOT, d) for d in dirs],
+                              [os.path.join(ROOT, f) for f in files])
+        except Exception as exc:
+            raise ApiError(400, "invalid rank_recall selection: {}".format(exc))
+        profile = flags.get("profile") or (mode_dir + "/profile.json")
+        pairs = (
+            ("rank_cluster", flags.get("rank_cluster")),
+            ("rank_global", flags.get("rank_global")),
+            ("recall_cluster", flags.get("recall_cluster")),
+            ("recall_global", flags.get("recall_global")),
+            ("profile", profile),
+        )
+        for name, path in pairs:
+            if not path or not os.path.isfile(os.path.join(ROOT, path)):
+                raise ApiError(400, "{} config not found: {}".format(
+                    name, path or "<empty>"))
+        dual_argv = [sys.executable,
+                     os.path.join(ROOT, "scripts", "run_rank_recall.py")]
+        dual_argv += argv
+        dual_argv += ["--rank-cluster", flags["rank_cluster"],
+                      "--rank-global", flags["rank_global"],
+                      "--recall-cluster", flags["recall_cluster"],
+                      "--recall-global", flags["recall_global"],
+                      "--profile", profile]
+        for flag in ("dry_run", "no_warmup", "no_plot"):
+            if flags.get(flag):
+                dual_argv.append("--" + flag.replace("_", "-"))
+        protocol = flags.get("protocol")
+        if protocol:
+            if protocol not in ("tcp", "rdma", "ub"):
+                raise ApiError(400, "protocol must be tcp|rdma|ub")
+            dual_argv += ["--protocol", protocol]
+        if flags.get("verbose"):
+            dual_argv.append("--verbose")
+        return dual_argv
     cluster = flags.get("cluster") or (mode_dir + "/cluster.json")
     global_cfg = flags.get("global") or (mode_dir + "/global.json")
     profile = flags.get("profile") or (mode_dir + "/profile.json")

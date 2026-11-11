@@ -1,7 +1,7 @@
 {
   "work_mode": "recall",
   "base_qps": 35,
-  "traffic_mode": "pulse",
+  "traffic_mode": "balanced",
   "qps_multiple": 1,
   "notify_count": 1,
   "client": {
@@ -9,11 +9,11 @@
     "port_base": 9301
   },
   "writer": {
-    "operation": "put_batch",
+    "operation": "upsert_from",
     "notify_threads": 1
   },
   "reader": {
-    "operation": "get",
+    "operation": "get_buffer",
     "num_threads": 1
   },
   "store_count_per_node": 2,

@@ -41,6 +41,12 @@ function _treeShortcut(pane) {
   return pane.files.filter(f => /spdiag_tree\.[^.]+\.txt$/.test(f.split("/").pop()));
 }
 
+function _defaultDetail(files) {
+  return files.find(f => f === "benchmark_detail.csv") ||
+         files.find(f => f === "rank/benchmark_detail.csv") ||
+         files.find(f => f.endsWith("/benchmark_detail.csv")) || "";
+}
+
 async function _loadFiles(pane, keepFile) {
   const prev = pane.file;
   pane.rows = []; pane.headers = []; pane.text = "";
@@ -57,7 +63,7 @@ async function _loadFiles(pane, keepFile) {
       if (prev && pane.files.includes(prev)) {
         target = prev;
       } else if (prev) {
-        const fallback = pane.files.find(f => f === "benchmark_detail.csv") || "";
+        const fallback = _defaultDetail(pane.files);
         target = fallback;
         if (fallback) {
           ElementPlus.ElMessage.warning(
@@ -68,7 +74,7 @@ async function _loadFiles(pane, keepFile) {
       }
     } else {
       // 新建框 / 结果跳转：沿用默认选中 benchmark_detail.csv
-      target = pane.files.find(f => f === "benchmark_detail.csv") || "";
+      target = _defaultDetail(pane.files);
     }
     if (target === prev) {
       if (target) await _loadContent(pane);   // 值未变不会触发 watcher

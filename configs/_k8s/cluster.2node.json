@@ -1,0 +1,21 @@
+{
+  "_note": "k8s两节点冒烟环境",
+  "venvs": {},
+  "controller": {
+    "ip": "141.62.32.55",
+    "ssh_user": "root",
+    "ssh_port": 22,
+    "ssh_key": "",
+    "passwd": "Jingdong12#$",
+    "kubectl": "/usr/local/bin/kubectl",
+    "kubeconfig": ""
+  },
+  "k8s": {
+    "namespace": "mooncake-bench",
+    "kubecontext": "",
+    "image": "mooncake-runtime-w00921547:latest",
+    "template": "configs/_k8s/templates/benchmark-pod.yaml.tpl",
+    "controller_workspace": "/home/w00921547/Mooncake-Performance",
+    "pod_workspace": "/tmp/Mooncake-Performance"
+  }
+}

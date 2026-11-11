@@ -746,7 +746,7 @@ def apply_cli_overrides(cfg, args):
         cfg["protocol"] = args.protocol
 
 
-def scenario_paths(globals_cfg, ts, cfg_name):
+def scenario_paths(globals_cfg, ts, cfg_name, local_result_dir=None):
     pod_ws = globals_cfg.get("_pod_workspace")
     if pod_ws:
         # k8s: paths inside the pod (workspace/scripts, workspace/logs/<ts>)
@@ -759,7 +759,13 @@ def scenario_paths(globals_cfg, ts, cfg_name):
         remote_log_dir = "{}/{}/logs".format(globals_cfg["remote_results_dir"], ts)
     remote_runner_basic = remote_scripts + "/run_benchmark_basic.sh"
     remote_runner_pipeline = remote_scripts + "/run_benchmark_pipeline.sh"
-    local_log_dir = os.path.join(RESULTS_DIR, ts, "logs", cfg_name)
+    # `ts` is also used as the remote/K8s/etcd run identifier.  Parallel
+    # rank+recall flattens its nested result path into that identifier (for
+    # example parent/rank -> parent-rank), so it must not be reused to derive
+    # the local filesystem path.  The caller passes the real result directory
+    # while standalone runs keep the historical outputs/<ts> fallback.
+    result_dir = local_result_dir or os.path.join(RESULTS_DIR, ts)
+    local_log_dir = os.path.join(result_dir, "logs", cfg_name)
     return (remote_dir, remote_scripts, remote_log_dir,
             remote_runner_basic, remote_runner_pipeline, local_log_dir)
 
@@ -2495,7 +2501,7 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
 # be cleaned up, even after a crashed or manually killed orchestrator run.
 # ---------------------------------------------------------------------------
 
-STATE_FILE = os.path.join(ROOT, ".state")
+STATE_FILE = os.environ.get("MC_BENCH_STATE_FILE", os.path.join(ROOT, ".state"))
 
 
 def state_append(entries):
@@ -2704,9 +2710,11 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     # scenario_params/cluster_session have no pod-IP dependency (topology is
     # a dead param in base_scenario_params) -> build them first so the k8s
     # ConfigMap (scripts + env.sh) can exist before pods mount it
+    local_result_dir = getattr(args, "_result_dir_path", None) or \
+        os.path.join(RESULTS_DIR, ts)
     remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
         remote_runner_pipeline, local_log_dir = \
-        scenario_paths(globals_cfg, ts, cfg_name)
+        scenario_paths(globals_cfg, ts, cfg_name, local_result_dir)
     remote_runner = remote_runner_basic
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
@@ -2879,7 +2887,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
-                                       os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+                                       os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -2895,7 +2903,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             reap_state_entries(cluster)
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+                                           os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             if is_k8s:
                 # pod was Ready; the benchmark command failed -> keep pod and
                 # namespace for troubleshooting (STOP / --clean-up tears down)
@@ -3264,9 +3272,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
     # k8s-pod nodes: pods are created by ensure_k8s_deployment below
     ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+    local_result_dir = getattr(args, "_result_dir_path", None) or \
+        os.path.join(RESULTS_DIR, ts)
     remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
         remote_runner_pipeline, local_log_dir = \
-        scenario_paths(globals_cfg, ts, cfg_name)
+        scenario_paths(globals_cfg, ts, cfg_name, local_result_dir)
     remote_runner = remote_runner_pipeline
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
@@ -3876,7 +3886,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
             prof_core.stop_and_collect(cluster, profile_sess,
-                                       os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+                                       os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -3900,7 +3910,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             reap_state_entries(cluster)
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(RESULTS_DIR, ts, "logs", cfg_name, "profiling"))
+                                           os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             if is_k8s:
                 # pods were Ready (or rolled out); keep Deployments + pods +
                 # namespace for troubleshooting (STOP / --clean-up tears down)
@@ -4162,7 +4172,7 @@ def parse_benchmark_log(paths, op_filter=None):
 
 
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
-                       mooncake_store_nodes=None):
+                       mooncake_store_nodes=None, result_dir=None):
     """拓扑判定（IP 匹配）：节点的 cluster.json `ip` 出现在
     mooncake_store_nodes 各节点的 `ip` 集合中即 local_node。"""
     store_ips = resolve_store_node_ips(
@@ -4178,7 +4188,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         return "local_node" if nip in store_ips else "remote_node"
 
     name = os.path.splitext(os.path.basename(cfg_path))[0]
-    out_csv = os.path.join(RESULTS_DIR, ts, "{}.csv".format(name))
+    out_csv = os.path.join(
+        result_dir or os.path.join(RESULTS_DIR, ts),
+        "{}.csv".format(name))
     rows = []
     is_pipeline = cfg.get("scenario") == "pipeline"
     if is_pipeline:
@@ -4626,6 +4638,10 @@ def parse_arguments(argv=None):
                              "including demo/; _-prefixed fragments always skipped); "
                              "comma-separated multi values; config-dir entries run "
                              "BEFORE --config files")
+    # Internal orchestration hook used by the WebUI rank+recall launcher.
+    # Keeping it out of --help avoids presenting an implementation detail as
+    # a normal benchmark knob.
+    parser.add_argument("--result-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="verbose logging (upload paths, per-file pulls, "
@@ -4820,13 +4836,32 @@ def main(args, cfg_paths):
         cleanup_cluster(cluster, globals_cfg, dry_run=args.dry_run)
         log("cleanup done")
         return
-    ts = time.strftime("%Y%m%d-%H%M")
-    ts_dir = os.path.join(RESULTS_DIR, ts)
-    n = 1
-    while os.path.exists(ts_dir):
-        ts = "{}-{}".format(time.strftime("%Y%m%d-%H%M"), n)
+    if args.result_dir:
+        ts_dir = os.path.abspath(
+            args.result_dir if os.path.isabs(args.result_dir)
+            else os.path.join(ROOT, args.result_dir))
+        try:
+            inside_outputs = os.path.commonpath([RESULTS_DIR, ts_dir]) == RESULTS_DIR
+        except ValueError:
+            inside_outputs = False
+        if not inside_outputs:
+            sys.exit("[ERROR] --result-dir must be under {}".format(RESULTS_DIR))
+        if os.path.exists(ts_dir):
+            sys.exit("[ERROR] --result-dir already exists: {}".format(ts_dir))
+        # The rendezvous/run identifier must remain unique even though rank
+        # and recall now live below one shared results parent.
+        ts = os.path.relpath(ts_dir, RESULTS_DIR).replace(os.sep, "-")
+    else:
+        ts = time.strftime("%Y%m%d-%H%M")
         ts_dir = os.path.join(RESULTS_DIR, ts)
-        n += 1
+        n = 1
+        while os.path.exists(ts_dir):
+            ts = "{}-{}".format(time.strftime("%Y%m%d-%H%M"), n)
+            ts_dir = os.path.join(RESULTS_DIR, ts)
+            n += 1
+    # Keep the real local path separate from `ts`, which may be a flattened
+    # remote run identifier for a nested rank/recall result directory.
+    args._result_dir_path = ts_dir
     if not args.dry_run:
         os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
         # full-detail log: every per-command/per-pod line goes here; the
@@ -4871,8 +4906,9 @@ def main(args, cfg_paths):
             if not args.dry_run:
                 store_nodes = (globals_cfg.get("mooncake_store_nodes", []) or []) \
                     if args.mode != "k8s" else []
-                rows = write_scenario_csv(os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
-                                          cluster, store_nodes)
+                rows = write_scenario_csv(
+                    os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
+                    cluster, store_nodes, result_dir=ts_dir)
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows

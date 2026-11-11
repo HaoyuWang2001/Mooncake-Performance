@@ -75,7 +75,8 @@ def test_missing_file_falls_back_to_detail_csv():
     """切换 run 时无同名文件 -> 自动展示 benchmark_detail.csv + toast。"""
     src = open(os.path.join(JS_DIR, "views", "results-view.js"),
                encoding="utf-8").read()
-    assert 'pane.files.find(f => f === "benchmark_detail.csv")' in src
+    assert "function _defaultDetail(files)" in src
+    assert 'f === "rank/benchmark_detail.csv"' in src
     assert "已自动展示 benchmark_detail.csv" in src
 
 

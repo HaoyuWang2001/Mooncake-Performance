@@ -24,12 +24,16 @@ def api_outputs(handler, query):
             d = os.path.join(out_dir, ts)
             if not os.path.isdir(d):
                 continue
-            csvs = [f for f in os.listdir(d) if f.endswith(".csv")]
+            csvs = []
+            for root, _dirs, files in os.walk(d):
+                csvs.extend(os.path.relpath(os.path.join(root, f), d)
+                            for f in files if f.endswith(".csv"))
             items.append({
                 "ts": ts,
                 "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
                                        time.localtime(os.path.getmtime(d))),
-                "has_detail": "benchmark_detail.csv" in csvs,
+                "has_detail": any(os.path.basename(f) == "benchmark_detail.csv"
+                                  for f in csvs),
                 "csv_count": len(csvs),
             })
     items.sort(key=lambda x: x["ts"], reverse=True)
