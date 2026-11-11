@@ -280,3 +280,27 @@ def test_no_hardcoded_metrics_defaults():
     for key in ("master_metrics_port", "master_metrics_namespace",
                 "master_metrics_pod"):
         assert 'get("{}"'.format(key) not in src
+
+
+def test_pipeline_key_space_ratio_configurable():
+    """pipeline.key_space_ratio overrides the built-in 0.9 headroom."""
+    assert bm._pipeline_key_space_ratio({}) == 0.9
+    assert bm._pipeline_key_space_ratio({"pipeline": {}}) == 0.9
+    assert bm._pipeline_key_space_ratio(
+        {"pipeline": {"key_space_ratio": 0.8}}) == 0.8
+    # smaller ratio -> smaller cap (20GiB*0.8 // (8MiB*4) = 512)
+    assert bm._pipeline_key_budget(
+        {"store_total_size": "20GB", "pipeline": {"key_space_ratio": 0.8}},
+        4, 8 << 20, 1, "8MB") == 512
+    # default unchanged
+    assert bm._pipeline_key_budget({"store_total_size": "20GB"},
+                                   4, 8 << 20, 1, "8MB") == 576
+
+
+def test_pipeline_key_space_ratio_rejects_bad_values():
+    for bad in (0, 1, 1.5, -0.1, "abc"):
+        try:
+            bm._pipeline_key_space_ratio({"pipeline": {"key_space_ratio": bad}})
+            raise AssertionError("should raise for {!r}".format(bad))
+        except RuntimeError as exc:
+            assert "key_space_ratio" in str(exc)

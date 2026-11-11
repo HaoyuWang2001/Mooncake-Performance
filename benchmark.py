@@ -461,20 +461,44 @@ def _basic_store_check(globals_cfg, cfg):
                                           kc * ds_bytes, store))
 
 
+_DEFAULT_KEY_SPACE_RATIO = 0.9
+
+
+def _pipeline_key_space_ratio(globals_cfg):
+    """Fraction of the effective store capacity the pipeline may fill
+    (global.json `pipeline.key_space_ratio`, default 0.9). Must be in (0,1);
+    an out-of-range/non-numeric value raises (a silent fallback could
+    overfill the store)."""
+    raw = (globals_cfg.get("pipeline") or {}).get("key_space_ratio")
+    if raw in (None, ""):
+        return _DEFAULT_KEY_SPACE_RATIO
+    try:
+        r = float(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "pipeline.key_space_ratio must be a number in (0,1), got {!r}"
+            "".format(raw))
+    if not (0.0 < r < 1.0):
+        raise RuntimeError(
+            "pipeline.key_space_ratio must be in (0,1), got {}".format(r))
+    return r
+
+
 def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, batch_size,
                          ds_label):
     """Derive the PER-WRITER key-space cap purely from the store capacity.
 
     Pipeline mode has NO key_count parameter: the writable key space is
-    always floor(store x 0.9 / data_size / writers), where `store` comes
+    always floor(store x ratio / data_size / writers), where `store` comes
     from global.json store_total_size (explicit) or the master-metrics
-    auto-discovery. 0.9 covers object metadata + in-flight batches. Each
-    writer wraps inside its cap (put family: untimed delete-before-write;
+    auto-discovery, and `ratio` is global.json pipeline.key_space_ratio
+    (default 0.9). The headroom covers object metadata + in-flight batches.
+    Each writer wraps inside its cap (put family: untimed delete-before-write;
     upsert_from: prefill once, then overwrite).
 
     Missing store source is a HARD error: without a store capacity the
-    writable amount cannot be derived and an unbounded run would exhaust
-    the store (observed: hidden 1000-key default -> 250GB attempted).
+    writable amount cannot be derived and an unbounded run would exhaust the
+    store (observed: hidden 1000-key default -> 250GB attempted).
     """
     store = _store_total_bytes(globals_cfg)   # effective (min rule)
     if store is None:
@@ -484,14 +508,15 @@ def _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, batch_size,
             "and/or set global.json 'master_metrics_url' to the master "
             "metrics endpoint (full URL including the port, e.g. "
             "http://<svc>.<ns>.svc.cluster.local:<port>/metrics)")
-    usable = int(store * 0.9)
+    ratio = _pipeline_key_space_ratio(globals_cfg)
+    usable = int(store * ratio)
     per = usable // (ds_bytes * writer_count) if ds_bytes and writer_count else 0
     if per < max(1, int(batch_size or 1)):
         raise RuntimeError(
-            "pipeline key space too small: store {}B x 0.9 / ({}B x {} "
+            "pipeline key space too small: store {}B x {} / ({}B x {} "
             "writers) = {} keys < batch_size {}; the store is too small "
             "for this data size ({})".format(
-                store, ds_bytes, writer_count, per,
+                store, ratio, ds_bytes, writer_count, per,
                 int(batch_size or 1), ds_label))
     return per
 
@@ -3117,15 +3142,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             int(cfg.get("batch_size", 1) or 1), _ds)
     cfg["_key_space"] = {str(_ds): _kc for _ds, _kc in _caps.items()}
     log("pipeline key space (store source={}, configured={}, probed={}, "
-        "effective={}):".format(_src, _fmt_gib(_a), _fmt_gib(_b),
-                                _fmt_gib(_eff)))
+        "effective={}, ratio={}):".format(_src, _fmt_gib(_a), _fmt_gib(_b),
+                                          _fmt_gib(_eff),
+                                          _pipeline_key_space_ratio(globals_cfg)))
     for _ds in sizes:
         _kc = _caps[_ds]
         log("    {}: {} writers x {} keys = {} (of {} effective, "
-            "0.9 headroom)".format(
+            "{} headroom)".format(
                 _ds, len(plan["writers"]), _kc,
                 _fmt_gib(len(plan["writers"]) * _kc * parse_data_size(_ds)),
-                _fmt_gib(_eff)))
+                _fmt_gib(_eff),
+                "{:g}".format(_pipeline_key_space_ratio(globals_cfg))))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     scenario_params.update({
         "BENCH_WRITER_COUNT": str(len(plan["writers"])),
