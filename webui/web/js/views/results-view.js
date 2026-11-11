@@ -44,6 +44,7 @@ function _treeShortcut(pane) {
 async function _loadFiles(pane, keepFile) {
   const prev = pane.file;
   pane.rows = []; pane.headers = []; pane.text = "";
+  pane.offset = 0; pane.size = 0; pane.eof = true;
   if (!pane.ts) { pane.files = []; pane.file = ""; return; }
   pane.loading = true;
   try {
@@ -83,6 +84,7 @@ async function _loadFiles(pane, keepFile) {
 
 async function _loadContent(pane) {
   pane.rows = []; pane.headers = []; pane.text = "";
+  pane.offset = 0; pane.size = 0; pane.eof = true;
   if (!pane.ts || !pane.file) return;
   const path = "outputs/" + pane.ts + "/" + pane.file;
   const kind = _kindOf(pane);
@@ -104,13 +106,39 @@ async function _loadContent(pane) {
       const r = await api("GET", "/api/file?path=" + encodeURIComponent(path));
       pane.text = r.content;
     } else {
-      const r = await api("GET", "/api/file?path=" + encodeURIComponent(path) + "&tail=131072");
+      // 分页：从文件头开始，每次加载一页（后端 MAX_TEXT_CHUNK），
+      // 「加载更多」按 offset 续读，日志再大也不会被静默截断
+      const r = await api("GET", "/api/file?path=" + encodeURIComponent(path) + "&offset=0");
       pane.text = r.content;
+      pane.offset = r.offset || 0;
+      pane.size = r.size || 0;
+      pane.eof = r.eof !== false;
     }
   } catch (e) {
     ElementPlus.ElMessage.error(e.message);
   } finally {
     pane.loading = false;
+  }
+}
+
+/* 追加下一页文本（分页加载入口） */
+async function _loadMore(pane) {
+  if (pane.loadingMore || pane.eof || !pane.ts || !pane.file) return;
+  const kind = _kindOf(pane);
+  if (kind !== "txt") return;
+  const path = "outputs/" + pane.ts + "/" + pane.file;
+  pane.loadingMore = true;
+  try {
+    const r = await api("GET", "/api/file?path=" + encodeURIComponent(path) +
+                               "&offset=" + (pane.offset || 0));
+    pane.text += r.content;
+    pane.offset = r.offset || pane.offset;
+    pane.size = r.size || pane.size;
+    pane.eof = r.eof !== false;
+  } catch (e) {
+    ElementPlus.ElMessage.error(e.message);
+  } finally {
+    pane.loadingMore = false;
   }
 }
 
@@ -120,6 +148,14 @@ function _csvColWidth(h) {
   let units = 0;
   for (const ch of String(h || "")) units += (ch.codePointAt(0) > 0x2e7f ? 2 : 1);
   return Math.max(90, units * 8 + 28);
+}
+
+function _fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
 let _paneUid = 0;
@@ -206,7 +242,16 @@ const ResPane = {
       <pre v-else-if="kindOf(pane) === 'json'" class="json" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
       <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
                    :text="pane.text"></spdiag-tree>
-      <pre v-else class="txt" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
+      <template v-else>
+        <pre class="txt" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
+        <div v-if="!pane.eof" class="page-bar">
+          <span class="hint">
+            已加载 {{ fmtBytes(pane.offset) }} / {{ fmtBytes(pane.size) }}
+          </span>
+          <el-button size="small" type="primary" plain :loading="pane.loadingMore"
+                     @click.stop="loadMore(pane)">加载更多</el-button>
+        </div>
+      </template>
     </div>
     <drag-handle v-if="!fs" :model-value="pane.auto ? 0 : (pane.h || 0)"
                  :min="200" :max="1000"
@@ -257,6 +302,7 @@ const ResPane = {
     return { setAuto, kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
              csvColWidth: _csvColWidth,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
+             loadMore: _loadMore, fmtBytes: _fmtBytes,
              rawUrl: p => "/api/file?path=" +
                encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
   },

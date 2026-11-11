@@ -161,6 +161,38 @@ def _guarded_file(query):
     return path, full
 
 
+def _read_text_page(full, offset):
+    """Read one MAX_TEXT_CHUNK page at `offset`; returns the paged payload
+    {content, offset, size, eof} consumed by the WebUI pager.
+
+    A UTF-8 character split at the chunk seam is completed by reading up to
+    4 extra bytes, so concatenating pages reproduces the file exactly (no
+    replacement chars, no skipped bytes) for any chunk size."""
+    size = os.path.getsize(full)
+    offset = max(0, min(offset, size))
+    with open(full, "rb") as f:
+        f.seek(offset)
+        chunk = f.read(MAX_TEXT_CHUNK)
+        base = len(chunk)
+        more = (offset + base) < size
+        if more and chunk:
+            chunk += f.read(4)   # enough to finish any split UTF-8 char
+    if more and chunk:
+        # consume at least the whole page; tolerate the trailing extra bytes
+        # starting a new character (they are re-read on the next page)
+        for cut in range(len(chunk), base - 1, -1):
+            try:
+                text = chunk[:cut].decode("utf-8")
+                new_off = offset + cut
+                return {"content": text, "offset": new_off, "size": size,
+                        "eof": new_off >= size}
+            except UnicodeDecodeError:
+                continue
+    new_off = offset + len(chunk)
+    return {"content": chunk.decode("utf-8", errors="replace"),
+            "offset": new_off, "size": size, "eof": new_off >= size}
+
+
 def api_file(handler, query):
     path, full = _guarded_file(query)
     mode = (query.get("mode", ["text"])[0] or "text").lower()
@@ -188,13 +220,8 @@ def api_file(handler, query):
                     "offset": size, "size": size}
         except ValueError:
             pass
-    offset = max(0, min(offset, size))
-    with open(full, "rb") as f:
-        f.seek(offset)
-        chunk = f.read(MAX_TEXT_CHUNK)
-    return {"content": chunk.decode("utf-8", errors="replace"),
-            "offset": offset + len(chunk), "size": size,
-            "eof": offset + len(chunk) >= size}
+    return _read_text_page(full, offset)
+
 
 
 def api_csv(handler, query):
