@@ -3442,6 +3442,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                         ["{}.dual_{}_c{}_p{}.writer.log".format(
                                             base_noext, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.reader.log".format(
+                                            base_noext, c["node"], c["id"], c["port"]),
+                                         "{}.dual_{}_c{}_p{}.writer.log.glog".format(
                                             base_noext, c["node"], c["id"], c["port"])],
                                         "dual c{}".format(c["id"])))
                     _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
@@ -3603,6 +3605,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         _wex, len(writer_pids), time.time() - _wt0))
                 _groups = [(get_node(cluster, w["node"]),
                             ["{}.writer_{}_w{}.log".format(
+                                base_noext, w["node"], w["gid"]),
+                             "{}.writer_{}_w{}.log.glog".format(
                                 base_noext, w["node"], w["gid"])],
                             "writer w{}".format(w["gid"]))
                            for w in plan["writers"]]
@@ -3643,6 +3647,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         _rex, len(reader_pids), time.time() - _rt0))
                 _groups = [(get_node(cluster, r["node"]),
                             ["{}.reader_{}_r{}_p{}.log".format(
+                                base_noext, r["node"], r["index"], r["port"]),
+                             "{}.reader_{}_r{}_p{}.log.glog".format(
                                 base_noext, r["node"], r["index"], r["port"])],
                             "reader r{}".format(r["index"]))
                            for r in plan["readers"]]
@@ -4725,7 +4731,8 @@ def main(args, cfg_paths):
                       extra="--scope full", dry_run=False,
                       cfg_name="final", node_name=sweep_remove["node"])
             scp_pull(sweep_remove["host"], nd,
-                     "{}/final.remove-keys.log".format(sweep_remove["remote_log_dir"]),
+                     "{}/final.remove-keys.log*".format(
+                         sweep_remove["remote_log_dir"]),
                      os.path.join(ts_dir, "logs"), dry_run=False)
             log("sweep-end remove-keys -> {}".format(
                 os.path.join(ts_dir, "logs", "final.remove-keys.log")))

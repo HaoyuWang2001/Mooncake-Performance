@@ -15,8 +15,10 @@
 #
 # All scenario/cluster configuration comes from env.sh (sourced here), then
 # env.mooncake.sh (hand-editable mooncake store/SDK tuning defaults; same-name
-# vars in env.mooncake.sh win). Output is written DIRECTLY to LOG_FILE (live
-# while the process runs); ylt easylog goes to $LOG_FILE.ylt.log.
+# vars in env.mooncake.sh win). Python output (RESULT/META/SUMMARY + run
+# narrative) is written DIRECTLY to LOG_FILE (live while the process runs);
+# the C++ SDK glog stream (stderr) goes to $LOG_FILE.glog so Python-side and
+# SDK-side logs never mix; ylt easylog goes to $LOG_FILE.ylt.log.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -59,9 +61,13 @@ CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 print_client_env "mode=$MODE"
+# stdout (Python) and stderr (C++ SDK glog + Python fatal errors) are kept in
+# SEPARATE files so per-role Python metrics (RESULT/SUMMARY) stay readable on
+# their own; the SDK glog stream lands in $LOG_FILE.glog and is pulled back
+# alongside the main log.
 MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
 "$PYTHON" "$CLIENT" --mode "$MODE" "$@" \
-  > "$LOG_FILE" 2>&1
+  > "$LOG_FILE" 2> "$LOG_FILE.glog"
 rc=$?
 # exit-code ledger: the orchestrator reads $LOG_FILE.exitrc after waiting
 # for a backgrounded client — a non-zero rc must FAIL the scenario instead

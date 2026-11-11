@@ -8,7 +8,7 @@ function _fileGroup(rel) {
   if (rel.includes("/profiling/") || rel.startsWith("profiling/")) return "profiling";
   if (base.endsWith(".csv")) return "csv";
   if (base.endsWith(".png") || base.endsWith(".jpg") || base.endsWith(".gif")) return "图片";
-  if (base.endsWith(".log") || base.endsWith(".txt")) return "日志";
+  if (base.endsWith(".log") || base.endsWith(".glog") || base.endsWith(".txt")) return "日志";
   if (base.endsWith(".json")) return "json";
   return "其他";
 }
@@ -426,6 +426,7 @@ const ResultsView = {
                             rawView: false, wrap: wrap, imgScale: "fit",
                             imgX: 0, imgY: 0,
                             rows: [], headers: [], text: "",
+                            offset: 0, size: 0, eof: true, loadingMore: false,
                             auto: true, h: null });
     }
 
