@@ -19,6 +19,8 @@ RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟�
     --type     both（缺省）| latency | queue-wait
 
 输出：<日志主干>.latency.png[.trimmed] / <日志主干>.queuewait.png[.trimmed]（dpi 150）。
+pipeline 日志主干中的 Pod 名不写入图片文件名，仅保留全局唯一的 client/role
+标识，避免 Windows MAX_PATH 导致出图失败。
 横轴：有时间戳 → 下轴时间线（HH:MM:SS）+ 顶轴 request#i；无时间戳 → request#i。
 benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用本脚本
 （--no-plot 关闭）。依赖：matplotlib（pip install matplotlib）。
@@ -54,12 +56,35 @@ STAT_HLINES_GATED = [("p99", "tab:orange", 100), ("p999", "tab:green", 1000),
                      ("p9999", "tab:purple", 10000)]
 REF_LINES = [(1.0, "1ms"), (2.0, "2ms")]
 TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
+_PIPELINE_POD_STEM_PATTERNS = (
+    # dual:   ...dual_<pod>_c0_p9301.reader
+    re.compile(r"^(?P<prefix>.*\.dual)_.+(?P<suffix>_c\d+_p\d+\.(?:reader|writer))$"),
+    # split reader: ...reader_<pod>_r0_p9201
+    re.compile(r"^(?P<prefix>.*\.reader)_.+(?P<suffix>_r\d+_p\d+)$"),
+    # split writer: ...writer_<pod>_w0
+    re.compile(r"^(?P<prefix>.*\.writer)_.+(?P<suffix>_w\d+)$"),
+)
 
 
 def percentile(sorted_vals, q):
     if not sorted_vals:
         return 0.0
     return sorted_vals[int(round(q * (len(sorted_vals) - 1)))]
+
+
+def _plot_file_stem(log_stem):
+    """Drop the pipeline Pod/node segment from generated image names.
+
+    Client/reader/writer ids are global within one scenario, so keeping the
+    suffix (cN/rN/wN, port and role) preserves uniqueness without carrying a
+    potentially very long Kubernetes Pod name into the Windows output path.
+    Non-pipeline/basic log names are returned unchanged.
+    """
+    for pattern in _PIPELINE_POD_STEM_PATTERNS:
+        match = pattern.match(log_stem)
+        if match:
+            return match.group("prefix") + match.group("suffix")
+    return log_stem
 
 
 def ts_to_seconds(ts):
@@ -227,7 +252,7 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
     plt.close(fig)
 
 
-def _emit_plots(stem, kind, vals, times, out_dir, outlier_ms, note):
+def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note):
     """Write the latency/queue-wait figure(s): full view always; trimmed view
     additionally when outliers exist (stats recomputed on trimmed data)."""
     suffix = "latency" if kind == "latency" else "queuewait"
@@ -235,12 +260,12 @@ def _emit_plots(stem, kind, vals, times, out_dir, outlier_ms, note):
     base_title = f"{stem}  ({note})"
     trimmed = [v for v in vals if v <= outlier_ms]
     has_out = len(trimmed) != len(vals)
-    png = os.path.join(out_dir, f"{stem}.{suffix}.png")
+    png = os.path.join(out_dir, f"{file_stem}.{suffix}.png")
     plot_series(vals, times, base_title, png, outlier_ms, include_outliers=True,
                 ylabel=ylabel)
     print(f"  -> {png}")
     if has_out:
-        png = os.path.join(out_dir, f"{stem}.{suffix}.trimmed.png")
+        png = os.path.join(out_dir, f"{file_stem}.{suffix}.trimmed.png")
         plot_series(trimmed, _trim_times(times, vals, outlier_ms),
                     f"{stem}  ({note}, outliers removed)", png, outlier_ms,
                     include_outliers=False, ylabel=ylabel)
@@ -257,6 +282,7 @@ def process_file(path, args):
     lats, qws, times, counts, qw_times = parse_result_file(path)
     out_dir = args.out or os.path.dirname(os.path.abspath(path))
     stem = os.path.splitext(os.path.basename(path))[0]
+    file_stem = _plot_file_stem(stem)
     status_note = "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "no RESULT"
     print(f"[{os.path.basename(path)}] RESULT status: {status_note}, OK-samples: {len(lats)}"
           + (f", queue_wait: {len(qws)}" if qws else "")
@@ -273,7 +299,7 @@ def process_file(path, args):
     print(f"  outlier threshold: {threshold}ms "
           f"({'auto = p99 x 10' if not args.outlier else 'explicit'})")
     if args.type in ("both", "latency"):
-        _emit_plots(stem, "latency", lats, times, out_dir, threshold,
+        _emit_plots(stem, file_stem, "latency", lats, times, out_dir, threshold,
                     f"{len(lats)} OK samples")
     if qws and args.type in ("both", "queue-wait"):
         # queue_wait 阈值独立按自身分布计算，避免被时延离群值牵连；
@@ -281,7 +307,7 @@ def process_file(path, args):
         # times 长度不同）
         qw_threshold = threshold if args.outlier else \
             max(round(percentile(sorted(qws), 0.99) * 10), 1)
-        _emit_plots(stem, "queue-wait", qws, qw_times, out_dir, qw_threshold,
+        _emit_plots(stem, file_stem, "queue-wait", qws, qw_times, out_dir, qw_threshold,
                     f"{len(qws)} samples")
 
 

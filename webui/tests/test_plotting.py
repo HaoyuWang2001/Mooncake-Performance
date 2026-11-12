@@ -7,6 +7,8 @@
 """
 import os
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 
@@ -14,6 +16,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 def _read(rel):
     with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
         return f.read()
+
+
+def _load_plot_module():
+    pytest.importorskip("matplotlib")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "plot_latency_for_test", os.path.join(ROOT, "scripts", "plot_latency.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_plot_script_caps_blas_threads_before_numpy():
@@ -39,3 +52,44 @@ def test_auto_plot_sets_env_and_runs_locally():
         assert var in src
     assert "env=plot_env" in src
     assert "[sys.executable, plot_script, \"--log\", log_dir]" in src
+
+
+def test_plot_file_stem_removes_pipeline_pod_but_keeps_unique_client_id():
+    pl = _load_plot_module()
+    pod = "mc-20261112-1429-rank-recall-recall-recall-smoke-client-c52d4w2"
+    base = "recall_smoke.benchmark_c1_t1_3.5MB"
+
+    assert pl._plot_file_stem(
+        f"{base}.dual_{pod}_c0_p9301.reader"
+    ) == f"{base}.dual_c0_p9301.reader"
+    assert pl._plot_file_stem(
+        f"{base}.dual_{pod}_c1_p9301.writer"
+    ) == f"{base}.dual_c1_p9301.writer"
+    assert pl._plot_file_stem(
+        f"{base}.reader_{pod}_r2_p9201"
+    ) == f"{base}.reader_r2_p9201"
+    assert pl._plot_file_stem(
+        f"{base}.writer_{pod}_w3"
+    ) == f"{base}.writer_w3"
+    assert pl._plot_file_stem("basic.benchmark_c1_t1_8MB") == \
+        "basic.benchmark_c1_t1_8MB"
+
+
+def test_plot_file_stem_avoids_regression_windows_max_path():
+    pl = _load_plot_module()
+    out_dir = (r"D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance"
+               r"\outputs\20261112-1429-rank-recall\recall\logs\recall_smoke")
+    old_stem = (
+        "recall_smoke.benchmark_c1_t1_3.5MB.dual_"
+        "mc-20261112-1429-rank-recall-recall-recall-smoke-client-c52d4w2_"
+        "c0_p9301.reader"
+    )
+    old_path = os.path.join(out_dir, old_stem + ".queuewait.png")
+    new_path = os.path.join(
+        out_dir, pl._plot_file_stem(old_stem) + ".queuewait.png")
+
+    # Windows joins with "\\" (the incident path is exactly 260 chars);
+    # POSIX CI adds one "/" after the drive-like prefix and sees 261.
+    assert len(old_path) >= 260
+    assert len(new_path) < 260
+    assert "client-c52d4w2" not in new_path
