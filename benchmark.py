@@ -1654,6 +1654,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                  ("run_benchmark_pipeline.sh", SCRIPTS_DIR),
                  ("mooncake_benchmark_client.py", SCRIPTS_DIR),
                  ("bench_etcd.py", SCRIPTS_DIR),
+                 ("logstats.py", SCRIPTS_DIR),
                  ("env.sh", None)]
         mooncake_env = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
         if os.path.exists(mooncake_env):
@@ -1725,7 +1726,8 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                       os.path.join(SCRIPTS_DIR, "run_benchmark_basic.sh"),
                       os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
                       os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py"),
-                      os.path.join(SCRIPTS_DIR, "bench_etcd.py")]
+                      os.path.join(SCRIPTS_DIR, "bench_etcd.py"),
+                      os.path.join(SCRIPTS_DIR, "logstats.py")]
         if os.path.exists(mooncake_env_path):
             push_files.append(mooncake_env_path)
         scp_push(n["ip"], n, push_files, remote_scripts, dry_run=dry_run)
@@ -1902,6 +1904,86 @@ def numa_node_check(node_name, numa_strict):
         return False
     raise RuntimeError(
         "numa_bind requires numactl on node {} (numa_strict=true)".format(node_name))
+
+
+def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
+                     dry=False):
+    """map 阶段：在节点/pod 内对每个 RESULT 日志执行 logstats，就地生成
+    <log>.stats.json（编排器默认只回传统计产物，原始日志留在节点上）。"""
+    py = resolve_venv(cluster, globals_cfg)
+    stats = []
+    for log in log_paths:
+        stats_file = log + ".stats.json"
+        cmd = "{} {} --log {}".format(
+            shlex.quote(py),
+            shlex.quote(remote_scripts + "/logstats.py"),
+            shlex.quote(log))
+        if dry:
+            log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
+        elif node.get("_pod"):
+            ns = node.get("_ns") or k8s_settings(cluster)["namespace"]
+            out, rc = controller_run(
+                cluster["_controller"],
+                ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
+                check=False)
+            if rc != 0:
+                log("[WARN] [map] logstats failed on pod {}: {}".format(
+                    node["_pod"], (out or "").strip()[:200]))
+        else:
+            try:
+                ssh_check_output(node["ip"], node, cmd, dry_run=dry,
+                                 quiet=True)
+            except Exception as exc:
+                log("[WARN] [map] logstats failed on {}: {}".format(
+                    node.get("ip"), exc))
+        stats.append(stats_file)
+    return stats
+
+
+def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
+                       remote_scripts, pull_raw=False):
+    """map（远端 logstats）→ 只拉 *.stats.json（pull_raw 时连原始日志一起拉）。
+    groups: [(node, [log paths], label, node_display_name)]。
+    返回 {node_display_name: 原始日志字节}（从 stats.meta.bytes 汇总）。"""
+    node_bytes = {}
+    for node, files, label, name in groups:
+        result_logs = [f for f in files if not f.endswith(".glog")]
+        stats = run_logstats_map(cluster, node, result_logs, remote_scripts,
+                                 globals_cfg, dry=dry)
+        pull_files = stats + (list(files) if pull_raw else [])
+        _pipeline_pull_parallel(
+            cluster, [(node, pull_files, label)], local_log_dir, dry)
+        if not dry and pull_raw:
+            node_bytes[name] = sum(
+                os.path.getsize(os.path.join(local_log_dir,
+                                             os.path.basename(f)))
+                for f in files
+                if os.path.isfile(os.path.join(local_log_dir,
+                                               os.path.basename(f))))
+        elif not dry:
+            total = 0
+            for sf in stats:
+                lp = os.path.join(local_log_dir, os.path.basename(sf))
+                if os.path.isfile(lp):
+                    try:
+                        with open(lp, "r", encoding="utf-8") as f:
+                            total += json.load(f).get("meta", {}).get(
+                                "bytes", 0)
+                    except (OSError, ValueError):
+                        pass
+            node_bytes[name] = total
+    return node_bytes
+
+
+def _log_node_volumes(node_bytes, what):
+    """Per-node raw-log volume line (user requirement: every run must show
+    how much log each node produced)."""
+    if not node_bytes:
+        return
+    parts = ["{}={}".format(n, _fmt_gib(b)) for n, b in
+             sorted(node_bytes.items()) if b]
+    if parts:
+        log("[stats] {} 节点日志量: {}".format(what, ", ".join(parts)))
 
 
 def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
@@ -2901,9 +2983,17 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                                   expected_s=expected, dry_run=dry,
                                   pids_file=remote_log + ".pids",
                                   cfg_name=cfg_name, node_name=primary_node_name)
-            pull_stage_logs(host, node,
-                            [remote_log] + ([remote_log + ".pids"] if c > 1 else []),
-                            local_log_dir, dry)
+            # map (remote logstats) + stats-only pull by default — the
+            # CSV/report consume *.stats.json; raw logs (+pids) only when
+            # explicitly requested (--pull-raw-logs / --png)
+            run_logstats_map(cluster, node, [remote_log], remote_scripts,
+                             globals_cfg, dry=dry)
+            _pull_files = [remote_log + ".stats.json"]
+            if getattr(args, "pull_raw_logs", False) \
+                    or getattr(args, "png", False):
+                _pull_files += [remote_log] + (
+                    [remote_log + ".pids"] if c > 1 else [])
+            pull_stage_logs(host, node, _pull_files, local_log_dir, dry)
             # clients exited naturally -> drop their ledger rows
             if not dry:
                 state_remove_cfg(cfg_name)
@@ -2916,7 +3006,11 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
         command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
-        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # raw-log full pull only on explicit request (stats already pulled
+        # per run combo; failure paths pull raw for diagnosis separately)
+        if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
+            pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
+                      local_log_dir, dry)
         echo_cpu_bindings(cfg_name, local_log_dir)
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
@@ -3668,10 +3762,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                             _pb, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.glog".format(
                                             _pb, c["node"], c["id"], c["port"])],
-                                        "dual c{}".format(c["id"])))
-                    _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
-                    log("logs: {} files / {} pods pulled".format(
-                        sum(len(f) for _n, f, _l in _groups), len(_groups)))
+                                        "dual c{}".format(c["id"]),
+                                        c["node"]))
+                    _nb = _map_and_pull_logs(
+                        cluster, _groups, local_log_dir, dry, globals_cfg,
+                        remote_scripts,
+                        pull_raw=bool(getattr(args, "pull_raw_logs", False)
+                                      or getattr(args, "png", False)))
+                    _log_node_volumes(_nb, cfg_name)
+                    log("logs: {} clients / {} pods processed".format(
+                        len(_groups), len(_groups)))
             else:
                 # Step 1: start all readers (one process per reader). Each reader
                 # binds its HTTP /notify server and SELF-REGISTERS into etcd
@@ -3835,11 +3935,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                              "{}.writer_{}_w{}.glog".format(
                                 _pod_base(base_noext, get_node(cluster, w["node"])),
                                 w["node"], w["gid"])],
-                            "writer w{}".format(w["gid"]))
+                            "writer w{}".format(w["gid"]),
+                            w["node"])
                            for w in plan["writers"]]
-                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
-                log("logs: {} files / {} pods pulled".format(
-                    sum(len(f) for _n, f, _l in _groups), len(_groups)))
+                _nb = _map_and_pull_logs(
+                    cluster, _groups, local_log_dir, dry, globals_cfg,
+                    remote_scripts,
+                    pull_raw=bool(getattr(args, "pull_raw_logs", False)
+                                  or getattr(args, "png", False)))
+                _log_node_volumes(_nb, cfg_name)
+                log("logs: {} writers / {} pods processed".format(
+                    len(_groups), len(_groups)))
                 # Step 6: shutdown readers via their /shutdown endpoint (k8s:
                 # direct pod IP; ssh: loopback curl on the reader's node) and
                 # wait for their final logs
@@ -3880,11 +3986,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                              "{}.reader_{}_r{}_p{}.glog".format(
                                 _pod_base(base_noext, get_node(cluster, r["node"])),
                                 r["node"], r["index"], r["port"])],
-                            "reader r{}".format(r["index"]))
+                            "reader r{}".format(r["index"]),
+                            r["node"])
                            for r in plan["readers"]]
-                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
-                log("logs: {} files / {} pods pulled".format(
-                    sum(len(f) for _n, f, _l in _groups), len(_groups)))
+                _nb = _map_and_pull_logs(
+                    cluster, _groups, local_log_dir, dry, globals_cfg,
+                    remote_scripts,
+                    pull_raw=bool(getattr(args, "pull_raw_logs", False)
+                                  or getattr(args, "png", False)))
+                _log_node_volumes(_nb, cfg_name)
+                log("logs: {} readers / {} pods processed".format(
+                    len(_groups), len(_groups)))
             # Step 7: remove empty .nohup redirect files (they capture script-level
             # errors only — empty on success). Non-empty ones are kept for diagnostics
             # and pulled back with the rest of the logs.
@@ -3929,7 +4041,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         run_ssh(host, node, command, dry_run=dry)
         if not dry:
             _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
-        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # raw-log full pull only on explicit request (per-role stats were
+        # pulled right after each role exited; failure paths pull raw)
+        if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
+            pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
+                      local_log_dir, dry)
         echo_cpu_bindings(cfg_name, local_log_dir)
         # All pipeline processes exited naturally -> drop their ledger rows.
         if not dry:
@@ -4140,6 +4256,19 @@ def cleanup_cluster(cluster, globals_cfg, dry_run=False):
 def parse_benchmark_log(paths, op_filter=None):
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
+    # stats-first: raw logs are no longer pulled by default — the compact
+    # *.stats.json (remote logstats map) carries every metric this parser
+    # returns. Raw parsing remains the fallback (--png / failure pulls /
+    # legacy runs). Per-role files are already role-filtered, so op_filter is
+    # not needed on the stats path.
+    stats = []
+    for p in paths:
+        sp = str(p) if str(p).endswith(".stats.json") else str(p) + ".stats.json"
+        st = load_stats(sp) if os.path.isfile(sp) else None
+        if st is not None:
+            stats.append(st)
+    if stats and len(stats) == len(paths):
+        return _merge_stats_aggs(stats)
     latencies = []
     lat_sum_ms = 0.0
     ok = fail = 0
@@ -4230,6 +4359,119 @@ def parse_benchmark_log(paths, op_filter=None):
         "queue_wait_max_ms": max(queue_waits) if queue_waits else 0.0,
         "max_depth": max_depth,
     }
+
+
+_LOGSTATS_MOD = [None]
+
+
+def load_stats(path):
+    """Load one logstats <log>.stats.json (None when missing/corrupt)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _logstats_module():
+    """The scripts/logstats.py module (histogram helpers shared with the map
+    stage, so the CSV never re-implements the bin ladder)."""
+    if _LOGSTATS_MOD[0] is None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "mc_logstats", os.path.join(SCRIPTS_DIR, "logstats.py"))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _LOGSTATS_MOD[0] = mod
+    return _LOGSTATS_MOD[0]
+
+
+def _merge_stats_aggs(stats_list):
+    """Merge one or more per-instance stats into the agg dict shape that
+    parse_benchmark_log returns (CSV TOTAL rows / multi-file aggregates):
+    key-based counts sum, wall = timestamp span, percentiles from the merged
+    histogram, queue-wait weighted by qw sample count."""
+    ls = _logstats_module()
+    total = ok = fail = ok_rows = 0
+    lat_sum = 0.0
+    qw_sum = 0.0
+    qw_n = 0
+    qw_max = 0.0
+    max_depth = 0
+    total_bytes = 0
+    ts_from = ts_to = None
+    wall_summary = 0.0
+    hist = {}
+    for st in stats_list:
+        g = st.get("global") or {}
+        meta = st.get("meta") or {}
+        total += g.get("key_total") or 0
+        ok += g.get("key_ok") or 0
+        fail += g.get("key_fail") or 0
+        rows_ok = g.get("ok") or 0
+        ok_rows += rows_ok
+        lat_sum += (g.get("avg_ms") or 0.0) * rows_ok
+        if g.get("qw_avg_ms") is not None:
+            n = g.get("qw_n")
+            n = rows_ok if n is None else n
+            qw_sum += g["qw_avg_ms"] * n
+            qw_n += n
+            qw_max = max(qw_max, g.get("qw_max_ms") or 0.0)
+        if meta.get("ts_from") is not None:
+            ts_from = meta["ts_from"] if ts_from is None else min(
+                ts_from, meta["ts_from"])
+        if meta.get("ts_to") is not None:
+            ts_to = meta["ts_to"] if ts_to is None else max(
+                ts_to, meta["ts_to"])
+        for b, n in (st.get("histogram") or {}).items():
+            hist[int(b)] = hist.get(int(b), 0) + n
+        for kind, payload in st.get("summaries") or []:
+            if kind != "summary":
+                continue
+            max_depth = max(max_depth, int(payload.get("max_depth", 0) or 0))
+            total_bytes += int(payload.get("bytes", 0) or 0)
+            wall_summary = max(wall_summary, float(payload.get("wall_s", 0) or 0))
+    span = (ts_to - ts_from) if (ts_from is not None and ts_to is not None) else 0.0
+    # single instance: the client SUMMARY wall is authoritative (it excludes
+    # connection setup); multi-instance: the common timestamp span
+    wall = wall_summary if len(stats_list) == 1 and wall_summary > 0 else span
+    n_rows = ok_rows
+    return {
+        "total": total,
+        "total_bytes": total_bytes,
+        "wall_s": wall,
+        "throughput_mb_s": (total_bytes / wall / 1024.0 ** 2) if wall > 0 else 0.0,
+        "throughput_gb_s": (total_bytes / wall / 1024.0 ** 3) if wall > 0 else 0.0,
+        "avg_ms": (lat_sum / n_rows) if n_rows else 0.0,
+        "min_ms": (ls.hist_percentile(hist, 0.0) if hist else 0.0),
+        "max_ms": (ls.hist_percentile(hist, 1.0) if hist else 0.0),
+        "p50_ms": (ls.hist_percentile(hist, 0.50) if hist else 0.0),
+        "p95_ms": (ls.hist_percentile(hist, 0.95) if hist else 0.0),
+        "p99_ms": (ls.hist_percentile(hist, 0.99) if hist else 0.0),
+        "p999_ms": (ls.hist_percentile(hist, 0.999) if hist else 0.0),
+        "p9999_ms": (ls.hist_percentile(hist, 0.9999) if hist else 0.0),
+        "lat_sum_ms": lat_sum,
+        "ok": ok,
+        "fail": fail,
+        "qps": (total / wall) if wall > 0 else 0.0,
+        "fail_rate": (fail / total) if total else 0.0,
+        "queue_wait_avg_ms": (qw_sum / qw_n) if qw_n else 0.0,
+        "queue_wait_max_ms": qw_max,
+        "max_depth": max_depth,
+    }
+
+
+def _glob_log_sources(directory, pattern):
+    """Log sources matching `pattern`: the raw log and/or its stats sibling
+    (stats wins when both exist)."""
+    found = {}
+    for p in glob.glob(os.path.join(directory, pattern)) + \
+            glob.glob(os.path.join(directory, pattern + ".stats.json")):
+        key = os.path.basename(p)
+        if key.endswith(".stats.json"):
+            key = key[:-len(".stats.json")]
+        found[key] = p        # stats version added last -> wins
+    return [found[k] for k in sorted(found)]
 
 
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
@@ -4374,9 +4616,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             # *.reader_<node>_r<index>_p<port>.log — node, gid, index and
             # port are parsed straight from the filename
             writer_files = {}   # gid -> (nodename, path)
-            for p in sorted(glob.glob(os.path.join(
-                    local_log_dir, "{}.{}.writer_*.log".format(name, run_name)))):
+            for p in _glob_log_sources(
+                    local_log_dir, "{}.{}.writer_*.log".format(name, run_name)):
                 base = os.path.basename(p)
+                if base.endswith(".stats.json"):
+                    base = base[:-len(".stats.json")]
                 if ".ylt." in base:
                     continue
                 m = re.search(r"\.writer_(.+)_w(\d+)\.log$", base)
@@ -4384,9 +4628,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                     continue
                 writer_files[int(m.group(2))] = (m.group(1), p)
             reader_files = {}   # index -> (nodename, path)
-            for p in sorted(glob.glob(os.path.join(
-                    local_log_dir, "{}.{}.reader_*.log".format(name, run_name)))):
+            for p in _glob_log_sources(
+                    local_log_dir, "{}.{}.reader_*.log".format(name, run_name)):
                 base = os.path.basename(p)
+                if base.endswith(".stats.json"):
+                    base = base[:-len(".stats.json")]
                 if ".ylt." in base:
                     continue
                 m = re.search(r"\.reader_(.+)_r(\d+)_p(\d+)\.log$", base)
@@ -4398,9 +4644,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             # *.log) still parse — role split by op filter
             dual_writer_files = {}   # id -> (nodename, path)
             dual_reader_files = {}   # id -> (nodename, path)
-            for p in sorted(glob.glob(os.path.join(
-                    local_log_dir, "{}.{}.dual_*.log".format(name, run_name)))):
+            for p in _glob_log_sources(
+                    local_log_dir, "{}.{}.dual_*.log".format(name, run_name)):
                 base = os.path.basename(p)
+                if base.endswith(".stats.json"):
+                    base = base[:-len(".stats.json")]
                 if ".ylt." in base:
                     continue
                 m = re.search(r"\.dual_(.+)_c(\d+)_p(\d+)\.(writer|reader)\.log$",
@@ -4711,9 +4959,21 @@ def parse_arguments(argv=None):
                         help="cooperative stop flag file (WebUI stop); a "
                              "SIGINT/SIGTERM/SIGBREAK also requests stop")
     parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--no-plot", action="store_true",
-                        help="skip the automatic latency/queue-wait plotting of "
-                             "this run's logs (default: plotted after the sweep)")
+    parser.add_argument("--no-plot", "--no-report", action="store_true",
+                        help="skip the automatic report/plotting of this run's "
+                             "logs (default: generated after the sweep)")
+    parser.add_argument("--png", action="store_true",
+                        help="compat switch: also pull the RAW client logs and "
+                             "generate the legacy PNG plots (plot_latency.py); "
+                             "implies --pull-raw-logs")
+    parser.add_argument("--pull-raw-logs", action="store_true",
+                        help="pull the raw client logs back (default: only the "
+                             "compact *.stats.json produced by remote logstats)")
+    parser.add_argument("--rebuild-report", default=None, metavar="OUTPUTS_TS",
+                        help="re-run the map/reduce for an existing run "
+                             "(outputs/<ts>): re-execute remote logstats, pull "
+                             "the stats and regenerate the reports; k8s uses a "
+                             "one-off pod reading the hostPath log root")
     parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
                         help="override protocol (tcp/rdma/ub); highest priority, "
                              "overrides the JSON config value")

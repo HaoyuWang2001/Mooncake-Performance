@@ -406,6 +406,7 @@ def compute_stats(path, top_n=100, context=20):
             "p999_ms": pct(0.999), "p9999_ms": pct(0.9999),
             "qw_avg_ms": round(qw_sum / qw_n, 6) if qw_n else None,
             "qw_max_ms": round(qw_max, 6) if qw_n else None,
+            "qw_n": qw_n,
             "exact": exact,
         },
         "histogram": {str(b): n for b, n in sorted(hist.items())},
