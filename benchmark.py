@@ -2102,7 +2102,8 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "early_stop": bool(early_stop),
         }
-        data = rp.reduce_scenario(rp.load(stats), meta)
+        data = rp.reduce_scenario(rp.load(stats), meta,
+                                  monitors=rp.reduce_monitors(local_log_dir))
         echarts = os.path.join(ROOT, "webui", "web", "vendor",
                                "echarts.min.js")
         out_dir = os.path.join(local_log_dir, "report")
@@ -3177,12 +3178,13 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # Basic clients may have been orphaned mid-run -> reap the ledger.
         if not dry:
             fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir)
-            _generate_reports(cfg, local_log_dir, args, early_stop=True,
-                              qps_target=total_target_qps, mode="basic")
-            reap_state_entries(cluster)
+            # profiling collect BEFORE the report so monitor CSVs reach it
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+            _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                              qps_target=total_target_qps, mode="basic")
+            reap_state_entries(cluster)
             if is_k8s:
                 # pod was Ready; the benchmark command failed -> keep pod and
                 # namespace for troubleshooting (STOP / --clean-up tears down)
@@ -4231,15 +4233,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   remove_node=locals().get("primary_node_name"),
                                   remove_runner=locals().get("remote_runner"),
                                   globals_cfg=globals_cfg)
+            # profiling collect BEFORE the report so monitor CSVs reach it
+            if profile_sess is not None:
+                prof_core.stop_and_collect(cluster, profile_sess,
+                                           os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             _generate_reports(cfg, local_log_dir, args, early_stop=True,
                               qps_target=plan["total_qps"],
                               launch_mode="rank_recall" if plan.get("dual") else "single",
                               mode="pipeline")
             # 复核台账：已死删行、杀不死的保留待下次 reap
             reap_state_entries(cluster)
-            if profile_sess is not None:
-                prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             if is_k8s:
                 # pods were Ready (or rolled out); keep Deployments + pods +
                 # namespace for troubleshooting (STOP / --clean-up tears down)

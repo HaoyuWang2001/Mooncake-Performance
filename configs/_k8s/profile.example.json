@@ -19,6 +19,21 @@
     "offcputime": {
       "enabled": false,
       "min_block_us": 1000
+    },
+    "mem": {
+      "enabled": true,
+      "interval_s": 1,
+      "proc_pattern": "mooncake_benchmark_client",
+      "leak_growth_pct": 30,
+      "leak_min_mb": 200
+    },
+    "urma": {
+      "enabled": false,
+      "bin": "mdcli",
+      "slot": 2,
+      "ubpus": [0, 1],
+      "interval_s": 1,
+      "bytes_per_flit": 20
     }
   },
   "outliers": {

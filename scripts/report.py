@@ -16,6 +16,7 @@ map 阶段（节点/pod 内 logstats.py）产出每个客户端日志的 <log>.s
   - 现场索引：每节点/每 pod 的宿主机路径、远程路径、日志体积与登录命令。
 """
 import argparse
+import csv
 import json
 import os
 import sys
@@ -274,10 +275,11 @@ def _sources(stats):
     return out, sorted(nodes.values(), key=lambda n: -n["bytes"])
 
 
-def reduce_scenario(stats, meta):
+def reduce_scenario(stats, meta, monitors=None):
     """Full scenario report data: stats grouped by data-size (caller passes a
     flat list where possible; the size label is taken from meta["size"] when
-    present, else 'all')."""
+    present, else 'all'). `monitors` (from reduce_monitors) is scenario-level
+    and independent of data-size."""
     by_size = {}
     for st in stats:
         size = (st.get("meta") or {}).get("size") or meta.get("size") or "all"
@@ -286,7 +288,258 @@ def reduce_scenario(stats, meta):
     for size, group in by_size.items():
         sizes[str(size)] = reduce_size(group, meta)
     sources, nodes = _sources(stats)
-    return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes}
+    return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
+            "monitors": monitors or {}}
+
+
+# ---------------------------------------------------------------------------
+# node monitors (mem / urma) — CSVs written by the profiling sampler scripts
+# ---------------------------------------------------------------------------
+
+MEM_HOST = "mem.host.csv"
+MEM_PROC = "mem.proc.csv"
+URMA_FLITS = "urma.flits.csv"
+MONITOR_CONFIG = "monitor.config.json"
+
+_MON_LEAK_PCT = 30.0
+_MON_LEAK_MB = 200.0
+_MON_FLIT_BYTES = 20
+MON_EMBED_MAX_POINTS = 2000
+
+
+def _read_csv_rows(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            return list(csv.reader(f))
+    except OSError:
+        return []
+
+
+def _to_float(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(x):
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_mem_host(path, node):
+    rows = _read_csv_rows(path)
+    if len(rows) < 2 or len(rows[0]) < 2:
+        return None
+    cols = [c.strip() for c in rows[0][1:]]
+    t, series = [], {c: [] for c in cols}
+    for r in rows[1:]:
+        ts = _to_float(r[0]) if r else None
+        if ts is None:
+            continue
+        t.append(int(ts))
+        for i, c in enumerate(cols):
+            series[c].append(_to_float(r[i + 1]) if i + 1 < len(r) else None)
+    if not t:
+        return None
+    return {"node": node, "t": t, "columns": cols, "series": series}
+
+
+def _parse_mem_proc(path, node, leak_pct, leak_mb):
+    rows = _read_csv_rows(path)
+    if len(rows) < 2:
+        return []
+    idx = {name.strip(): i for i, name in enumerate(rows[0])}
+    if any(n not in idx for n in ("ts", "pid", "rss_kb")):
+        return []
+    groups = {}
+    for r in rows[1:]:
+        def cell(name):
+            i = idx[name]
+            return r[i] if i < len(r) else None
+        ts, pid = _to_int(cell("ts")), _to_int(cell("pid"))
+        rss = _to_float(cell("rss_kb"))
+        if ts is None or pid is None:
+            continue
+        key = (node, pid)
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"node": node, "pid": pid,
+                               "comm": (cell("comm") or "").strip(),
+                               "t": [], "rss_mb": [], "pss_mb": []}
+        g["t"].append(ts)
+        g["rss_mb"].append(round(rss / 1024.0, 2) if rss is not None else None)
+        pss = _to_float(cell("pss_kb"))
+        g["pss_mb"].append(round(pss / 1024.0, 2) if pss is not None else None)
+    out = []
+    for g in groups.values():
+        vals = [v for v in g["rss_mb"] if v is not None]
+        if not vals:
+            continue
+        first, last = vals[0], vals[-1]
+        growth = last - first
+        growth_pct = (growth / first * 100.0) if first > 0 else 0.0
+        g.update({"rss_first_mb": round(first, 2), "rss_last_mb": round(last, 2),
+                  "rss_peak_mb": round(max(vals), 2),
+                  "rss_growth_mb": round(growth, 2),
+                  "rss_growth_pct": round(growth_pct, 1),
+                  "leak_suspect": bool(growth_pct >= leak_pct and growth >= leak_mb)})
+        out.append(g)
+    out.sort(key=lambda x: (x["node"], -x.get("rss_growth_mb", 0)))
+    return out
+
+
+def _parse_urma(path, node, flit_bytes):
+    rows = _read_csv_rows(path)
+    if len(rows) < 2:
+        return []
+    idx = {name.strip(): i for i, name in enumerate(rows[0])}
+    if any(n not in idx for n in ("ts_ns", "ubpu", "port", "rx_flits", "tx_flits")):
+        return []
+    groups = {}
+    for r in rows[1:]:
+        def cell(name):
+            i = idx[name]
+            return r[i] if i < len(r) else None
+        ts, ubpu, port = _to_int(cell("ts_ns")), _to_int(cell("ubpu")), _to_int(cell("port"))
+        rx, tx = _to_int(cell("rx_flits")), _to_int(cell("tx_flits"))
+        if None in (ts, ubpu, port, rx, tx):
+            continue
+        groups.setdefault((ubpu, port), []).append((ts, rx, tx))
+    gib = float(1024 ** 3)
+    out = []
+    for (ubpu, port), samples in groups.items():
+        samples.sort(key=lambda s: s[0])
+        t, rxr, txr = [], [], []
+        prev = None
+        for ts, rx, tx in samples:
+            if prev is not None:
+                dt_ns = ts - prev[0]
+                drx, dtx = rx - prev[1], tx - prev[2]
+                if dt_ns > 0 and drx >= 0 and dtx >= 0:
+                    sec = dt_ns / 1e9
+                    t.append(round(ts / 1e9, 3))
+                    rxr.append(round(drx * flit_bytes / sec / gib, 4))
+                    txr.append(round(dtx * flit_bytes / sec / gib, 4))
+            prev = (ts, rx, tx)
+        if not t:
+            continue
+        out.append({"node": node, "ubpu": ubpu, "port": port, "t": t,
+                    "rx": rxr, "tx": txr,
+                    "rx_avg": round(sum(rxr) / len(rxr), 3), "rx_max": max(rxr),
+                    "tx_avg": round(sum(txr) / len(txr), 3), "tx_max": max(txr)})
+    out.sort(key=lambda x: (x["node"], x["ubpu"], x["port"]))
+    return out
+
+
+def reduce_monitors(local_log_dir):
+    """Scan <local_log_dir>/**/profiling/<node>/ for monitor CSVs.
+
+    Returns {config, mem_host, mem_proc, urma, summary} or {} when no monitor
+    artifact exists (old runs / monitoring disabled). Never raises."""
+    mem_host, mem_proc, urma, cfg = [], [], [], {}
+    try:
+        for root, _dirs, files in os.walk(local_log_dir):
+            fset = set(files)
+            if not (fset & {MEM_HOST, MEM_PROC, URMA_FLITS}):
+                continue
+            node = os.path.basename(root)
+            if not cfg and MONITOR_CONFIG in fset:
+                try:
+                    with open(os.path.join(root, MONITOR_CONFIG),
+                              "r", encoding="utf-8") as f:
+                        cfg = json.load(f) or {}
+                except (OSError, ValueError):
+                    cfg = {}
+            mem_cfg = cfg.get("mem") or {}
+            leak_pct = float(mem_cfg.get("leak_growth_pct") or _MON_LEAK_PCT)
+            leak_mb = float(mem_cfg.get("leak_min_mb") or _MON_LEAK_MB)
+            flit_bytes = int((cfg.get("urma") or {}).get("bytes_per_flit")
+                             or _MON_FLIT_BYTES)
+            if MEM_HOST in fset:
+                h = _parse_mem_host(os.path.join(root, MEM_HOST), node)
+                if h:
+                    mem_host.append(h)
+            if MEM_PROC in fset:
+                mem_proc.extend(_parse_mem_proc(
+                    os.path.join(root, MEM_PROC), node, leak_pct, leak_mb))
+            if URMA_FLITS in fset:
+                urma.extend(_parse_urma(
+                    os.path.join(root, URMA_FLITS), node, flit_bytes))
+    except Exception:
+        pass
+    if not (mem_host or mem_proc or urma):
+        return {}
+    summary = {"peak_mem_mb": {}, "worst_proc": None, "peak_urma": None}
+    for h in mem_host:
+        used = [c for c in h["columns"] if "used_mb" in c]
+        peak = 0.0
+        for i in range(len(h["t"])):
+            s = sum((h["series"][c][i] or 0) for c in used)
+            peak = max(peak, s)
+        summary["peak_mem_mb"][h["node"]] = round(peak, 1)
+    if mem_proc:
+        worst = max(mem_proc, key=lambda p: p.get("rss_growth_mb") or 0)
+        summary["worst_proc"] = {
+            "label": "{}/{} {}".format(worst["node"], worst["pid"],
+                                       worst.get("comm") or "").strip(),
+            "growth_mb": worst.get("rss_growth_mb"),
+            "growth_pct": worst.get("rss_growth_pct"),
+            "leak_suspect": worst.get("leak_suspect")}
+    if urma:
+        best = max(urma, key=lambda u: max(u.get("rx_max") or 0, u.get("tx_max") or 0))
+        summary["peak_urma"] = {
+            "label": "{} ubpu={} port={}".format(best["node"], best["ubpu"],
+                                                 best["port"]),
+            "value": round(max(best.get("rx_max") or 0, best.get("tx_max") or 0), 3)}
+    return {"config": cfg, "mem_host": mem_host, "mem_proc": mem_proc,
+            "urma": urma, "summary": summary}
+
+
+def _downsample(t, arrays, max_points=MON_EMBED_MAX_POINTS):
+    """Bucket-average the series down to <= max_points (embedded report size
+    bound); data.js keeps the full-resolution series."""
+    n = len(t)
+    if n <= max_points or max_points <= 0:
+        return t, arrays
+    step = (n + max_points - 1) // max_points
+    out_t = []
+    out_arrays = [[] for _ in arrays]
+    for i in range(0, n, step):
+        j = min(i + step, n)
+        out_t.append(t[(i + j) // 2])
+        for k, arr in enumerate(arrays):
+            vals = [arr[x] for x in range(i, j) if arr[x] is not None]
+            out_arrays[k].append(round(sum(vals) / len(vals), 3) if vals else None)
+    return out_t, out_arrays
+
+
+def compact_monitors(mons):
+    """Downsampled monitor payload embedded into report.html (full series stay
+    in data.js)."""
+    if not mons:
+        return {}
+    out = {"summary": mons.get("summary") or {},
+           "mem_host": [], "mem_proc": [], "urma": []}
+    for h in mons.get("mem_host") or []:
+        cols = h.get("columns") or []
+        t, arrs = _downsample(h["t"], [h["series"][c] for c in cols])
+        out["mem_host"].append({"node": h["node"], "t": t, "columns": cols,
+                                "series": {c: arrs[i] for i, c in enumerate(cols)}})
+    for p in mons.get("mem_proc") or []:
+        t, arrs = _downsample(p["t"], [p["rss_mb"], p["pss_mb"]])
+        q = dict(p)
+        q["t"], q["rss_mb"], q["pss_mb"] = t, arrs[0], arrs[1]
+        out["mem_proc"].append(q)
+    for u in mons.get("urma") or []:
+        t, arrs = _downsample(u["t"], [u["rx"], u["tx"]])
+        q = dict(u)
+        q["t"], q["rx"], q["tx"] = t, arrs[0], arrs[1]
+        out["urma"].append(q)
+    return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -568,14 +821,78 @@ function renderAll(){
   renderSummary(); buildChart(); renderTable(); renderErrors();
   if(!window.__srcDone){renderSources();window.__srcDone=true;}
 }
+let monCharts={};
+function _monChart(id, series, yname){
+  const box=document.getElementById(id); if(!box||!series.length) return false;
+  let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
+  c.setOption({animation:false,textStyle:{fontSize:12},
+    tooltip:{trigger:'axis',confine:true},
+    legend:{top:0,type:'scroll'},
+    grid:{left:56,right:20,top:36,bottom:56},
+    xAxis:{type:'time',axisLabel:{formatter:v=>hhmmss(v/1000)}},
+    yAxis:{type:'value',name:yname,scale:true},
+    dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
+    series:series}, true);
+  return true;
+}
+function renderMonitors(){
+  const M=D.monitors||{}; const card=document.getElementById('monitorcard');
+  if(!card) return;
+  const has=(M.mem_host&&M.mem_host.length)||(M.mem_proc&&M.mem_proc.length)||
+    (M.urma&&M.urma.length);
+  if(!has){card.style.display='none';return;}
+  card.style.display='';
+  const g=document.getElementById('moncards'); g.innerHTML='';
+  const sm=M.summary||{};
+  if(sm.peak_mem_mb) Object.keys(sm.peak_mem_mb).forEach(n=>
+    g.appendChild(kv('峰值内存 '+n, sm.peak_mem_mb[n], 'MB')));
+  if(sm.worst_proc){
+    const w=sm.worst_proc;
+    const k=kv('RSS 最大增幅', w.label||'-', '');
+    if(w.leak_suspect){
+      const t=el('span','tag warn',' 疑似泄露');
+      k.querySelector('.v').appendChild(t);
+    }
+    k.appendChild(el('div','note',
+      (w.growth_mb==null?'-':w.growth_mb+' MB')+' / '+
+      (w.growth_pct==null?'-':w.growth_pct+'%')));
+    g.appendChild(k);
+  }
+  if(sm.peak_urma&&sm.peak_urma.value!=null)
+    g.appendChild(kv('端口峰值带宽', sm.peak_urma.label||'-',
+      sm.peak_urma.value.toFixed(3)+' GiB/s'));
+  const hs=[];
+  (M.mem_host||[]).forEach(h=>h.columns.forEach(c=>hs.push({
+    name:h.node+'/'+c,type:'line',showSymbol:false,
+    data:h.t.map((t,i)=>[t*1000,h.series[c][i]])})));
+  _monChart('memchart', hs, 'MB');
+  const ps=(M.mem_proc||[]).map(p=>({
+    name:p.node+'/'+p.pid+(p.comm?' '+p.comm:''),type:'line',showSymbol:false,
+    data:p.t.map((t,i)=>[t*1000,p.rss_mb[i]])}));
+  _monChart('procchart', ps, 'RSS MB');
+  const us=[];
+  (M.urma||[]).forEach(u=>{
+    const tag=u.node+' ubpu='+u.ubpu+' port='+u.port;
+    us.push({name:tag+' RX',type:'line',showSymbol:false,
+      data:u.t.map((t,i)=>[t*1000,u.rx[i]])});
+    us.push({name:tag+' TX',type:'line',showSymbol:false,
+      data:u.t.map((t,i)=>[t*1000,u.tx[i]])});
+  });
+  _monChart('urmachart', us, 'GiB/s');
+}
 function mount(){
   const sizeSel=document.getElementById('sizeSel');
-  Object.keys(S).forEach(k=>{const o=el('option',null,k);o.value=k;sizeSel.appendChild(o);});
-  sizeSel.value=curSize;
-  sizeSel.onchange=()=>{curSize=sizeSel.value;curRole='all';curStep=0;
-    renderRoleButtons(); renderAll();};
-  renderRoleButtons(); renderAll();
-  window.addEventListener('resize',()=>{if(chart)chart.resize();});
+  if(sizeSel){
+    Object.keys(S).forEach(k=>{const o=el('option',null,k);o.value=k;sizeSel.appendChild(o);});
+    sizeSel.value=curSize;
+    sizeSel.onchange=()=>{curSize=sizeSel.value;curRole='all';curStep=0;
+      renderRoleButtons(); renderAll();};
+  }
+  renderRoleButtons(); renderAll(); renderMonitors();
+  window.addEventListener('resize',()=>{
+    if(chart)chart.resize();
+    Object.keys(monCharts).forEach(k=>monCharts[k].resize());
+  });
 }
 function renderRoleButtons(){
   const box=document.getElementById('roles'); box.innerHTML='';
@@ -632,7 +949,8 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT):
     size_keys = list((data.get("sizes") or {}).keys())
     # compact copy for the HTML: only top-K clients carry minute series
     embedded = {"meta": meta, "sizes": {}, "nodes": data.get("nodes") or [],
-                "sources": data.get("sources") or []}
+                "sources": data.get("sources") or [],
+                "monitors": compact_monitors(data.get("monitors") or {})}
     for size, z in (data.get("sizes") or {}).items():
         clients = sorted(z.get("clients") or [],
                          key=lambda c: -float(c.get("p99_ms") or 0))
@@ -682,6 +1000,18 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT):
 <div class="note">数据文件：report.html（自包含）+ data.js（全量，深查用）。
 由 logstats（map）+ report.py（reduce）生成。</div>
 """.format(gran="1 秒 / 1 分钟")
+    mon = data.get("monitors") or {}
+    if mon.get("mem_host") or mon.get("mem_proc") or mon.get("urma"):
+        body += """
+<div class="card" id="monitorcard"><h2>节点监控（内存 / URMA 端口）</h2>
+<div id="moncards" class="grid"></div>
+<div id="memchart" class="chart"></div>
+<div id="procchart" class="chart"></div>
+<div id="urmachart" class="chart"></div>
+<div class="note">整机内存来自 numastat（NUMA 分列），进程内存来自
+/proc/&lt;pid&gt;/smaps_rollup；URMA 端口为 mdcli flit 计数器差分（GiB/s，1024 进制）。
+时间轴与上方延迟图同源，可对照异常窗口；进程 RSS 持续增长会被标记「疑似泄露」。</div></div>
+"""
     echarts_js = _read_echarts(echarts_path)
     html = _page_html("场景报表", subtitle, body, embedded, echarts_js,
                       "data.js", True)
@@ -705,6 +1035,23 @@ def render_overview(run_meta, scenarios, out_dir):
         z = next(iter((sc.get("sizes") or {}).values()), {})
         s = (z or {}).get("summary") or {}
         link = sc.get("report_rel") or ""
+        ms = (sc.get("monitors") or {}).get("summary") or {}
+        bits = []
+        pm = ms.get("peak_mem_mb") or {}
+        if pm:
+            bits.append("峰值内存 " + ", ".join(
+                "{}={} MB".format(k, v) for k, v in pm.items()))
+        wp = ms.get("worst_proc")
+        if wp and wp.get("leak_suspect"):
+            bits.append('<span class="tag warn">RSS 疑似泄露 {} ({} MB / {}%)'
+                        "</span>".format(wp.get("label") or "",
+                                         wp.get("growth_mb"),
+                                         wp.get("growth_pct")))
+        pu = ms.get("peak_urma")
+        if pu and pu.get("value") is not None:
+            bits.append("端口峰值 {} GiB/s".format(pu["value"]))
+        monline = ('<div class="note">监控：' + " · ".join(bits) +
+                   "</div>") if bits else ""
         cards.append("""
 <div class="card"><h2>{name}</h2>
 <div class="sub">{mode} · {clients} 客户端 · 时长 {dur} {early}</div>
@@ -717,6 +1064,7 @@ def render_overview(run_meta, scenarios, out_dir):
 <div class="kv"><div class="k">p999</div><div class="v">{p999}<span class="u"> ms</span></div></div>
 <div class="kv"><div class="k">失败率</div><div class="v">{fr}<span class="u"> %</span></div></div>
 </div>
+{monline}
 <div style="margin-top:10px"><a href="{link}">打开场景完整报表 →</a></div>
 </div>""".format(
             name=m.get("config") or "scenario", mode=m.get("mode") or "",
@@ -727,7 +1075,8 @@ def render_overview(run_meta, scenarios, out_dir):
             ok=s.get("ok", "-"), fail=s.get("fail", "-"),
             qps=s.get("qps", "-"), p50=s.get("p50_ms", "-"),
             p99=s.get("p99_ms", "-"), p999=s.get("p999_ms", "-"),
-            fr=round((s.get("fail_rate") or 0) * 100, 2), link=link))
+            fr=round((s.get("fail_rate") or 0) * 100, 2), link=link,
+            monline=monline))
     nodes = run_meta.get("nodes") or []
     node_rows = "".join(
         "<tr><td class='mono'>{n}</td><td class='n'>{p}</td>"

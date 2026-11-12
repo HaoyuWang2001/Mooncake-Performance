@@ -25,6 +25,8 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 | `perf` | on-CPU 任意函数火焰图（系统级 `-a`） | `sudo -n perf record -F 99 -a -g --call-graph fp -o perf.data`，SIGINT 后轮询落盘再收集；stderr 存 `perf.data.err` 一并收集 | sudo（可关） |
 | `runqlat` | 调度延迟直方图（bt/runqlat.bt，周期输出带时间戳） | `sudo -n env INTERVAL=10 bpftrace runqlat.bt`（.bt 启动时推送到远端 profiling 目录） | sudo（可关） |
 | `offcputime` | off-CPU/持锁等待（bt/offcputime.bt，大事件明细带时间戳） | `sudo -n env MIN_BLOCK_US=1000 bpftrace offcputime.bt`（同上） | sudo（可关） |
+| `mem` | 整机内存（numastat 各 NUMA MemUsed + MemAvailable）与进程内存（`/proc/<pid>/smaps_rollup` 的 Rss/Pss/Private/Swap），用于泄露观测。**默认开启** | `env INTERVAL_S=1 PROC_PATTERN=mooncake_benchmark_client bash mem_monitor.sh`，追加写 CSV | 无（仅 client 进程） |
+| `urma` | UBPU 端口流量：mdcli 读取 flit 计数器，报表端差分计算带宽 | `env INTERVAL_S=1 SLOT=2 UBPUS="0 1" bash urma_monitor.sh`，追加写 CSV | 无（仅装有 mdcli 的节点启动） |
 
 工具在节点上不可用（探测失败）→ `[WARN]` 跳过该工具，其余照常。**逐工具故障隔离**：任一
 工具启动失败仅 `[WARN]` 跳过自身，不影响其余工具与场景。sudo 用法（profile 逐工具
@@ -62,8 +64,16 @@ outputs/<ts>/
         ├── spdiag.show.txt
         ├── spdiag_tree.<接口>.txt      # 自动生成的文本打点树（树定义 configs/_spdiag_trees/）
         ├── perf.data / perf.data.err
-        └── runqlat.out / offcputime.out
+        ├── runqlat.out / offcputime.out
+        ├── mem.host.csv / mem.proc.csv # 整机/进程内存时间序列（mem 工具）
+        ├── urma.flits.csv              # UBPU 端口 flit 计数器（urma 工具）
+        └── monitor.config.json         # 生效的监控参数（阈值/间隔/slot/flit 字节）
 ```
+
+内存与 URMA 监控数据由 `scripts/report.py` 的 `reduce_monitors()` 汇总进
+`outputs/<ts>/logs/<配置名>/report/report.html` 的「节点监控」卡片：整机内存、
+进程 RSS 曲线 + 摘要（峰值内存 / RSS 最大增幅进程「疑似泄露」/ 端口峰值带宽）。
+无监控产物的旧 run 不会渲染该卡片；`--rebuild-report` 直接复用本地 CSV。
 
 spdiag_tree.<接口>.txt：按 `configs/_spdiag_trees/*.json` 的 (point, module) 挂载
 Avg/P999/P9999/Max/Ticks，自动计算残差（`|r|>1µs 且 >2%·parent.avg → ALERT`），
