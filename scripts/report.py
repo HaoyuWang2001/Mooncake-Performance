@@ -256,26 +256,182 @@ def reduce_size(stats, meta):
     }
 
 
-def _sources(stats):
+def _sources(stats, traces=None):
     out = []
-    nodes = {}
     for st in stats:
         meta = st.get("meta") or {}
-        node = meta.get("node") or "?"
-        b = int(meta.get("bytes") or 0)
-        out.append({"node": node, "pod": meta.get("pod") or "",
+        out.append({"node": meta.get("node") or "?",
+                    "pod": meta.get("pod") or "",
                     "role": meta.get("role") or "",
                     "source": meta.get("source") or "",
                     "remote_path": meta.get("remote_path") or "",
-                    "bytes": b})
-        agg = nodes.setdefault(node, {"node": node, "bytes": 0, "pods": 0})
-        agg["bytes"] += b
-        agg["pods"] += 1
+                    "bytes": int(meta.get("bytes") or 0),
+                    "kind": "log"})
+    for st in traces or []:
+        meta = st.get("meta") or {}
+        out.append({"node": meta.get("node") or "?",
+                    "pod": meta.get("pod") or "",
+                    "role": meta.get("role") or "",
+                    "source": meta.get("source") or "",
+                    "remote_path": meta.get("remote_path") or "",
+                    "bytes": int(meta.get("bytes") or 0),
+                    "kind": "glog"})
     out.sort(key=lambda s: (s["node"], s["pod"], s["source"]))
-    return out, sorted(nodes.values(), key=lambda n: -n["bytes"])
+    nodes = {}
+    for s in out:
+        agg = nodes.setdefault(s["node"], {"node": s["node"], "bytes": 0,
+                                           "_pods": set()})
+        agg["bytes"] += s["bytes"]
+        # client count = distinct LOG sources (one per client); k8s pods use
+        # the pod name, ssh falls back to the log basename. glog entries only
+        # contribute bytes (they are the same clients).
+        if s.get("kind") == "log":
+            agg["_pods"].add(s["pod"] or s["source"])
+    node_list = [{"node": n["node"], "bytes": n["bytes"],
+                  "pods": len(n["_pods"])} for n in nodes.values()]
+    return out, sorted(node_list, key=lambda n: -n["bytes"])
 
 
-def reduce_scenario(stats, meta, monitors=None):
+# ---------------------------------------------------------------------------
+# C++ SDK trace reduce (breakdown[api] main lines; one file per client glog)
+# ---------------------------------------------------------------------------
+
+TRACE_META_KEYS = ("lines", "trace_lines", "slice_lines", "parse_errors")
+
+
+def _merge_field(a, b):
+    if a is None:
+        return dict(b) if b else None
+    out = a
+    out["n"] = (out.get("n") or 0) + (b.get("n") or 0)
+    out["neg"] = (out.get("neg") or 0) + (b.get("neg") or 0)
+    out["sum"] = (out.get("sum") or 0.0) + (b.get("sum") or 0.0)
+    for k in ("min", "max"):
+        v = b.get(k)
+        if v is not None:
+            out[k] = v if out.get(k) is None else (
+                min(out[k], v) if k == "min" else max(out[k], v))
+    h = out.setdefault("hist", {})
+    for bin_, n in (b.get("hist") or {}).items():
+        h[str(bin_)] = h.get(str(bin_), 0) + int(n)
+    return out
+
+
+def _field_pcts(fd):
+    hist = {int(k): v for k, v in (fd.get("hist") or {}).items()}
+    n = fd.get("n") or 0
+    return {
+        "n": n, "neg": fd.get("neg") or 0,
+        "avg": round((fd.get("sum") or 0.0) / n, 4) if n else 0.0,
+        "min": fd.get("min"), "max": fd.get("max"),
+        "p50": round(ls.hist_percentile(hist, 0.50), 4) if hist else 0.0,
+        "p95": round(ls.hist_percentile(hist, 0.95), 4) if hist else 0.0,
+        "p99": round(ls.hist_percentile(hist, 0.99), 4) if hist else 0.0,
+        "p999": round(ls.hist_percentile(hist, 0.999), 4) if hist else 0.0,
+    }
+
+
+def _merge_value_counts(a, b, cap=24):
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        out[str(k)] = out.get(str(k), 0) + int(v)
+    items = sorted(out.items(), key=lambda kv: -kv[1])
+    if len(items) <= cap:
+        return dict(items)
+    keep = dict(items[:cap])
+    keep["other"] = sum(v for _k, v in items[cap:])
+    return keep
+
+
+def _merge_bucket_rows(dst, rows):
+    """dst: {t: [n, ok, fail, sum, max, 0, 0, hist]} <- trace bucket rows."""
+    for r in rows or []:
+        t = int(r[0])
+        b = dst.get(t)
+        if b is None:
+            b = dst[t] = [0, 0, 0, 0.0, 0.0, 0.0, 0.0, {}]
+        b[0] += int(r[1])
+        b[1] += int(r[2])
+        b[2] += int(r[3])
+        b[3] += float(r[4])
+        b[4] = max(b[4], float(r[5]))
+        b[5] += float(r[6])
+        b[6] = max(b[6], float(r[7]))
+        for k, n in (r[8] or {}).items():
+            b[7][int(k)] = b[7].get(int(k), 0) + int(n)
+    return dst
+
+
+def reduce_trace_size(trace_list):
+    """Merge per-client trace stats into one data-size block."""
+    groups = {}
+    clients = []
+    tops = []
+    metad = {"files": 0, "lines": 0, "trace_lines": 0, "slice_lines": 0,
+             "parse_errors": 0, "sample_rates": {}}
+    for st in trace_list:
+        m = st.get("meta") or {}
+        metad["files"] += 1
+        for k in TRACE_META_KEYS:
+            metad[k] += m.get(k) or 0
+        if m.get("sample_rate") is not None:
+            key = str(m["sample_rate"])
+            metad["sample_rates"][key] = metad["sample_rates"].get(key, 0) + 1
+        cl = {"name": m.get("source") or "", "node": m.get("node") or "",
+              "pod": m.get("pod") or "", "role": m.get("role") or "",
+              "ops": {}}
+        for gname, g in (st.get("groups") or {}).items():
+            gg = groups.setdefault(gname, {"ops": {}})
+            for op, o in (g.get("ops") or {}).items():
+                cl["ops"][op] = cl["ops"].get(op, 0) + (o.get("count") or 0)
+                dst = gg["ops"].setdefault(op, {
+                    "count": 0, "ok": 0, "fail": 0, "status": {},
+                    "fields": {}, "_buckets": {"seconds": {}, "minutes": {}},
+                    "size_values": {}, "replicas": {}, "slice_count": {},
+                    "residual": None, "top": []})
+                dst["count"] += o.get("count") or 0
+                dst["ok"] += o.get("ok") or 0
+                dst["fail"] += o.get("fail") or 0
+                for k, n in (o.get("status") or {}).items():
+                    dst["status"][k] = dst["status"].get(k, 0) + int(n)
+                for fk, fd in (o.get("fields") or {}).items():
+                    dst["fields"][fk] = _merge_field(dst["fields"].get(fk), fd)
+                _merge_bucket_rows(dst["_buckets"]["seconds"],
+                                   o.get("seconds"))
+                _merge_bucket_rows(dst["_buckets"]["minutes"],
+                                   o.get("minutes"))
+                for vk in ("size_values", "replicas", "slice_count"):
+                    dst[vk] = _merge_value_counts(dst[vk], o.get(vk))
+                if o.get("residual"):
+                    dst["residual"] = _merge_field(dst["residual"],
+                                                   o["residual"])
+                tops.extend(o.get("top") or [])
+        clients.append(cl)
+    for _gname, g in groups.items():
+        for _op, o in g["ops"].items():
+            o["fields"] = {k: _field_pcts(fd) for k, fd in o["fields"].items()}
+            o["residual"] = _field_pcts(o["residual"]) if o.get("residual") \
+                else None
+            buckets = o.pop("_buckets")
+            for bk in ("seconds", "minutes"):
+                bmap = buckets[bk]
+                rows = []
+                for t, b in sorted(bmap.items()):
+                    n, okc, failc, ssum, mx = b[0], b[1], b[2], b[3], b[4]
+                    hb = b[7]
+                    rows.append([
+                        int(t), n, okc, failc,
+                        round(ssum / n, 3) if n else 0.0,
+                        round(mx, 6),
+                        round(ls.hist_percentile(hb, 0.50), 4) if hb else 0.0,
+                        round(ls.hist_percentile(hb, 0.99), 4) if hb else 0.0])
+                o[bk] = rows
+    tops.sort(key=lambda e: -float(e.get("total_us") or 0))
+    return {"meta": metad, "groups": groups, "top": tops[:50],
+            "clients": clients}
+
+
+def reduce_scenario(stats, meta, monitors=None, traces=None):
     """Full scenario report data: stats grouped by data-size (caller passes a
     flat list where possible; the size label is taken from meta["size"] when
     present, else 'all'). `monitors` (from reduce_monitors) is scenario-level
@@ -287,7 +443,22 @@ def reduce_scenario(stats, meta, monitors=None):
     sizes = {}
     for size, group in by_size.items():
         sizes[str(size)] = reduce_size(group, meta)
-    sources, nodes = _sources(stats)
+    trace_list = traces or []
+    by_size_trace = {}
+    for st in trace_list:
+        tsize = str((st.get("meta") or {}).get("size")
+                    or meta.get("size") or "all")
+        by_size_trace.setdefault(tsize, []).append(st)
+    for size, group in by_size_trace.items():
+        blk = sizes.get(size)
+        if blk is None:
+            blk = sizes[size] = {"summary": None, "embed_step": 60,
+                                 "series": {}, "clients": [], "errors": {},
+                                 "error_excerpt": None,
+                                 "error_excerpt_status": None,
+                                 "slowest": [], "anomalies": []}
+        blk["trace"] = reduce_trace_size(group)
+    sources, nodes = _sources(stats, trace_list)
     return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
             "monitors": monitors or {}}
 
@@ -819,6 +990,7 @@ function renderAll(){
   document.getElementById('sizeSel').style.display =
     Object.keys(S).length>1?'inline-block':'none';
   renderSummary(); buildChart(); renderTable(); renderErrors();
+  renderTrace();
   if(!window.__srcDone){renderSources();window.__srcDone=true;}
 }
 let monCharts={};
@@ -911,6 +1083,196 @@ function renderRoleButtons(){
     box2.appendChild(b);
   });
 }
+/* ---------------- SDK 全链路（C++ trace，breakdown[api] 主行） ---------------- */
+const TREAD = [["total_us",0],["query_total_us",1],["query_route_us",2],
+  ["query_rpc_us",2],["select_us",1],["buf_alloc_us",1],["memread_total_us",1],
+  ["read_submit_us",2],["read_queue_us",2],["read_urma_us",2],
+  ["read_teardown_us",2],["residual",1]];
+const TWRITE = [["total_us",0],["prep_total_us",1],["prep_buf_alloc_us",2],
+  ["prep_memcpy_us",2],["prep_split_us",2],["checksum_us",1],["prepare_us",1],
+  ["query_us",1],["put_start_us",1],["memwrite_total_us",1],
+  ["memwrite_submit_us",2],["memwrite_queue_us",2],["memwrite_urma_us",2],
+  ["memwrite_teardown_us",2],["put_end_us",1],["finalize_us",1],
+  ["cache_invalidate_us",1],["revoke_us",1],["residual",1]];
+let tGroup="", tOp="", tChart=null, tStackChart=null;
+function traceOf(){const z=Z();return z&&z.trace?z.trace:null;}
+function tGroupsList(){const t=traceOf();if(!t)return[];
+  return Object.keys(t.groups||{}).filter(function(g){
+    return Object.keys((t.groups[g]||{}).ops||{}).length;});}
+function tTree(g){if(g==="read")return TREAD;if(g==="write")return TWRITE;
+  return [["total_us",0],["residual",1]];}
+function tPick(){
+  const t=traceOf();if(!t)return null;
+  const gs=tGroupsList();if(!gs.length)return null;
+  if(gs.indexOf(tGroup)<0)tGroup=gs[0];
+  const ops=Object.keys((t.groups[tGroup]||{}).ops||{});
+  if(ops.indexOf(tOp)<0)tOp=ops[0]||"";
+  if(!tOp)return null;
+  return {t:t,g:tGroup,op:tOp,data:t.groups[tGroup].ops[tOp]};}
+function renderTrace(){
+  const card=document.getElementById("tracecard");
+  const t=traceOf();
+  if(!t||!tGroupsList().length){card.style.display="none";return;}
+  card.style.display="";
+  const m=t.meta||{};
+  const rates=Object.keys(m.sample_rates||{});
+  document.getElementById("tmeta").textContent=
+    "trace 文件 "+m.files+" · 解析行 "+m.trace_lines+
+    " · slice 行（仅计数）"+m.slice_lines+" · 解析失败 "+m.parse_errors+
+    (rates.length?(" · 采样率 "+rates.join("/")):"");
+  const gbox=document.getElementById("tgroups");gbox.innerHTML="";
+  tGroupsList().forEach(function(g){
+    const b=el("button",g===tGroup?"on":"",
+               g==="read"?"读":(g==="write"?"写":"其它"));
+    b.onclick=function(){tGroup=g;tOp="";renderTrace();};
+    gbox.appendChild(b);});
+  const sel=document.getElementById("topSel");
+  const ops=Object.keys((t.groups[tGroup]||{}).ops||{});
+  sel.style.display=ops.length>1?"inline-block":"none";
+  if(ops.length>1){
+    sel.innerHTML="";
+    ops.forEach(function(o){const op=el("option",null,o);op.value=o;
+      sel.appendChild(op);});
+    sel.value=tOp||ops[0];
+    sel.onchange=function(){tOp=sel.value;renderTrace();};
+  }
+  const cur=tPick();if(!cur)return;
+  const d=cur.data;
+  const f=d.fields||{};
+  const tot=f.total_us||{};
+  const cards=document.getElementById("tcards");cards.innerHTML="";
+  cards.appendChild(kv("样本数", d.count));
+  cards.appendChild(kv("失败", d.fail));
+  if(tot.avg!=null)cards.appendChild(kv("平均", tot.avg,"µs"));
+  if(tot.p50!=null)cards.appendChild(kv("p50", tot.p50,"µs"));
+  if(tot.p95!=null)cards.appendChild(kv("p95", tot.p95,"µs"));
+  if(tot.p99!=null)cards.appendChild(kv("p99", tot.p99,"µs"));
+  if(tot.p999!=null)cards.appendChild(kv("p999", tot.p999,"µs"));
+  if(tot.max!=null)cards.appendChild(kv("最大", tot.max,"µs"));
+  buildTraceStack(cur);
+  buildTraceChart(cur);
+  renderTraceTable(cur);
+  renderTraceTop(cur);
+  renderTraceStatus(cur);
+}
+function buildTraceChart(cur){
+  const box=document.getElementById("tchart");
+  if(!tChart)tChart=echarts.init(box);
+  const rows=cur.data.seconds||[];
+  if(!rows.length){tChart.clear();return;}
+  const x=rows.map(function(r){return r[0]*1000;});
+  tChart.setOption({animation:false,textStyle:{fontSize:12},
+    tooltip:{trigger:"axis",confine:true,formatter:function(ps){
+      const r=rows[ps[0].dataIndex];
+      return "<b>"+fullts(r[0])+"</b><br>样本数："+r[1]+"<br>失败："+r[3]+
+        "<br>平均(µs)："+r[4]+"<br>p50(µs)："+r[6]+"<br>p99(µs)："+r[7];}},
+    legend:{top:0,type:"scroll"},grid:{left:56,right:20,top:36,bottom:64},
+    xAxis:{type:"time",axisLabel:{formatter:function(v){return hhmmss(v/1000);}}},
+    yAxis:[{type:"value",name:"µs",scale:true},
+           {type:"value",name:"样本数",position:"right",splitLine:{show:false}}],
+    dataZoom:[{type:"inside"},{type:"slider",height:18,bottom:8}],
+    series:[
+      {name:"样本数",type:"bar",yAxisIndex:1,
+       data:x.map(function(v,i){return [v,rows[i][1]];}),
+       itemStyle:{color:"rgba(14,116,144,.35)"},barMaxWidth:8,large:true},
+      {name:"失败",type:"bar",yAxisIndex:1,
+       data:x.map(function(v,i){return [v,rows[i][3]];}),
+       itemStyle:{color:"rgba(214,69,69,.55)"},barMaxWidth:8,large:true},
+      {name:"平均",type:"line",data:x.map(function(v,i){return [v,rows[i][4]];}),
+       showSymbol:false,lineStyle:{width:1,type:"dashed"}},
+      {name:"p50",type:"line",data:x.map(function(v,i){return [v,rows[i][6]];}),
+       showSymbol:false,lineStyle:{width:1.5}},
+      {name:"p99",type:"line",data:x.map(function(v,i){return [v,rows[i][7]];}),
+       showSymbol:false,lineStyle:{width:1.8}}
+    ]},true);
+}
+function buildTraceStack(cur){
+  const box=document.getElementById("tstack");
+  if(!tStackChart)tStackChart=echarts.init(box);
+  const tree=tTree(cur.g);
+  const f=cur.data.fields||{};
+  const stages=tree.filter(function(t){return t[1]===1&&t[0]!=="residual";});
+  const series=stages.map(function(s){
+    return {name:s[0],type:"bar",stack:"s",barMaxWidth:26,
+      data:[{value:Math.max(0,(f[s[0]]||{}).p50||0)}]};});
+  tStackChart.setOption({animation:false,textStyle:{fontSize:11},
+    tooltip:{trigger:"axis",confine:true,axisPointer:{type:"shadow"},
+      formatter:function(ps){
+        let tot=0;ps.forEach(function(p){tot+=(p.value||0);});
+        return "<b>"+ps[0].name+"</b>（p50 构成，合计 "+tot.toFixed(1)+" µs）<br>"+
+          ps.map(function(p){return p.marker+p.seriesName+"："+
+            (p.value||0)+" µs";}).join("<br>");}},
+    legend:{type:"scroll",top:0},
+    grid:{left:120,right:24,top:36,bottom:24},
+    xAxis:{type:"value",name:"µs"},
+    yAxis:{type:"category",data:[cur.op]},
+    series:series},true);
+}
+function renderTraceTable(cur){
+  const tb=document.querySelector("#ttable tbody");tb.innerHTML="";
+  const f=cur.data.fields||{};
+  const tree=tTree(cur.g);
+  const head=el("tr");
+  ["阶段","n","平均","p50","p95","p99","p999","最大"].forEach(function(h,i){
+    head.appendChild(el("th",i?"n":"",h));});
+  tb.appendChild(head);
+  const known={};tree.forEach(function(t){known[t[0]]=1;});
+  function row(key,label,depth,st){
+    const tr=el("tr");
+    const td=el("td");
+    td.style.paddingLeft=(8+depth*16)+"px";
+    td.textContent=label;
+    tr.appendChild(td);
+    const src=st||{};
+    [src.n==null?"-":src.n, src.avg==null?"-":src.avg,
+     src.p50==null?"-":src.p50, src.p95==null?"-":src.p95,
+     src.p99==null?"-":src.p99, src.p999==null?"-":src.p999,
+     src.max==null?"-":src.max].forEach(function(v){
+      tr.appendChild(el("td","n",String(v)));});
+    tb.appendChild(tr);
+  }
+  tree.forEach(function(t){
+    const k=t[0],depth=t[1];
+    if(k==="residual"){row(k,"残差（total − 阶段和）",1,cur.data.residual);return;}
+    if(f[k])row(k,k,depth,f[k]);
+  });
+  Object.keys(f).filter(function(k){return !known[k]&&k.endsWith("_us");})
+    .forEach(function(k){row(k,k+"（其它阶段）",1,f[k]);});
+}
+function renderTraceTop(cur){
+  const tb=document.querySelector("#ttop tbody");tb.innerHTML="";
+  const top=(cur.data.top||[]).slice(0,50);
+  top.forEach(function(e){
+    const tr=el("tr");
+    const st=Object.entries(e.stages||{}).sort(function(a,b){return b[1]-a[1];})
+      .slice(0,3).map(function(x){return x[0].replace(/_us$/,"")+"="+x[1];})
+      .join(" ");
+    [e.start_time||"",e.trace_id||"",e.key||"",e.op||"",e.status||"",
+     e.size||"",e.total_us==null?"":e.total_us,st].forEach(function(v,i){
+      const td=el("td","mono",String(v));
+      if(i===5||i===6)td.className="n mono";
+      tr.appendChild(td);});
+    tb.appendChild(tr);
+  });
+}
+function renderTraceStatus(cur){
+  const box=document.getElementById("terrs");box.innerHTML="";
+  const st=cur.data.status||{};
+  const es=Object.entries(st).sort(function(a,b){return b[1]-a[1];});
+  if(!es.length){box.appendChild(el("div","note","无数据"));return;}
+  const t=el("table");
+  const thead=el("thead");const hr=el("tr");
+  hr.appendChild(el("th",null,"状态"));hr.appendChild(el("th","n","次数"));
+  thead.appendChild(hr);t.appendChild(thead);
+  const tb=el("tbody");
+  es.forEach(function(x){
+    const tr=el("tr");
+    tr.appendChild(el("td","mono",x[0]));
+    tr.appendChild(el("td","n",String(x[1])));
+    tb.appendChild(tr);});
+  t.appendChild(tb);box.appendChild(t);
+}
+
 document.addEventListener('DOMContentLoaded',mount);
 """
 
@@ -988,6 +1350,29 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT):
 <div id="mainchart" class="chart"></div>
 <div class="note">悬停查看每个桶的全部统计量；滚轮/拖动缩放；点击下方客户端行可叠加该客户端的分钟曲线。
 粒度：{gran}。大范围以上采用聚合桶（非逐点），Top 慢点表保留单点级证据。</div></div>
+<div class="card" id="tracecard" style="display:none">
+<h2>SDK 全链路（C++ trace）</h2>
+<div class="sub" id="tmeta"></div>
+<div class="toolbar"><span id="tgroups" class="toolbar"></span>
+<select id="topSel" style="display:none"></select></div>
+<div id="tcards" class="grid"></div>
+<div id="tstack" class="chart sm"></div>
+<div id="tchart" class="chart"></div>
+<div class="note">上：阶段构成（各阶段 p50 堆叠）；下：按 start_time 的 1s/1min 桶（样本数柱 + 端到端时延 p50/p99）。
+样例为采样命中或失败的请求（样本数 ≠ 请求总数）；阶段表含残差（total − 阶段和）。</div>
+<h2 style="margin-top:14px">阶段分解（树）</h2>
+<div class="wrapx"><table id="ttable"><tbody></tbody></table></div>
+<h2 style="margin-top:14px">最慢请求（Top-50）</h2>
+<div class="wrapx"><table id="ttop"><thead><tr>
+<th>start_time</th><th>trace_id</th><th>key</th><th>op</th><th>状态</th>
+<th class="n">size</th><th class="n">total (µs)</th><th>主要阶段</th>
+</tr></thead><tbody></tbody></table></div>
+<h2 style="margin-top:14px">状态分布</h2>
+<div id="terrs"></div>
+<div class="note">说明：① 采样门控——主行仅在采样命中或失败时出现；② put/upsert 的
+memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total_us 为全部副本合计）；
+③ `-1` 表示该阶段拿不到时间戳（不参与时延统计）；④ slice 明细行 P1 仅计数，后续补充。</div>
+</div>
 <pre class="term" style="display:none"></pre>
 <div class="card"><h2>客户端（点击行叠加曲线）</h2><div class="wrapx">
 <table id="ctable"><thead><tr>

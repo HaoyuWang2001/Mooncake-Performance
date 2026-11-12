@@ -1655,6 +1655,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                  ("mooncake_benchmark_client.py", SCRIPTS_DIR),
                  ("bench_etcd.py", SCRIPTS_DIR),
                  ("logstats.py", SCRIPTS_DIR),
+                 ("tracestats.py", SCRIPTS_DIR),
                  ("env.sh", None)]
         mooncake_env = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
         if os.path.exists(mooncake_env):
@@ -1727,7 +1728,8 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                       os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
                       os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py"),
                       os.path.join(SCRIPTS_DIR, "bench_etcd.py"),
-                      os.path.join(SCRIPTS_DIR, "logstats.py")]
+                      os.path.join(SCRIPTS_DIR, "logstats.py"),
+                      os.path.join(SCRIPTS_DIR, "tracestats.py")]
         if os.path.exists(mooncake_env_path):
             push_files.append(mooncake_env_path)
         scp_push(n["ip"], n, push_files, remote_scripts, dry_run=dry_run)
@@ -1910,6 +1912,81 @@ def numa_node_check(node_name, numa_strict):
 # the raw logs as well (stats-only above it — raw stays on the nodes).
 RAW_AUTO_PULL_MAX = 100 * 1024 ** 2
 
+_TRACE_MOD = [None]
+
+
+def _trace_module():
+    if _TRACE_MOD[0] is None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "mc_tracestats", os.path.join(SCRIPTS_DIR, "tracestats.py"))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _TRACE_MOD[0] = mod
+    return _TRACE_MOD[0]
+
+
+def _hifreq_sample_rate():
+    """MC_HIFREQ_LOG_SAMPLE_RATE from scripts/env.mooncake.sh (the same file
+    staged to every node), default 0.1 when absent. Only used to annotate the
+    report (sample count != request count)."""
+    path = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"\s*export\s+MC_HIFREQ_LOG_SAMPLE_RATE=(\S+)",
+                             line)
+                if m:
+                    return float(m.group(1).strip("'\""))
+    except (OSError, ValueError):
+        pass
+    return 0.1
+
+
+def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
+                       dry=False, node_name=None, role=None, size=None,
+                       sample_rate=None):
+    """map 阶段（C++ trace）：在节点/pod 内对每个 .glog 执行 tracestats，
+    就地生成 <glog>.trace.json（只回传统计，glog 原始文件留远端）。"""
+    py = resolve_venv(cluster, globals_cfg)
+    out = []
+    for log in glog_paths:
+        trace_file = log + ".trace.json"
+        cmd = "{} {} --log {}".format(
+            shlex.quote(py),
+            shlex.quote(remote_scripts + "/tracestats.py"),
+            shlex.quote(log))
+        if node_name:
+            cmd += " --node {}".format(shlex.quote(str(node_name)))
+        if node.get("_pod"):
+            cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
+        if role:
+            cmd += " --role {}".format(shlex.quote(str(role)))
+        if size:
+            cmd += " --size {}".format(shlex.quote(str(size)))
+        if sample_rate is not None:
+            cmd += " --sample-rate {}".format(sample_rate)
+        if dry:
+            log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
+        elif node.get("_pod"):
+            ns = node.get("_ns") or k8s_settings(cluster)["namespace"]
+            o, rc = controller_run(
+                cluster["_controller"],
+                ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
+                check=False)
+            if rc != 0:
+                log("[WARN] [map] tracestats failed on pod {}: {}".format(
+                    node["_pod"], (o or "").strip()[:200]))
+        else:
+            try:
+                ssh_check_output(node["ip"], node, cmd, dry_run=dry,
+                                 quiet=True)
+            except Exception as exc:
+                log("[WARN] [map] tracestats failed on {}: {}".format(
+                    node.get("ip"), exc))
+        out.append(trace_file)
+    return out
+
 
 def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
                      dry=False, node_name=None, role=None, size=None):
@@ -1961,8 +2038,10 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
     groups: [(node, [log paths], label, node_display_name)]。
     返回 {node_display_name: 原始日志字节}（从 stats.meta.bytes 汇总）。"""
     node_bytes = {}
+    sample_rate = _hifreq_sample_rate()
     for node, files, label, name in groups:
         result_logs = [f for f in files if not f.endswith(".glog")]
+        glog_logs = [f for f in files if f.endswith(".glog")]
         role = None
         if result_logs:
             base = os.path.basename(result_logs[0])
@@ -1973,7 +2052,10 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
         stats = run_logstats_map(cluster, node, result_logs, remote_scripts,
                                  globals_cfg, dry=dry, node_name=name,
                                  role=role, size=size)
-        pull_files = stats + (list(files) if pull_raw else [])
+        traces = run_tracestats_map(
+            cluster, node, glog_logs, remote_scripts, globals_cfg, dry=dry,
+            node_name=name, role=role, size=size, sample_rate=sample_rate)
+        pull_files = stats + traces + (list(files) if pull_raw else [])
         _pipeline_pull_parallel(
             cluster, [(node, pull_files, label)], local_log_dir, dry)
         if not dry and pull_raw:
@@ -2077,6 +2159,36 @@ def _collect_local_stats(local_log_dir):
     return sorted(set(stats))
 
 
+def _collect_local_traces(local_log_dir):
+    """Trace stats available locally: pulled *.trace.json, or computed
+    locally from raw .glog (small-run auto pull / --png / rebuild)."""
+    traces = []
+    for root, _dirs, files in os.walk(local_log_dir):
+        for fn in sorted(files):
+            if fn.endswith(".trace.json"):
+                traces.append(os.path.join(root, fn))
+    have = set(traces)
+    for root, _dirs, files in os.walk(local_log_dir):
+        for fn in sorted(files):
+            if not fn.endswith(".glog"):
+                continue
+            p = os.path.join(root, fn)
+            tp = p + ".trace.json"
+            if tp in have:
+                continue
+            try:
+                st = _trace_module().compute_trace_stats(
+                    p, sample_rate=_hifreq_sample_rate())
+                with open(tp, "w", encoding="utf-8") as f:
+                    json.dump(st, f, ensure_ascii=False,
+                              separators=(",", ":"))
+                traces.append(tp)
+            except Exception as exc:
+                log_detail("[report] local trace stats failed for {}: {}"
+                           .format(fn, exc))
+    return sorted(set(traces))
+
+
 def _generate_reports(cfg, local_log_dir, args, early_stop=False,
                       qps_target=0, launch_mode="single", mode="pipeline"):
     """Reduce the map products and render the scenario report. WARN-only —
@@ -2102,8 +2214,10 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "early_stop": bool(early_stop),
         }
+        traces = _collect_local_traces(local_log_dir)
         data = rp.reduce_scenario(rp.load(stats), meta,
-                                  monitors=rp.reduce_monitors(local_log_dir))
+                                  monitors=rp.reduce_monitors(local_log_dir),
+                                  traces=rp.load(traces))
         echarts = os.path.join(ROOT, "webui", "web", "vendor",
                                "echarts.min.js")
         out_dir = os.path.join(local_log_dir, "report")
@@ -3120,7 +3234,12 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             run_logstats_map(cluster, node, [remote_log], remote_scripts,
                              globals_cfg, dry=dry,
                              node_name=primary_node_name, size=ds)
-            _pull_files = [remote_log + ".stats.json"]
+            run_tracestats_map(cluster, node, [remote_log + ".glog"],
+                               remote_scripts, globals_cfg, dry=dry,
+                               node_name=primary_node_name, size=ds,
+                               sample_rate=_hifreq_sample_rate())
+            _pull_files = [remote_log + ".stats.json",
+                           remote_log + ".glog.trace.json"]
             if getattr(args, "pull_raw_logs", False) \
                     or getattr(args, "png", False):
                 _pull_files += [remote_log, remote_log + ".glog"] + (
@@ -5316,11 +5435,12 @@ def rebuild_reports(ts):
         loaded = rp.load(stats)
         roles = {(st.get("meta") or {}).get("role") for st in loaded}
         mode = "pipeline" if roles & {"writer", "reader"} else "basic"
+        traces = _collect_local_traces(d)
         data = rp.reduce_scenario(loaded, {
             "config": name, "mode": mode, "clients": len(loaded),
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "early_stop": False,          # unknown for historical runs
-        })
+        }, monitors=rp.reduce_monitors(d), traces=rp.load(traces))
         html, _dj = rp.render_scenario(data, os.path.join(d, "report"),
                                        echarts)
         log("[report] rebuilt {} -> {}".format(

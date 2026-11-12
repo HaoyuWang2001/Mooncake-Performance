@@ -140,3 +140,89 @@ def test_rebuild_reports_local(tmp_path, monkeypatch):
     assert (tmp_path / "20261112-1000" / "report" / "overview.html").is_file()
     # missing run -> non-zero
     assert bm.rebuild_reports("nope") == 2
+
+
+# ---------------------------------------------------------------------------
+# C++ SDK trace integration (reduce + report section)
+# ---------------------------------------------------------------------------
+
+GLOG = "I20261112 10:23:41.000000 12345 te.cc:88] "
+TRACE_READ = (GLOG + "trace_id[18446744073] breakdown[get_buffer] key[bench/obj] "
+              "status[ok] size[262144] type[memory_remote] replica_count[2] "
+              "remote_endpoint[10.20.1.9:50051] local_endpoint[10.20.1.7:50051] "
+              "start_time[2026-11-12 10:23:41.882310] query_total_us[50] "
+              "query_route_us[12] query_rpc_us[38] select_us[4] buf_alloc_us[6] "
+              "memread_total_us[206] read_submit_us[16] read_queue_us[12] "
+              "read_urma_us[166] read_teardown_us[12] slice_count[4] "
+              "read_urma_min_us[140] read_urma_avg_us[154] memcpy_us[0] total_us[266]")
+TRACE_WRITE = (GLOG + "trace_id[18446744073] breakdown[put] key[bench/obj] "
+               "status[ok] size[1048576] replicas[2] "
+               "start_time[2026-11-12 10:23:43.110220] prep_total_us[54] "
+               "prep_buf_alloc_us[9] prep_memcpy_us[42] prep_split_us[3] "
+               "checksum_us[31] prepare_us[4] query_us[0] put_start_us[58] "
+               "memwrite_total_us[188] memwrite_submit_us[11] "
+               "memwrite_queue_us[14] memwrite_urma_us[152] memwrite_teardown_us[11] "
+               "slice_count[2] memwrite_urma_min_us[148] memwrite_urma_avg_us[150] "
+               "put_end_us[66] finalize_us[0] cache_invalidate_us[0] revoke_us[0] "
+               "total_us[401]")
+
+
+def _trace_stats(tmp_path, name, size="8MB"):
+    from tracestats import compute_trace_stats
+    p = tmp_path / name
+    p.write_text(TRACE_READ + "\n" + TRACE_WRITE + "\n", encoding="utf-8")
+    return compute_trace_stats(str(p), node="n1", role="", size=size,
+                               sample_rate=1.0)
+
+
+def test_reduce_trace_block_and_sources(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"},
+                              traces=[_trace_stats(tmp_path, "c.glog")])
+    z = data["sizes"]["8MB"]
+    assert "trace" in z
+    tr = z["trace"]
+    assert tr["meta"]["trace_lines"] == 2 and tr["meta"]["files"] == 1
+    read = tr["groups"]["read"]["ops"]["get_buffer"]
+    assert read["count"] == 1
+    tot = read["fields"]["total_us"]
+    assert tot["max"] == 266 and tot["p50"] > 0
+    assert "p99" in read["fields"]["memread_total_us"]
+    write = tr["groups"]["write"]["ops"]["put"]
+    assert write["fields"]["memwrite_total_us"]["max"] == 188
+    # residual row present (~0 for both samples)
+    assert read["residual"]["n"] == 1 and abs(read["residual"]["max"]) <= 1
+    # time buckets carry avg/p50/p99 (indices 4/6/7)
+    assert read["seconds"] and len(read["seconds"][0]) == 8
+    # glog source included in the on-site index with kind=glog
+    glogs = [s for s in data["sources"] if s.get("kind") == "glog"]
+    assert glogs and glogs[0]["source"] == "c.glog"
+    assert tr["top"] and tr["top"][0]["total_us"] == 401
+
+
+def test_render_trace_section(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    tr = _trace_stats(tmp_path, "c.glog")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    html, dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert "SDK 全链路" in src
+    assert 'id="tracecard"' in src and 'id="tstack"' in src and 'id="tchart"' in src
+    assert "阶段分解" in src and "残差（total − 阶段和）" in src
+    assert "最慢请求" in src
+    # embedded data carries the trace block
+    import re as _re
+    emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
+                                src, _re.S).group(1))
+    assert "trace" in emb["sizes"]["8MB"]
+    full = open(dj, encoding="utf-8").read()
+    assert "trace" in full
+
+
+def test_render_without_trace_keeps_card_hidden(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "out2"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    # card exists but hidden by default; JS hides it when data.trace is absent
+    assert 'id="tracecard" style="display:none"' in src
