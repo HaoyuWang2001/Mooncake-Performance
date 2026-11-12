@@ -136,8 +136,8 @@ writer.count_per_node=2；历史文件名的 `_n{N}` 后缀已随档位目录废
 | --- | --- | --- | --- |
 | `work_mode` | rank(精排) / recall(召排) | `rank` | `recall` |
 | `traffic_mode` | `balanced`=均衡（按 QPS 均匀节流）/ `pulse`=脉冲（每秒窗口集中突发） | 两者皆测 | 两者皆测 |
-| `base_qps` | 基准写入 QPS | 105 | 35 |
-| `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
+| `base_qps` | 单节点基准写入 QPS（节点内全部 writer/client 均分） | 105 | 35 |
+| `qps_multiple` | QPS 倍数（单节点写入 = base × 倍数；集群总写入再 × N） | 1 / 2 / 3 | 1 / 2 / 3 |
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数；须 ≤ reader 池 cpn×N） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
 | `client` | **双角色部署块（出现即选择 dual 模式）**：`{count_per_node, port_base}`——每节点 client 进程数（总数 = cpn×N，每个进程**同时是 writer+reader**，端口默认 9301，单端口四 endpoint）；出现该块时 writer/reader 块仅提供 operation/线程数等接口参数 | smoke 两用例必填 | 不使用 |
 | `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`/`upsert_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101） | cpn=1（notify_threads=notify_count） | cpn=1 |

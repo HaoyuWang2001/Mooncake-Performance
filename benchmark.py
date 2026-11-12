@@ -85,6 +85,47 @@ def _install_stop_handlers():
 def _check_stop():
     if stop_requested():
         raise StopRequested()
+
+
+_PARALLEL_READY_TIMEOUT_S = 600
+
+
+def _parallel_pods_ready_barrier(args):
+    """Wait until both rank/recall children have all benchmark Pods Ready.
+
+    ``run_rank_recall.py`` gives both children one private directory and a
+    distinct role. Each child atomically publishes ``<role>.ready`` only
+    after its own Deployment rollout(s) completed. The barrier is one-shot:
+    it synchronizes the first scenario of each child, which is the shared
+    rank+recall launch point, without coupling later sweep entries.
+    """
+    ready_dir = getattr(args, "parallel_ready_dir", None)
+    role = getattr(args, "parallel_ready_role", None)
+    if not ready_dir or not role or getattr(args, "_parallel_ready_done", False):
+        return
+    if role not in ("rank", "recall"):
+        raise RuntimeError("invalid parallel ready role: {}".format(role))
+    os.makedirs(ready_dir, exist_ok=True)
+    marker = os.path.join(ready_dir, role + ".ready")
+    tmp = marker + ".{}.tmp".format(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("{}\n".format(os.getpid()))
+    os.replace(tmp, marker)
+    peer = "recall" if role == "rank" else "rank"
+    peer_marker = os.path.join(ready_dir, peer + ".ready")
+    log("[parallel] {} Pods ready; waiting for {} Pods".format(role, peer))
+    deadline = time.time() + _PARALLEL_READY_TIMEOUT_S
+    while not os.path.isfile(peer_marker):
+        _check_stop()
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "parallel Pods-ready barrier timed out after {}s: {} marker "
+                "not found".format(_PARALLEL_READY_TIMEOUT_S, peer))
+        time.sleep(0.2)
+    args._parallel_ready_done = True
+    log("[parallel] rank and recall Pods ready; continuing benchmark")
+
+
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 # RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
@@ -662,11 +703,12 @@ def pipeline_plan(cfg, node_count=1):
     a node gets port_base + i (k8s pods all use port_base itself — every
     pod has its own network namespace).
 
-    Total write QPS = base_qps * qps_multiple, split evenly across all
-    writers. Writers get global gids 1..W and readers global indices 0..R-1
+    Per-node write QPS = base_qps * qps_multiple. It is split evenly across
+    the writers/dual clients on that node, and cluster total is per-node QPS
+    times N. Writers get global gids 1..W and readers global indices 0..R-1
     in node order. The plan carries the node SLOT; the caller materializes
-    concrete node names (ssh cluster nodes / k8s pod names) into
-    entry["node"]. The reader pool must cover notify_count.
+    concrete node names (ssh cluster nodes / k8s pod names) into entry["node"].
+    The reader pool must cover notify_count.
 
     The legacy writer/reader client_nodes lists are gone — the benchmark
     faces the whole cluster, not per-role node assignments.
@@ -3397,6 +3439,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "(N={}, spread maxSkew=1, run={})".format(
                         len(plan["writers"]), len(plan["readers"]),
                         n_nodes, _run_label))
+            # Cross-child rank+recall synchronization. This point is after
+            # every Deployment replica is available and before scripts/data
+            # setup or any benchmark client is launched.
+            _parallel_pods_ready_barrier(args)
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
         # optional NUMA binding: per node, round-robin the node's client
@@ -4669,6 +4715,10 @@ def parse_arguments(argv=None):
     # Keeping it out of --help avoids presenting an implementation detail as
     # a normal benchmark knob.
     parser.add_argument("--result-dir", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--parallel-ready-dir", default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--parallel-ready-role", choices=("rank", "recall"),
+                        default=None, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="verbose logging (upload paths, per-file pulls, "

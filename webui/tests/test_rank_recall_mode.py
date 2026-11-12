@@ -2,14 +2,18 @@ import io
 import os
 import shutil
 import sys
+import threading
 import time
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import benchmark as bm
 from benchmark import scenario_paths
-from scripts.run_rank_recall import _child_env, _pump, partition_configs
+from scripts.run_rank_recall import (_child_argv, _child_env, _pump,
+                                     partition_configs)
 from webui.backend.routers.runs import _build_run_argv
 from webui.backend.routers.outputs import api_outputs
 from webui.backend.common import ApiError
@@ -31,6 +35,51 @@ def test_children_have_isolated_namespace_ledgers():
     assert rank != recall
     assert rank_env["PYTHONUTF8"] == "1"
     assert rank_env["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_children_share_ready_dir_with_distinct_roles(tmp_path):
+    args = SimpleNamespace(
+        rank_cluster="rank-cluster.json", rank_global="rank-global.json",
+        recall_cluster="recall-cluster.json", recall_global="recall-global.json",
+        profile="profile.json", dry_run=False, no_warmup=False,
+        no_plot=False, verbose=False, protocol=None, stop_file=None)
+    ready_dir = str(tmp_path / "ready")
+
+    rank = _child_argv(args, "rank", ["rank.json"], "parent", ready_dir)
+    recall = _child_argv(args, "recall", ["recall.json"], "parent", ready_dir)
+
+    assert rank[rank.index("--parallel-ready-dir") + 1] == ready_dir
+    assert recall[recall.index("--parallel-ready-dir") + 1] == ready_dir
+    assert rank[rank.index("--parallel-ready-role") + 1] == "rank"
+    assert recall[recall.index("--parallel-ready-role") + 1] == "recall"
+
+
+def test_parallel_pods_ready_barrier_waits_for_peer(tmp_path, monkeypatch):
+    monkeypatch.setattr(bm, "_check_stop", lambda: None)
+    args = SimpleNamespace(parallel_ready_dir=str(tmp_path),
+                           parallel_ready_role="rank")
+    errors = []
+
+    def run_barrier():
+        try:
+            bm._parallel_pods_ready_barrier(args)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_barrier)
+    thread.start()
+    deadline = time.time() + 2
+    while not (tmp_path / "rank.ready").exists() and time.time() < deadline:
+        time.sleep(0.01)
+    assert (tmp_path / "rank.ready").exists()
+    assert thread.is_alive(), "rank must wait until recall publishes readiness"
+
+    (tmp_path / "recall.ready").write_text("peer\n", encoding="utf-8")
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert not errors
+    assert args._parallel_ready_done is True
 
 
 def test_log_pump_survives_character_not_encodable_by_console():
