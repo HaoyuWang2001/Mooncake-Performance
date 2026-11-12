@@ -3122,9 +3122,25 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             _pull_files = [remote_log + ".stats.json"]
             if getattr(args, "pull_raw_logs", False) \
                     or getattr(args, "png", False):
-                _pull_files += [remote_log] + (
+                _pull_files += [remote_log, remote_log + ".glog"] + (
                     [remote_log + ".pids"] if c > 1 else [])
             pull_stage_logs(host, node, _pull_files, local_log_dir, dry)
+            # small runs: pull the raw log too (cheap; full per-point
+            # inspection + local stats recompute); large runs stay stats-only
+            if not dry and not (getattr(args, "pull_raw_logs", False)
+                                or getattr(args, "png", False)):
+                _sp = os.path.join(local_log_dir,
+                                   os.path.basename(remote_log) + ".stats.json")
+                _b = 0
+                try:
+                    with open(_sp, "r", encoding="utf-8") as _f:
+                        _b = json.load(_f).get("meta", {}).get("bytes", 0)
+                except (OSError, ValueError):
+                    _b = 0
+                if 0 < _b <= RAW_AUTO_PULL_MAX:
+                    pull_stage_logs(host, node,
+                                    [remote_log, remote_log + ".glog"],
+                                    local_log_dir, dry)
             # clients exited naturally -> drop their ledger rows
             if not dry:
                 state_remove_cfg(cfg_name)
@@ -4538,6 +4554,53 @@ def _merge_stats_aggs(stats_list):
     key-based counts sum, wall = timestamp span, percentiles from the merged
     histogram, queue-wait weighted by qw sample count."""
     ls = _logstats_module()
+    # single instance: the stats global fields are already exact (or
+    # histogram-derived by the same ladder) — use them verbatim instead of
+    # re-deriving from the rounded histogram buckets
+    if len(stats_list) == 1:
+        st = stats_list[0]
+        g = st.get("global") or {}
+        meta = st.get("meta") or {}
+        max_depth = 0
+        total_bytes = 0
+        wall = 0.0
+        for kind, payload in st.get("summaries") or []:
+            if kind != "summary":
+                continue
+            max_depth = max(max_depth, int(payload.get("max_depth", 0) or 0))
+            total_bytes += int(payload.get("bytes", 0) or 0)
+            wall = max(wall, float(payload.get("wall_s", 0) or 0))
+        total = g.get("key_total") or 0
+        ok = g.get("key_ok") or 0
+        fail = g.get("key_fail") or 0
+        wall = wall or (meta.get("wall_s") or 0.0)
+        return {
+            "total": total,
+            "total_bytes": total_bytes,
+            "wall_s": wall,
+            "throughput_mb_s": (total_bytes / wall / 1024.0 ** 2)
+            if wall > 0 else 0.0,
+            "throughput_gb_s": (total_bytes / wall / 1024.0 ** 3)
+            if wall > 0 else 0.0,
+            "avg_ms": g.get("avg_ms") or 0.0,
+            "min_ms": g.get("min_ms") or 0.0,
+            "max_ms": g.get("max_ms") or 0.0,
+            "p50_ms": g.get("p50_ms") or 0.0,
+            "p95_ms": g.get("p95_ms") or 0.0,
+            "p99_ms": g.get("p99_ms") or 0.0,
+            "p999_ms": g.get("p999_ms") or 0.0,
+            "p9999_ms": g.get("p9999_ms") or 0.0,
+            "lat_sum_ms": (g.get("avg_ms") or 0.0) * (g.get("ok") or 0),
+            "ok": ok,
+            "fail": fail,
+            "qps": (total / wall) if wall > 0 else 0.0,
+            "fail_rate": (fail / total) if total else 0.0,
+            "queue_wait_avg_ms": (g.get("qw_avg_ms")
+                                  if g.get("qw_avg_ms") is not None else 0.0),
+            "queue_wait_max_ms": (g.get("qw_max_ms")
+                                  if g.get("qw_max_ms") is not None else 0.0),
+            "max_depth": max_depth,
+        }
     total = ok = fail = ok_rows = 0
     lat_sum = 0.0
     qw_sum = 0.0
@@ -4912,7 +4975,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         # identical to how run_basic_scenario executes the runs
         for c, t, ds in build_runs(cfg):
             path = os.path.join(local_log_dir, "{}.benchmark_c{}_t{}_{}.log".format(name, c, t, ds))
-            if not os.path.exists(path):
+            if not os.path.exists(path) and not os.path.exists(
+                    path + ".stats.json"):
                 continue
             row_data_size_bytes = parse_data_size(ds)
             base_row_vals = {
