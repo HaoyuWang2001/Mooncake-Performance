@@ -15,6 +15,7 @@ import csv
 import glob
 import ipaddress
 import json
+import math
 import os
 import posixpath
 import re
@@ -3160,6 +3161,26 @@ def _pipeline_k8s_roles(plan):
             ("writer", plan["writers"], plan["writer_port_base"]))
 
 
+def _pipeline_client_timeout(cfg, rendezvous_timeout_s, warmup_enabled=True):
+    """Return a lifetime that cannot expire before orchestrated shutdown.
+
+    Pipeline readers start their lifetime clock before rendezvous.  Budget for
+    both registration barriers, the complete writer window, and the shutdown
+    hand-off/exit grace.  The timeout is only a safety ceiling: the
+    orchestrator still terminates clients through /shutdown on the normal
+    path, so a generous value does not lengthen successful runs.
+    """
+    rendezvous_s = max(0.0, float(rendezvous_timeout_s or 0))
+    duration_s = max(0.0, float(cfg.get("duration", 0) or 0))
+    warmup_s = 0.0
+    if warmup_enabled:
+        warmup_s = max(
+            0.0, float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0))
+    shutdown_grace_s = 60.0
+    return max(1, int(math.ceil(
+        2.0 * rendezvous_s + warmup_s + duration_s + shutdown_grace_s)))
+
+
 def _k8s_deployment_pods(cluster, run_label, role):
     """Sorted pod names of a pipeline role's Deployment (label selector)."""
     c = cluster["_controller"]
@@ -3433,14 +3454,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     numactl_ok[node_name] = False
                 numa_counter[node_name] = 0
         warmup = "false" if args.no_warmup else "true"
+        client_timeout_s = _pipeline_client_timeout(
+            cfg, rendezvous_timeout_s, warmup_enabled=(warmup == "true"))
         reader_threads = plan["reader_threads"]
         log("scenario {} (pipeline, {}): N={}, writers={}, readers={}, "
             "notify_count={}, total_qps={}, per_writer_qps={}, traffic={}, "
-            "run_id={}, sizes={}".format(
+            "run_id={}, client_timeout={}s, sizes={}".format(
                 cfg_name, work_mode, n_nodes, len(plan["writers"]),
                 len(plan["readers"]), plan["notify_count"], plan["total_qps"],
                 plan["per_writer_qps"], cfg.get("traffic_mode", "pulse"),
-                run_id, sizes))
+                run_id, client_timeout_s, sizes))
         current_ds = None
         for ds in sizes:
             if ds != current_ds:
@@ -3530,12 +3553,14 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     ccmd = ("MC_READER_LOG={rlog} nohup {p}bash {runner} pipeline "
                             "{log} --client-id {cid} --role both --listen-port {port} "
                             "--writer-operation {wop} --reader-operation {rop} "
-                            "--num-threads {thr} --warmup {wu} --timeout 300{kc}{na} "
+                            "--num-threads {thr} --warmup {wu} "
+                            "--timeout {timeout}{kc}{na} "
                             "> {nohup} 2>&1 & echo $!").format(
                         rlog=reader_log, p=launch_prefix, runner=remote_runner,
                         log=merged_log, cid=c["id"], port=c["port"],
                         wop=writer_op, rop=reader_op, thr=reader_threads,
-                        wu=warmup, kc=kc_arg, na=numa_arg, nohup=nohup_log)
+                        wu=warmup, timeout=client_timeout_s, kc=kc_arg,
+                        na=numa_arg, nohup=nohup_log)
                     pid = ssh_check_output(rn["ip"], rn, ccmd, dry_run=dry)
                     reader_pids.append((c, pid))
                     writer_pids.append((c, pid))
@@ -3659,10 +3684,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         if numactl_ok.get(r["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
                     rcmd = ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
-                            "--role reader --listen-port {} --warmup false --timeout 300 "
+                            "--role reader --listen-port {} --warmup false "
+                            "--timeout {} "
                             "--operation {} {} > {} 2>&1 & echo $!").format(
                         launch_prefix, remote_runner, merged_log, r["index"],
-                        reader_threads, r["port"], reader_op, numa_arg, nohup_log)
+                        reader_threads, r["port"], client_timeout_s, reader_op,
+                        numa_arg, nohup_log)
                     pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
                     reader_pids.append((r, pid))
                     if not dry and pid:

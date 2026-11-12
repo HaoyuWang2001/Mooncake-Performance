@@ -81,6 +81,24 @@ def test_pipeline_plan_dual_client_mode():
     assert plan["writers"] is plan["clients"] and plan["readers"] is plan["clients"]
 
 
+def test_pipeline_client_timeout_covers_long_recall_window():
+    cfg = {"duration": 300, "warmup": {"duration": 5}}
+    timeout_s = bm._pipeline_client_timeout(
+        cfg, rendezvous_timeout_s=120, warmup_enabled=True)
+
+    # Two rendezvous budgets + warmup + measurement + shutdown grace.
+    assert timeout_s == 605
+    # The orchestrator's normal shutdown happens after warmup + duration +
+    # ten seconds, so the client must still be alive then.
+    assert timeout_s > 5 + 300 + 10
+
+
+def test_pipeline_client_timeout_respects_no_warmup():
+    cfg = {"duration": 300, "warmup": {"duration": 5}}
+    assert bm._pipeline_client_timeout(
+        cfg, rendezvous_timeout_s=120, warmup_enabled=False) == 600
+
+
 def test_loader_strips_client_nodes(tmp_path, capsys):
     cfg_file = tmp_path / "p.json"
     cfg_file.write_text(json.dumps({
