@@ -554,14 +554,17 @@ mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`�
 
 ### 7.3 日志体系
 
-客户端进程有三条日志流，落点如下（`<LOG_FILE>` 为对应 stage 的 client 日志，随
-`cfg_name.*` glob 自动拉回本地 `outputs/<ts>/logs/<cfg>/`）：
+客户端进程的日志**按来源三流分离**（read / writer / client-glog），互不混写：
 
 | 日志流 | 承载内容 | 落点 |
 |---|---|---|
-| Python stdout（`log()`/`emit()`/RESULT） | 进度打点、META/SUMMARY/RESULT | 合并进 `<LOG_FILE>`（与 C++ stderr 按时间交织） |
-| C++ glog（`LOG()`/`MC_LOG()`） | setup 期连接证据：`ConnectToCvmSubmasters`、`connected to submaster`、`Loaded partition routing`、`Version mismatch`、`MountSegment` 等 | **stderr**，被 `2>&1` 合入 `<LOG_FILE>` |
+| Python（`log()`/`emit()`/RESULT） | 进度打点、META/SUMMARY/RESULT | **`MC_WRITER_LOG` / `MC_READER_LOG` 文件**（客户端启动即 `sys.stdout` 重绑到角色日志；dual 进程按 thread-local 路由：reader 工作线程/notify 线程 → reader 日志，其余 → writer 日志；单角色/basic/stage 进程只设其一，全部 Python 输出进该文件；两者都未设时回退 stdout 兼容手工 CLI） |
+| C++ SDK glog（`LOG()`/`MC_LOG()`） | setup 期连接证据：`ConnectToCvmSubmasters`、`connected to submaster`、`Loaded partition routing`、`Version mismatch`、`MountSegment` 等 | SDK 默认写 **OS fd1（stdout）**（`MC_LOG_ENABLE=on` 且未设 `MC_LOG_DIR` 时）；runner 把 fd1+fd2 收进 **`<GLOG_FILE>`**（Python fatal traceback 也在其中）。若需 SDK 自管日志文件，可设 `MC_LOG_DIR`（实测可靠），但本仓库默认不用它——stdout 单一流最简单 |
 | C++ ylt easylog（coro_rpc 内部） | 连接池事件、建连失败细节（connect/fail/refuse/timeout） | `<LOG_FILE>.ylt.log`（绝对路径，multi-client 带 `===== client.N =====` 分节头） |
+
+glog 文件名：dual `<base>.glog`；分离角色 `<base>.writer_<node>_w<gid>.glog` /
+`<base>.reader_<node>_r<idx>_p<port>.glog`；basic/stage `LOG_FILE` 去掉 `.log` 换 `.glog`
+（basic 多客户端逐 client 拆分后合并）。WebUI 已把 `.glog` 归入日志分组。
 
 关键说明：
 
@@ -769,29 +772,65 @@ mode + cluster + global，**不需要 profile**，不可恢复。
 
 ```
 outputs/<时间戳，如 20261010-1308>/
-├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 为双 Schema 40 列）
+├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 42 列）
 ├── benchmark_detail.csv        # 全部用例汇总（pipeline 仅 writer/reader TOTAL 行）
+├── report/
+│   └── overview.html           # run 总览：各场景摘要卡 + 链接 + 节点日志量
 ├── profiling/                  # run 级异常值台账（跨配置聚合）
 │   ├── outliers.json
 │   └── outliers.slices.txt
 └── logs/
     ├── final.remove-keys.log   # 场景结束兜底 remove-all 日志（最后一个成功配置节点）
     └── <配置名>/               # 每个配置一个子目录
+        ├── report/
+        │   ├── report.html     # 场景完整报表（自包含：内联 ECharts + TopK 数据）
+        │   └── data.js         # 全量数据（同目录时报表自动加载，供客户端深查）
         ├── <配置名>.generate-data.log
         ├── <配置名>.prepare-store.log
         ├── <配置名>.remove-keys.log
-        ├── <配置名>.benchmark_c{clients}_t{threads}.log
+        ├── <配置名>.<run>.log.stats.json   # ← 默认只回传该紧凑统计（原始日志留远端）
         ├── profiling/<节点>/   # 该配置的 profiling 产物（多配置 run 互不覆盖）
         │   ├── spdiag.show.txt
         │   ├── spdiag_tree.<接口>.txt   # 自动生成的文本打点树（见 10.4）
         │   └── perf.data / *.out ...
-        └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port}.log / .writer{gid}.log ...
-            （脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
+        └── (pipeline) <配置名>.benchmark_c1_t1.dual_<pod>_c0_p9301.{writer,reader}.log[.stats.json] / .glog
+            （--pull-raw-logs / 失败路径 / 小 run 自动回拉时才有原始 .log；
+             脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
 ```
+
+**k8s 宿主机日志持久化**：pod 的 logs 目录挂 hostPath，日志实际落
+`<k8s.host_log_root>/<run_id>/<pod名称>/…`（默认 `/var/lib/mooncake-bench`，可配）。
+pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**，只提示逐节点清理命令。
+报表「现场索引」列出每节点/pod 的远程路径、日志体积与登录命令（ssh / kubectl exec）。
 
 ## 10. 本地分析工具
 
-### 10.1 plot_latency.py（时延统计图）
+### 10.1 HTML 报表（默认产物，logstats map + report reduce）
+
+结果分析默认不再生成 PNG 散点图，而是**可独立打开的 HTML 报表**（与 WebUI 解耦）：
+
+- **map（远端就地）**：`scripts/logstats.py` 在节点/pod 内逐客户端日志统计，产出
+  `<log>.stats.json`（全局精确计数/分位数、对数定梯直方图、1s/1min 桶、per-op 统计、
+  SUMMARY 字段、错误码 + 首错误 ±20 行摘录、Top-100 慢点、异常窗口自检）。编排器默认
+  **只回传 stats**；原始日志留在节点（失败路径、`--pull-raw-logs` 或原始日志 ≤100MB 的
+  小 run 会回拉原始日志）。
+- **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
+  渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
+  `overview.html`（run 总览）。
+- **展示方式**：主时间线按 **1s 桶**（≤1 天；>1 天自动用 1min 桶、1s 留 data.js）——
+  QPS 柱 + p50/p99/p999/最大 线 + 失败柱，悬停查看该桶全部统计量、滚轮缩放；点击客户端
+  行叠加其分钟曲线；异常窗口在图上以黄色竖线标注；Top-100 慢点表保留单点级证据。
+  不再逐点画散点（数十万点会遮挡且无法读数）。
+- **三路径**：done / failed / stopped（STOP 优雅停）都会出报表，报表标注「提前停止/异常」。
+- **重建**：`benchmark.py --rebuild-report outputs/<ts>` 仅用本地 stats/原始日志重建报表
+  （覆盖「run 正常结束但报表阶段失败」；远端重建需重新 map，暂未自动实现）。
+- **开关**：`--no-report`（`--no-plot` 同义）跳过；`--png` 保留旧 PNG 绘图流程
+  （会连带回拉原始日志，仅小 run 实用）。
+- **待办（已记录）**：store 容量周期采样时间线（P3）、增量 map / 节点日志轮转上限、
+  按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。
+- 依赖：无第三方库（ECharts 5.5.1 已 vendor 在 `webui/web/vendor/echarts.min.js`）。
+
+### 10.1.1 plot_latency.py（旧 PNG 图，`--png` 兼容模式）
 
 根据客户端日志中的 RESULT 行绘制**点线图**：横轴 = 第 i 个请求，纵轴 = 时延(ms)；
 横向虚线标注 `avg`/`max`（恒定）与 `p99`/`p999`/`p9999`（样本量门控：分别需 ≥100/1000/10000 个样本，不足则不加线，不同颜色 + 数值），`1ms`/`2ms` 灰色点划参考线；
@@ -814,8 +853,8 @@ python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
 - **离群双图**：存在离群值时每个统计量出两幅——原名图（包含离群值，红 x 标注，分位线按
   全量计算）+ `.trimmed.png`（剔除离群值，分位线按剔除后数据重算）；无离群仅单图
 - 依赖 matplotlib：`pip install matplotlib`；输出 PNG（dpi 150）
-- **新 run 自动绘图**：benchmark.py 主流程结束后自动对本 run 的 `outputs/<ts>/logs/`
-  全量出图（子进程隔离，绘图失败仅 `[WARN]` 不影响测试结果）；`--no-plot` 跳过
+- **自动调用**：仅在 `--png` 模式下由 benchmark.py 主流程结束调用（子进程隔离，失败仅
+  `[WARN]`）；默认产物是 10.1 的 HTML 报表
 
 ### 10.2 run_schedule.py（夜间定时串行执行）
 
@@ -859,7 +898,8 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   每张卡片按钮为 **运行 / 停止 / 删除(确认，运行中拒绝) / 详情**；实例可反复运行，每次运行
   生成独立 run（历史抽屉按 run 列出，点击跳实例详情或结果）
 - **实例详情（新页签）**：顶部**浏览器式页签**可同时打开多个实例（× 关闭、sessionStorage
-  记忆），内容为实例信息快照 + 操作（运行/停止/删除/改名/**跳转至结果详情**）+ 日志查看
+  记忆），内容为实例信息快照 + 操作（运行/停止/删除/改名/**跳转至结果详情**/**查看报表**）
+  + 日志查看
   （复制、自动换行开关、搜索高亮与 ↑↓ 跳转、按页自动加载）。**Rank+Recall 组合实例的日志
   上下分屏**分别显示 rank / recall 两路，并可切换「合并日志」查看含父进程行的原始流；
   跳转结果取 run 产物目录的顶层父目录（`rank/`、`recall/` 子目录在结果页内浏览）
@@ -870,8 +910,9 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   通知两边并按各自 namespace 清理。该模式要求选择中两类配置均非空
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
   并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
-  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（profiling 指标占位：
-  profiling/outliers.json）、文本 tail
+  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty、文本分页；
+  文件分组新增**「报表」**（`.html`）：选中后在面板点击「在新标签页打开报表」，HTML 报表
+  内联 ECharts 可独立打开/分享（同目录 `data.js` 自动加载全量深查数据）
 - **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
   再执行（scheduler 等待期允许手动发起 run，响应带 warning）
 - **并发规则（多实例）**：可同时运行多个实例，但按共享资源守卫——k8s 的
