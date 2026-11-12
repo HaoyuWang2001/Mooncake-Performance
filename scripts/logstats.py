@@ -34,6 +34,8 @@ import sys
 
 TS_PREFIX = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}")
 RESULT_PREFIX = "RESULT\t"
+SUMMARY_PREFIX = "SUMMARY\t"
+META_PREFIX = "META\t"
 
 # 对数定梯：0.001ms 起、ratio 1.2、80 档（约到 2000s）。所有客户端共用
 # 同一阶梯 -> 直方图按 bin 相加即可无损合并，集群分位数由此还原。
@@ -158,6 +160,32 @@ def _read_context(path, center_line, context):
     return text[:EXCERPT_CAP]
 
 
+def _scan_summaries(path, cap=8):
+    """SUMMARY/META lines of one log (JSON payloads). A dual legacy mixed
+    log carries writer + reader summaries; keep all (capped)."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith(SUMMARY_PREFIX):
+                    try:
+                        out.append(("summary",
+                                    json.loads(line[len(SUMMARY_PREFIX):])))
+                    except ValueError:
+                        continue
+                elif line.startswith(META_PREFIX):
+                    try:
+                        out.append(("meta",
+                                    json.loads(line[len(META_PREFIX):])))
+                    except ValueError:
+                        continue
+                if len(out) >= cap:
+                    break
+    except OSError:
+        pass
+    return out
+
+
 def compute_stats(path, top_n=100, context=20):
     rows = 0
     total = ok = fail = 0
@@ -185,11 +213,17 @@ def compute_stats(path, top_n=100, context=20):
         okrow = status == "OK"
         total += 1
         key_total += kc
-        opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0})
+        opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0,
+                                   "_lats": [], "_h": {}, "_sum": 0.0})
         opd["count"] += 1
         opd["keys"] += kc
         if okrow:
             opd["ok"] += 1
+            ob = bin_of(row["lat"])
+            opd["_h"][ob] = opd["_h"].get(ob, 0) + 1
+            opd["_sum"] += row["lat"]
+            if len(opd["_lats"]) < EXACT_LIMIT:
+                opd["_lats"].append(row["lat"])
         else:
             opd["fail"] += 1
         ep = _ts_to_epoch(row["ts"])
@@ -287,6 +321,28 @@ def compute_stats(path, top_n=100, context=20):
         def pct(q):
             return round(hist_percentile(hist, q), 6)
 
+    # per-op finalized stats (counts + latency percentiles per op name)
+    ops_out = {}
+    for op, opd in ops.items():
+        if opd["_lats"] and len(opd["_lats"]) == opd["ok"]:
+            ls = sorted(opd["_lats"])
+            def opct(q, _ls=ls):
+                return round(_exact_percentile(_ls, q), 6)
+            opmin, opmax = round(ls[0], 6), round(ls[-1], 6)
+        else:
+            def opct(q, _h=opd["_h"]):
+                return round(hist_percentile(_h, q), 6)
+            opmin = round(hist_percentile(opd["_h"], 0.0), 6)
+            opmax = round(hist_percentile(opd["_h"], 1.0), 6)
+        ops_out[op] = {
+            "count": opd["count"], "ok": opd["ok"], "fail": opd["fail"],
+            "keys": opd["keys"],
+            "avg_ms": round(opd["_sum"] / opd["ok"], 6) if opd["ok"] else 0.0,
+            "min_ms": opmin, "max_ms": opmax,
+            "p50_ms": opct(0.50), "p95_ms": opct(0.95), "p99_ms": opct(0.99),
+            "p999_ms": opct(0.999), "p9999_ms": opct(0.9999),
+        }
+
     # minute buckets: exact merge of the 1s buckets
     minutes = {}
     for sec in sorted(seconds):
@@ -353,7 +409,8 @@ def compute_stats(path, top_n=100, context=20):
             "exact": exact,
         },
         "histogram": {str(b): n for b, n in sorted(hist.items())},
-        "ops": ops,
+        "ops": ops_out,
+        "summaries": _scan_summaries(path),
         "seconds": buckets_to_list(seconds, 1),
         "minutes": buckets_to_list(minutes, 60),
         "errors": errors,

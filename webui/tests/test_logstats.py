@@ -149,3 +149,27 @@ def test_topn_is_bounded(tmp_path):
     assert len(st["slowest"]) == 10
     assert st["slowest"][0]["lat_ms"] >= st["slowest"][-1]["lat_ms"]
     assert st["slowest"][0]["lat_ms"] == 0.999
+
+
+def test_summaries_and_per_op_stats(tmp_path):
+    text = (
+        "META\t{\"mode\": \"pipeline_dual\", \"client_id\": 0}\n"
+        "RESULT\t2026-11-12 10:00:01.000000\tput\tk1\t1.000000\tOK\n"
+        "RESULT\t2026-11-12 10:00:02.000000\tput\tk2\t2.000000\tOK\n"
+        "RESULT\t2026-11-12 10:00:03.000000\tput\tk3\t3.000000\tOK\n"
+        "RESULT\t2026-11-12 10:00:04.000000\tget\tk4\t8.000000\tOK\n"
+        "RESULT\t2026-11-12 10:00:05.000000\tget\tk5\t9.000000\tOK\n"
+        "SUMMARY\t{\"mode\": \"benchmark\", \"total\": 5, \"ok\": 5, \"fail\": 0, "
+        "\"wall_s\": 5.0, \"qps\": 1.0, \"max_depth\": 7}\n"
+    )
+    st = ls.compute_stats(_write(tmp_path, text))
+    # summaries captured (META + SUMMARY)
+    kinds = [k for k, _ in st["summaries"]]
+    assert "meta" in kinds and "summary" in kinds
+    summary = [v for k, v in st["summaries"] if k == "summary"][0]
+    assert summary["wall_s"] == 5.0 and summary["max_depth"] == 7
+    # per-op latency stats
+    put = st["ops"]["put"]
+    assert put["ok"] == 3 and put["p50_ms"] == 2.0 and put["max_ms"] == 3.0
+    get = st["ops"]["get"]
+    assert get["ok"] == 2 and get["avg_ms"] == 8.5 and get["min_ms"] == 8.0
