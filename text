@@ -1,0 +1,283 @@
+results root: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall
+[parallel] starting rank=1 config(s), recall=1 config(s)
+[rank] [15:17:19] [benchmark] [k8s] controller info: HOME=/root | KUBECONFIG= | PATH=/usr/share/Modules/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin | kubectl=/usr/local/bin/kubectl | context=kubernetes-admin@kubernetes
+[recall] [15:17:19] [benchmark] [k8s] controller info: HOME=/root | KUBECONFIG= | PATH=/usr/share/Modules/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin | kubectl=/usr/local/bin/kubectl | context=kubernetes-admin@kubernetes
+[recall] [15:17:20] [benchmark] k8s dns: mooncake-master.mooncake-recall.svc.cluster.local -> 192.168.5.46 (kubectl svc mooncake-master)
+[rank] [15:17:20] [benchmark] k8s dns: mooncake-master.mooncake-rank.svc.cluster.local -> 192.168.117.182 (kubectl svc mooncake-master)
+[rank] [15:17:20] [benchmark] [benchmark] store capacity (probed): total=108.00 GiB, free=108.00 GiB
+[rank] [15:17:20] [benchmark] [benchmark] store capacity: configured=80.00 GiB, probed=108.00 GiB, effective=80.00 GiB (min(configured,probed))
+[recall] [15:17:20] [benchmark] [benchmark] store capacity (probed): total=1080.00 GiB, free=1080.00 GiB
+[recall] [15:17:20] [benchmark] [benchmark] store capacity: configured=240.00 GiB, probed=1080.00 GiB, effective=240.00 GiB (min(configured,probed))
+[recall] [15:17:20] [benchmark] k8s dns: mooncake-etcd.mooncake-recall.svc.cluster.local -> 10.103.31.187 (kubectl svc mooncake-etcd)
+[rank] [15:17:20] [benchmark] k8s dns: mooncake-etcd.mooncake-rank.svc.cluster.local -> 10.110.210.198 (kubectl svc mooncake-etcd)
+[recall] [15:17:20] [benchmark] mode=k8s dry_run=False cluster=configs_k8s\cluster.16node-recall.json global=configs_k8s\global.recall.json profile=configs_k8s\profile.json
+[rank] [15:17:20] [benchmark] mode=k8s dry_run=False cluster=configs_k8s\cluster.16node-rank.json global=configs_k8s\global.rank.json profile=configs_k8s\profile.json
+[recall] [15:17:20] [benchmark] [k8s] settings: namespace=mooncake-bench-recall template=configs_k8s\templates\benchmark-pod.yaml.tpl
+[rank] [15:17:20] [benchmark] [k8s] settings: namespace=mooncake-bench-rank template=configs_k8s\templates\benchmark-pod.yaml.tpl
+[recall] [15:17:20] [benchmark] [k8s] image: mooncake-runtime-w00921547:latest
+[rank] [15:17:20] [benchmark] [k8s] image: mooncake-runtime-w00921547:latest
+[recall] [15:17:20] [benchmark] [k8s] workspaces: controller=/home/w00921547/Mooncake-Performance pod=/tmp/Mooncake-Performance
+[rank] [15:17:20] [benchmark] [k8s] workspaces: controller=/home/w00921547/Mooncake-Performance pod=/tmp/Mooncake-Performance
+[rank] [15:17:20] [benchmark] results root: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank
+[recall] [15:17:20] [benchmark] results root: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\recall
+[rank] [15:17:20] [benchmark] full log: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\benchmark.log
+[recall] [15:17:20] [benchmark] full log: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\recall\benchmark.log
+[recall] [15:17:21] [benchmark] [k8s] workspace ready on [root@141.62.32.3](mailto:root@141.62.32.3): /home/w00921547/Mooncake-Performance (scripts,data,logs,pods,push-tmp,pull-tmp)
+[rank] [15:17:21] [benchmark] [k8s] workspace ready on [root@141.62.32.3](mailto:root@141.62.32.3): /home/w00921547/Mooncake-Performance (scripts,data,logs,pods,push-tmp,pull-tmp)
+[recall] [15:17:21] [benchmark] [k8s] pre-run script: k8s-deployment\scripts\k8s-prerun.sh -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[rank] [15:17:21] [benchmark] [k8s] pre-run script: k8s-deployment\scripts\k8s-prerun.sh -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[recall] [15:17:21] [benchmark] [k8s] prerun: bash /home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[rank] [15:17:21] [benchmark] [k8s] prerun: bash /home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[recall] [15:17:21] [benchmark] [k8s] pre-run done rc=0 elapsed=0.1s
+[rank] [15:17:21] [benchmark] [k8s] pre-run done rc=0 elapsed=0.1s
+[rank] [15:17:22] [benchmark] [k8s] namespace mooncake-bench-rank created
+[rank] [15:17:22] [benchmark] [k8s] pods:     kubectl -n mooncake-bench-rank get pods -o wide
+[recall] [15:17:22] [benchmark] [k8s] namespace mooncake-bench-recall created
+[recall] [15:17:22] [benchmark] [k8s] pods:     kubectl -n mooncake-bench-recall get pods -o wide
+[rank] [15:17:22] [benchmark] === scenario rank_smoke (op=, topo=remote_node, protocol=ub) primary_node=None ===
+[rank] [15:17:22] [benchmark] pipeline key space (store source=min(configured,probed), configured=80.00 GiB, probed=108.00 GiB, effective=80.00 GiB, ratio=0.9):
+[rank] [15:17:22] [benchmark]     8MB: 18 writers x 512 keys = 72.00 GiB (of 80.00 GiB effective, 0.9 headroom)
+[recall] [15:17:22] [benchmark] === scenario recall_smoke (op=, topo=remote_node, protocol=ub) primary_node=None ===
+[recall] [15:17:22] [benchmark] pipeline key space (store source=min(configured,probed), configured=240.00 GiB, probed=1080.00 GiB, effective=240.00 GiB, ratio=0.9):
+[recall] [15:17:22] [benchmark]     3.5MB: 54 writers x 1170 keys = 215.95 GiB (of 240.00 GiB effective, 0.9 headroom)
+[rank] [15:17:23] [benchmark] k8s dns: mooncake-etcd.mooncake-rank.svc.cluster.local -> 10.110.210.198 (kubectl svc mooncake-etcd)
+[recall] [15:17:23] [benchmark] k8s dns: mooncake-etcd.mooncake-recall.svc.cluster.local -> 10.103.31.187 (kubectl svc mooncake-etcd)
+[recall] [15:17:23] [benchmark] [k8s] staging 6 files (run=20261112-1517-rank-recall-recall-recall_smoke) -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/scripts/20261112-1517-rank-recall-recall-recall_smoke
+[rank] [15:17:23] [benchmark] [k8s] staging 6 files (run=20261112-1517-rank-recall-rank-rank_smoke) -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/scripts/20261112-1517-rank-recall-rank-rank_smoke
+[recall] [15:17:23] [benchmark] [k8s] configmap mc-bench-20261112-1517-rank-recall-recall-recall-smoke created (ns=mooncake-bench-recall, keys=bench_etcd.py,env.mooncake.sh,env.sh,mooncake_benchmark_client.py,run_benchmark_basic.sh,run_benchmark_pipeline.sh)
+[rank] [15:17:24] [benchmark] [k8s] configmap mc-bench-20261112-1517-rank-recall-rank-rank-smoke created (ns=mooncake-bench-rank, keys=bench_etcd.py,env.mooncake.sh,env.sh,mooncake_benchmark_client.py,run_benchmark_basic.sh,run_benchmark_pipeline.sh)
+[recall] [15:17:24] [benchmark] [k8s] deployment mc-20261112-1517-rank-recall-recall-recall-smoke-client create: ns=mooncake-bench-recall role=client replicas=54 image=mooncake-runtime-w00921547:latest
+[rank] [15:17:24] [benchmark] [k8s] deployment mc-20261112-1517-rank-recall-rank-rank-smoke-client create: ns=mooncake-bench-rank role=client replicas=18 image=mooncake-runtime-w00921547:latest
+[recall] [15:17:33] [benchmark] [k8s] deployment mc-20261112-1517-rank-recall-recall-recall-smoke-client ready (role=client, replicas=54, elapsed=8.6s)
+[rank] [15:17:33] [benchmark] [k8s] deployment mc-20261112-1517-rank-recall-rank-rank-smoke-client ready (role=client, replicas=18, elapsed=8.8s)
+[rank] [15:17:38] [benchmark] [k8s] pipeline pods ready: 18 dual clients (N=9, spread maxSkew=1, run=20261112-1517-rank-recall-rank-rank_smoke)
+[rank] [15:17:38] [benchmark] [parallel] rank Pods ready; waiting for recall Pods
+[recall] [15:17:47] [benchmark] [k8s] pipeline pods ready: 54 dual clients (N=9, spread maxSkew=1, run=20261112-1517-rank-recall-recall-recall_smoke)
+[recall] [15:17:47] [benchmark] [parallel] recall Pods ready; waiting for rank Pods
+[recall] [15:17:47] [benchmark] [parallel] rank and recall Pods ready; continuing benchmark
+[rank] [15:17:48] [benchmark] [parallel] rank and recall Pods ready; continuing benchmark
+[rank] [15:17:53] [benchmark] k8s pipeline pods: numa/cpu binding disabled (containers)
+[rank] [15:17:53] [benchmark] scenario rank_smoke (pipeline, rank): N=9, writers=18, readers=18, notify_count=10, total_qps=945.0, per_writer_qps=52.5, traffic=balanced, run_id=20261112-1517-rank-recall-rank-rank_smoke, client_timeout=335s, sizes=['8MB']
+[recall] [15:18:03] [benchmark] k8s pipeline pods: numa/cpu binding disabled (containers)
+[recall] [15:18:03] [benchmark] scenario recall_smoke (pipeline, recall): N=9, writers=54, readers=54, notify_count=1, total_qps=315.0, per_writer_qps=5.833333333333333, traffic=balanced, run_id=20261112-1517-rank-recall-recall-recall_smoke, client_timeout=335s, sizes=['3.5MB']
+[rank] [15:18:44] [benchmark] value.bin (8MB): 18/18 pods ready (generated 18, cached 0, 51.3s)
+[rank] [15:18:44] [benchmark] rank_smoke running...
+[rank] [INFO] SETUP_UB_DEVICE=bonding_dev_50
+[rank] [client-env] mode=remove-keys POD_IP=192.168.125.60 NODE_NAME=worker07 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.125.60 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.125.60 SETUP_UB_DEVICE=bonding_dev_50 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[rank] [15:18:51] [benchmark] rank_smoke done rc=0 elapsed=6.4s
+[rank] [15:18:52] [benchmark] [verify] 8MB start: store after remove allocated=0.00 GiB / total=108.00 GiB (0.0%), nonzero segments=0/0
+[rank] [15:18:58] [benchmark] launched 18 dual clients
+[rank] [15:19:00] [benchmark] pipeline rendezvous: 18/18 dual clients registered (1.5s)
+[rank] [15:19:01] [benchmark] pipeline trigger: /start sent to 18 dual clients (parallel x8)
+[rank] [15:19:01] [benchmark] pipeline dual: waiting 45s for writer phases, then /shutdown
+[rank] [15:20:01] [benchmark] clients exited: 18/18 (13.1s)
+[recall] [15:20:39] [benchmark] value.bin (3.5MB): 54/54 pods ready (generated 54, cached 0, 155.9s)
+[recall] [15:20:39] [benchmark] recall_smoke running...
+[recall] [INFO] SETUP_UB_DEVICE=bonding_dev_72
+[recall] [client-env] mode=remove-keys POD_IP=192.168.30.121 NODE_NAME=worker02 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.30.121 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.30.121 SETUP_UB_DEVICE=bonding_dev_72 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[rank] [15:20:40] [benchmark] logs: 54 files / 18 pods pulled
+[recall] [15:20:46] [benchmark] recall_smoke done rc=0 elapsed=6.3s
+[rank] [INFO] SETUP_UB_DEVICE=bonding_dev_50
+[rank] [client-env] mode=remove-keys POD_IP=192.168.125.60 NODE_NAME=worker07 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.125.60 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.125.60 SETUP_UB_DEVICE=bonding_dev_50 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[recall] [15:20:47] [benchmark] [verify] 3.5MB start: store after remove allocated=0.00 GiB / total=1080.00 GiB (0.0%), nonzero segments=0/0
+[rank] [15:20:52] [benchmark] [verify] config end: store after remove allocated=0.00 GiB / total=108.00 GiB (0.0%), nonzero segments=0/0
+[recall] [15:21:06] [benchmark] launched 54 dual clients
+[recall] [15:21:07] [benchmark] pipeline rendezvous: 54/54 dual clients registered (1.5s)
+[recall] [15:21:10] [benchmark] pipeline trigger: /start sent to 54 dual clients (parallel x8)
+[recall] [15:21:10] [benchmark] pipeline dual: waiting 45s for writer phases, then /shutdown
+[recall] [15:22:37] [benchmark] clients exited: 54/54 (37.2s)
+[recall] [15:23:33] [benchmark] logs: 162 files / 54 pods pulled
+[rank] [15:23:35] [benchmark] final running...
+[rank] [INFO] SETUP_UB_DEVICE=bonding_dev_50
+[rank] [client-env] mode=remove-keys POD_IP=192.168.125.60 NODE_NAME=worker07 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.125.60 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.125.60 SETUP_UB_DEVICE=bonding_dev_50 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[rank] [15:23:42] [benchmark] final done rc=0 elapsed=6.6s
+[rank] [15:23:45] [benchmark] [verify] sweep end: store after remove allocated=0.00 GiB / total=108.00 GiB (0.0%), nonzero segments=0/0
+[rank] [15:23:45] [benchmark] sweep-end remove-keys -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\final.remove-keys.log
+[rank] [15:23:45] [benchmark] [k8s] delete deployment mc-20261112-1517-rank-recall-rank-rank-smoke-client (ns=mooncake-bench-rank)
+[rank] [15:23:46] [benchmark] [k8s] delete pod mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f5m6nz (ns=mooncake-bench-rank)
+[recall] [INFO] SETUP_UB_DEVICE=bonding_dev_72
+[recall] [client-env] mode=remove-keys POD_IP=192.168.30.121 NODE_NAME=worker02 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.30.121 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.30.121 SETUP_UB_DEVICE=bonding_dev_72 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[rank] [15:23:54] [benchmark] [k8s] delete configmap mc-bench-20261112-1517-rank-recall-rank-rank-smoke (ns=mooncake-bench-rank)
+[rank] [15:23:55] [benchmark] detail -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\benchmark_detail.csv
+[rank] [15:23:55] [benchmark] SUMMARY: all 1 scenarios OK
+[recall] [15:23:55] [benchmark] [verify] config end: store after remove allocated=0.00 GiB / total=1080.00 GiB (0.0%), nonzero segments=0/0
+[rank] [15:24:06] [benchmark] [k8s] namespace mooncake-bench-rank deleted (elapsed=11.1s)
+[rank] [15:24:06] [benchmark] done. results in D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank
+[rank] [15:24:06] [benchmark] [benchmark] plotting locally on this machine (orchestrator): C:\Users\y00909761\AppData\Local\Programs\Python\Python310\python.exe D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\scripts\plot_latency.py --log D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs
+[rank] [final.remove-keys.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [final.remove-keys.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f5m6nz_c0_p9301.reader.log] RESULT status: OK:11913, OK-samples: 11913, queue_wait: 11913
+[rank]   outlier threshold: 34ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c0_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c0_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f5m6nz_c0_p9301.writer.log] RESULT status: ERR:-105:3  OK:1127, OK-samples: 1127
+[rank]   outlier threshold: 40ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c0_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f5m6nz_c0_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6kxv7_c1_p9301.reader.log] RESULT status: OK:11765, OK-samples: 11765, queue_wait: 11765
+[rank]   outlier threshold: 35ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c1_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c1_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6kxv7_c1_p9301.writer.log] RESULT status: ERR:-105:1  OK:1209, OK-samples: 1209
+[rank]   outlier threshold: 41ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c1_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6kxv7_c1_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6skwm_c2_p9301.reader.log] RESULT status: OK:11747, OK-samples: 11747, queue_wait: 11747
+[rank]   outlier threshold: 34ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c2_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c2_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6skwm_c2_p9301.writer.log] RESULT status: OK:1034, OK-samples: 1034
+[rank]   outlier threshold: 41ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c2_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6skwm_c2_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6vss5_c3_p9301.reader.log] RESULT status: OK:11734, OK-samples: 11734, queue_wait: 11734
+[rank]   outlier threshold: 25ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c3_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c3_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6vss5_c3_p9301.writer.log] RESULT status: ERR:-105:2  OK:1142, OK-samples: 1142
+[rank]   outlier threshold: 23ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c3_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f6vss5_c3_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f8zfzz_c4_p9301.reader.log] RESULT status: OK:11761, OK-samples: 11761, queue_wait: 11761
+[rank]   outlier threshold: 20ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c4_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c4_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f8zfzz_c4_p9301.writer.log] RESULT status: ERR:-105:2  OK:1202, OK-samples: 1202
+[rank]   outlier threshold: 18ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c4_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55f8zfzz_c4_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fcx9ss_c5_p9301.reader.log] RESULT status: OK:11895, OK-samples: 11895, queue_wait: 11895
+[rank]   outlier threshold: 27ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c5_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c5_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fcx9ss_c5_p9301.writer.log] RESULT status: OK:945, OK-samples: 945
+[rank]   outlier threshold: 30ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c5_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fcx9ss_c5_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fdb5n7_c6_p9301.reader.log] RESULT status: OK:11850, OK-samples: 11850, queue_wait: 11850
+[rank]   outlier threshold: 24ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c6_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c6_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fdb5n7_c6_p9301.writer.log] RESULT status: OK:1026, OK-samples: 1026
+[rank]   outlier threshold: 21ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c6_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fdb5n7_c6_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fh6gqx_c7_p9301.reader.log] RESULT status: OK:11680, OK-samples: 11680, queue_wait: 11680
+[rank]   outlier threshold: 26ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c7_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c7_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fh6gqx_c7_p9301.writer.log] RESULT status: ERR:-105:2  OK:1370, OK-samples: 1370
+[rank]   outlier threshold: 25ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c7_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fh6gqx_c7_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fhr5js_c8_p9301.reader.log] RESULT status: OK:11671, OK-samples: 11671, queue_wait: 11671
+[rank]   outlier threshold: 19ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c8_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c8_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fhr5js_c8_p9301.writer.log] RESULT status: ERR:-105:5  OK:1413, OK-samples: 1413
+[rank]   outlier threshold: 16ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c8_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fhr5js_c8_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fj6ldn_c9_p9301.reader.log] RESULT status: OK:11767, OK-samples: 11767, queue_wait: 11767
+[rank]   outlier threshold: 29ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c9_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c9_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fj6ldn_c9_p9301.writer.log] RESULT status: OK:1218, OK-samples: 1218
+[rank]   outlier threshold: 26ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c9_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fj6ldn_c9_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fmcg6w_c10_p9301.reader.log] RESULT status: OK:11790, OK-samples: 11790, queue_wait: 11790
+[rank]   outlier threshold: 24ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c10_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c10_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fmcg6w_c10_p9301.writer.log] RESULT status: ERR:-105:2  OK:1171, OK-samples: 1171
+[rank]   outlier threshold: 20ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c10_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fmcg6w_c10_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fn8sqh_c11_p9301.reader.log] RESULT status: OK:11852, OK-samples: 11852, queue_wait: 11852
+[rank]   outlier threshold: 24ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c11_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c11_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fn8sqh_c11_p9301.writer.log] RESULT status: ERR:-105:1  OK:1133, OK-samples: 1133
+[rank]   outlier threshold: 21ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c11_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fn8sqh_c11_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fp6qxc_c12_p9301.reader.log] RESULT status: OK:11924, OK-samples: 11924, queue_wait: 11924
+[rank]   outlier threshold: 22ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c12_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c12_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fp6qxc_c12_p9301.writer.log] RESULT status: ERR:-105:2  OK:1072, OK-samples: 1072
+[rank]   outlier threshold: 19ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c12_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fp6qxc_c12_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fqrbhv_c13_p9301.reader.log] RESULT status: OK:11718, OK-samples: 11718, queue_wait: 11718
+[rank]   outlier threshold: 29ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c13_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c13_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fqrbhv_c13_p9301.writer.log] RESULT status: ERR:-105:3  OK:1173, OK-samples: 1173
+[rank]   outlier threshold: 27ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c13_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fqrbhv_c13_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fqwlt2_c14_p9301.reader.log] RESULT status: OK:11695, OK-samples: 11695, queue_wait: 11695
+[rank]   outlier threshold: 29ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c14_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c14_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fqwlt2_c14_p9301.writer.log] RESULT status: ERR:-105:2  OK:1267, OK-samples: 1267
+[rank]   outlier threshold: 27ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c14_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fqwlt2_c14_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55ftxmgz_c15_p9301.reader.log] RESULT status: OK:11595, OK-samples: 11595, queue_wait: 11595
+[rank]   outlier threshold: 21ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c15_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c15_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55ftxmgz_c15_p9301.writer.log] RESULT status: ERR:-105:6  OK:1420, OK-samples: 1420
+[rank]   outlier threshold: 18ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c15_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55ftxmgz_c15_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fvdg4j_c16_p9301.reader.log] RESULT status: OK:11839, OK-samples: 11839, queue_wait: 11839
+[rank]   outlier threshold: 27ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c16_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c16_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fvdg4j_c16_p9301.writer.log] RESULT status: ERR:-105:1  OK:1175, OK-samples: 1175
+[rank]   outlier threshold: 24ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c16_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fvdg4j_c16_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fvfjmz_c17_p9301.reader.log] RESULT status: OK:11712, OK-samples: 11712, queue_wait: 11712
+[rank]   outlier threshold: 34ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c17_p9301.reader.latency.png
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c17_p9301.reader.queuewait.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fvfjmz_c17_p9301.writer.log] RESULT status: OK:1136, OK-samples: 1136
+[rank]   outlier threshold: 36ms (auto = p99 x 10)
+[rank]   -> D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1517-rank-recall\rank\logs\rank_smoke\rank_smoke.benchmark_c1_t1_8MB.dual_c17_p9301.writer.latency.png
+[rank] [rank_smoke.benchmark_c1_t1_8MB.dual_mc-20261112-1517-rank-recall-rank-rank-smoke-client-7bf55fvfjmz_c17_p9301.writer.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.generate-data.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.remove-keys-end.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.remove-keys-end.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.remove-keys.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] [rank_smoke.remove-keys.log.ylt.log] RESULT status: no RESULT, OK-samples: 0  [no timestamps -> request#i axis]
+[rank]   skip (no OK samples)
+[rank] done

@@ -3410,7 +3410,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         "BENCH_WARMUP_DURATION": str(cfg.get("warmup", {}).get("duration", 0)),
         # etcd rendezvous scope + barrier timeouts (client-side fallbacks)
         "BENCH_RUN_ID": run_id,
-        "BENCH_RENDEZVOUS_TIMEOUT": str(rendezvous_timeout_s),
+        # Client-side /start wait window = this value. In parallel rank+recall
+        # the client idles at the cross-child gate (up to
+        # _PARALLEL_READY_TIMEOUT_S) before /start arrives, so extend the
+        # client's window by the same ceiling; orchestrator-side barriers
+        # keep the configured rendezvous_timeout_s.
+        "BENCH_RENDEZVOUS_TIMEOUT": str(
+            rendezvous_timeout_s + (_PARALLEL_READY_TIMEOUT_S
+                                    if getattr(args, "parallel_ready_dir", None)
+                                    else 0)),
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     # k8s: ConfigMap (scripts + shared env.sh) must exist before pods mount it
