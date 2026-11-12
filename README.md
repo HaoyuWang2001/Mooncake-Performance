@@ -830,6 +830,28 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。
 - 依赖：无第三方库（ECharts 5.5.1 已 vendor 在 `webui/web/vendor/echarts.min.js`）。
 
+#### SDK 全链路（C++ trace）—— 报表内的第二层统计
+
+在 Python 侧打点（RESULT）之外，报表还解析 **Mooncake SDK 自己打到 glog 的
+`breakdown[<op>]` trace 行**（`scripts/tracestats.py`，map 阶段就地统计）：
+`trace_id[...] breakdown[get_buffer|put|upsert|...] name[value] ...`（括号感知解析，
+`start_time` 含空格、`-1` 为拿不到时间戳的哨兵）。它给出每个样本请求的**端到端时延
+与各阶段时延的树状分解**，远细于 Python 侧的单点时延：
+
+- **读**（get_buffer）：`total ≈ query_total(route+rpc) + select + buf_alloc + memread_total(submit+queue+urma+teardown)`
+- **写**（put/upsert 家族）：`total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare + query/put_start + memwrite_total(submit+queue+urma+teardown) + put_end/finalize + cache_invalidate + revoke`
+- 报表展示：方向页签（读/写/其它）+ op 选择、样本/分位卡、**阶段 p50 堆叠构成**、
+  独立 1s/1min 时间线（样本数柱 + 端到端 p50/p99）、**树形阶段分位表（含残差
+  total−阶段和）**、Top-50 慢请求（含前三耗时阶段）、状态分布；未知的 `*_us` 字段
+  自动归入「其它阶段」。
+- **采样门控**：主行仅在采样命中（`MC_HIFREQ_LOG_SAMPLE_RATE`）或失败时出现，
+  **样本数 ≠ 请求总数**，报表显示实际采样率（仓库当前配置为 `1`，长跑需降采样）。
+- **多副本限制**：put/upsert 的 `memwrite_*` 与 slice 明细仅代表最后一个副本的传输，
+  `memwrite_total_us` 为全部副本合计（SDK 侧限制，报表脚注说明）。
+- **slice 明细行**（`breakdown[<op>.slice]`）P1 仅计数，逐 slice 分析后续补充。
+- 原始 `.glog` 默认留远端（hostPath），报表「现场索引」列出其路径/体积与登录命令；
+  `--rebuild-report` 也能从本地 `.glog` 重算 trace 统计。
+
 ### 10.1.1 plot_latency.py（旧 PNG 图，`--png` 兼容模式）
 
 根据客户端日志中的 RESULT 行绘制**点线图**：横轴 = 第 i 个请求，纵轴 = 时延(ms)；
