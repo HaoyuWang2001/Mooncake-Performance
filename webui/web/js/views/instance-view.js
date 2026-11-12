@@ -291,6 +291,8 @@ const InstanceView = {
           <el-button size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      @click="gotoResults">跳转至结果详情</el-button>
+          <el-button size="small" plain :disabled="!latestRun"
+                     @click="openReport">查看报表</el-button>
         </div>
       </el-card>
 
@@ -461,6 +463,32 @@ const InstanceView = {
       store.resultsTarget = _instResultsTarget(r.ts_dir);
       store.view = "results";
     }
+    /* 报表与 WebUI 解耦：定位该 run 的 report.html 并在新标签页打开 */
+    async function openReport() {
+      const r = latestRun.value;
+      if (!r || !r.ts_dir) return;
+      const rel = String(r.ts_dir).replace(/^outputs[\\/]/, "");
+      const parts = rel.split("/");
+      const root = parts[0];
+      const sub = parts.slice(1).join("/");
+      let files = [];
+      try {
+        files = (await api("GET", "/api/outputs/" +
+          encodeURIComponent(root) + "/tree")).files || [];
+      } catch (e) { files = []; }
+      const pref = sub ? sub + "/" : "";
+      const pick =
+        files.find(f => f === pref + "report/overview.html") ||
+        files.find(f => f.startsWith(pref) && /(^|\/)report\/report\.html$/.test(f)) ||
+        files.find(f => /(^|\/)report\/overview\.html$/.test(f)) ||
+        files.find(f => /(^|\/)report\/report\.html$/.test(f));
+      if (!pick) {
+        ElementPlus.ElMessage.warning("该 run 还没有报表（未生成或已清理）");
+        return;
+      }
+      window.open("/api/file?path=" + encodeURIComponent(
+        "outputs/" + root + "/" + pick) + "&mode=raw", "_blank");
+    }
 
     const latestRun = Vue.computed(() => {
       const d = detail.value;
@@ -485,6 +513,7 @@ const InstanceView = {
     return { tabs, active, detail, busyRun, busyStop, merged, ticket,
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, activate, closeTab,
-             statusType, statusText, run, stop, remove, rename, gotoResults };
+             statusType, statusText, run, stop, remove, rename,
+             gotoResults, openReport };
   },
 };

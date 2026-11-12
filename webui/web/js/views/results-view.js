@@ -7,6 +7,7 @@ function _fileGroup(rel) {
   if (/spdiag_tree\.[^.]+\.txt$/.test(base)) return "spdiag树";
   if (rel.includes("/profiling/") || rel.startsWith("profiling/")) return "profiling";
   if (base.endsWith(".csv")) return "csv";
+  if (base.endsWith(".html")) return "报表";
   if (base.endsWith(".png") || base.endsWith(".jpg") || base.endsWith(".gif")) return "图片";
   if (base.endsWith(".log") || base.endsWith(".glog") || base.endsWith(".txt")) return "日志";
   if (base.endsWith(".json")) return "json";
@@ -21,6 +22,7 @@ function _kindOf(pane) {
   const g = _fileGroup(pane.file);
   if (g === "图片") return "img";
   if (g === "csv") return "csv";
+  if (g === "报表") return "html";
   if (g === "json") return "json";
   return "txt";
 }
@@ -31,7 +33,7 @@ function _groupedFiles(pane) {
     const g = _fileGroup(f);
     (groups[g] = groups[g] || []).push(f);
   }
-  const order = ["csv", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
+  const order = ["csv", "报表", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
   return order.filter(g => groups[g]).map(g => ({ label: g, opts: groups[g] }));
 }
 
@@ -160,6 +162,11 @@ function _csvIsNumeric(rows, key) {
   return seen;
 }
 
+function rawUrlOf(pane) {
+  return "/api/file?path=" +
+    encodeURIComponent("outputs/" + pane.ts + "/" + pane.file) + "&mode=raw";
+}
+
 /* CSV 列宽按表头显示宽度估算（CJK≈2 个显示单位），保证表头单行显示；
    Element Plus 默认 min-width=90 会把 queue_wait_avg_ms 等长表头挤成两行。 */
 function _csvColWidth(h) {
@@ -259,6 +266,18 @@ const ResPane = {
                          :align="csvIsNumeric(pane.rows, 'c' + i) ? 'right' : 'left'"
                          :class-name="csvIsNumeric(pane.rows, 'c' + i) ? 'mc-num' : ''"></el-table-column>
       </el-table>
+      <div v-else-if="kindOf(pane) === 'html'" class="report-pane">
+        <div class="report-pane-icon">📊</div>
+        <div class="report-pane-title">{{ pane.file }}</div>
+        <div class="report-pane-desc">
+          HTML 报表与 WebUI 解耦，可独立打开；点击按钮在新标签页查看
+          （图表可缩放/悬停查看每个桶的统计量）。
+        </div>
+        <el-button type="primary" @click="openReport(pane)">在新标签页打开报表</el-button>
+        <div class="mc-muted" style="margin-top: 8px">
+          也可直接分享该文件：report.html 单文件可用；同目录 data.js 提供全量深查数据。
+        </div>
+      </div>
       <pre v-else-if="kindOf(pane) === 'json'" class="json" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
       <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
                    :text="pane.text"></spdiag-tree>
@@ -323,8 +342,8 @@ const ResPane = {
              csvColWidth: _csvColWidth, csvIsNumeric: _csvIsNumeric,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              loadMore: _loadMore, fmtBytes: _fmtBytes,
-             rawUrl: p => "/api/file?path=" +
-               encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
+             openReport: p => window.open(rawUrlOf(p), "_blank"),
+             rawUrl: rawUrlOf };
   },
 };
 

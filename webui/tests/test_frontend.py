@@ -107,6 +107,21 @@ def test_missing_file_falls_back_to_detail_csv():
     assert "已自动展示 benchmark_detail.csv" in src
 
 
+def test_reports_in_results_and_instance_detail():
+    """HTML 报表：结果页「报表」分组 + 新标签打开；实例详情「查看报表」。"""
+    results = open(os.path.join(JS_DIR, "views", "results-view.js"),
+                   encoding="utf-8").read()
+    inst = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+                encoding="utf-8").read()
+    assert 'base.endsWith(".html")' in results
+    assert '"报表"' in results
+    assert "openReport" in results and '"_blank"' in results
+    assert "在新标签页打开报表" in results
+    assert "查看报表" in inst
+    assert "report/overview.html" in inst
+    assert "report\\/report\\.html" in inst   # regex form in openReport
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()
