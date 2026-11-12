@@ -227,10 +227,16 @@ store 节点列表），实际通信仍经 master 发现 store。
 - **warmup 语义**：正式测量前以相同部署形态运行 warmup.duration 秒（notify 带 warmup=1 标记，writer
   不输出 RESULT、reader 照常读取但不记录，SUMMARY 计入 warmup_total）；
 - **异步通知**：`writer.notify_async=true` 时，写入后提交 HTTP notify 即继续按目标 QPS 写入；
-  `notify_threads` 控制 HTTP 发送线程数，`notify_max_inflight`（默认 256）限制每个 writer 已排队及正在
-  执行的 HTTP 请求总数，满额时才阻塞写入。rank 配置已开启，其他配置默认 false（每批等待通知结束）。
+  `notify_queue_size` 控制每个 writer 的发送队列容量（按目标 HTTP 请求计，不含正在发送的请求），
+  `notify_threads` 控制固定发送线程数。rank 配置使用 8192 条队列，队列满时才阻塞写入，不丢弃通知。
+  未设置 `notify_queue_size` 时回退到旧字段 `notify_max_inflight`（默认 256），旧字段现作为队列容量别名。
+  rank 已开启异步，其他配置默认 false（每批等待通知结束）。`notify_inflight_peak` 现在只统计正在发送的请求。
+  HTTP 请求使用按目标地址分组的长连接池，每个连接同时只处理一个请求，每个目标最多保留两条空闲连接；
+  接收端支持 HTTP/1.1、Content-Length，发送端完整读取响应后复用连接，连接异常后丢弃、不自动重试。
   warmup 的通知在测量前排空，正式通知在测量结束后排空再退出；排空时间不计入配置的测量时长。
   writer SUMMARY 和 CSV 记录 notify 提交/成功/失败、在途峰值、背压及排空耗时、平均/最大 HTTP 时延。
+  另记录 `notify_queue_peak`、`notify_queue_wait_avg_ms/max_ms`（入发送队列到开始发送的等待时间），
+  以及 `notify_connections_created/reused`（包含 warmup 的连接创建/复用次数）。TOTAL 行队列/在途峰值取各实例最大值。
   异步发送不会消除接收端瓶颈；队列满时仍会背压，HTTP 超时仍计为失败且不自动重试。
 - **operation 角色化**：`writer.operation`（写接口）与 `reader.operation`（读接口）**真实驱动调用**
   ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`、`upsert_from`（逐 key 调用），reader 支持

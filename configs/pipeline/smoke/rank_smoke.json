@@ -12,7 +12,7 @@
     "operation": "upsert_from",
     "notify_threads": 10,
     "notify_async": true,
-    "notify_max_inflight": 256
+    "notify_queue_size": 8192
   },
   "reader": {
     "operation": "get_buffer",

@@ -5,7 +5,8 @@ import os
 import sys
 import threading
 import time
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 import pytest
 
@@ -32,9 +33,8 @@ def _run(monkeypatch, args, open_notify, write=None):
     monkeypatch.setattr(client, "load_value", lambda *a: b"value")
     monkeypatch.setattr(client, "emit", lambda tag, data: emitted.append((tag, data)))
     monkeypatch.setattr(client, "_run_iface", write or (lambda *a: (0.1, "OK")))
-    class Opener:
-        open = staticmethod(open_notify)
-    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: Opener())
+    monkeypatch.setattr(client._NotifyHTTPPool, "send",
+                        lambda self, reader, path: open_notify(path, timeout=0.5))
     client._writer_run_phases(args, object(), [{"host": "reader", "port": 9301}])
     return next(data for tag, data in emitted if tag == "SUMMARY")
 
@@ -67,10 +67,12 @@ def test_bounded_queue_and_failures_drained(monkeypatch):
     summary = _run(monkeypatch, _args(notify_max_inflight=2, target_qps=10000),
                    open_notify)
     assert summary["notify_inflight_peak"] == 2
+    assert summary["notify_queue_peak"] <= 2
     assert summary["notify_backpressure_ms"] > 0
     assert summary["notify_drain_ms"] > 0
     assert summary["notify_submitted"] == summary["notify_fail"] > 0
     assert summary["notify_ok"] == 0
+    assert summary["notify_queue_wait_avg_ms"] > 0
 
 
 def test_warmup_drains_before_measurement(monkeypatch):
@@ -108,6 +110,9 @@ def test_notify_plan_validation():
         bm.pipeline_plan({"writer": {"notify_max_inflight": 0}})
     with pytest.raises(RuntimeError, match="JSON boolean"):
         bm.pipeline_plan({"writer": {"notify_async": "false"}})
+    with pytest.raises(RuntimeError, match="notify_queue_size"):
+        bm.pipeline_plan({"writer": {"notify_queue_size": 0}})
+    assert bm.pipeline_plan({"writer": {"notify_queue_size": 8192}})["notify_queue_size"] == 8192
 
 
 def test_notify_summary_aggregation(tmp_path):
@@ -118,7 +123,9 @@ def test_notify_summary_aggregation(tmp_path):
             mode="pipeline_writer_summary", notify_submitted=count,
             notify_ok=count - 1, notify_fail=1, notify_avg_ms=10 + 10 * i,
             notify_inflight_peak=count, notify_max_ms=30 + i,
-            notify_backpressure_ms=5, notify_drain_ms=7)) + "\n", encoding="utf-8")
+            notify_backpressure_ms=5, notify_drain_ms=7, notify_queue_peak=count,
+            notify_queue_wait_avg_ms=20 + 10 * i, notify_connections_created=2,
+            notify_connections_reused=count)) + "\n", encoding="utf-8")
         paths.append(path)
     agg = bm.parse_benchmark_log(paths, op_filter="pipeline_write")
     assert agg["notify_submitted"] == 8
@@ -126,6 +133,10 @@ def test_notify_summary_aggregation(tmp_path):
     assert agg["notify_avg_ms"] == 17.5
     assert agg["notify_inflight_peak"] == 6
     assert agg["notify_backpressure_ms"] == 10
+    assert agg["notify_queue_peak"] == 6
+    assert agg["notify_queue_wait_avg_ms"] == 27.5
+    assert agg["notify_connections_created"] == 4
+    assert agg["notify_connections_reused"] == 8
     assert bm.parse_benchmark_log(paths, op_filter="pipeline_read")["notify_submitted"] == 0
 
 
@@ -138,9 +149,14 @@ def test_notify_env_resolution(monkeypatch):
     args = Args()
     client._resolve_env(args)
     assert args.notify_async is True and args.notify_max_inflight == 19
+    assert args.notify_queue_size == 19
     args = Args(notify_async="false", notify_max_inflight=7)
     client._resolve_env(args)
     assert args.notify_async is False and args.notify_max_inflight == 7
+    monkeypatch.setenv("BENCH_NOTIFY_QUEUE_SIZE", "8192")
+    args = Args()
+    client._resolve_env(args)
+    assert args.notify_queue_size == 8192
     with pytest.raises(ValueError, match="notify_max_inflight"):
         client._resolve_env(Args(notify_max_inflight=0))
 
@@ -149,7 +165,9 @@ def test_async_client_lifetime_includes_both_drains():
     cfg = dict(duration=30, warmup={"duration": 5},
                writer={"notify_async": True, "notify_threads": 10,
                        "notify_max_inflight": 256})
-    assert bm._pipeline_client_timeout(cfg, 120) == 361
+    assert bm._pipeline_client_timeout(cfg, 120) == 362
+    cfg["writer"]["notify_queue_size"] = 8192
+    assert bm._pipeline_client_timeout(cfg, 120) == 1156
 
 
 def test_notify_metrics_exported_to_csv(tmp_path):
@@ -168,3 +186,80 @@ def test_notify_metrics_exported_to_csv(tmp_path):
     assert writer["notify_submitted"] == 3
     assert writer["notify_ok"] == 2 and writer["notify_fail"] == 1
     assert writer["notify_drain_ms"] == 9
+
+
+@pytest.fixture
+def notify_server(monkeypatch):
+    handler = client._PipelineNotifyHandler
+    queue = Queue(maxsize=8192)
+    for key, value in dict(queue=queue, deadline=time.time() + 60,
+                           qlock=threading.Lock(), qdepth=0, qmax=0,
+                           start_event=threading.Event()).items():
+        monkeypatch.setattr(handler, key, value)
+    server = client._PipelineNotifyServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield {"host": "127.0.0.1", "port": server.server_address[1]}, queue
+    server.shutdown()
+    server.server_close()
+    thread.join()
+
+
+def test_http_keepalive_reuses_connection_and_frames_all_replies(notify_server):
+    reader, queue = notify_server
+    pool = client._NotifyHTTPPool()
+    try:
+        for i in range(20):
+            pool.send(reader, "/notify?key=k{}&writer_id=0".format(i))
+        for path in ("/health", "/start", "/unknown", "/shutdown"):
+            pool.send(reader, path)
+        assert queue.qsize() == 20
+        assert pool.created == 1 and pool.reused == 23
+    finally:
+        pool.close()
+
+
+def test_http_pool_concurrent_exclusive_checkout(notify_server):
+    reader, queue = notify_server
+    pool = client._NotifyHTTPPool()
+    try:
+        with ThreadPoolExecutor(max_workers=10) as workers:
+            futures = [workers.submit(pool.send, reader,
+                       "/notify?key=k{}&writer_id=0".format(i)) for i in range(200)]
+            for future in futures:
+                future.result()
+        assert queue.qsize() == 200
+        assert pool.reused > 0
+        assert len(pool.idle[(reader["host"], reader["port"])]) <= 2
+    finally:
+        pool.close()
+
+
+def test_failed_connection_discarded_without_retry(notify_server, monkeypatch):
+    reader, queue = notify_server
+    reply = client._PipelineNotifyHandler._reply
+    def disconnect_first(self, body):
+        if "key=first" in self.path:
+            self.close_connection = True  # received and enqueued, but no reply
+            return
+        reply(self, body)
+    monkeypatch.setattr(client._PipelineNotifyHandler, "_reply", disconnect_first)
+    pool = client._NotifyHTTPPool()
+    try:
+        with pytest.raises(Exception):
+            pool.send(reader, "/notify?key=first&writer_id=0")
+        pool.send(reader, "/notify?key=second&writer_id=0")
+        assert queue.qsize() == 2  # no duplicate from an automatic retry
+        assert pool.created == 2
+    finally:
+        pool.close()
+
+
+def test_large_send_queue_keeps_writer_progressing(monkeypatch):
+    def slow_notify(*a, **kw):
+        time.sleep(0.02)
+    summary = _run(monkeypatch, _args(notify_queue_size=8192, target_qps=1000), slow_notify)
+    assert summary["notify_submitted"] > 10
+    assert summary["notify_queue_peak"] > 0
+    assert summary["notify_backpressure_ms"] == 0
+    assert summary["notify_submitted"] == summary["notify_ok"]

@@ -168,6 +168,8 @@ PIPELINE_CSV_HEADER = [
     "notify_async", "notify_max_inflight", "notify_submitted", "notify_ok",
     "notify_fail", "notify_inflight_peak", "notify_backpressure_ms",
     "notify_drain_ms", "notify_avg_ms", "notify_max_ms",
+    "notify_queue_size", "notify_queue_peak", "notify_queue_wait_avg_ms",
+    "notify_queue_wait_max_ms", "notify_connections_created", "notify_connections_reused",
 ]
 
 
@@ -740,6 +742,9 @@ def pipeline_plan(cfg, node_count=1):
     notify_max_inflight = int(writer_cfg.get("notify_max_inflight", 256))
     if notify_max_inflight < 1:
         raise RuntimeError("writer.notify_max_inflight must be >= 1")
+    notify_queue_size = int(writer_cfg.get("notify_queue_size", notify_max_inflight))
+    if notify_queue_size < 1:
+        raise RuntimeError("writer.notify_queue_size must be >= 1")
     if client_cfg:
         # ---- dual-role deployment (rank/recall minimal shape): one process
         # per entry hosting BOTH writer and reader behind one HTTP port.
@@ -765,6 +770,7 @@ def pipeline_plan(cfg, node_count=1):
             "notify_threads": int(writer_cfg.get("notify_threads", 1)),
             "notify_async": notify_async,
             "notify_max_inflight": notify_max_inflight,
+            "notify_queue_size": notify_queue_size,
             "reader_threads": int(reader_cfg.get("num_threads", 1)),
             "writer_port_base": c_base,
             "reader_port_base": c_base,
@@ -790,6 +796,7 @@ def pipeline_plan(cfg, node_count=1):
         "notify_threads": int(writer_cfg.get("notify_threads", 1)),
         "notify_async": notify_async,
         "notify_max_inflight": notify_max_inflight,
+        "notify_queue_size": notify_queue_size,
         "reader_threads": int(reader_cfg.get("num_threads", 1)),
         "writer_port_base": w_base,
         "reader_port_base": r_base,
@@ -3240,9 +3247,10 @@ def _pipeline_client_timeout(cfg, rendezvous_timeout_s, warmup_enabled=True):
     if writer_cfg.get("notify_async", False):
         # Each HTTP call has a 0.5s socket timeout; reserve queue-drain
         # budgets after both warmup and measurement, plus existing grace.
-        inflight = int(writer_cfg.get("notify_max_inflight", 256))
+        queued = int(writer_cfg.get("notify_queue_size",
+                                    writer_cfg.get("notify_max_inflight", 256)))
         threads = max(1, int(writer_cfg.get("notify_threads", 1) or 1))
-        shutdown_grace_s += 2 * 0.5 * math.ceil(inflight / threads)
+        shutdown_grace_s += 2 * 0.5 * (math.ceil(queued / threads) + 1)
     return max(1, int(math.ceil(
         2.0 * rendezvous_s + warmup_s + duration_s + shutdown_grace_s)))
 
@@ -3401,6 +3409,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         "BENCH_NOTIFY_THREADS": str(plan["notify_threads"]),
         "BENCH_NOTIFY_ASYNC": "true" if plan["notify_async"] else "false",
         "BENCH_NOTIFY_MAX_INFLIGHT": str(plan["notify_max_inflight"]),
+        "BENCH_NOTIFY_QUEUE_SIZE": str(plan["notify_queue_size"]),
         "BENCH_NOTIFY_PIPELINE": ",".join(cfg.get("notify_pipeline", [])),
         "BENCH_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
         "BENCH_DURATION": str(cfg.get("duration", 30)),
@@ -3886,7 +3895,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         exited = wait_process_exit(
                             cluster, w["node"], pid,
                             "writer w{}".format(w["gid"]),
-                            int(warmup_duration + duration) + 300, dry_run=dry,
+                            client_timeout_s, dry_run=dry,
                             expected_s=warmup_duration + duration,
                             marker=_PIPELINE_PID_MARKER)
                         if exited:
@@ -4203,8 +4212,11 @@ def parse_benchmark_log(paths, op_filter=None):
     max_depth = 0
     notify = {k: 0 for k in (
         "notify_submitted", "notify_ok", "notify_fail", "notify_inflight_peak",
-        "notify_backpressure_ms", "notify_drain_ms", "notify_max_ms")}
+        "notify_backpressure_ms", "notify_drain_ms", "notify_max_ms",
+        "notify_queue_peak", "notify_queue_wait_max_ms",
+        "notify_connections_created", "notify_connections_reused")}
     notify_elapsed_sum = 0.0
+    notify_queue_wait_sum = 0.0
     for path in paths:
         for line in open(path, "r", encoding="utf-8", errors="replace"):
             line = line.rstrip("\n")
@@ -4261,11 +4273,14 @@ def parse_benchmark_log(paths, op_filter=None):
                 if (s.get("mode") == "pipeline_writer_summary" and
                         op_filter in (None, "pipeline_write")):
                     for k in notify:
-                        if k in ("notify_inflight_peak", "notify_max_ms"):
+                        if k in ("notify_inflight_peak", "notify_max_ms",
+                                 "notify_queue_peak", "notify_queue_wait_max_ms"):
                             notify[k] = max(notify[k], s.get(k, 0))
                         else:
                             notify[k] += s.get(k, 0)
                     notify_elapsed_sum += s.get("notify_avg_ms", 0) * (
+                        s.get("notify_ok", 0) + s.get("notify_fail", 0))
+                    notify_queue_wait_sum += s.get("notify_queue_wait_avg_ms", 0) * (
                         s.get("notify_ok", 0) + s.get("notify_fail", 0))
     latencies.sort()
     if starts and len(walls) == len(starts):
@@ -4277,6 +4292,7 @@ def parse_benchmark_log(paths, op_filter=None):
     total = ok + fail
     completed = notify["notify_ok"] + notify["notify_fail"]
     notify["notify_avg_ms"] = notify_elapsed_sum / completed if completed else 0.0
+    notify["notify_queue_wait_avg_ms"] = notify_queue_wait_sum / completed if completed else 0.0
     return dict(notify, **{
         "total": total,
         "total_bytes": total_bytes,
@@ -4362,6 +4378,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
                 "notify_async": plan["notify_async"] if role == "writer" else "",
                 "notify_max_inflight": plan["notify_max_inflight"] if role == "writer" else "",
+                "notify_queue_size": plan["notify_queue_size"] if role == "writer" else "",
                 "data_size": ds,
                 "batch_size": cfg.get("batch_size", ""),
                 # effective per-writer cap: auto-computed value when
@@ -4409,7 +4426,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             if row["role"] == "writer":
                 for k in ("notify_submitted", "notify_ok", "notify_fail",
                           "notify_inflight_peak", "notify_backpressure_ms",
-                          "notify_drain_ms", "notify_avg_ms", "notify_max_ms"):
+                          "notify_drain_ms", "notify_avg_ms", "notify_max_ms",
+                          "notify_queue_peak", "notify_queue_wait_avg_ms",
+                          "notify_queue_wait_max_ms", "notify_connections_created",
+                          "notify_connections_reused"):
                     row[k] = agg[k]
             # bytes/throughput count successful operations only
             row["total_bytes"] = int(ok * bytes_per_op)

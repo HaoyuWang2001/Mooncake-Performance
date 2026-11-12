@@ -6,7 +6,7 @@
     "count_per_node": 1,
     "operation": "put_batch",
     "notify_async": true,
-    "notify_max_inflight": 256
+    "notify_queue_size": 8192
   },
   "reader": {
     "operation": "get",
