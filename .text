@@ -1,0 +1,152 @@
+results root: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1950-rank-recall
+[parallel] starting rank=1 config(s), recall=1 config(s)
+[recall] [19:50:16] [benchmark] [k8s] controller info: HOME=/root | KUBECONFIG= | PATH=/usr/share/Modules/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin | kubectl=/usr/local/bin/kubectl | context=kubernetes-admin@kubernetes
+[rank] [19:50:16] [benchmark] [k8s] controller info: HOME=/root | KUBECONFIG= | PATH=/usr/share/Modules/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin | kubectl=/usr/local/bin/kubectl | context=kubernetes-admin@kubernetes
+[recall] [19:50:17] [benchmark] k8s dns: mooncake-master.mooncake-recall.svc.cluster.local -> 192.168.196.111 (kubectl svc mooncake-master)
+[rank] [19:50:17] [benchmark] k8s dns: mooncake-master.mooncake-rank.svc.cluster.local -> 192.168.99.161 (kubectl svc mooncake-master)
+[recall] [19:50:17] [benchmark] [benchmark] store capacity (probed): total=1080.00 GiB, free=1080.00 GiB
+[rank] [19:50:17] [benchmark] [benchmark] store capacity (probed): total=108.00 GiB, free=108.00 GiB
+[recall] [19:50:17] [benchmark] [benchmark] store capacity: configured=240.00 GiB, probed=1080.00 GiB, effective=240.00 GiB (min(configured,probed))
+[rank] [19:50:17] [benchmark] [benchmark] store capacity: configured=50.00 GiB, probed=108.00 GiB, effective=50.00 GiB (min(configured,probed))
+[rank] [19:50:17] [benchmark] k8s dns: mooncake-etcd.mooncake-rank.svc.cluster.local -> 10.104.38.252 (kubectl svc mooncake-etcd)
+[recall] [19:50:17] [benchmark] k8s dns: mooncake-etcd.mooncake-recall.svc.cluster.local -> 10.100.165.22 (kubectl svc mooncake-etcd)
+[rank] [19:50:17] [benchmark] mode=k8s dry_run=False cluster=configs_k8s\cluster.16node-rank.json global=configs_k8s\global.rank.json profile=configs_k8s\profile.json
+[recall] [19:50:17] [benchmark] mode=k8s dry_run=False cluster=configs_k8s\cluster.16node-recall.json global=configs_k8s\global.recall.json profile=configs_k8s\profile.json
+[rank] [19:50:17] [benchmark] [k8s] settings: namespace=mooncake-bench-rank template=configs_k8s\templates\benchmark-pod.yaml.tpl
+[recall] [19:50:17] [benchmark] [k8s] settings: namespace=mooncake-bench-recall template=configs_k8s\templates\benchmark-pod.yaml.tpl
+[rank] [19:50:17] [benchmark] [k8s] image: mooncake-runtime-w00921547:latest
+[recall] [19:50:17] [benchmark] [k8s] image: mooncake-runtime-w00921547:latest
+[rank] [19:50:17] [benchmark] [k8s] workspaces: controller=/home/w00921547/Mooncake-Performance pod=/tmp/Mooncake-Performance
+[recall] [19:50:17] [benchmark] [k8s] workspaces: controller=/home/w00921547/Mooncake-Performance pod=/tmp/Mooncake-Performance
+[rank] [19:50:17] [benchmark] results root: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1950-rank-recall\rank
+[recall] [19:50:17] [benchmark] results root: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1950-rank-recall\recall
+[rank] [19:50:17] [benchmark] full log: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1950-rank-recall\rank\benchmark.log
+[recall] [19:50:17] [benchmark] full log: D:\Benchmark\CodeHub\Mooncake-Performance-main\Mooncake-Performance\outputs\20261112-1950-rank-recall\recall\benchmark.log
+[rank] [19:50:18] [benchmark] [k8s] workspace ready on [root@141.62.32.3](mailto:root@141.62.32.3): /home/w00921547/Mooncake-Performance (scripts,data,logs,pods,push-tmp,pull-tmp)
+[recall] [19:50:18] [benchmark] [k8s] workspace ready on [root@141.62.32.3](mailto:root@141.62.32.3): /home/w00921547/Mooncake-Performance (scripts,data,logs,pods,push-tmp,pull-tmp)
+[recall] [19:50:18] [benchmark] [k8s] pre-run script: k8s-deployment\scripts\k8s-prerun.sh -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[rank] [19:50:18] [benchmark] [k8s] pre-run script: k8s-deployment\scripts\k8s-prerun.sh -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[rank] [19:50:18] [benchmark] [k8s] prerun: bash /home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[recall] [19:50:18] [benchmark] [k8s] prerun: bash /home/w00921547/Mooncake-Performance/k8s-prerun.sh
+[rank] [19:50:18] [benchmark] [k8s] pre-run done rc=0 elapsed=0.1s
+[recall] [19:50:18] [benchmark] [k8s] pre-run done rc=0 elapsed=0.1s
+[recall] [19:50:19] [benchmark] [k8s] namespace mooncake-bench-recall created
+[rank] [19:50:19] [benchmark] [k8s] namespace mooncake-bench-rank created
+[recall] [19:50:19] [benchmark] [k8s] pods:     kubectl -n mooncake-bench-recall get pods -o wide
+[rank] [19:50:19] [benchmark] [k8s] pods:     kubectl -n mooncake-bench-rank get pods -o wide
+[rank] [19:50:19] [benchmark] === scenario rank_smoke (op=, topo=remote_node, protocol=ub) primary_node=None ===
+[recall] [19:50:19] [benchmark] === scenario recall_smoke (op=, topo=remote_node, protocol=ub) primary_node=None ===
+[rank] [19:50:19] [benchmark] pipeline key space (store source=min(configured,probed), configured=50.00 GiB, probed=108.00 GiB, effective=50.00 GiB, ratio=0.9):
+[recall] [19:50:19] [benchmark] pipeline key space (store source=min(configured,probed), configured=240.00 GiB, probed=1080.00 GiB, effective=240.00 GiB, ratio=0.9):
+[rank] [19:50:19] [benchmark]     8MB: 18 writers x 320 keys = 45.00 GiB (of 50.00 GiB effective, 0.9 headroom)
+[recall] [19:50:19] [benchmark]     3.5MB: 54 writers x 1170 keys = 215.95 GiB (of 240.00 GiB effective, 0.9 headroom)
+[rank] [19:50:20] [benchmark] k8s dns: mooncake-etcd.mooncake-rank.svc.cluster.local -> 10.104.38.252 (kubectl svc mooncake-etcd)
+[recall] [19:50:20] [benchmark] k8s dns: mooncake-etcd.mooncake-recall.svc.cluster.local -> 10.100.165.22 (kubectl svc mooncake-etcd)
+[rank] [19:50:20] [benchmark] [k8s] staging 6 files (run=20261112-1950-rank-recall-rank-rank_smoke) -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/scripts/20261112-1950-rank-recall-rank-rank_smoke
+[recall] [19:50:20] [benchmark] [k8s] staging 6 files (run=20261112-1950-rank-recall-recall-recall_smoke) -> [root@141.62.32.3](mailto:root@141.62.32.3):/home/w00921547/Mooncake-Performance/scripts/20261112-1950-rank-recall-recall-recall_smoke
+[rank] [19:50:21] [benchmark] [k8s] configmap mc-bench-20261112-1950-rank-recall-rank-rank-smoke created (ns=mooncake-bench-rank, keys=bench_etcd.py,env.mooncake.sh,env.sh,mooncake_benchmark_client.py,run_benchmark_basic.sh,run_benchmark_pipeline.sh)
+[recall] [19:50:21] [benchmark] [k8s] configmap mc-bench-20261112-1950-rank-recall-recall-recall-smoke created (ns=mooncake-bench-recall, keys=bench_etcd.py,env.mooncake.sh,env.sh,mooncake_benchmark_client.py,run_benchmark_basic.sh,run_benchmark_pipeline.sh)
+[rank] [19:50:21] [benchmark] [k8s] deployment mc-20261112-1950-rank-recall-rank-rank-smoke-client create: ns=mooncake-bench-rank role=client replicas=18 image=mooncake-runtime-w00921547:latest
+[recall] [19:50:21] [benchmark] [k8s] deployment mc-20261112-1950-rank-recall-recall-recall-smoke-client create: ns=mooncake-bench-recall role=client replicas=54 image=mooncake-runtime-w00921547:latest
+[rank] [19:50:30] [benchmark] [k8s] deployment mc-20261112-1950-rank-recall-rank-rank-smoke-client ready (role=client, replicas=18, elapsed=8.9s)
+[recall] [19:50:30] [benchmark] [k8s] deployment mc-20261112-1950-rank-recall-recall-recall-smoke-client ready (role=client, replicas=54, elapsed=9.0s)
+[rank] [19:50:35] [benchmark] [k8s] pipeline pods ready: 18 dual clients (N=9, spread maxSkew=1, run=20261112-1950-rank-recall-rank-rank_smoke)
+[rank] [19:50:40] [benchmark] k8s pipeline pods: numa/cpu binding disabled (containers)
+[rank] [19:50:40] [benchmark] scenario rank_smoke (pipeline, rank): N=9, writers=18, readers=18, notify_count=10, total_qps=945.0, per_writer_qps=52.5, traffic=balanced, run_id=20261112-1950-rank-recall-rank-rank_smoke, client_timeout=2026s, sizes=['8MB']
+[recall] [19:50:45] [benchmark] [k8s] pipeline pods ready: 54 dual clients (N=9, spread maxSkew=1, run=20261112-1950-rank-recall-recall-recall_smoke)
+[recall] [19:51:02] [benchmark] k8s pipeline pods: numa/cpu binding disabled (containers)
+[recall] [19:51:02] [benchmark] scenario recall_smoke (pipeline, recall): N=9, writers=54, readers=54, notify_count=1, total_qps=315.0, per_writer_qps=5.833333333333333, traffic=balanced, run_id=20261112-1950-rank-recall-recall-recall_smoke, client_timeout=1205s, sizes=['3.5MB']
+[rank] [19:51:32] [benchmark] value.bin (8MB): 18/18 pods ready (generated 18, cached 0, 51.7s)
+[rank] [19:51:32] [benchmark] rank_smoke running...
+[rank] [INFO] SETUP_UB_DEVICE=bonding_dev_95
+[rank] [client-env] mode=remove-keys POD_IP=192.168.196.89 NODE_NAME=worker04 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.196.89 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.196.89 SETUP_UB_DEVICE=bonding_dev_95 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[rank] [19:51:39] [benchmark] rank_smoke done rc=0 elapsed=6.6s
+[rank] [19:51:40] [benchmark] [verify] 8MB start: store after remove allocated=0.00 GiB / total=108.00 GiB (0.0%), nonzero segments=0/0
+[rank] [19:51:47] [benchmark] launched 18 dual clients
+[rank] [19:51:48] [benchmark] pipeline rendezvous: 18/18 dual clients registered (1.5s)
+[rank] [19:51:48] [benchmark] [parallel] rank clients registered; holding /start, waiting for recall
+[recall] [19:53:37] [benchmark] value.bin (3.5MB): 54/54 pods ready (generated 54, cached 0, 155.4s)
+[recall] [19:53:37] [benchmark] recall_smoke running...
+[recall] [INFO] SETUP_UB_DEVICE=bonding_dev_59
+[recall] [client-env] mode=remove-keys POD_IP=192.168.5.4 NODE_NAME=worker01 LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:/usr/lib64/urma: SETUP_FABRIC_IP=192.168.5.4 MC_FABRIC_IP= MC_TCP_BIND_ADDRESS=192.168.5.4 SETUP_UB_DEVICE=bonding_dev_59 MC_URMA_TRANS_MODE=RM SETUP_PROTOCOL=ub
+[recall] [19:53:43] [benchmark] recall_smoke done rc=0 elapsed=6.5s
+[recall] [19:53:45] [benchmark] [verify] 3.5MB start: store after remove allocated=0.00 GiB / total=1080.00 GiB (0.0%), nonzero segments=0/0
+[recall] [19:54:04] [benchmark] launched 54 dual clients
+[recall] [19:54:06] [benchmark] pipeline rendezvous: 54/54 dual clients registered (1.5s)
+[recall] [19:54:06] [benchmark] [parallel] recall clients registered; holding /start, waiting for rank
+[recall] [19:54:06] [benchmark] [parallel] rank and recall aligned at /start; continuing benchmark
+[rank] [19:54:06] [benchmark] [parallel] rank and recall aligned at /start; continuing benchmark
+[rank] [19:54:07] [benchmark] pipeline trigger: /start sent to 18 dual clients (parallel x8)
+[rank] [19:54:07] [benchmark] pipeline dual: waiting for all writers and notify drain
+[recall] [19:54:08] [benchmark] pipeline trigger: /start sent to 54 dual clients (parallel x8)
+[recall] [19:54:08] [benchmark] pipeline dual: waiting for all writers and notify drain
+[rank] [19:59:30] [benchmark] clients exited: 18/18 (15.7s)
+[recall] [20:00:02] [benchmark] clients exited: 54/54 (43.5s)
+[recall] Exception (client): Key-exchange timed out waiting for key negotiation
+[recall] Traceback (most recent call last):
+[recall]   File "C:\Users\y00909761\AppData\Local\Programs\Python\Python310\lib\site-packages\paramiko\transport.py", line 2085, in run
+[recall]     self._channel_handler_table[ptype](chan, m)
+[recall]   File "C:\Users\y00909761\AppData\Local\Programs\Python\Python310\lib\site-packages\paramiko\channel.py", line 1185, in _handle_close
+[recall]     self.transport._send_user_message(m)
+[recall]   File "C:\Users\y00909761\AppData\Local\Programs\Python\Python310\lib\site-packages\paramiko\transport.py", line 1826, in _send_user_message
+[recall]     raise SSHException(
+[recall] paramiko.ssh_exception.SSHException: Key-exchange timed out waiting for key negotiation
+[recall] 
+[recall] [20:01:22] [benchmark] [WARN] log pull failed for dual c27: missing: recall_smoke.benchmark_c1_t1_3.5MB.dual_mc-20261112-1950-rank-recall-recall-recall-smoke-client-96j77t4_c27_p9301.writer.log.glog
+[recall] [20:01:22] [benchmark] [WARN] log pull failed for dual c28: missing: recall_smoke.benchmark_c1_t1_3.5MB.dual_mc-20261112-1950-rank-recall-recall-recall-smoke-client-96jls62_c28_p9301.writer.log, recall_smoke.benchmark_c1_t1_3.5MB.dual_mc-20261112-1950-rank-recall-recall-recall-smoke-client-96jls62_c28_p9301.reader.log, recall_smoke.benchmark_c1_t1_3.5MB.dual_mc-20261112-1950-rank-recall-recall-recall-smoke-client-96jls62_c28_p9301.writer.log.glog
+[recall] [20:01:31] [benchmark] [WARN] log pull failed for dual c30: missing: recall_smoke.benchmark_c1_t1_3.5MB.dual_mc-20261112-1950-rank-recall-recall-recall-smoke-client-96jxnxv_c30_p9301.writer.log, recall_smoke.benchmark_c1_t1_3.5MB.dual_mc-20261112-1950-rank-recall-recall-recall-smoke-client-96jxnxv_c30_p9301.reader.log
+[recall] [20:02:05] [benchmark] [FAIL] scenario recall_smoke failed; pulling remote logs for diagnosis ...
+[recall] [20:02:06] [benchmark] fail-cleanup dual c0: already exited; skipping /shutdown
+[recall] [20:02:06] [benchmark] fail-cleanup dual c1: already exited; skipping /shutdown
+[recall] [20:02:06] [benchmark] fail-cleanup dual c2: already exited; skipping /shutdown
+[recall] [20:02:07] [benchmark] fail-cleanup dual c3: already exited; skipping /shutdown
+[recall] [20:02:07] [benchmark] fail-cleanup dual c4: already exited; skipping /shutdown
+[recall] [20:02:08] [benchmark] fail-cleanup dual c5: already exited; skipping /shutdown
+[recall] [20:02:08] [benchmark] fail-cleanup dual c6: already exited; skipping /shutdown
+[recall] [20:02:09] [benchmark] fail-cleanup dual c7: already exited; skipping /shutdown
+[recall] [20:02:09] [benchmark] fail-cleanup dual c8: already exited; skipping /shutdown
+[recall] [20:02:09] [benchmark] fail-cleanup dual c9: already exited; skipping /shutdown
+[recall] [20:02:10] [benchmark] fail-cleanup dual c10: already exited; skipping /shutdown
+[recall] [20:02:10] [benchmark] fail-cleanup dual c11: already exited; skipping /shutdown
+[recall] [20:02:11] [benchmark] fail-cleanup dual c12: already exited; skipping /shutdown
+[recall] [20:02:11] [benchmark] fail-cleanup dual c13: already exited; skipping /shutdown
+[recall] [20:02:11] [benchmark] fail-cleanup dual c14: already exited; skipping /shutdown
+[recall] [20:02:12] [benchmark] fail-cleanup dual c15: already exited; skipping /shutdown
+[recall] [20:02:12] [benchmark] fail-cleanup dual c16: already exited; skipping /shutdown
+[recall] [20:02:13] [benchmark] fail-cleanup dual c17: already exited; skipping /shutdown
+[recall] [20:02:13] [benchmark] fail-cleanup dual c18: already exited; skipping /shutdown
+[recall] [20:02:14] [benchmark] fail-cleanup dual c19: already exited; skipping /shutdown
+[recall] [20:02:14] [benchmark] fail-cleanup dual c20: already exited; skipping /shutdown
+[recall] [20:02:14] [benchmark] fail-cleanup dual c21: already exited; skipping /shutdown
+[recall] [20:02:15] [benchmark] fail-cleanup dual c22: already exited; skipping /shutdown
+[recall] [20:02:15] [benchmark] fail-cleanup dual c23: already exited; skipping /shutdown
+[recall] [20:02:16] [benchmark] fail-cleanup dual c24: already exited; skipping /shutdown
+[recall] [20:02:16] [benchmark] fail-cleanup dual c25: already exited; skipping /shutdown
+[recall] [20:02:17] [benchmark] fail-cleanup dual c26: already exited; skipping /shutdown
+[recall] [20:02:17] [benchmark] fail-cleanup dual c27: already exited; skipping /shutdown
+[recall] [20:02:18] [benchmark] fail-cleanup dual c28: already exited; skipping /shutdown
+[recall] [20:02:18] [benchmark] fail-cleanup dual c29: already exited; skipping /shutdown
+[recall] [20:02:19] [benchmark] fail-cleanup dual c30: already exited; skipping /shutdown
+[recall] [20:02:19] [benchmark] fail-cleanup dual c31: already exited; skipping /shutdown
+[recall] [20:02:20] [benchmark] fail-cleanup dual c32: already exited; skipping /shutdown
+[recall] [20:02:20] [benchmark] fail-cleanup dual c33: already exited; skipping /shutdown
+[recall] [20:02:20] [benchmark] fail-cleanup dual c34: already exited; skipping /shutdown
+[recall] [20:02:21] [benchmark] fail-cleanup dual c35: already exited; skipping /shutdown
+[recall] [20:02:21] [benchmark] fail-cleanup dual c36: already exited; skipping /shutdown
+[recall] [20:02:22] [benchmark] fail-cleanup dual c37: already exited; skipping /shutdown
+[recall] [20:02:22] [benchmark] fail-cleanup dual c38: already exited; skipping /shutdown
+[recall] [20:02:22] [benchmark] fail-cleanup dual c39: already exited; skipping /shutdown
+[recall] [20:02:23] [benchmark] fail-cleanup dual c40: already exited; skipping /shutdown
+[recall] [20:02:23] [benchmark] fail-cleanup dual c41: already exited; skipping /shutdown
+[recall] [20:02:23] [benchmark] fail-cleanup dual c42: already exited; skipping /shutdown
+[recall] [20:02:24] [benchmark] fail-cleanup dual c43: already exited; skipping /shutdown
+[recall] [20:02:24] [benchmark] fail-cleanup dual c44: already exited; skipping /shutdown
+[recall] [20:02:24] [benchmark] fail-cleanup dual c45: already exited; skipping /shutdown
+[recall] [20:02:25] [benchmark] fail-cleanup dual c46: already exited; skipping /shutdown
+[recall] [20:02:25] [benchmark] fail-cleanup dual c47: already exited; skipping /shutdown
+[recall] [20:02:26] [benchmark] fail-cleanup dual c48: already exited; skipping /shutdown
+[recall] [20:02:26] [benchmark] fail-cleanup dual c49: already exited; skipping /shutdown
+[recall] [20:02:26] [benchmark] fail-cleanup dual c50: already exited; skipping /shutdown
+[recall] [20:02:27] [benchmark] fail-cleanup dual c51: already exited; skipping /shutdown
+[recall] [20:02:27] [benchmark] fail-cleanup dual c52: already exited; skipping /shutdown
+[recall] [20:02:28] [benchmark] fail-cleanup dual c53: already exited; skipping /shutdown
