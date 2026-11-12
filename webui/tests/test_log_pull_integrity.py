@@ -38,20 +38,12 @@ class _FakeSFTP:
         self.closed = True
 
 
-class _FakeClient:
-    def __init__(self, sftp):
-        self._sftp = sftp
-
-    def open_sftp(self):
-        return self._sftp
-
-
 def _install(monkeypatch, sftp, listing):
     monkeypatch.setattr(u, "is_k8s_node", lambda node: False)
     monkeypatch.setattr(u, "ssh_check_output",
-                        lambda host, node, cmd, quiet=False: listing)
-    monkeypatch.setattr(u, "_ssh_client",
-                        lambda node: _FakeClient(sftp))
+                        lambda host, node, cmd, quiet=False, timeout=None: listing)
+    monkeypatch.setattr(u, "_sftp_client",
+                        lambda node, timeout=None: sftp)
 
 
 def test_scp_pull_full_file_ok(tmp_path, monkeypatch):
@@ -89,7 +81,7 @@ def test_scp_pull_mid_transfer_exception_removes_partial(tmp_path, monkeypatch):
     assert not (tmp_path / "x.log").exists(), "partial local file must be gone"
 
 
-def test_pull_logs_retries_once_then_succeeds(tmp_path, monkeypatch):
+def test_pull_logs_retries_then_succeeds(tmp_path, monkeypatch):
     calls = []
 
     def fake_scp(host, node, glob, local, dry_run=False):
@@ -100,11 +92,12 @@ def test_pull_logs_retries_once_then_succeeds(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "scp_pull", fake_scp)
     monkeypatch.setattr(bm, "get_node", lambda cluster, name: {"ip": "1.2.3.4"})
     monkeypatch.setattr(bm, "_ssh_drop", lambda node: None)
+    monkeypatch.setattr(bm, "_wait_log_pull_retry", lambda *a, **k: None)
     bm.pull_logs({}, ["n1"], "/rlog", "cfg", str(tmp_path), False)
     assert len(calls) == 2
 
 
-def test_pull_logs_fails_after_retry(tmp_path, monkeypatch):
+def test_pull_logs_fails_after_retries(tmp_path, monkeypatch):
     calls = []
 
     def fake_scp(host, node, glob, local, dry_run=False):
@@ -114,12 +107,13 @@ def test_pull_logs_fails_after_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "scp_pull", fake_scp)
     monkeypatch.setattr(bm, "get_node", lambda cluster, name: {"ip": "1.2.3.4"})
     monkeypatch.setattr(bm, "_ssh_drop", lambda node: None)
+    monkeypatch.setattr(bm, "_wait_log_pull_retry", lambda *a, **k: None)
     try:
         bm.pull_logs({}, ["n1"], "/rlog", "cfg", str(tmp_path), False)
-        raise AssertionError("should raise after the single retry")
+        raise AssertionError("should raise after all retries")
     except RuntimeError as exc:
         assert "persistent failure" in str(exc)
-    assert len(calls) == 2
+    assert len(calls) == bm._LOG_PULL_ATTEMPTS
 
 
 def test_pull_stage_logs_retries_but_never_raises(tmp_path, monkeypatch):
@@ -132,6 +126,7 @@ def test_pull_stage_logs_retries_but_never_raises(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bm, "scp_pull", fake_scp)
     monkeypatch.setattr(bm, "_ssh_drop", lambda node: None)
+    monkeypatch.setattr(bm, "_wait_log_pull_retry", lambda *a, **k: None)
     # transient -> retried, no raise
     bm.pull_stage_logs("1.2.3.4", {"ip": "1.2.3.4"}, ["/r/x.log"],
                        str(tmp_path), False)
@@ -146,4 +141,4 @@ def test_pull_stage_logs_retries_but_never_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "scp_pull", always_fail)
     bm.pull_stage_logs("1.2.3.4", {"ip": "1.2.3.4"}, ["/r/x.log"],
                        str(tmp_path), False)
-    assert len(calls) == 2
+    assert len(calls) == bm._LOG_PULL_ATTEMPTS

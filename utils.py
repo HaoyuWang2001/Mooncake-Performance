@@ -250,7 +250,7 @@ def controller_run(controller, args, check=True, timeout=None):
         if controller.get("kubeconfig"):
             shell = "KUBECONFIG={} {}".format(
                 shlex.quote(controller["kubeconfig"]), shell)
-        out, rc = _ssh_exec(controller, shell + " 2>&1")
+        out, rc = _ssh_exec(controller, shell + " 2>&1", timeout=timeout)
     if check and rc != 0:
         raise RuntimeError("kubectl {} failed (rc={}): {}".format(
             " ".join(str(a) for a in args), rc, out.strip()[:500]))
@@ -362,13 +362,13 @@ def controller_put(controller, local_files, remote_dir):
         sftp.close()
 
 
-def controller_get_file(controller, remote_path, local_dir):
+def controller_get_file(controller, remote_path, local_dir, timeout=None):
     os.makedirs(local_dir, exist_ok=True)
     if controller_is_local(controller):
         shutil.copy2(remote_path, os.path.join(local_dir, os.path.basename(remote_path)))
         return
     remote_path = _remote_path(remote_path)
-    sftp = _ssh_client(controller).open_sftp()
+    sftp = _sftp_client(controller, timeout=timeout)
     try:
         sftp.get(remote_path, os.path.join(local_dir, os.path.basename(remote_path)))
     finally:
@@ -507,6 +507,20 @@ def _ssh_drop(node):
             pass
 
 
+def _sftp_client(node, timeout=None):
+    """Open an SFTP session on the cached connection. With ``timeout``
+    both the channel/subsystem open and every SFTP packet read are
+    bounded, so a black-holed server raises instead of hanging."""
+    client = _ssh_client(node)
+    if not timeout:
+        return client.open_sftp()
+    import paramiko
+    chan = client.get_transport().open_session(timeout=timeout)
+    chan.settimeout(timeout)
+    chan.invoke_subsystem("sftp")
+    return paramiko.SFTPClient(chan)
+
+
 def _drain_chan(chan, relay, out):
     """Move pending channel output: relay to the console or capture it."""
     while chan.recv_ready():
@@ -524,14 +538,26 @@ def _drain_chan(chan, relay, out):
         # else: discard (parity with the old CLI capture: stdout only)
 
 
-def _ssh_exec(node, command, relay=False):
+def _ssh_exec(node, command, relay=False, timeout=None):
     """Execute one command on the cached connection -> (stdout_text, rc).
-    A broken cached connection is dropped so the next call reconnects."""
+    A broken cached connection is dropped so the next call reconnects.
+    With ``timeout`` (seconds) a black-holed session — sshd accepting the
+    TCP connection but never confirming the channel open, or a command
+    that never finishes — raises instead of hanging forever, so callers
+    can drop the connection and retry."""
     out = []
     try:
         client = _ssh_client(node)
-        stdin, stdout, stderr = client.exec_command(command)
-        chan = stdout.channel
+        if timeout:
+            # Bound BOTH the channel open and the command lifetime; the
+            # plain exec_command() path cannot time out a stuck open.
+            chan = client.get_transport().open_session(timeout=timeout)
+            chan.settimeout(timeout)
+            chan.exec_command(command)
+        else:
+            _stdin, stdout, _stderr = client.exec_command(command)
+            chan = stdout.channel
+        deadline = time.time() + timeout if timeout else None
         while not chan.exit_status_ready():
             if stop_requested():
                 try:
@@ -541,6 +567,10 @@ def _ssh_exec(node, command, relay=False):
                 _ssh_drop(node)
                 raise StopRequested()
             _drain_chan(chan, relay, out)
+            if deadline is not None and time.time() > deadline:
+                raise RuntimeError(
+                    "ssh command timed out after {:.0f}s on {}: {}".format(
+                        timeout, node.get("ip", "?"), command[:120]))
             time.sleep(0.1)
         # post-exit drain: sshd delivers EOF after any remaining output
         grace = time.time() + 5
@@ -583,7 +613,7 @@ def run_ssh(host, node, command, dry_run=False):
             "".format(rc, host, command))
 
 
-def ssh_check_output(host, node, command, dry_run=False, quiet=False):
+def ssh_check_output(host, node, command, dry_run=False, quiet=False, timeout=None):
     if is_k8s_node(node):
         if not quiet:
             log_detail("[k8s] $ {}".format(kubectl_exec_line(node, command)))
@@ -592,7 +622,8 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
             return ""
         out, rc = controller_run(node["_controller"],
                                  ["-n", node["_ns"], "exec", node["_pod"],
-                                  "--", "bash", "-c", command], check=False)
+                                  "--", "bash", "-c", command], check=False,
+                                 timeout=timeout)
         if rc != 0:
             raise RuntimeError(
                 "kubectl exec failed (rc={}) on {}: {}\n  output: {}".format(
@@ -604,7 +635,7 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
     if dry_run:
         log_detail("      (dry-run, skipped)")
         return ""
-    out, rc = _ssh_exec(node, command)
+    out, rc = _ssh_exec(node, command, timeout=timeout)
     if rc != 0:
         raise RuntimeError(
             "ssh command failed (rc={}) on {}: {}\n  output: {}".format(
@@ -675,7 +706,11 @@ def _verify_pulled_size(remote_size, local_path, remote_name, where):
                 where, remote_name, want, local_size))
 
 
-def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
+def scp_pull(host, node, remote_glob, local_dir, dry_run=False, timeout=300):
+    """Pull remote files (glob) into local_dir, size-verified. ``timeout``
+    bounds every underlying SSH/SFTP operation (channel open, kubectl cp,
+    stat, transfer), so a black-holed controller raises and the callers'
+    retry logic can drop + reopen the connection instead of hanging."""
     if is_k8s_node(node):
         # kubectl cp does NOT expand globs: list matching paths via exec,
         # then copy each file individually. A single missing non-glob path
@@ -686,7 +721,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
             return
         listing = ssh_check_output(host, node,
                                    "ls -1 {} 2>/dev/null || true".format(remote_glob),
-                                   quiet=True)
+                                   quiet=True, timeout=timeout)
         files = [l.strip() for l in listing.splitlines() if l.strip()]
         if not files and not any(c in remote_glob for c in "*?["):
             raise RuntimeError("kubectl cp pull failed: no such file on {}: {}".format(
@@ -711,13 +746,13 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                 if controller_is_local(c):
                     out, rc = controller_run(
                         c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f),
-                            dst], check=False)
+                            dst], check=False, timeout=timeout)
                 else:
                     out, rc = controller_run(
                         c, ["-n", node["_ns"], "cp", "{}:{}".format(node["_pod"], f), dst],
-                        check=False)
+                        check=False, timeout=timeout)
                     if rc == 0:
-                        controller_get_file(c, dst, local_dir)
+                        controller_get_file(c, dst, local_dir, timeout=timeout)
             except Exception:
                 _remove_partial(local_file)
                 raise
@@ -725,7 +760,8 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
                 _remove_partial(local_file)
                 raise RuntimeError("kubectl cp pull failed for {}: {}".format(f, out.strip()[:300]))
             remote_size = ssh_check_output(
-                host, node, "stat -c %s {}".format(shlex.quote(f)), quiet=True)
+                host, node, "stat -c %s {}".format(shlex.quote(f)), quiet=True,
+                timeout=timeout)
             _verify_pulled_size(remote_size, local_file, f, node["_pod"])
         log_detail("[k8s] pulled {} files from pod {} -> {}".format(
             len(files), node["_pod"], local_dir))
@@ -735,7 +771,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
     # path raises (parity with scp failure for guarded collectors).
     listing = ssh_check_output(host, node,
                                "ls -1 {} 2>/dev/null || true".format(remote_glob),
-                               quiet=True)
+                               quiet=True, timeout=timeout)
     files = [l.strip() for l in listing.splitlines() if l.strip()]
     if not files and not any(c in remote_glob for c in "*?["):
         raise RuntimeError("scp pull failed: no such file on {}: {}".format(
@@ -745,7 +781,7 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False):
         log_detail("      (dry-run, skipped)")
         return
     os.makedirs(local_dir, exist_ok=True)
-    sftp = _ssh_client(node).open_sftp()
+    sftp = _sftp_client(node, timeout=timeout)
     try:
         for f in files:
             log_detail("[scp] <- {} : {}".format(host, f))

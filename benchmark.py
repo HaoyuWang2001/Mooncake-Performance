@@ -1944,11 +1944,47 @@ def numa_node_check(node_name, numa_strict):
         "numa_bind requires numactl on node {} (numa_strict=true)".format(node_name))
 
 
+_LOG_PULL_ATTEMPTS = 3
+_LOG_PULL_BACKOFF_S = (1.0, 3.0)
+
+
+def _log_pull_transport(node):
+    """Return the SSH endpoint that actually carries a log transfer.
+
+    A k8s-pod entry is only a kubectl target.  Remote kubectl and the second
+    controller->orchestrator copy both run over the shared controller SSH
+    connection, so dropping the pod's synthetic cache key cannot repair an
+    ``SSH session not active`` failure.
+    """
+    if is_k8s_node(node):
+        controller = node.get("_controller")
+        if not controller or controller.get("_local"):
+            return None
+        return controller
+    return node
+
+
+def _reset_log_pull_transport(node):
+    transport = _log_pull_transport(node)
+    if transport is not None:
+        _ssh_drop(transport)
+
+
+def _wait_log_pull_retry(attempt, label):
+    """Back off before the next attempt; *attempt* is zero based."""
+    delay = _LOG_PULL_BACKOFF_S[min(attempt, len(_LOG_PULL_BACKOFF_S) - 1)]
+    log_detail("[WARN] log pull retry {}/{} for {} after {:.1f}s".format(
+        attempt + 2, _LOG_PULL_ATTEMPTS, label, delay))
+    time.sleep(delay)
+
+
 def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
-    """Pull every <cfg>.* file from each involved node. Retried ONCE (with a
-    reconnect) because scp_pull now verifies byte sizes: a channel killed
-    mid-transfer raises instead of silently leaving a truncated local log,
-    and a single retry recovers the common transient case."""
+    """Pull every <cfg>.* file from each involved node.
+
+    Transfers are size verified by :func:`scp_pull`.  A failed transfer gets
+    two retries with reconnect + backoff; this covers both a cut SFTP channel
+    and a stale remote-controller SSH session.
+    """
     pulled_ips = set()
     for node_name in involved_nodes:
         n = get_node(cluster, node_name)
@@ -1957,7 +1993,7 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
         pulled_ips.add(n["ip"])
         remote_glob = "{}/{}.*".format(remote_log_dir, cfg_name)
         last_exc = None
-        for attempt in (0, 1):
+        for attempt in range(_LOG_PULL_ATTEMPTS):
             try:
                 scp_pull(n["ip"], n, remote_glob, local_log_dir, dry_run=dry_run)
                 last_exc = None
@@ -1966,33 +2002,35 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
                 last_exc = exc
                 if dry_run:
                     break
-                if attempt == 0:
+                if attempt + 1 < _LOG_PULL_ATTEMPTS:
                     try:
-                        _ssh_drop(n)   # reconnect before the retry
+                        _reset_log_pull_transport(n)
                     except Exception:
                         pass
+                    _wait_log_pull_retry(attempt, n["ip"])
         if last_exc is not None:
             raise last_exc
 
 
 def pull_stage_logs(ip, node, remote_files, local_dir, dry_run):
     """Incremental pull of just-finished stage log(s) so previous stages are
-    locally readable while later (long) stages run. Each file is retried once
+    locally readable while later (long) stages run. Each file is retried twice
     (size-verified by scp_pull); still failing files only WARN — the
     authoritative full pull happens later via pull_logs/_pipeline_pull_parallel."""
     if dry_run or not remote_files:
         return
     for f in remote_files:
-        for attempt in (0, 1):
+        for attempt in range(_LOG_PULL_ATTEMPTS):
             try:
                 scp_pull(ip, node, f, local_dir, dry_run=False)
                 break
             except Exception as exc:
-                if attempt == 0:
+                if attempt + 1 < _LOG_PULL_ATTEMPTS:
                     try:
-                        _ssh_drop(node)
+                        _reset_log_pull_transport(node)
                     except Exception:
                         pass
+                    _wait_log_pull_retry(attempt, os.path.basename(f))
                     continue
                 log_detail("[WARN] stage log pull {}: {}".format(f, exc))
 
@@ -2270,9 +2308,11 @@ def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry, workers=None):
     Paramiko allows one channel per command on the cached connection but the
     server caps concurrent sessions (MaxSessions, often 10) — pulling 8+
     groups at once intermittently kills channels. Concurrency therefore
-    defaults to 4, and each group is VERIFIED locally and retried once after
-    a reconnect; only a still-missing group is reported (WARN + raised at
-    the end, same fail-the-scenario semantics as the sequential pull)."""
+    defaults to 4.  Retry is performed in whole-pool rounds: all active
+    transfers finish before a shared controller connection is reset.  This
+    avoids one worker closing a freshly reconnected session underneath the
+    other workers.  Each retry only fetches files still missing locally.
+    """
     if dry or not groups:
         return 0
     from concurrent.futures import ThreadPoolExecutor
@@ -2284,29 +2324,56 @@ def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry, workers=None):
                     local_log_dir, os.path.basename(f)))]
 
     def _one(group):
-        node, files, label = group
-        for _attempt in (0, 1):
+        node, _files, label = group
+        errors = []
+        for f in _missing(group):
             try:
-                pull_stage_logs(node["ip"], node, files, local_log_dir, False)
-            except Exception:
-                pass
-            missing = _missing(group)
-            if not missing:
-                return (label, None)
-            try:
-                _ssh_drop(node)
-            except Exception:
-                pass
-        return (label, "missing: " + ", ".join(
-            os.path.basename(f) for f in _missing(group)))
+                scp_pull(node["ip"], node, f, local_log_dir, dry_run=False)
+            except Exception as exc:
+                errors.append("{}: {}".format(os.path.basename(f), exc))
+        return label, _missing(group), errors
 
     workers = max(1, min(workers or 4, len(groups)))
+    pending = list(groups)
+    last_errors = {}
+    for attempt in range(_LOG_PULL_ATTEMPTS):
+        failed_labels = set()
+        with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
+            for label, missing, errors in pool.map(_one, pending):
+                if missing:
+                    failed_labels.add(label)
+                    if errors:
+                        last_errors[label] = errors[-1]
+        if not failed_labels:
+            return 0
+        pending = [g for g in pending if g[2] in failed_labels]
+        if attempt + 1 >= _LOG_PULL_ATTEMPTS:
+            break
+
+        # No worker is active here.  Reset each real transport once; many pod
+        # groups normally share the same remote kubectl controller.
+        reset = set()
+        for node, _files, _label in pending:
+            transport = _log_pull_transport(node)
+            token = id(transport) if transport is not None else None
+            if token is None or token in reset:
+                continue
+            reset.add(token)
+            try:
+                _ssh_drop(transport)
+            except Exception:
+                pass
+        _wait_log_pull_retry(attempt, "{} missing group(s)".format(len(pending)))
+
     errs = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for label, err in pool.map(_one, groups):
-            if err:
-                errs.append((label, err))
-                log("[WARN] log pull failed for {}: {}".format(label, err))
+    for group in pending:
+        _node, _files, label = group
+        missing = _missing(group)
+        err = "missing: " + ", ".join(os.path.basename(f) for f in missing)
+        if label in last_errors:
+            err += "; last error: " + last_errors[label]
+        errs.append((label, err))
+        log("[WARN] log pull failed for {}: {}".format(label, err))
     if errs:
         raise RuntimeError("log pull failed for {}/{}: {} ({})".format(
             len(errs), len(groups), errs[0][0], errs[0][1]))
