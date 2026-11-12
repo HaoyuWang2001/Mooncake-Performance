@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 # bench_etcd lives next to this file on every node (pushed together with
 # the runner scripts); pipeline rendezvous uses it over the etcd gateway.
@@ -1049,6 +1049,9 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
         pool = list(readers)
     notify_count = int(getattr(args, "notify_count", 0) or 0)
     notify_threads = max(1, int(getattr(args, "notify_threads", 1) or 1))
+    notify_async = bool(getattr(args, "notify_async", False))
+    notify_max_inflight = max(
+        1, int(getattr(args, "notify_max_inflight", 256) or 256))
     # Original datasystem semantics:
     #   balanced = even pacing at target_qps (interval = 1/qps between batches)
     #   pulse    = per 1s window, fire target_qps batches back-to-back (burst),
@@ -1063,11 +1066,18 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
                   "start_ts": time.time(),
                   "num_readers": len(pool), "notify_count": notify_count,
                   "notify_threads": notify_threads,
+                  "notify_async": notify_async,
+                  "notify_max_inflight": notify_max_inflight,
                   "writer_count": args.writer_count, "reader_count": args.reader_count})
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    from concurrent.futures import ThreadPoolExecutor
     notify_pool = ThreadPoolExecutor(max_workers=notify_threads)
+    pending_notifies = set()
+    notify_stats = {
+        "submitted": 0, "ok": 0, "fail": 0, "inflight_peak": 0,
+        "backpressure_ms": 0.0, "drain_ms": 0.0,
+        "elapsed_ms_sum": 0.0, "elapsed_ms_max": 0.0,
+    }
     seq = [0]
     # optional per-writer key-space cap (BENCH_KEY_COUNT): the sequence wraps at
     # key_cap; wrapped non-upsert batches remove their keys first
@@ -1082,6 +1092,101 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
     # measured-phase stats (warmup writes stay out of the metrics)
     stats = {"keys_ok": 0, "keys_fail": 0, "batches_ok": 0, "batches_fail": 0, "lats": []}
     last_flush = [time.time()]
+
+    def _notify(r, ks, ts, wf):
+        query = "&".join("key=" + k for k in ks)
+        url = "http://{}:{}/notify?{}&writer_id={}&write_ts={}&warmup={}".format(
+            r["host"], r["port"], query, writer_id, ts, wf)
+        started = time.perf_counter()
+        try:
+            response = opener.open(url, timeout=0.5)
+            response.close()
+            ok, error = True, ""
+        except Exception as exc:
+            ok, error = False, str(exc)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if not ok:
+            sys.stdout.write(
+                "RESULT\t{}\tpipeline_notify\t{}\t0\tERR:{} "
+                "target={}:{} elapsed_ms={:.3f} warmup={}\n".format(
+                    now_hms(), ks[0], error, r["host"], r["port"],
+                    elapsed_ms, wf))
+        return wf == "1", ok, elapsed_ms
+
+    def _record_notify(future):
+        try:
+            is_warmup, ok, elapsed_ms = future.result()
+        except Exception as exc:
+            # _notify catches transport errors itself; this protects the writer
+            # from an unexpected worker exception without losing the denominator.
+            is_warmup, ok, elapsed_ms = False, False, 0.0
+            sys.stdout.write(
+                "RESULT\t{}\tpipeline_notify\t<worker>\t0\tERR:{}\n".format(
+                    now_hms(), exc))
+        if is_warmup:
+            return
+        notify_stats["ok" if ok else "fail"] += 1
+        notify_stats["elapsed_ms_sum"] += elapsed_ms
+        notify_stats["elapsed_ms_max"] = max(
+            notify_stats["elapsed_ms_max"], elapsed_ms)
+
+    def _reap_ready_notifies():
+        done = [future for future in pending_notifies if future.done()]
+        for future in done:
+            pending_notifies.remove(future)
+            _record_notify(future)
+
+    def _wait_for_notify_slot(measured):
+        if not pending_notifies:
+            return
+        started = time.perf_counter()
+        done, _ = wait(pending_notifies, return_when=FIRST_COMPLETED)
+        if measured:
+            notify_stats["backpressure_ms"] += \
+                (time.perf_counter() - started) * 1000.0
+        for future in done:
+            pending_notifies.remove(future)
+            _record_notify(future)
+
+    def _drain_notifies(measured):
+        if not pending_notifies:
+            return
+        started = time.perf_counter()
+        done, _ = wait(pending_notifies)
+        for future in done:
+            _record_notify(future)
+        pending_notifies.clear()
+        if measured:
+            notify_stats["drain_ms"] += \
+                (time.perf_counter() - started) * 1000.0
+
+    def _dispatch_notifies(selected, keys, write_ts, wflag, is_warmup):
+        if not selected:
+            return
+        if notify_async:
+            _reap_ready_notifies()
+            for reader in selected:
+                while len(pending_notifies) >= notify_max_inflight:
+                    _wait_for_notify_slot(not is_warmup)
+                pending_notifies.add(notify_pool.submit(
+                    _notify, reader, keys, write_ts, wflag))
+                if not is_warmup:
+                    notify_stats["submitted"] += 1
+                    notify_stats["inflight_peak"] = max(
+                        notify_stats["inflight_peak"], len(pending_notifies))
+            _reap_ready_notifies()
+            return
+
+        # Legacy closed-loop mode: one batch fans out concurrently, but the
+        # next write waits for every selected reader.
+        futures = [notify_pool.submit(
+            _notify, reader, keys, write_ts, wflag) for reader in selected]
+        if not is_warmup:
+            notify_stats["submitted"] += len(futures)
+            notify_stats["inflight_peak"] = max(
+                notify_stats["inflight_peak"], len(futures))
+        for future in futures:
+            _record_notify(future)
 
     def _run_phase(phase_deadline, is_warmup):
         next_t = time.time() + interval
@@ -1168,20 +1273,7 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
                 selected = random.sample(pool, n_sel) if pool else []
                 write_ts = time.time()
                 wflag = "1" if is_warmup else "0"
-                def _notify(r, ks=keys, ts=write_ts, wf=wflag):
-                    query = "&".join("key=" + k for k in ks)
-                    url = "http://{}:{}/notify?{}&writer_id={}&write_ts={}&warmup={}".format(
-                        r["host"], r["port"], query, writer_id, ts, wf)
-                    try:
-                        opener.open(url, timeout=0.5)
-                    except Exception as exc:
-                        sys.stdout.write("RESULT\t{}\tpipeline_notify\t{}\t0\tERR:{} target={}:{}\n".format(
-                            now_hms(), ks[0], exc, r["host"], r["port"]))
-                # blocking submit = natural backpressure; pacing accounts for
-                # the slowest in-flight notify instead of the sequential sum
-                futures = [notify_pool.submit(_notify, r) for r in selected]
-                for f in futures:
-                    f.result()
+                _dispatch_notifies(selected, keys, write_ts, wflag, is_warmup)
             if not is_warmup:
                 now = time.time()
                 if now - last_flush[0] >= 1.0:
@@ -1197,17 +1289,26 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
                     if sleep_t > 0:
                         time.sleep(sleep_t)
 
-    if do_warmup and warmup_duration > 0:
-        log("pipeline writer warmup start (duration={}s, target_qps={})".format(
-            warmup_duration, target_qps))
-        emit("META", {"mode": "pipeline_warmup_start", "writer_id": writer_id,
-                      "duration": warmup_duration, "ts": time.time()})
-        _run_phase(time.time() + warmup_duration, True)
-        emit("META", {"mode": "pipeline_warmup_end", "writer_id": writer_id,
-                      "ts": time.time()})
-        log("pipeline writer warmup done")
-    log("pipeline writer measured start (duration={}s)".format(duration))
-    _run_phase(time.time() + duration, False)
+    try:
+        if do_warmup and warmup_duration > 0:
+            log("pipeline writer warmup start (duration={}s, target_qps={})".format(
+                warmup_duration, target_qps))
+            emit("META", {"mode": "pipeline_warmup_start", "writer_id": writer_id,
+                          "duration": warmup_duration, "ts": time.time()})
+            _run_phase(time.time() + warmup_duration, True)
+            # Do not let warmup notifications leak into the measured window.
+            _drain_notifies(False)
+            emit("META", {"mode": "pipeline_warmup_end", "writer_id": writer_id,
+                          "ts": time.time()})
+            log("pipeline writer warmup done")
+        log("pipeline writer measured start (duration={}s)".format(duration))
+        _run_phase(time.time() + duration, False)
+        # Preserve delivery semantics: all accepted notifications finish before
+        # the writer summary/client shutdown, but this drain is outside 30s.
+        _drain_notifies(True)
+    finally:
+        _drain_notifies(False)
+        notify_pool.shutdown(wait=True)
     log("pipeline writer measured done (keys_ok={}, keys_fail={})".format(
         stats["keys_ok"], stats["keys_fail"]))
     sys.stdout.flush()
@@ -1230,6 +1331,18 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
         "wall_s": duration, "ok": stats["keys_ok"], "fail": stats["keys_fail"],
         "qps": (keys_total / duration) if duration > 0 else 0.0,
         "fail_rate": (stats["keys_fail"] / keys_total) if keys_total else 0.0,
+        "notify_async": notify_async,
+        "notify_max_inflight": notify_max_inflight,
+        "notify_submitted": notify_stats["submitted"],
+        "notify_ok": notify_stats["ok"],
+        "notify_fail": notify_stats["fail"],
+        "notify_inflight_peak": notify_stats["inflight_peak"],
+        "notify_backpressure_ms": notify_stats["backpressure_ms"],
+        "notify_drain_ms": notify_stats["drain_ms"],
+        "notify_avg_ms": ((notify_stats["elapsed_ms_sum"] /
+                           (notify_stats["ok"] + notify_stats["fail"]))
+                          if (notify_stats["ok"] + notify_stats["fail"]) else 0.0),
+        "notify_max_ms": notify_stats["elapsed_ms_max"],
         # interface throughput = successful bytes / sum of successful
         # put_batch call durations (busy time, not wall clock)
         "throughput_mb_s": (ok_bytes / busy_s / 1024.0 ** 2) if busy_s > 0 else 0.0,
@@ -1709,6 +1822,10 @@ def _pipeline_dual(args, store):
             _writer_run_phases(args_wr, store, readers,
                                do_warmup=(args.warmup == "true"),
                                exclude_id=my_id)
+            # Keep every reader alive until all peers have drained their
+            # asynchronous sends; the controller gates /shutdown on this KV.
+            bench_etcd.kv_put(args.etcd_endpoints,
+                              rdz_prefix + "writers_done/{}".format(my_id), "1")
         except BaseException as exc:
             import traceback
             traceback.print_exc()
@@ -1823,6 +1940,18 @@ def _resolve_env(args):
         args.notify_count = int(os.environ.get("BENCH_NOTIFY_COUNT", "1"))
     if args.notify_threads is None:
         args.notify_threads = int(os.environ.get("BENCH_NOTIFY_THREADS", "1"))
+    if args.notify_async is None:
+        args.notify_async = os.environ.get("BENCH_NOTIFY_ASYNC", "false")
+    if isinstance(args.notify_async, str):
+        raw = args.notify_async.strip().lower()
+        if raw not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+            raise ValueError("BENCH_NOTIFY_ASYNC must be true or false")
+        args.notify_async = raw in ("true", "1", "yes", "on")
+    if args.notify_max_inflight is None:
+        args.notify_max_inflight = int(os.environ.get(
+            "BENCH_NOTIFY_MAX_INFLIGHT", "256"))
+    if args.notify_max_inflight < 1:
+        raise ValueError("notify_max_inflight must be >= 1")
     if args.notify_pipeline is None:
         raw = os.environ.get("BENCH_NOTIFY_PIPELINE", "get")
         args.notify_pipeline = [s.strip() for s in raw.split(",")]
@@ -1885,6 +2014,10 @@ def main():
     parser.add_argument("--reader-count", type=int, default=None)
     parser.add_argument("--target-qps", type=float, default=None)
     parser.add_argument("--notify-threads", type=int, default=None)
+    parser.add_argument("--notify-async", choices=["true", "false"], default=None,
+                        help="submit notifications without waiting per write")
+    parser.add_argument("--notify-max-inflight", type=int, default=None,
+                        help="maximum queued plus running HTTP notifications (default 256)")
     parser.add_argument("--notify-count", type=int, default=None)
     parser.add_argument("--notify-pipeline", default=None)
     parser.add_argument("--traffic-mode", default=None)

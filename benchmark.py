@@ -165,6 +165,9 @@ PIPELINE_CSV_HEADER = [
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
     "p9999_ms",
     "queue_wait_avg_ms", "queue_wait_max_ms", "max_depth",
+    "notify_async", "notify_max_inflight", "notify_submitted", "notify_ok",
+    "notify_fail", "notify_inflight_peak", "notify_backpressure_ms",
+    "notify_drain_ms", "notify_avg_ms", "notify_max_ms",
 ]
 
 
@@ -731,6 +734,12 @@ def pipeline_plan(cfg, node_count=1):
     qps_multiple = float(cfg.get("qps_multiple", 1))
     per_node_qps = base_qps * qps_multiple
     total_qps = per_node_qps * node_count
+    notify_async = writer_cfg.get("notify_async", False)
+    if not isinstance(notify_async, bool):
+        raise RuntimeError("writer.notify_async must be a JSON boolean")
+    notify_max_inflight = int(writer_cfg.get("notify_max_inflight", 256))
+    if notify_max_inflight < 1:
+        raise RuntimeError("writer.notify_max_inflight must be >= 1")
     if client_cfg:
         # ---- dual-role deployment (rank/recall minimal shape): one process
         # per entry hosting BOTH writer and reader behind one HTTP port.
@@ -754,6 +763,8 @@ def pipeline_plan(cfg, node_count=1):
             "per_writer_qps": per_client_qps,
             "notify_count": int(cfg.get("notify_count", 1)),
             "notify_threads": int(writer_cfg.get("notify_threads", 1)),
+            "notify_async": notify_async,
+            "notify_max_inflight": notify_max_inflight,
             "reader_threads": int(reader_cfg.get("num_threads", 1)),
             "writer_port_base": c_base,
             "reader_port_base": c_base,
@@ -777,6 +788,8 @@ def pipeline_plan(cfg, node_count=1):
         "per_writer_qps": per_writer_qps,
         "notify_count": int(cfg.get("notify_count", 1)),
         "notify_threads": int(writer_cfg.get("notify_threads", 1)),
+        "notify_async": notify_async,
+        "notify_max_inflight": notify_max_inflight,
         "reader_threads": int(reader_cfg.get("num_threads", 1)),
         "writer_port_base": w_base,
         "reader_port_base": r_base,
@@ -3223,6 +3236,13 @@ def _pipeline_client_timeout(cfg, rendezvous_timeout_s, warmup_enabled=True):
         warmup_s = max(
             0.0, float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0))
     shutdown_grace_s = 60.0
+    writer_cfg = cfg.get("writer", {}) or {}
+    if writer_cfg.get("notify_async", False):
+        # Each HTTP call has a 0.5s socket timeout; reserve queue-drain
+        # budgets after both warmup and measurement, plus existing grace.
+        inflight = int(writer_cfg.get("notify_max_inflight", 256))
+        threads = max(1, int(writer_cfg.get("notify_threads", 1) or 1))
+        shutdown_grace_s += 2 * 0.5 * math.ceil(inflight / threads)
     return max(1, int(math.ceil(
         2.0 * rendezvous_s + warmup_s + duration_s + shutdown_grace_s)))
 
@@ -3379,6 +3399,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         "BENCH_TARGET_QPS": str(plan["per_writer_qps"]),
         "BENCH_NOTIFY_COUNT": str(plan["notify_count"]),
         "BENCH_NOTIFY_THREADS": str(plan["notify_threads"]),
+        "BENCH_NOTIFY_ASYNC": "true" if plan["notify_async"] else "false",
+        "BENCH_NOTIFY_MAX_INFLIGHT": str(plan["notify_max_inflight"]),
         "BENCH_NOTIFY_PIPELINE": ",".join(cfg.get("notify_pipeline", [])),
         "BENCH_TRAFFIC_MODE": cfg.get("traffic_mode", "pulse"),
         "BENCH_DURATION": str(cfg.get("duration", 30)),
@@ -3653,18 +3675,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         "(parallel x{})".format(
                             len(_items), min(_PIPELINE_PARALLEL,
                                              len(_items))))
-                    # writers run INSIDE the clients: after the expected
-                    # window (+grace) shut the reader side down so every
-                    # client flushes both summaries and exits
-                    warmup_s = (float(cfg.get("warmup", {}).get("duration", 0) or 0)
-                                if warmup == "true" else 0.0)
-                    expected_s = warmup_s + float(cfg.get("duration", 30)) + 10.0
-                    log("pipeline dual: waiting {:.0f}s for writer phases, "
-                        "then /shutdown".format(expected_s))
-                    t0 = time.time()
-                    while time.time() - t0 < expected_s:
-                        _check_stop()
-                        time.sleep(min(1.0, expected_s - (time.time() - t0)))
+                    # Writers publish completion only after draining notify.
+                    # Keep all reader endpoints alive until every writer is
+                    # done, including warmup drain and measured drain time.
+                    completion_timeout = client_timeout_s
+                    log("pipeline dual: waiting for all writers and notify drain")
+                    _pipeline_barrier(cluster, etcd_endpoints,
+                                      "mcbench/{}/writers_done/".format(run_id),
+                                      len(plan["clients"]), completion_timeout,
+                                      "completed dual writers", run_id)
                     _pid_by_obj = {id(e): (pid or "").strip()
                                    for e, pid in writer_pids}
                     _items = [(get_node(cluster, c["node"]), c["port"],
@@ -4168,6 +4187,10 @@ def parse_benchmark_log(paths, op_filter=None):
     walls = []
     queue_waits = []
     max_depth = 0
+    notify = {k: 0 for k in (
+        "notify_submitted", "notify_ok", "notify_fail", "notify_inflight_peak",
+        "notify_backpressure_ms", "notify_drain_ms", "notify_max_ms")}
+    notify_elapsed_sum = 0.0
     for path in paths:
         for line in open(path, "r", encoding="utf-8", errors="replace"):
             line = line.rstrip("\n")
@@ -4221,6 +4244,15 @@ def parse_benchmark_log(paths, op_filter=None):
                 total_bytes += int(s.get("bytes", 0))
                 walls.append(float(s.get("wall_s", 0.0)))
                 max_depth = max(max_depth, int(s.get("max_depth", 0)))
+                if (s.get("mode") == "pipeline_writer_summary" and
+                        op_filter in (None, "pipeline_write")):
+                    for k in notify:
+                        if k in ("notify_inflight_peak", "notify_max_ms"):
+                            notify[k] = max(notify[k], s.get(k, 0))
+                        else:
+                            notify[k] += s.get(k, 0)
+                    notify_elapsed_sum += s.get("notify_avg_ms", 0) * (
+                        s.get("notify_ok", 0) + s.get("notify_fail", 0))
     latencies.sort()
     if starts and len(walls) == len(starts):
         ends = [s + w for s, w in zip(starts, walls)]
@@ -4229,7 +4261,9 @@ def parse_benchmark_log(paths, op_filter=None):
         wall = 0.0
     n = len(latencies)
     total = ok + fail
-    return {
+    completed = notify["notify_ok"] + notify["notify_fail"]
+    notify["notify_avg_ms"] = notify_elapsed_sum / completed if completed else 0.0
+    return dict(notify, **{
         "total": total,
         "total_bytes": total_bytes,
         "wall_s": wall,
@@ -4249,7 +4283,7 @@ def parse_benchmark_log(paths, op_filter=None):
         "queue_wait_avg_ms": (sum(queue_waits) / len(queue_waits)) if queue_waits else 0.0,
         "queue_wait_max_ms": max(queue_waits) if queue_waits else 0.0,
         "max_depth": max_depth,
-    }
+    })
 
 
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
@@ -4312,6 +4346,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "protocol": cfg["protocol"],
                 "num_threads": plan["reader_threads"] if role == "reader" else "",
                 "notify_threads": plan["notify_threads"] if role == "writer" else "",
+                "notify_async": plan["notify_async"] if role == "writer" else "",
+                "notify_max_inflight": plan["notify_max_inflight"] if role == "writer" else "",
                 "data_size": ds,
                 "batch_size": cfg.get("batch_size", ""),
                 # effective per-writer cap: auto-computed value when
@@ -4356,6 +4392,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["success"] = ok
             row["fail"] = fail
             row["fail_rate"] = agg["fail_rate"]
+            if row["role"] == "writer":
+                for k in ("notify_submitted", "notify_ok", "notify_fail",
+                          "notify_inflight_peak", "notify_backpressure_ms",
+                          "notify_drain_ms", "notify_avg_ms", "notify_max_ms"):
+                    row[k] = agg[k]
             # bytes/throughput count successful operations only
             row["total_bytes"] = int(ok * bytes_per_op)
             row["wall_s"] = wall

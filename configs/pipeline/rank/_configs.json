@@ -4,7 +4,9 @@
   "data_size": ["8MB"],
   "writer": {
     "count_per_node": 1,
-    "operation": "put_batch"
+    "operation": "put_batch",
+    "notify_async": true,
+    "notify_max_inflight": 256
   },
   "reader": {
     "operation": "get",
