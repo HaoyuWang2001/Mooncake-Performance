@@ -541,14 +541,30 @@ class _NoCall(Exception):
 
 
 def now_hms():
-    """Local wall-clock timestamp for RESULT rows (HH:MM:SS.microseconds).
+    """Local wall-clock timestamp for RESULT rows (YYYY-MM-DD HH:MM:SS.micro).
 
+    The DATE part disambiguates multi-day (7x24h) runs — the legacy
+    HH:MM:SS-only format folded midnight heuristically in every parser.
     Localization aid only — latency values come from the timed region; wall
     clock may skew across nodes and is never used for measurement.
     """
     t = time.time()
-    return time.strftime("%H:%M:%S", time.localtime(t)) + ".{:06d}".format(
-        int((t % 1) * 1e6))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + \
+        ".{:06d}".format(int((t % 1) * 1e6))
+
+
+_BASIC_RESULT_LOCK = threading.Lock()
+
+
+def _write_result_row(op_name, key, lat, status, ts):
+    """Stream ONE basic RESULT row as it is produced (streaming flush): a
+    mid-run kill (STOP/kill -9) keeps every completed sample instead of
+    losing the whole in-memory buffer. The write sits OUTSIDE the timed
+    region (latency is captured around the interface call only)."""
+    with _BASIC_RESULT_LOCK:
+        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\n".format(
+            ts, op_name, key, lat, status))
+        sys.stdout.flush()
 
 
 def _run_iface(store, make_call, check, keys, value, ctx):
@@ -698,11 +714,18 @@ GET_IFACE_DEFS = {
     "get_into": (_get_into_make_call, _get_into_check),
     "get_buffer": (_get_buffer_make_call, _get_buffer_check),
 }
-def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
+def _run_thread(args, store, keys, value, results, deadline=None, ctx=None,
+                emit_rows=True):
     op = args.operation
     batch_size = max(1, args.batch_size)
     put_ratio = args.put_ratio
     local = []
+
+    def record(op_name, key, lat, status):
+        ts = now_hms()
+        local.append((op_name, key, lat, status, ts))
+        if emit_rows:                      # warmup rows are discarded
+            _write_result_row(op_name, key, lat, status, ts)
     def keys_iter():
         if deadline is None:
             for k in keys:
@@ -758,7 +781,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if i < n_put_units:
                 group = put_keys[i * batch_size:(i + 1) * batch_size]
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[put_iface], group, value, ctx)
-                local.append(("put", group[0], lat, status, now_hms()))
+                record("put", group[0], lat, status)
                 pace()
             if i < n_get_units:
                 base = i * batch_size
@@ -767,7 +790,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                 gkeys = gkeys[:n_get - base]
                 if gkeys:
                     lat, status = _run_iface(store, *GET_IFACE_DEFS[get_iface], gkeys, value, ctx)
-                    local.append(("get", gkeys[0], lat, status, now_hms()))
+                    record("get", gkeys[0], lat, status)
                     pace()
 
         if deadline is None:
@@ -797,7 +820,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if deadline is None:
                 for group in groups_iter():
                     lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                    local.append((op, group[0], lat, status, now_hms()))
+                    record(op, group[0], lat, status)
                     pace()
             else:
                 # duration mode: full-key passes; after each completed pass
@@ -813,7 +836,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                             break
                         group = keys[j:j + batch_size]
                         lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                        local.append((op, group[0], lat, status, now_hms()))
+                        record(op, group[0], lat, status)
                         pace()
                     else:
                         store.batch_remove(keys, force=True)
@@ -823,7 +846,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if deadline is None:
                 for k in keys_iter():
                     lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                    local.append((op, k, lat, status, now_hms()))
+                    record(op, k, lat, status)
                     pace()
             else:
                 # duration mode: full-key passes with untimed self-clear
@@ -835,7 +858,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                         if time.time() >= deadline:
                             break
                         lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                        local.append((op, k, lat, status, now_hms()))
+                        record(op, k, lat, status)
                         pace()
                     else:
                         if op != "upsert_from":
@@ -846,12 +869,12 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
         if op in GET_BATCH_IFACES:
             for group in groups_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], group, value, ctx)
-                local.append((op, group[0], lat, status, now_hms()))
+                record(op, group[0], lat, status)
                 pace()
         else:
             for k in keys_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], [k], value, ctx)
-                local.append((op, k, lat, status, now_hms()))
+                record(op, k, lat, status)
                 pace()
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
@@ -890,7 +913,7 @@ def run_warmup(args, store, value, ctx=None):
     wargs.target_qps = 0  # warmup free-runs; pacing is for measured phase
     results = []
     _run_thread(wargs, store, keys, value, results, deadline=time.time() + duration,
-                ctx=ctx)
+                ctx=ctx, emit_rows=False)
     store.batch_remove(keys, force=True)
     log("warmup done (ops={})".format(len(results)))
 def _percentile(sorted_vals, p):
@@ -1017,10 +1040,9 @@ def cmd_benchmark(args, store):
     emit("SUMMARY", summary)
     log("benchmark done (total={}, ok={}, fail={}, wall_s={:.3f})".format(
         total, ok_count, fail_count, wall_s))
-    for opname, k, lat, status, ts in results:
-        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\n".format(
-            ts, opname, k, lat, status))
-    sys.stdout.flush()
+    # RESULT rows were streamed per-op by _write_result_row (basic streaming
+    # flush): nothing left to write here — the order change (RESULT before
+    # SUMMARY) is invisible to every parser (line scans, order-independent).
 
 # --------------------------------------------------------------------------
 

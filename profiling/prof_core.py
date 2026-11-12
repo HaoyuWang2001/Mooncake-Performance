@@ -283,7 +283,10 @@ def stop_and_collect(cluster, session, local_prof_dir):
 # --------------------------------------------------------------------------
 
 def _ts_to_seconds(ts):
-    h, m, rest = ts.split(":")
+    # "YYYY-MM-DD HH:MM:SS.micro" (dated) or legacy "HH:MM:SS.micro":
+    # take the time-of-day part; the caller folds day boundaries forward
+    hms = ts.split(" ")[-1] if " " in ts else ts
+    h, m, rest = hms.split(":")
     return int(h) * 3600 + int(m) * 60 + float(rest)
 
 
@@ -331,7 +334,11 @@ def slice_window(prof_dir, center_seconds, window_ms):
                 continue
             lines = []
             for line in open(path, "r", encoding="utf-8", errors="replace"):
-                for m in re.finditer(r"\b(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\b", line):
+                # dated "YYYY-MM-DD HH:MM:SS(.micro)" (new RESULT rows) or
+                # bare time-of-day (bpftrace/spdiag artifacts)
+                for m in re.finditer(
+                        r"\b(?:(?:\d{4}-\d{2}-\d{2}) )?(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\b",
+                        line):
                     try:
                         s = _ts_to_seconds(m.group(1))
                     except ValueError:

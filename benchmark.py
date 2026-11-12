@@ -88,7 +88,10 @@ SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 # RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
 # legacy rows start with the op name directly (see parse_benchmark_log)
-TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
+# RESULT row timestamp: new "YYYY-MM-DD HH:MM:SS.micro" (date disambiguates
+# multi-day runs) or legacy "HH:MM:SS.micro". The optional date prefix
+# keeps both formats detectable with one regex.
+TS_PREFIX = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}")
 # store interface families (mirror scripts/mooncake_benchmark_client.py so the
 # orchestrator can validate operation values and choose staging behaviour)
 PIPELINE_PUT_IFACES = ("put", "put_batch", "put_from", "upsert_from")

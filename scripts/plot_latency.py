@@ -53,7 +53,9 @@ STAT_HLINES_ALWAYS = [("avg", "tab:blue"), ("max", "tab:red")]
 STAT_HLINES_GATED = [("p99", "tab:orange", 100), ("p999", "tab:green", 1000),
                      ("p9999", "tab:purple", 10000)]
 REF_LINES = [(1.0, "1ms"), (2.0, "2ms")]
-TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
+# new "YYYY-MM-DD HH:MM:SS.micro" (dated, multi-day safe) or legacy
+# "HH:MM:SS.micro" — one regex detects both
+TS_PREFIX = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}")
 
 
 def percentile(sorted_vals, q):
@@ -63,8 +65,14 @@ def percentile(sorted_vals, q):
 
 
 def ts_to_seconds(ts):
-    """'HH:MM:SS.micro' -> seconds since midnight (float)."""
-    h, m, rest = ts.split(":")
+    """'YYYY-MM-DD HH:MM:SS.micro' (or legacy 'HH:MM:SS.micro')
+    -> seconds since midnight of the time-of-day part (float).
+
+    The day part is dropped HERE on purpose: callers fold day boundaries
+    forward heuristically (a backward jump in time-of-day = one day passed),
+    which is exact for the continuous per-op log stream."""
+    hms = ts.split(" ")[-1] if " " in ts else ts
+    h, m, rest = hms.split(":")
     return int(h) * 3600 + int(m) * 60 + float(rest)
 
 
