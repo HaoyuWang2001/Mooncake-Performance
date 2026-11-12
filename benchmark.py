@@ -3524,6 +3524,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         warmup = "false" if args.no_warmup else "true"
         client_timeout_s = _pipeline_client_timeout(
             cfg, rendezvous_timeout_s, warmup_enabled=(warmup == "true"))
+        # Parallel rank+recall: registered clients idle at the cross-child
+        # /start gate while the peer child finishes data-gen/smoke/boot.
+        # Reserve the ready-barrier ceiling on top of the normal lifetime
+        # (safety ceiling only: /shutdown still ends successful runs early).
+        if getattr(args, "parallel_ready_dir", None):
+            client_timeout_s += _PARALLEL_READY_TIMEOUT_S
         reader_threads = plan["reader_threads"]
         log("scenario {} (pipeline, {}): N={}, writers={}, readers={}, "
             "notify_count={}, total_qps={}, per_writer_qps={}, traffic={}, "
