@@ -1906,10 +1906,16 @@ def numa_node_check(node_name, numa_strict):
         "numa_bind requires numactl on node {} (numa_strict=true)".format(node_name))
 
 
+# Small-run threshold: below this total raw-log size the orchestrator pulls
+# the raw logs as well (stats-only above it — raw stays on the nodes).
+RAW_AUTO_PULL_MAX = 100 * 1024 ** 2
+
+
 def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
-                     dry=False):
+                     dry=False, node_name=None, role=None, size=None):
     """map 阶段：在节点/pod 内对每个 RESULT 日志执行 logstats，就地生成
-    <log>.stats.json（编排器默认只回传统计产物，原始日志留在节点上）。"""
+    <log>.stats.json（编排器默认只回传统计产物，原始日志留在节点上）。
+    产物 meta 里写入 node/pod/role/远程路径，供报表分节点统计与现场索引。"""
     py = resolve_venv(cluster, globals_cfg)
     stats = []
     for log in log_paths:
@@ -1918,6 +1924,15 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             shlex.quote(py),
             shlex.quote(remote_scripts + "/logstats.py"),
             shlex.quote(log))
+        if node_name:
+            cmd += " --node {}".format(shlex.quote(str(node_name)))
+        if node.get("_pod"):
+            cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
+        if role:
+            cmd += " --role {}".format(shlex.quote(str(role)))
+        if size:
+            cmd += " --size {}".format(shlex.quote(str(size)))
+        cmd += " --remote-path {}".format(shlex.quote(log))
         if dry:
             log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
         elif node.get("_pod"):
@@ -1941,15 +1956,23 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
 
 
 def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
-                       remote_scripts, pull_raw=False):
+                       remote_scripts, pull_raw=False, size=None):
     """map（远端 logstats）→ 只拉 *.stats.json（pull_raw 时连原始日志一起拉）。
     groups: [(node, [log paths], label, node_display_name)]。
     返回 {node_display_name: 原始日志字节}（从 stats.meta.bytes 汇总）。"""
     node_bytes = {}
     for node, files, label, name in groups:
         result_logs = [f for f in files if not f.endswith(".glog")]
+        role = None
+        if result_logs:
+            base = os.path.basename(result_logs[0])
+            for _r in ("writer", "reader"):
+                if ".{}.log".format(_r) in base:
+                    role = _r
+                    break
         stats = run_logstats_map(cluster, node, result_logs, remote_scripts,
-                                 globals_cfg, dry=dry)
+                                 globals_cfg, dry=dry, node_name=name,
+                                 role=role, size=size)
         pull_files = stats + (list(files) if pull_raw else [])
         _pipeline_pull_parallel(
             cluster, [(node, pull_files, label)], local_log_dir, dry)
@@ -1972,6 +1995,17 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
                     except (OSError, ValueError):
                         pass
             node_bytes[name] = total
+    # Small runs: pull the raw logs too (cheap) so the report can offer full
+    # per-point inspection (scatter layer + exact excerpts). Large runs stay
+    # stats-only (raw logs remain on the nodes).
+    if not dry and not pull_raw:
+        total_bytes = sum(node_bytes.values())
+        if 0 < total_bytes <= RAW_AUTO_PULL_MAX:
+            log_detail("[map] raw logs {} -> pulling raw too (<= {})".format(
+                _fmt_gib(total_bytes), _fmt_gib(RAW_AUTO_PULL_MAX)))
+            for node, files, label, name in groups:
+                _pipeline_pull_parallel(
+                    cluster, [(node, list(files), label)], local_log_dir, dry)
     return node_bytes
 
 
@@ -1984,6 +2018,102 @@ def _log_node_volumes(node_bytes, what):
              sorted(node_bytes.items()) if b]
     if parts:
         log("[stats] {} 节点日志量: {}".format(what, ", ".join(parts)))
+
+
+_REPORT_MOD = [None]
+_REPORT_ACC = []      # [{data, report_html}] accumulated for the run overview
+
+
+def _report_module():
+    if _REPORT_MOD[0] is None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "mc_report", os.path.join(SCRIPTS_DIR, "report.py"))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REPORT_MOD[0] = mod
+    return _REPORT_MOD[0]
+
+
+def _is_client_log(name):
+    """True for measured client logs (per role/combo), false for stage logs."""
+    if not name.endswith(".log"):
+        return False
+    if any(k in name for k in (".ylt.", ".nohup", ".glog", ".exitrc")):
+        return False
+    if any(k in name for k in (".generate-data.", ".remove-keys",
+                               ".prepare-store.")):
+        return False
+    return True
+
+
+def _collect_local_stats(local_log_dir):
+    """Stats for every client log available locally: pulled remote stats are
+    used as-is; raw-only logs get stats computed locally (small-run auto
+    pull / --png / legacy runs). Returns sorted stats paths."""
+    stats = []
+    for root, _dirs, files in os.walk(local_log_dir):
+        for fn in files:
+            if fn.endswith(".stats.json"):
+                stats.append(os.path.join(root, fn))
+    have = set(stats)
+    for root, _dirs, files in os.walk(local_log_dir):
+        for fn in sorted(files):
+            if not _is_client_log(fn):
+                continue
+            p = os.path.join(root, fn)
+            sp = p + ".stats.json"
+            if sp in have:
+                continue
+            try:
+                st = _logstats_module().compute_stats(p)
+                with open(sp, "w", encoding="utf-8") as f:
+                    json.dump(st, f, ensure_ascii=False,
+                              separators=(",", ":"))
+                stats.append(sp)
+            except Exception as exc:
+                log_detail("[report] local stats failed for {}: {}".format(
+                    fn, exc))
+    return sorted(set(stats))
+
+
+def _generate_reports(cfg, local_log_dir, args, early_stop=False,
+                      qps_target=0, launch_mode="single", mode="pipeline"):
+    """Reduce the map products and render the scenario report. WARN-only —
+    never fails the benchmark path."""
+    if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
+        return None
+    try:
+        rp = _report_module()
+        stats = _collect_local_stats(local_log_dir)
+        if not stats:
+            log_detail("[report] no client logs under {}; skipped".format(
+                local_log_dir))
+            return None
+        cfg_name = os.path.splitext(os.path.basename(
+            cfg.get("__cfg_path__") or "scenario"))[0]
+        meta = {
+            "config": cfg_name,
+            "mode": mode,
+            "launch_mode": launch_mode,
+            "clients": len(stats),
+            "qps_target": qps_target,
+            "protocol": "",
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "early_stop": bool(early_stop),
+        }
+        data = rp.reduce_scenario(rp.load(stats), meta)
+        echarts = os.path.join(ROOT, "webui", "web", "vendor",
+                               "echarts.min.js")
+        out_dir = os.path.join(local_log_dir, "report")
+        html, _datajs = rp.render_scenario(data, out_dir, echarts)
+        log("[report] {} -> {}".format(
+            cfg_name, os.path.relpath(html, ROOT)))
+        _REPORT_ACC.append({"data": data, "report_html": html})
+        return data
+    except Exception as exc:
+        log("[WARN] report generation failed: {}".format(exc))
+        return None
 
 
 def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
@@ -2987,7 +3117,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             # CSV/report consume *.stats.json; raw logs (+pids) only when
             # explicitly requested (--pull-raw-logs / --png)
             run_logstats_map(cluster, node, [remote_log], remote_scripts,
-                             globals_cfg, dry=dry)
+                             globals_cfg, dry=dry,
+                             node_name=primary_node_name, size=ds)
             _pull_files = [remote_log + ".stats.json"]
             if getattr(args, "pull_raw_logs", False) \
                     or getattr(args, "png", False):
@@ -3021,6 +3152,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
+        _generate_reports(cfg, local_log_dir, args,
+                          qps_target=total_target_qps, mode="basic")
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
                 "remote_log_dir": remote_log_dir}
     except Exception:
@@ -3028,6 +3161,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # Basic clients may have been orphaned mid-run -> reap the ledger.
         if not dry:
             fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir)
+            _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                              qps_target=total_target_qps, mode="basic")
             reap_state_entries(cluster)
             if profile_sess is not None:
                 prof_core.stop_and_collect(cluster, profile_sess,
@@ -3768,7 +3903,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         cluster, _groups, local_log_dir, dry, globals_cfg,
                         remote_scripts,
                         pull_raw=bool(getattr(args, "pull_raw_logs", False)
-                                      or getattr(args, "png", False)))
+                                      or getattr(args, "png", False)),
+                        size=ds)
                     _log_node_volumes(_nb, cfg_name)
                     log("logs: {} clients / {} pods processed".format(
                         len(_groups), len(_groups)))
@@ -3942,7 +4078,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     cluster, _groups, local_log_dir, dry, globals_cfg,
                     remote_scripts,
                     pull_raw=bool(getattr(args, "pull_raw_logs", False)
-                                  or getattr(args, "png", False)))
+                                  or getattr(args, "png", False)),
+                    size=ds)
                 _log_node_volumes(_nb, cfg_name)
                 log("logs: {} writers / {} pods processed".format(
                     len(_groups), len(_groups)))
@@ -3993,7 +4130,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     cluster, _groups, local_log_dir, dry, globals_cfg,
                     remote_scripts,
                     pull_raw=bool(getattr(args, "pull_raw_logs", False)
-                                  or getattr(args, "png", False)))
+                                  or getattr(args, "png", False)),
+                    size=ds)
                 _log_node_volumes(_nb, cfg_name)
                 log("logs: {} readers / {} pods processed".format(
                     len(_groups), len(_groups)))
@@ -4059,6 +4197,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
+        _generate_reports(cfg, local_log_dir, args,
+                          qps_target=plan["total_qps"],
+                          launch_mode="rank_recall" if plan.get("dual") else "single",
+                          mode="pipeline")
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
                 "remote_log_dir": remote_log_dir}
     except Exception:
@@ -4073,6 +4215,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   remove_node=locals().get("primary_node_name"),
                                   remove_runner=locals().get("remote_runner"),
                                   globals_cfg=globals_cfg)
+            _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                              qps_target=plan["total_qps"],
+                              launch_mode="rank_recall" if plan.get("dual") else "single",
+                              mode="pipeline")
             # 复核台账：已死删行、杀不死的保留待下次 reap
             reap_state_entries(cluster)
             if profile_sess is not None:
@@ -5026,7 +5172,7 @@ def parse_arguments(argv=None):
         if not os.path.exists(p):
             sys.exit("[ERROR] config not found: {}".format(p))
         cfg_paths.append(p)
-    if not cfg_paths and not args.clean_up:
+    if not cfg_paths and not args.clean_up and not args.rebuild_report:
         sys.exit("[ERROR] provide --config and/or --config-dir (comma-separated "
                  "multi values allowed), or --clean-up for a standalone cluster cleanup")
     return args, cfg_paths
@@ -5078,7 +5224,65 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
             f.write("\n".join(lines) + "\n")
 
 
+def rebuild_reports(ts):
+    """--rebuild-report: regenerate the reports for an existing run purely
+    from LOCAL artifacts (pulled stats and/or raw logs). Covers the
+    "run finished but report generation failed" case without touching the
+    remote side. Returns the process exit code."""
+    ts_dir = os.path.join(RESULTS_DIR, ts)
+    logs_root = os.path.join(ts_dir, "logs")
+    if not os.path.isdir(logs_root):
+        log("[ERROR] no logs directory under {}".format(
+            os.path.relpath(ts_dir, ROOT)))
+        return 2
+    rp = _report_module()
+    echarts = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
+    scenarios = []
+    for name in sorted(os.listdir(logs_root)):
+        d = os.path.join(logs_root, name)
+        if not os.path.isdir(d) or name == "report":
+            continue
+        stats = _collect_local_stats(d)
+        if not stats:
+            log("[WARN] {}: no stats/raw logs locally; skipped".format(name))
+            continue
+        loaded = rp.load(stats)
+        roles = {(st.get("meta") or {}).get("role") for st in loaded}
+        mode = "pipeline" if roles & {"writer", "reader"} else "basic"
+        data = rp.reduce_scenario(loaded, {
+            "config": name, "mode": mode, "clients": len(loaded),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "early_stop": False,          # unknown for historical runs
+        })
+        html, _dj = rp.render_scenario(data, os.path.join(d, "report"),
+                                       echarts)
+        log("[report] rebuilt {} -> {}".format(
+            name, os.path.relpath(html, ROOT)))
+        scenarios.append(dict(data, report_rel=os.path.relpath(
+            html, os.path.join(ts_dir, "report")).replace(os.sep, "/")))
+    if not scenarios:
+        log("[ERROR] rebuild: no local stats or raw logs found under {} — "
+            "re-run with --pull-raw-logs, or use --rebuild-report on the "
+            "originating machine".format(os.path.relpath(logs_root, ROOT)))
+        return 1
+    by_node = {}
+    for sc in scenarios:
+        for n in sc.get("nodes") or []:
+            e = by_node.setdefault(n.get("node"), {"node": n.get("node"),
+                                                   "pods": 0, "bytes": 0})
+            e["pods"] += n.get("pods") or 0
+            e["bytes"] += n.get("bytes") or 0
+    ov = rp.render_overview({
+        "run": ts, "mode": "", "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "nodes": sorted(by_node.values(), key=lambda x: -(x.get("bytes") or 0)),
+    }, scenarios, os.path.join(ts_dir, "report"))
+    log("[report] overview -> {}".format(os.path.relpath(ov, ROOT)))
+    return 0
+
+
 def main(args, cfg_paths):
+    if getattr(args, "rebuild_report", None):
+        sys.exit(rebuild_reports(args.rebuild_report))
     stop_file = args.stop_file or os.environ.get("BENCH_STOP_FILE")
     if stop_file:
         args.stop_file = stop_file
@@ -5313,40 +5517,51 @@ def main(args, cfg_paths):
         else:
             cleanup_k8s_namespace(cluster, dry_run=False)
     log("done. results in {}".format(ts_dir))
-    # auto-plot runs on the ORCHESTRATOR (local sys.executable, local logs dir);
-    # it must never run on remote nodes. Skip when a failed run produced no logs.
+    # Reports + optional PNG: everything runs on the ORCHESTRATOR (local
+    # sys.executable, local logs dir), never on remote nodes.
+    #   - scenario reports were rendered during the run (stats reduce)
+    #   - the run-level overview is rendered here
+    #   - the legacy PNG plots are generated only with --png (compat switch)
     if not args.no_plot:
-        log_dir = os.path.join(ts_dir, "logs")
-        has_logs = bool(glob.glob(os.path.join(log_dir, "**", "*.log"),
-                                  recursive=True))
-        if not has_logs:
-            log("[WARN] auto-plot skipped (no *.log under {})".format(log_dir))
-        else:
-            plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
-            # Plotting is 100% local (on this orchestrator machine). Cap the
-            # BLAS/OpenMP thread pools: OpenBLAS pre-allocates one buffer per
-            # thread at import, which on Windows can fail with
-            # "OpenBLAS error: Memory allocation still failed" when the commit
-            # limit/pagefile is tight or Python is 32-bit. Plotting gains
-            # nothing from parallel BLAS, so single-thread keeps the footprint
-            # minimal and sidesteps the failure.
-            plot_env = dict(os.environ)
-            for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
-                        "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-                plot_env[var] = "1"
-            log("[benchmark] plotting locally on this machine (orchestrator): "
-                "{} {} --log {}".format(sys.executable, plot_script, log_dir))
+        if _REPORT_ACC:
             try:
-                proc = subprocess.run(
-                    [sys.executable, plot_script, "--log", log_dir],
-                    check=False, env=plot_env)
-                if proc.returncode != 0:
-                    log("[WARN] auto-plot failed (rc={}); figures skipped - "
-                        "see the traceback above (plotter crash). Plotting "
-                        "runs locally; if matplotlib is missing: pip install "
-                        "matplotlib".format(proc.returncode))
+                rp = _report_module()
+                ov_dir = os.path.join(ts_dir, "report")
+                scenarios = []
+                for acc in _REPORT_ACC:
+                    d = acc["data"]
+                    rel = os.path.relpath(acc["report_html"], ov_dir)
+                    scenarios.append(dict(d, report_rel=rel.replace(os.sep, "/")))
+                by_node = {}
+                for sc in scenarios:
+                    for n in sc.get("nodes") or []:
+                        e = by_node.setdefault(n.get("node"),
+                                               {"node": n.get("node"),
+                                                "pods": 0, "bytes": 0})
+                        e["pods"] += n.get("pods") or 0
+                        e["bytes"] += n.get("bytes") or 0
+                run_meta = {
+                    "run": os.path.basename(ts_dir),
+                    "mode": args.mode,
+                    "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "nodes": sorted(by_node.values(),
+                                    key=lambda x: -(x.get("bytes") or 0)),
+                }
+                ov = rp.render_overview(run_meta, scenarios, ov_dir)
+                log("[report] overview -> {}".format(
+                    os.path.relpath(ov, ROOT)))
             except Exception as exc:
-                log("[WARN] auto-plot failed: {}".format(exc))
+                log("[WARN] overview report failed: {}".format(exc))
+        if args.png:
+            log_dir = os.path.join(ts_dir, "logs")
+            has_logs = bool(glob.glob(os.path.join(log_dir, "**", "*.log"),
+                                      recursive=True))
+            if not has_logs:
+                log("[WARN] --png: no raw *.log under {} (raw logs are only "
+                    "pulled for small runs / failures / --pull-raw-logs)"
+                    "".format(log_dir))
+            else:
+                _run_legacy_plots(log_dir)
     if args.clean_up:
         # reap first: recorded processes must be killed before their
         # scripts/binaries vanish with the remote directory
@@ -5435,6 +5650,30 @@ def cleanup_on_stop():
             except OSError:
                 pass
         clear_stop()
+
+
+def _run_legacy_plots(log_dir):
+    """Legacy PNG plots (plot_latency.py) — only with --png."""
+    plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
+    # Plotting is 100% local. Cap the BLAS/OpenMP thread pools: OpenBLAS
+    # pre-allocates one buffer per thread at import, which on Windows can
+    # fail with "OpenBLAS error: Memory allocation still failed" when the
+    # commit limit/pagefile is tight or Python is 32-bit.
+    plot_env = dict(os.environ)
+    for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        plot_env[var] = "1"
+    log("[benchmark] plotting locally on this machine (orchestrator): "
+        "{} {} --log {}".format(sys.executable, plot_script, log_dir))
+    try:
+        proc = subprocess.run([sys.executable, plot_script, "--log", log_dir],
+                              check=False, env=plot_env)
+        if proc.returncode != 0:
+            log("[WARN] auto-plot failed (rc={}); figures skipped - see the "
+                "traceback above; if matplotlib is missing: pip install "
+                "matplotlib".format(proc.returncode))
+    except Exception as exc:
+        log("[WARN] auto-plot failed: {}".format(exc))
 
 
 if __name__ == "__main__":

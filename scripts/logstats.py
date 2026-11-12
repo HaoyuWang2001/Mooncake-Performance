@@ -186,7 +186,8 @@ def _scan_summaries(path, cap=8):
     return out
 
 
-def compute_stats(path, top_n=100, context=20):
+def compute_stats(path, top_n=100, context=20, node=None, pod=None,
+                  role=None, remote_path=None, size=None):
     rows = 0
     total = ok = fail = 0
     key_total = key_ok = key_fail = 0
@@ -389,6 +390,11 @@ def compute_stats(path, top_n=100, context=20):
         "meta": {
             "source": os.path.basename(path),
             "bytes": os.path.getsize(path),
+            "node": node,
+            "pod": pod,
+            "role": role,
+            "remote_path": remote_path or path,
+            "size": size,
             "rows": rows,
             "ts_from": ts_from, "ts_to": ts_to,
             "wall_s": round(ts_to - ts_from, 3) if ts_from and ts_to else None,
@@ -432,9 +438,18 @@ def main(argv=None):
                         help="output path (default: <log>.stats.json)")
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--context", type=int, default=20)
+    # provenance stamped by the orchestrator's map stage (used by the report's
+    # per-node/per-pod breakdown and the on-site log location index)
+    parser.add_argument("--node", default=None)
+    parser.add_argument("--pod", default=None)
+    parser.add_argument("--role", default=None)
+    parser.add_argument("--remote-path", default=None)
+    parser.add_argument("--size", default=None)
     args = parser.parse_args(argv)
     out = args.out or (args.log + ".stats.json")
-    stats = compute_stats(args.log, top_n=args.top_n, context=args.context)
+    stats = compute_stats(args.log, top_n=args.top_n, context=args.context,
+                          node=args.node, pod=args.pod, role=args.role,
+                          remote_path=args.remote_path, size=args.size)
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, separators=(",", ":"))
