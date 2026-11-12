@@ -155,14 +155,17 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
     END=$(( i * KEY_COUNT / NUM_CLIENTS ))
     bind_launch "$i"
     print_client_env "client-id=$i mode=$MODE"
-    # per-client ylt easylog file (absolute path; merged below with headers)
+    # three-stream separation: Python RESULT/SUMMARY -> MC_WRITER_LOG file;
+    # fd1+fd2 (C++ SDK glog + Python fatal) -> the per-client glog file
+    # (merged into LOG_FILE.glog below)
+    MC_WRITER_LOG="$LOG_DIR/client.$i.log" \
     MC_YLT_LOG_PATH="$LOG_DIR/client.$i.ylt.log" \
     ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" \
       --mode "$MODE" \
       --client-id "$i" --key-start "$START" --key-end "$END" \
       $BIND_ARGS \
       "${ARGS[@]}" \
-      > "$LOG_DIR/client.$i.log" 2>&1 &
+      > "$LOG_DIR/client.$i.glog" 2>&1 &
     echo $! >> "$LOG_FILE.pids"
   done
   for pid in $(jobs -p); do
@@ -180,6 +183,12 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
     echo "===== $(basename "$f") =====" >> "$LOG_FILE.ylt.log"
     cat "$f" >> "$LOG_FILE.ylt.log"
   done
+  : > "$LOG_FILE.glog"
+  for f in "$LOG_DIR"/client.*.glog; do
+    [ -f "$f" ] || continue
+    echo "===== $(basename "$f") =====" >> "$LOG_FILE.glog"
+    cat "$f" >> "$LOG_FILE.glog"
+  done
   rm -rf "$LOG_DIR"
 else
   # single-process/stage mode: write DIRECTLY to LOG_FILE so the output is
@@ -193,9 +202,12 @@ else
     BIND_ARGS=""
   fi
   print_client_env "client-id=1 mode=$MODE"
+  # three-stream separation: Python stream -> MC_WRITER_LOG (= LOG_FILE);
+  # fd1+fd2 (SDK glog + fatal) -> LOG_FILE.glog
+  MC_WRITER_LOG="$LOG_FILE" \
   MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
   ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" --mode "$MODE" ${BIND_ARGS} "${ARGS[@]}" \
-    > "$LOG_FILE" 2>&1 &
+    > "$LOG_FILE.glog" 2>&1 &
   CHILD=$!
   echo "$CHILD" >> "$LOG_FILE.pids"
   wait "$CHILD"

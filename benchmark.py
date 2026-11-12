@@ -3514,6 +3514,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     reader_log = "{}.dual_{}_c{}_p{}.reader.log".format(
                         base_noext, c["node"], c["id"], c["port"])
                     nohup_log = merged_log.replace(".log", ".nohup")
+                    # process-level client-glog (SDK glog + fatal) -> <base>.glog
+                    glog_file = merged_log.replace(".writer.log", ".glog")
                     numa_arg = ""
                     launch_prefix = ""
                     if (cpu_shard > 0 or numa_bind) and not dry \
@@ -3527,12 +3529,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         numa_arg = "--cpu-bind {}".format(cl)
                         if numactl_ok.get(c["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                    ccmd = ("MC_READER_LOG={rlog} nohup {p}bash {runner} pipeline "
+                    ccmd = ("MC_READER_LOG={rlog} MC_GLOG_FILE={glog} nohup {p}bash {runner} pipeline "
                             "{log} --client-id {cid} --role both --listen-port {port} "
                             "--writer-operation {wop} --reader-operation {rop} "
                             "--num-threads {thr} --warmup {wu} --timeout 300{kc}{na} "
                             "> {nohup} 2>&1 & echo $!").format(
-                        rlog=reader_log, p=launch_prefix, runner=remote_runner,
+                        rlog=reader_log, glog=glog_file, p=launch_prefix, runner=remote_runner,
                         log=merged_log, cid=c["id"], port=c["port"],
                         wop=writer_op, rop=reader_op, thr=reader_threads,
                         wu=warmup, kc=kc_arg, na=numa_arg, nohup=nohup_log)
@@ -3625,7 +3627,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                             base_noext, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.reader.log".format(
                                             base_noext, c["node"], c["id"], c["port"]),
-                                         "{}.dual_{}_c{}_p{}.writer.log.glog".format(
+                                         "{}.dual_{}_c{}_p{}.glog".format(
                                             base_noext, c["node"], c["id"], c["port"])],
                                         "dual c{}".format(c["id"])))
                     _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
@@ -3788,7 +3790,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 _groups = [(get_node(cluster, w["node"]),
                             ["{}.writer_{}_w{}.log".format(
                                 base_noext, w["node"], w["gid"]),
-                             "{}.writer_{}_w{}.log.glog".format(
+                             "{}.writer_{}_w{}.glog".format(
                                 base_noext, w["node"], w["gid"])],
                             "writer w{}".format(w["gid"]))
                            for w in plan["writers"]]
@@ -3830,7 +3832,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 _groups = [(get_node(cluster, r["node"]),
                             ["{}.reader_{}_r{}_p{}.log".format(
                                 base_noext, r["node"], r["index"], r["port"]),
-                             "{}.reader_{}_r{}_p{}.log.glog".format(
+                             "{}.reader_{}_r{}_p{}.glog".format(
                                 base_noext, r["node"], r["index"], r["port"])],
                             "reader r{}".format(r["index"]))
                            for r in plan["readers"]]

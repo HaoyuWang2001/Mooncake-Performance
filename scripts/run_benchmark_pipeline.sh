@@ -61,13 +61,17 @@ CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 print_client_env "mode=$MODE"
-# stdout (Python) and stderr (C++ SDK glog + Python fatal errors) are kept in
-# SEPARATE files so per-role Python metrics (RESULT/SUMMARY) stay readable on
-# their own; the SDK glog stream lands in $LOG_FILE.glog and is pulled back
-# alongside the main log.
+# Three-stream separation (read / writer / client-glog): the client writes its
+# Python stream (RESULT/META/SUMMARY/progress) DIRECTLY into MC_WRITER_LOG
+# (dual readers additionally use MC_READER_LOG, both exported by the
+# orchestrator), so the OS-level fd 1 stays dedicated to the C++ SDK glog
+# stream. fd1 + fd2 (SDK glog + Python fatal tracebacks) are captured
+# together into the glog file; the ylt easylog keeps its own file.
+export MC_WRITER_LOG="${MC_WRITER_LOG:-$LOG_FILE}"
+GLOG="${MC_GLOG_FILE:-${LOG_FILE%.log}.glog}"
 MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
 "$PYTHON" "$CLIENT" --mode "$MODE" "$@" \
-  > "$LOG_FILE" 2> "$LOG_FILE.glog"
+  > "$GLOG" 2>&1
 rc=$?
 # exit-code ledger: the orchestrator reads $LOG_FILE.exitrc after waiting
 # for a backgrounded client — a non-zero rc must FAIL the scenario instead

@@ -117,6 +117,106 @@ def unbuffer_stdio():
     except Exception:
         pass
 
+
+# --------------------------------------------------------------------------
+# Three-stream log separation (read / writer / client-glog)
+#
+# The mooncake SDK writes its glog stream to the OS-level fd 1 (stdout), so a
+# plain `> LOG_FILE` redirect would mix SDK glog into the Python RESULT
+# stream. Instead the runner captures fd1+fd2 into the .glog file and the
+# client rebinds sys.stdout to the ROLE LOGS below: Python output
+# (RESULT/META/SUMMARY/progress) goes to MC_WRITER_LOG / MC_READER_LOG while
+# fd 1 stays dedicated to the SDK. Routing:
+#   only one log configured (single-role / basic / stage processes)
+#       -> ALL Python output goes there
+#   both configured (dual) -> reader-marked threads write the reader log,
+#       everything else (writer thread + process-level lines) the writer log
+#   neither configured      -> stdout untouched (manual CLI runs)
+# --------------------------------------------------------------------------
+class _RoleStdout(object):
+    """sys.stdout replacement routing Python output into the role logs."""
+
+    def __init__(self, writer_h, reader_h, fallback):
+        self._w = writer_h
+        self._r = reader_h
+        self._fallback = fallback
+        self._tls = threading.local()
+
+    def _target(self):
+        if self._r is not None and getattr(self._tls, "reader", False):
+            return self._r
+        return self._w or self._r or self._fallback
+
+    def mark_reader(self):
+        self._tls.reader = True
+
+    def write(self, s):
+        return self._target().write(s)
+
+    def writelines(self, lines):
+        return self._target().writelines(lines)
+
+    def flush(self):
+        self._target().flush()
+
+    @property
+    def encoding(self):
+        return getattr(self._target(), "encoding", "utf-8")
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def reconfigure(self, **kwargs):
+        # line-buffered handles are opened by _open_role_log; forward any
+        # reconfigure (e.g. unbuffer_stdio) to them, never to fd 1
+        for h in (self._w, self._r):
+            if h is not None:
+                try:
+                    h.reconfigure(**kwargs)
+                except Exception:
+                    pass
+
+
+def _open_role_log(env_name):
+    path = (os.environ.get(env_name) or "").strip()
+    if not path:
+        return None
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        return open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        sys.stderr.write("[WARN] cannot open {} {}: {}; Python output "
+                         "falls back to stdout\n".format(env_name, path, exc))
+        return None
+
+
+def init_role_logs():
+    """Rebind sys.stdout to the role-log proxy; called as the FIRST thing in
+    main() so every Python line lands in the role logs (see _RoleStdout)."""
+    writer_h = _open_role_log("MC_WRITER_LOG")
+    reader_h = _open_role_log("MC_READER_LOG")
+    if writer_h is None and reader_h is None:
+        return
+    sys.stdout = _RoleStdout(writer_h, reader_h, sys.stdout)
+
+
+def _mark_reader_thread():
+    """Tag the CURRENT thread as reader-side (dual-mode output routing)."""
+    so = sys.stdout
+    if isinstance(so, _RoleStdout):
+        so.mark_reader()
+
+
+def _reader_log_handle():
+    """The MC_READER_LOG handle opened by init_role_logs (None when unset)."""
+    so = sys.stdout
+    return so._r if isinstance(so, _RoleStdout) else None
+
 # Environment snapshot printed once at process start (per client), before
 # argparse / SDK import. <unset> keeps missing values explicit.
 _ENV_LOG_KEYS = ("POD_IP", "NODE_NAME", "LD_LIBRARY_PATH", "SETUP_FABRIC_IP",
@@ -1336,6 +1436,7 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self._handle()
     def _handle(self):
+        _mark_reader_thread()   # dual mode: reader-side service thread
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/notify":
@@ -1390,6 +1491,7 @@ def _reader_worker(args, store, queue, deadline, results, ctx=None):
     actual store reads warm up the reader->store path — but are tagged so
     they stay out of the measured metrics.
     """
+    _mark_reader_thread()   # dual mode: route this thread's log() to reader log
     pipeline = args.notify_pipeline if isinstance(args.notify_pipeline, list) else ["get"]
     reader_op = args.operation or "get"
     if reader_op not in GET_IFACE_DEFS:
@@ -1739,22 +1841,10 @@ def _pipeline_dual(args, store):
     log("pipeline dual client done (reader items={})".format(len(results)))
     if rctx is not None:
         rctx.teardown(store)
-    # reader output → its own log (writer rows stay on stdout / main log)
-    reader_log = (os.environ.get("MC_READER_LOG") or "").strip()
-    out_stream = None
-    if reader_log:
-        try:
-            out_stream = open(reader_log, "a", encoding="utf-8", buffering=1)
-        except OSError:
-            log("[WARN] cannot open MC_READER_LOG {}; reader output -> stdout"
-                "".format(reader_log))
-            out_stream = None
-    try:
-        _emit_reader_summary(args, results, num_threads, meas_duration,
-                             out=out_stream)
-    finally:
-        if out_stream is not None:
-            out_stream.close()
+    # reader output → its own log (writer rows stay on the writer log);
+    # the handle is owned by init_role_logs (MC_READER_LOG), line-buffered
+    _emit_reader_summary(args, results, num_threads, meas_duration,
+                         out=_reader_log_handle())
     if writer_error:
         raise SystemExit("[ERROR] dual {}: writer phase failed: {}"
                          "".format(my_id, writer_error[0]))
@@ -1840,7 +1930,15 @@ def _resolve_env(args):
         args.rendezvous_timeout = int(
             os.environ.get("BENCH_RENDEZVOUS_TIMEOUT", "120"))
 def main():
+    init_role_logs()
     unbuffer_stdio()
+    # TEST-ONLY hook: simulate the C++ SDK writing its glog stream straight
+    # to OS fd 1 (the stream the runner captures into <base>.glog). Lets the
+    # hermetic runner e2e assert the three-stream separation without the
+    # real SDK. Never set in production.
+    if os.environ.get("MC_FAKE_SDK_GLOG"):
+        os.write(1, b"I20261112 101500.123456 999 fake.cc:42] fake sdk glog\n")
+        os.write(1, b"W20261112 101500.200000 999 fake.cc:43] fake sdk warn\n")
     log("[client-env] pid={} argv={} {}".format(
         os.getpid(), " ".join(sys.argv[1:]), env_snapshot()))
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
