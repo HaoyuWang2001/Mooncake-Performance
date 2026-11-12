@@ -90,14 +90,17 @@ def _check_stop():
 _PARALLEL_READY_TIMEOUT_S = 600
 
 
-def _parallel_pods_ready_barrier(args):
-    """Wait until both rank/recall children have all benchmark Pods Ready.
+def _parallel_start_barrier(args):
+    """Hold the first pipeline /start until the peer rank/recall child is ready.
 
     ``run_rank_recall.py`` gives both children one private directory and a
-    distinct role. Each child atomically publishes ``<role>.ready`` only
-    after its own Deployment rollout(s) completed. The barrier is one-shot:
-    it synchronizes the first scenario of each child, which is the shared
-    rank+recall launch point, without coupling later sweep entries.
+    distinct role. Each child atomically publishes ``<role>.ready`` only after
+    its own client pool finished rendezvous (i.e. it is one step away from
+    triggering /start), then blocks until the peer marker exists — so both
+    children enter their measured window together instead of staggering with
+    the asymmetric data-generation phases. The barrier is one-shot: it
+    synchronizes the first /start of each child, which is the shared
+    rank+recall pressure point, without coupling later sweep entries.
     """
     ready_dir = getattr(args, "parallel_ready_dir", None)
     role = getattr(args, "parallel_ready_role", None)
@@ -113,17 +116,18 @@ def _parallel_pods_ready_barrier(args):
     os.replace(tmp, marker)
     peer = "recall" if role == "rank" else "rank"
     peer_marker = os.path.join(ready_dir, peer + ".ready")
-    log("[parallel] {} Pods ready; waiting for {} Pods".format(role, peer))
+    log("[parallel] {} clients registered; holding /start, waiting for "
+        "{}".format(role, peer))
     deadline = time.time() + _PARALLEL_READY_TIMEOUT_S
     while not os.path.isfile(peer_marker):
         _check_stop()
         if time.time() >= deadline:
             raise RuntimeError(
-                "parallel Pods-ready barrier timed out after {}s: {} marker "
+                "parallel /start barrier timed out after {}s: {} marker "
                 "not found".format(_PARALLEL_READY_TIMEOUT_S, peer))
         time.sleep(0.2)
     args._parallel_ready_done = True
-    log("[parallel] rank and recall Pods ready; continuing benchmark")
+    log("[parallel] rank and recall aligned at /start; continuing benchmark")
 
 
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
@@ -3439,10 +3443,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "(N={}, spread maxSkew=1, run={})".format(
                         len(plan["writers"]), len(plan["readers"]),
                         n_nodes, _run_label))
-            # Cross-child rank+recall synchronization. This point is after
-            # every Deployment replica is available and before scripts/data
-            # setup or any benchmark client is launched.
-            _parallel_pods_ready_barrier(args)
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
         # optional NUMA binding: per node, round-robin the node's client
@@ -3634,6 +3634,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         "({:.1f}s)".format(len(plan["clients"]),
                                            len(plan["clients"]),
                                            time.time() - t0))
+                    # Cross-child rank+recall /start alignment: the full
+                    # client pool is registered; hold /start until the peer
+                    # child reaches the same gate so both children's
+                    # measured windows overlap.
+                    _parallel_start_barrier(args)
                     _items = [(get_node(cluster, c["node"]), c["port"], "",
                                "dual c{}".format(c["id"]))
                               for c in plan["clients"]]
@@ -3822,6 +3827,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
                         "".format(len(plan["writers"]), len(plan["writers"]),
                                   time.time() - t0))
+                    # Cross-child rank+recall /start alignment (see the dual
+                    # branch above for rationale).
+                    _parallel_start_barrier(args)
                     _items = [(get_node(cluster, w["node"]), w["port"], "",
                                "writer w{}".format(w["gid"]))
                               for w in plan["writers"]]

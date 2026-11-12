@@ -54,7 +54,7 @@ def test_children_share_ready_dir_with_distinct_roles(tmp_path):
     assert recall[recall.index("--parallel-ready-role") + 1] == "recall"
 
 
-def test_parallel_pods_ready_barrier_waits_for_peer(tmp_path, monkeypatch):
+def test_parallel_start_barrier_waits_for_peer(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "_check_stop", lambda: None)
     args = SimpleNamespace(parallel_ready_dir=str(tmp_path),
                            parallel_ready_role="rank")
@@ -62,7 +62,7 @@ def test_parallel_pods_ready_barrier_waits_for_peer(tmp_path, monkeypatch):
 
     def run_barrier():
         try:
-            bm._parallel_pods_ready_barrier(args)
+            bm._parallel_start_barrier(args)
         except Exception as exc:
             errors.append(exc)
 

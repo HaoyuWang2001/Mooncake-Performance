@@ -69,8 +69,10 @@ def _child_argv(args, work_mode, files, parent, ready_dir):
     argv = [sys.executable, os.path.join(ROOT, "benchmark.py"), "--k8s",
             "--cluster", cluster, "--global", global_cfg,
             "--profile", args.profile, "-f", ",".join(files)]
-    # Internal cross-child barrier: each benchmark child creates its Pods,
-    # marks its own role ready, then waits until the peer marker exists.
+    # Internal cross-child barrier: each benchmark child runs setup (Pods,
+    # data, smoke) and registers its clients, marks its own role ready at
+    # the /start gate, then waits until the peer marker exists so both
+    # children trigger /start together.
     argv += ["--parallel-ready-dir", ready_dir,
              "--parallel-ready-role", work_mode]
     if not args.dry_run:
@@ -204,7 +206,7 @@ def main(argv=None):
             failed = [name for name, proc in children.items()
                       if proc.poll() not in (None, 0)]
             if failed and not stop_requested.is_set():
-                # A child may fail before publishing its Pods-ready marker.
+                # A child may fail before publishing its /start-gate marker.
                 # Wake the peer out of the barrier so it can clean up instead
                 # of waiting for the full barrier timeout.
                 peer_failure = True
