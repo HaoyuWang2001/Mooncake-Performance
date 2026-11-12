@@ -148,6 +148,20 @@ def remote_log_path(remote_log_dir, scenario, name):
     return "{}/{}.{}.log".format(remote_log_dir, scenario, name)
 
 
+def _pod_base(base_noext, node):
+    """Per-pod log base name. k8s pods get their OWN subdirectory under the
+    (hostPath-mounted) log dir so the on-node layout is
+    <host_log_root>/<run_id>/<pod_name>/… (log persistence across pod
+    deletion); ssh nodes keep the flat layout (one shared log dir per node).
+
+    base_noext = "<remote_log_dir>/<cfg>.<run_name>" (no trailing .log);
+    POSIX-only string ops on purpose: remote paths are always /-joined."""
+    if node is None or not node.get("_pod"):
+        return base_noext
+    head, tail = base_noext.rsplit("/", 1)
+    return "{}/{}/{}".format(head, node["_pod"], tail)
+
+
 def data_size_list(cfg):
     """Validate and return the scenario's data_size entries.
 
@@ -1111,7 +1125,15 @@ def k8s_settings(cluster):
         if not k8s.get(key):
             raise RuntimeError(
                 "cluster.json k8s.{} is required for --k8s".format(key))
+    # hostPath root for on-node log persistence (run_id/pod_name subdirs);
+    # overridable per cluster, defaults to /var/lib/mooncake-bench
+    k8s.setdefault("host_log_root", "/var/lib/mooncake-bench")
     return k8s
+
+
+def host_log_dir(cluster, ts):
+    """Per-run hostPath directory mounted at the pod's logs/<ts> path."""
+    return "{}/{}".format(k8s_settings(cluster)["host_log_root"].rstrip("/"), ts)
 
 
 def k8s_run_label(ts, cfg_name):
@@ -1285,6 +1307,8 @@ def _render_pod_yaml(cluster, ts, cfg_name):
         "{{MC_CONFIGMAP_NAME}}": _configmap_name(run_label),
         "{{MC_SCRIPTS_MOUNT}}": k8s["pod_workspace"] + "/scripts",
         "{{MC_WORKDIR_MOUNT}}": k8s["pod_workspace"],
+        "{{MC_HOST_LOG_DIR}}": host_log_dir(cluster, ts),
+        "{{MC_LOG_MOUNT}}": k8s["pod_workspace"] + "/logs/" + ts,
     }
     for key, val in repl.items():
         text = text.replace(key, val)
@@ -1892,6 +1916,10 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
             continue
         pulled_ips.add(n["ip"])
         remote_glob = "{}/{}.*".format(remote_log_dir, cfg_name)
+        # k8s stage logs live in per-pod subdirs of the hostPath log dir
+        pod = n.get("_pod") if n else None
+        if pod:
+            remote_glob = "{}/{}/{}.*".format(remote_log_dir, pod, cfg_name)
         last_exc = None
         for attempt in (0, 1):
             try:
@@ -2658,7 +2686,10 @@ def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
               dry_run=False, pull_to=None, cfg_name=None, node_name=None,
               quiet=False):
     _check_stop()
-    remote_log = remote_log_path(remote_log_dir, log_prefix, mode)
+    # k8s: stage logs land in the pod's OWN subdirectory of the hostPath
+    # log dir (<root>/<run_id>/<pod>/…); ssh keeps the flat layout
+    remote_log = _pod_base(remote_log_path(remote_log_dir, log_prefix, mode),
+                           node)
     command = "bash {} {} {}".format(runner, mode, remote_log)
     if extra:
         command += " " + extra
@@ -2967,6 +2998,8 @@ def _render_deployment_yaml(cluster, ts, cfg_name, role, replicas):
         "{{MC_CONFIGMAP_NAME}}": _configmap_name(run_label),
         "{{MC_SCRIPTS_MOUNT}}": k8s["pod_workspace"] + "/scripts",
         "{{MC_WORKDIR_MOUNT}}": k8s["pod_workspace"],
+        "{{MC_HOST_LOG_DIR}}": host_log_dir(cluster, ts),
+        "{{MC_LOG_MOUNT}}": k8s["pod_workspace"] + "/logs/" + ts,
     }
     for key, val in repl.items():
         text = text.replace(key, val)
@@ -3513,9 +3546,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     # writer and reader output NEVER share a file: logs and
                     # per-role latency/queue-wait plots stay separated
                     merged_log = "{}.dual_{}_c{}_p{}.writer.log".format(
-                        base_noext, c["node"], c["id"], c["port"])
+                        _pod_base(base_noext, rn), c["node"], c["id"], c["port"])
                     reader_log = "{}.dual_{}_c{}_p{}.reader.log".format(
-                        base_noext, c["node"], c["id"], c["port"])
+                        _pod_base(base_noext, rn), c["node"], c["id"], c["port"])
                     nohup_log = merged_log.replace(".log", ".nohup")
                     # process-level client-glog (SDK glog + fatal) -> <base>.glog
                     glog_file = merged_log.replace(".writer.log", ".glog")
@@ -3617,21 +3650,24 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                 _check_exitrc(
                                     cluster, c["node"],
                                     "{}.dual_{}_c{}_p{}.writer.log.exitrc".format(
-                                        base_noext, c["node"], c["id"],
-                                        c["port"]),
+                                        _pod_base(base_noext,
+                                                  get_node(cluster, c["node"])),
+                                        c["node"], c["id"], c["port"]),
                                     "dual c{}".format(c["id"]))
                     if not dry:
                         log("clients exited: {}/{} ({:.1f}s)".format(
                             _w_exited, len(writer_pids), time.time() - _w_t0))
                     _groups = []
                     for c in plan["clients"]:
-                        _groups.append((get_node(cluster, c["node"]),
+                        _rn = get_node(cluster, c["node"])
+                        _pb = _pod_base(base_noext, _rn)
+                        _groups.append((_rn,
                                         ["{}.dual_{}_c{}_p{}.writer.log".format(
-                                            base_noext, c["node"], c["id"], c["port"]),
+                                            _pb, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.reader.log".format(
-                                            base_noext, c["node"], c["id"], c["port"]),
+                                            _pb, c["node"], c["id"], c["port"]),
                                          "{}.dual_{}_c{}_p{}.glog".format(
-                                            base_noext, c["node"], c["id"], c["port"])],
+                                            _pb, c["node"], c["id"], c["port"])],
                                         "dual c{}".format(c["id"])))
                     _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
                     log("logs: {} files / {} pods pulled".format(
@@ -3646,7 +3682,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 for r in plan["readers"]:
                     rn = get_node(cluster, r["node"])
                     merged_log = "{}.reader_{}_r{}_p{}.log".format(
-                        base_noext, r["node"], r["index"], r["port"])
+                        _pod_base(base_noext, rn), r["node"], r["index"], r["port"])
                     nohup_log = merged_log.replace(".log", ".nohup")
                     numa_arg = ""
                     launch_prefix = ""
@@ -3709,7 +3745,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 for w in plan["writers"]:
                     wn = get_node(cluster, w["node"])
                     merged_log = "{}.writer_{}_w{}.log".format(
-                        base_noext, w["node"], w["gid"])
+                        _pod_base(base_noext, wn), w["node"], w["gid"])
                     nohup_log = merged_log.replace(".log", ".nohup")
                     numa_arg = ""
                     launch_prefix = ""
@@ -3785,16 +3821,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             _check_exitrc(
                                 cluster, w["node"],
                                 "{}.writer_{}_w{}.log.exitrc".format(
-                                    base_noext, w["node"], w["gid"]),
+                                    _pod_base(base_noext,
+                                              get_node(cluster, w["node"])),
+                                    w["node"], w["gid"]),
                                 "writer w{}".format(w["gid"]))
                 if not dry:
                     log("writers exited: {}/{} ({:.1f}s)".format(
                         _wex, len(writer_pids), time.time() - _wt0))
                 _groups = [(get_node(cluster, w["node"]),
                             ["{}.writer_{}_w{}.log".format(
-                                base_noext, w["node"], w["gid"]),
+                                _pod_base(base_noext, get_node(cluster, w["node"])),
+                                w["node"], w["gid"]),
                              "{}.writer_{}_w{}.glog".format(
-                                base_noext, w["node"], w["gid"])],
+                                _pod_base(base_noext, get_node(cluster, w["node"])),
+                                w["node"], w["gid"])],
                             "writer w{}".format(w["gid"]))
                            for w in plan["writers"]]
                 _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
@@ -3826,17 +3866,20 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             _check_exitrc(
                                 cluster, r["node"],
                                 "{}.reader_{}_r{}_p{}.log.exitrc".format(
-                                    base_noext, r["node"], r["index"],
-                                    r["port"]),
+                                    _pod_base(base_noext,
+                                              get_node(cluster, r["node"])),
+                                    r["node"], r["index"], r["port"]),
                                 "reader r{}".format(r["index"]))
                 if not dry:
                     log("readers exited: {}/{} ({:.1f}s)".format(
                         _rex, len(reader_pids), time.time() - _rt0))
                 _groups = [(get_node(cluster, r["node"]),
                             ["{}.reader_{}_r{}_p{}.log".format(
-                                base_noext, r["node"], r["index"], r["port"]),
+                                _pod_base(base_noext, get_node(cluster, r["node"])),
+                                r["node"], r["index"], r["port"]),
                              "{}.reader_{}_r{}_p{}.glog".format(
-                                base_noext, r["node"], r["index"], r["port"])],
+                                _pod_base(base_noext, get_node(cluster, r["node"])),
+                                r["node"], r["index"], r["port"])],
                             "reader r{}".format(r["index"]))
                            for r in plan["readers"]]
                 _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
@@ -3854,18 +3897,21 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             if c["node"] == node_name:
                                 nohup_files.append(
                                     "{}.dual_{}_c{}_p{}.writer.nohup".format(
-                                        base_noext, c["node"], c["id"], c["port"]))
+                                        _pod_base(base_noext, n), c["node"],
+                                        c["id"], c["port"]))
                     else:
                         for r in plan["readers"]:
                             if r["node"] == node_name:
                                 nohup_files.append(
                                     "{}.reader_{}_r{}_p{}.nohup".format(
-                                        base_noext, r["node"], r["index"], r["port"]))
+                                        _pod_base(base_noext, n), r["node"],
+                                        r["index"], r["port"]))
                         for w in plan["writers"]:
                             if w["node"] == node_name:
                                 nohup_files.append(
                                     "{}.writer_{}_w{}.nohup".format(
-                                        base_noext, w["node"], w["gid"]))
+                                        _pod_base(base_noext, n), w["node"],
+                                        w["gid"]))
                     if nohup_files:
                         cleanup_cmd = "for f in {}; do [ -s \"$f\" ] || rm -f \"$f\"; done".format(
                             " ".join(nohup_files))
@@ -4070,6 +4116,16 @@ def cleanup_cluster(cluster, globals_cfg, dry_run=False):
         reap_k8s_namespaces(cluster)
         cleanup_k8s_namespace(cluster, dry_run)
         cleanup_k8s_workspace(cluster, dry_run)
+        # hostPath 日志按用户要求持久化在节点上（<root>/<run_id>/<pod>/），
+        # CLEAN-UP 不自动删除（追查现场优先）；controller 无法直接登录
+        # 各节点，给出逐节点清理命令提示。
+        try:
+            root = k8s_settings(cluster)["host_log_root"]
+            log("[k8s] 宿主机日志留存于各节点 {}/<run_id>/<pod>/ "
+                "（CLEAN-UP 不删除）；如需释放请逐节点执行： "
+                "rm -rf {}/*".format(root, root))
+        except Exception:
+            pass
         return
     remote_dir = globals_cfg["remote_dir"]
     for node_name in sorted(cluster.get("nodes", {})):

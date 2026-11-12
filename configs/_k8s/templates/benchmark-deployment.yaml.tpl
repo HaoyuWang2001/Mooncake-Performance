@@ -50,6 +50,12 @@ spec:
           name: {{MC_CONFIGMAP_NAME}}
       - name: workdir
         emptyDir: {}
+      # 日志宿主机持久化（每个 pod 挂同一 <root>/<run_id>，写入各自的
+      # <pod>/ 子目录；节点磁盘上的最终布局 = <root>/<run_id>/<pod>/…）
+      - name: hostlogs
+        hostPath:
+          path: {{MC_HOST_LOG_DIR}}
+          type: DirectoryOrCreate
       containers:
       - name: benchmark
         image: {{MC_IMAGE}}
@@ -87,6 +93,8 @@ spec:
           mountPath: {{MC_SCRIPTS_MOUNT}}
         - name: workdir
           mountPath: {{MC_WORKDIR_MOUNT}}
+        - name: hostlogs
+          mountPath: {{MC_LOG_MOUNT}}
       # Deployment 的 pod template 强制 restartPolicy=Always（裸 Pod 模板
       # 的 Never 不适用于 Deployment）；容器为 sleep infinity，无副作用
       restartPolicy: Always
