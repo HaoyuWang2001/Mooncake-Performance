@@ -33,7 +33,7 @@ def validate_config_content(path, content):
         return errors
     rp = os.path.realpath(path)
     scenario_dir = None
-    for cat in ("basic", "pipeline"):
+    for cat in ("basic", "pipeline", "kvtest"):
         cdir = os.path.realpath(os.path.join(bm.CONFIGS_DIR, cat))
         if rp == cdir or rp.startswith(cdir + os.sep):
             scenario_dir = cat
@@ -68,6 +68,11 @@ def validate_config_content(path, content):
         if not isinstance(params, list) or not params:
             errors.append("params must be a non-empty array of "
                           "{num_clients, num_threads} objects")
+    elif scenario_dir == "kvtest":
+        try:
+            bm.kvtest_plan(merged, 1)  # node_count=1: shape validation only
+        except (RuntimeError, KeyError, ValueError) as exc:
+            errors.append("kvtest plan invalid: {}".format(exc))
     else:
         try:
             bm.pipeline_plan(merged, 1)  # node_count=1: shape validation only

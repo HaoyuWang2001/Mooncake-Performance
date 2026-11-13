@@ -11,6 +11,7 @@ Structure:
   - utils.py: generic helpers (ssh/scp execution, json/size parsing)
 """
 import argparse
+import base64
 import csv
 import glob
 import ipaddress
@@ -170,6 +171,26 @@ PIPELINE_CSV_HEADER = [
     "notify_drain_ms", "notify_avg_ms", "notify_max_ms",
     "notify_queue_size", "notify_queue_peak", "notify_queue_wait_avg_ms",
     "notify_queue_wait_max_ms", "notify_connections_created", "notify_connections_reused",
+]
+# kvtest rows come from each mooncake_kvtest instance's summary.json (per-op
+# total/success/failure/bytes + latency percentiles). One writer row and/or
+# one reader row per instance per data size + aggregate TOTAL rows.
+KVTEST_CSV_HEADER = [
+    "config_name",
+    "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
+    "num_threads", "notify_threads",
+    "data_size", "key_pool_size", "batch_size", "duration",
+    "client_count", "notify_count", "store_count",
+    "base_qps", "qps_multiple", "target_qps",
+    "total", "success", "fail", "fail_rate",
+    "total_bytes", "wall_s", "qps",
+    "throughput_mb_s", "throughput_gb_s",
+    "avg_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms", "p9999_ms",
+    "max_ms",
+    "verify_failures",
+    "notify_submitted", "notify_ok", "notify_fail",
+    "notify_avg_ms", "notify_max_ms",
+    "queue_wait_avg_ms", "queue_wait_max_ms",
 ]
 
 
@@ -801,6 +822,63 @@ def pipeline_plan(cfg, node_count=1):
         "writer_port_base": w_base,
         "reader_port_base": r_base,
     }
+
+
+# --------------------------------------------------------------------------
+# kvtest planning (C++ mooncake_kvtest binary; same config shape as pipeline)
+# --------------------------------------------------------------------------
+
+# our pipeline-style operation names -> kvtest-native names. The binary
+# normalizes both forms, but writing the native form keeps summary.json op
+# keys stable for the CSV aggregation.
+KVTEST_WRITER_OPS = {
+    "put": "upsert",
+    "put_batch": "batch_upsert_from",
+    "put_from": "upsert_from",
+    "upsert_from": "upsert_from",
+}
+KVTEST_READER_OPS = {
+    "get": "get_buffer",
+    "get_batch": "batch_get_buffer",
+    "get_into": "get_buffer",
+    "get_buffer": "get_buffer",
+}
+
+# runner-script marker for pid liveness probes of kvtest instances (the
+# ledger pid is the run_kvtest.sh bash wrapper; see _PIPELINE_PID_MARKER)
+_KVTEST_PID_MARKER = "run_kvtest.sh"
+
+
+def kvtest_plan(cfg, node_count=1):
+    """kvtest process plan: reuse the pipeline topology planning (dual
+    "client" block or separate writer/reader blocks, count_per_node x N on
+    every cluster node) and add the kvtest-specific fields — per-instance
+    write-thread count and GLOBAL instance ids. kvtest namespaces its keys
+    and notify sender ids by instance_id, so writers and readers must never
+    share one: dual clients take 0..C-1, separate writers 0..W-1 and readers
+    continue at W."""
+    plan = pipeline_plan(cfg, node_count=node_count)
+    writer_cfg = cfg.get("writer", {}) or {}
+    plan["writer_threads"] = max(1, int(writer_cfg.get("num_threads", 1) or 1))
+    if plan.get("dual"):
+        for c in plan["clients"]:
+            c["iid"] = c["id"]
+    else:
+        base = len(plan["writers"])
+        for i, w in enumerate(plan["writers"]):
+            w["iid"] = i
+        for r in plan["readers"]:
+            r["iid"] = base + r["index"]
+    return plan
+
+
+def _kvtest_split_qps(per_node_qps, cpn, local):
+    """Integer QPS split of one node's rate across its cpn instances
+    (105 across 2 -> 53 + 52, mirroring the binary's own thread split)."""
+    total = max(0, int(per_node_qps))
+    cpn = max(1, int(cpn))
+    base, rem = divmod(total, cpn)
+    return base + (1 if local < rem else 0)
 
 
 # --------------------------------------------------------------------------
@@ -1692,6 +1770,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
     try:
         files = [("run_benchmark_basic.sh", SCRIPTS_DIR),
                  ("run_benchmark_pipeline.sh", SCRIPTS_DIR),
+                 ("run_kvtest.sh", SCRIPTS_DIR),
                  ("mooncake_benchmark_client.py", SCRIPTS_DIR),
                  ("bench_etcd.py", SCRIPTS_DIR),
                  ("env.sh", None)]
@@ -1764,6 +1843,7 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
         push_files = [env_sh_path,
                       os.path.join(SCRIPTS_DIR, "run_benchmark_basic.sh"),
                       os.path.join(SCRIPTS_DIR, "run_benchmark_pipeline.sh"),
+                      os.path.join(SCRIPTS_DIR, "run_kvtest.sh"),
                       os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py"),
                       os.path.join(SCRIPTS_DIR, "bench_etcd.py")]
         if os.path.exists(mooncake_env_path):
@@ -1773,6 +1853,8 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
             remote_scripts + "/env.sh",
             remote_scripts + "/run_benchmark_basic.sh",
             remote_scripts + "/run_benchmark_pipeline.sh"), dry_run=dry_run)
+        run_ssh(n["ip"], n, "chmod +x {}".format(
+            remote_scripts + "/run_kvtest.sh"), dry_run=dry_run)
 
 
 def value_check_cmd(remote_data_dir, scenario, data_size_bytes):
@@ -2242,17 +2324,20 @@ def _pipeline_wipe_etcd(cluster, globals_cfg):
         log("[k8s-pipeline] etcd: wiped {} stale mcbench/ keys".format(n))
 
 
-def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
-    """POST to a pipeline process's HTTP endpoint (writer /start, reader
-    /shutdown) by curling LOOPBACK ON THE NODE ITSELF. The node transport
-    dispatches automatically: ssh nodes run curl over the ssh connection,
-    k8s pods run it via kubectl exec inside the pod. The orchestrator host
-    must NEVER be assumed to reach pod IPs / fabric IPs directly — it sits
-    outside those networks on real clusters (a direct http_probe to the
-    pod IP times out there). Returns True on HTTP 200."""
+def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False,
+                        method="POST"):
+    """POST/GET to a pipeline/kvtest process's HTTP endpoint (writer /start,
+    reader /shutdown, kvtest /health //summary //stop) by curling LOOPBACK ON
+    THE NODE ITSELF. The node transport dispatches automatically: ssh nodes
+    run curl over the ssh connection, k8s pods run it via kubectl exec inside
+    the pod. The orchestrator host must NEVER be assumed to reach pod IPs /
+    fabric IPs directly — it sits outside those networks on real clusters (a
+    direct http_probe to the pod IP times out there). Returns True on HTTP
+    200."""
     url = "http://127.0.0.1:{}{}".format(port, path)
     cmd = ("curl -s --noproxy '*' --connect-timeout 2 --max-time {} "
-           "-X POST -o /dev/null -w '%{{http_code}}' {}").format(timeout, url)
+           "-X {} -o /dev/null -w '%{{http_code}}' {}").format(
+               timeout, method, url)
     out = ssh_check_output(node_entry["ip"], node_entry, cmd, dry_run=dry)
     return str(out).strip() == "200"
 
@@ -2260,7 +2345,8 @@ def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False):
 _PIPELINE_PARALLEL = 8
 
 
-def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False):
+def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False,
+                            method="POST"):
     """POST to many pipeline endpoints with bounded concurrency (default 8).
 
     The ssh transport keeps ONE cached connection per node and opens one
@@ -2284,7 +2370,8 @@ def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False):
                     _pipeline_shutdown(cluster, node_entry, port, pid, what)
                     return what, True, ""
                 ok = _pipeline_http_call(node_entry, port, path,
-                                         timeout=timeout, dry=dry)
+                                         timeout=timeout, dry=dry,
+                                         method=method)
                 if ok:
                     return what, True, ""
                 err = "non-200"
@@ -4112,6 +4199,788 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         raise
 
 
+# --------------------------------------------------------------------------
+# kvtest scenario (C++ mooncake_kvtest: notify pipeline fully in C++)
+# --------------------------------------------------------------------------
+
+def _kvtest_deploy_binary(cluster, involved_nodes, local_binary, remote_scripts,
+                          pod_workspace, is_k8s, dry_run):
+    """kvtest.binary_local: push the C++ binary from the orchestrator to
+    every node/pod and return the remote path the instances will run (no
+    image rebuild / manual deployment needed). Returns "" when unset — the
+    plain kvtest.binary name is then resolved from PATH on the target.
+    k8s pods mount scripts/ read-only (ConfigMap), so the binary lands in
+    the writable pod workspace under kvtest-bin/ instead."""
+    local = str(local_binary or "").strip()
+    if not local:
+        return ""
+    local = os.path.abspath(local)
+    if not os.path.isfile(local):
+        raise RuntimeError(
+            "kvtest.binary_local not found on the orchestrator: {}"
+            "".format(local))
+    base = os.path.basename(local)
+    bindir = (posixpath.join(pod_workspace or "/tmp", "kvtest-bin")
+              if is_k8s else remote_scripts)
+    for node_name in involved_nodes:
+        n = get_node(cluster, node_name)
+        run_ssh(n["ip"], n, "mkdir -p {}".format(bindir), dry_run=dry_run)
+        scp_push(n["ip"], n, [local], bindir, dry_run=dry_run)
+        run_ssh(n["ip"], n, "chmod +x {}".format(
+            posixpath.join(bindir, base)), dry_run=dry_run)
+    log("kvtest binary pushed: {} -> {} target(s) at {}".format(
+        base, len(involved_nodes), bindir))
+    return posixpath.join(bindir, base)
+
+
+def _kvtest_store_targets(globals_cfg, cluster_session):
+    """(metadata_server, master_server_address) for the kvtest store block,
+    mirroring make_store() in mooncake_benchmark_client.py: etcd mode uses
+    the etcd URI for both; http mode uses master_addr + metadata_server (or
+    the derived http://<master>/metadata default)."""
+    if str(globals_cfg.get("master_type", "") or "") == "etcd":
+        eps = cluster_session.get("SETUP_ETCD_ENDPOINTS", "")
+        if not eps:
+            raise RuntimeError(
+                "kvtest: master_type=etcd requires global.json etcd_endpoints")
+        return eps, eps
+    master = cluster_session.get("SETUP_MASTER_ADDR", "")
+    if not master:
+        raise RuntimeError(
+            "kvtest: master_type=http requires global.json master_addr")
+    metadata = (cluster_session.get("SETUP_METADATA_SERVER", "")
+                or "http://{}/metadata".format(master))
+    return metadata, master
+
+
+def _kvtest_key_pool(cfg, globals_cfg, plan, writer_count, ds_bytes, ds_label):
+    """kvtest.key_pool_size: >0 = explicit fixed pool (validated against the
+    binary's divisibility rule); 0/absent = auto-derived per-writer key
+    budget from the store capacity (same rule as pipeline), snapped DOWN to
+    a multiple of num_threads * batch_keys_count (binary requirement)."""
+    kv = cfg.get("kvtest", {}) or {}
+    raw = int(kv.get("key_pool_size", 0) or 0)
+    batch = max(1, int(cfg.get("batch_size", 1) or 1))
+    minimum = plan["writer_threads"] * batch
+    if raw > 0:
+        if raw < minimum or raw % minimum:
+            raise RuntimeError(
+                "kvtest key_pool_size {} must be >= num_threads x batch = {} "
+                "and divisible by it (binary requirement)".format(
+                    raw, minimum))
+        return raw
+    per = _pipeline_key_budget(globals_cfg, writer_count, ds_bytes, batch,
+                               ds_label)
+    pool = (per // minimum) * minimum
+    if pool < minimum:
+        raise RuntimeError(
+            "kvtest key pool too small: store-derived budget {} keys cannot "
+            "provide a multiple of num_threads x batch = {} (data size {})"
+            "".format(per, minimum, ds_label))
+    return pool
+
+
+def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
+                                 entry, role, ds_label, key_pool,
+                                 all_instances):
+    """Per-instance mooncake_kvtest JSON config. __FABRIC_IP__ and
+    __UB_DEVICE__ are late-bound by run_kvtest.sh (per-pod values that only
+    exist at runtime, after env.sh's urma_admin / POD_IP resolution)."""
+    kv = cfg.get("kvtest", {}) or {}
+    writer_threads = plan["writer_threads"] if role in ("writer", "dual") else 1
+    metadata_server, master_addr = _kvtest_store_targets(
+        globals_cfg, cluster_session)
+    writer_op = KVTEST_WRITER_OPS[
+        (cfg.get("writer", {}) or {}).get("operation", "")]
+    reader_op = KVTEST_READER_OPS[
+        (cfg.get("reader", {}) or {}).get("operation", "")]
+    return {
+        "mode": "pipeline",
+        "instance_id": entry["iid"],
+        "listen_port": entry["port"],
+        "role": role,
+        "pipeline": [writer_op],
+        "notify_pipeline": [reader_op],
+        "target_qps": max(0, int(entry.get("_qps", 0) or 0)),
+        "num_threads": writer_threads,
+        "num_total_threads": writer_threads + plan["reader_threads"],
+        "notify_threads": plan["notify_threads"],
+        "notify_count": plan["notify_count"],
+        "batch_keys_count": max(1, int(cfg.get("batch_size", 1) or 1)),
+        "key_pool_size": key_pool,
+        "notify_queue_max": int(kv.get("notify_queue_max", 8192) or 8192),
+        "enable_jitter": bool(kv.get("enable_jitter", True)),
+        "data_sizes": [ds_label],
+        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 3000) or 3000),
+        "output_dir": entry["_out_dir"],
+        "cpu_affinity": entry.get("_cpu_affinity", ""),
+        "verify_level": kv.get("verify_level", "size"),
+        "verify_sample_bytes": kv.get("verify_sample_bytes", "4KB"),
+        "verify_sample_step_bytes": kv.get("verify_sample_step_bytes", "1MB"),
+        "verify_fail_op": bool(kv.get("verify_fail_op", False)),
+        "nodes": [
+            {"host": i["host"], "port": i["port"],
+             "instance_id": i["iid"], "role": i["role"]}
+            for i in all_instances
+        ],
+        "store": {
+            "local_hostname": "__FABRIC_IP__:{}".format(
+                entry.get("_lhost_port", 12345)),
+            "metadata_server": metadata_server,
+            "global_segment_size": 0,
+            "local_buffer_size": int(parse_size_bytes(
+                globals_cfg.get("local_buffer_size", 8589934592))),
+            "protocol": cfg["protocol"],
+            "rdma_devices": "__UB_DEVICE__",
+            "master_server_address": master_addr,
+            "tenant_id": globals_cfg.get("tenant_id", "default"),
+            "replica_num": max(1, int(kv.get("replica_num", 1) or 1)),
+        },
+    }
+
+
+def _kvtest_health_gate(cluster, entries, timeout_s, what):
+    """Poll GET /health on every kvtest instance until all respond. The
+    binary starts its HTTP server only AFTER the store client setup, so
+    'healthy' means store connected + notify endpoint bound. Raises with the
+    missing list on timeout."""
+    if not entries:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = time.time()
+    pending = list(entries)
+
+    def _probe(entry):
+        n = get_node(cluster, entry["node"])
+        try:
+            return _pipeline_http_call(n, entry["port"], "/health",
+                                       timeout=3, method="GET")
+        except Exception:
+            return False
+
+    log("kvtest health gate: waiting for {} {} (timeout {}s)".format(
+        len(pending), what, timeout_s))
+    while pending:
+        _check_stop()
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+            results = list(pool.map(_probe, pending))
+        pending = [e for e, ok in zip(pending, results) if not ok]
+        if not pending:
+            break
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(
+                "kvtest health gate timed out after {}s: {}/{} {} not "
+                "healthy: {}".format(
+                    timeout_s, len(pending), len(entries), what,
+                    ", ".join("i{} on {}".format(e["iid"], e["node"])
+                              for e in pending[:8])))
+        time.sleep(2)
+    log("kvtest health gate: {}/{} {} healthy ({:.1f}s)".format(
+        len(entries), len(entries), what, time.time() - t0))
+
+
+def _kvtest_kill_tree(cluster, node_name, pid):
+    """Tree-kill a kvtest instance: the ledger pid is the run_kvtest.sh bash
+    wrapper, so pgrep -P widens the kill to the C++ binary child. The first
+    SIGTERM is the binary's own graceful-stop path; SIG9 only follows when
+    it refuses to die."""
+    n = get_node(cluster, node_name)
+    try:
+        ssh_check_output(
+            n["ip"], n,
+            "kill $(pgrep -P {pid} 2>/dev/null) {pid} 2>/dev/null; sleep 1; "
+            "kill -9 $(pgrep -P {pid} 2>/dev/null) {pid} 2>/dev/null || true"
+            "".format(pid=pid), quiet=True)
+    except Exception as exc:
+        log("[WARN] fail-cleanup: kill pid {} on {} failed: {}".format(
+            pid, node_name, exc))
+
+
+def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
+                        cfg_name, local_log_dir, remove_host=None,
+                        remove_node=None, remove_runner=None, globals_cfg=None):
+    """Best-effort cleanup after a kvtest scenario failure: graceful /stop
+    (flushes summary.json) -> short exit wait -> tree-kill stragglers ->
+    flatten + store remove-all -> pull logs. Mirrors fail_cleanup_pipeline
+    minus the etcd rendezvous wipe (kvtest keeps no rendezvous state)."""
+    log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ..."
+        "".format(cfg_name))
+    # 1. graceful /stop so summary.json is flushed where still possible
+    items = []
+    for entry, pid in instance_pids:
+        if "node" not in entry:
+            continue  # deployment never materialized the pod entries
+        items.append((get_node(cluster, entry["node"]), entry["port"],
+                      (pid or "").strip(),
+                      "fail-cleanup kvtest i{}".format(entry["iid"])))
+    for _what, _ok, _err in _pipeline_http_parallel(cluster, items, "/stop",
+                                                    timeout=5):
+        if not _ok:
+            log("[WARN] fail-cleanup: {} /stop failed: {}".format(_what, _err))
+    # 2. short wait so graceful exits finish and final logs flush
+    for entry, pid in instance_pids:
+        if pid:
+            try:
+                wait_process_exit(cluster, entry["node"], pid,
+                                  "fail-cleanup kvtest i{}".format(entry["iid"]),
+                                  30, marker=_KVTEST_PID_MARKER)
+            except Exception:
+                pass
+    # 3. tree-kill any still-alive instance
+    for entry, pid in instance_pids:
+        if pid:
+            _kvtest_kill_tree(cluster, entry["node"], pid)
+    # 4. flatten per-instance artifacts best-effort (pull_logs' {cfg}.* glob
+    # only sees flat names; the raw output dirs live under kvtest_out/)
+    for entry, _pid in instance_pids:
+        base = entry.get("_base")
+        if not base or "node" not in entry:
+            continue
+        try:
+            n = get_node(cluster, entry["node"])
+            out_dir = entry.get("_out_dir") or "{}/kvtest_out/{}".format(
+                remote_log_dir, base)
+            ssh_check_output(
+                n["ip"], n,
+                "cp '{o}/summary.json' '{d}/{b}.summary.json' 2>/dev/null; "
+                "cp '{o}/latency_timeseries.csv' '{d}/{b}.timeseries.csv "
+                "2>/dev/null; true".format(o=out_dir, d=remote_log_dir, b=base),
+                quiet=True)
+        except Exception:
+            pass
+    # 5. best-effort store remove-all: a FAILED run must not leave objects
+    # behind (the success path removes at config end)
+    if remove_host and remove_node and remove_runner:
+        try:
+            run_stage(remove_host, get_node(cluster, remove_node),
+                      remove_runner, "remove-keys", remote_log_dir, cfg_name,
+                      extra="--scope full", dry_run=False,
+                      node_name=remove_node)
+            log("[FAIL] fail-cleanup: store remove-all issued")
+            if globals_cfg is not None:
+                _verify_store_clean(cluster, globals_cfg, cfg_name,
+                                    "fail cleanup")
+        except Exception as exc:
+            log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
+    # 6. pull every log of this scenario (stage logs + instance logs + nohup)
+    try:
+        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
+                  local_log_dir, False)
+    except Exception as exc:
+        log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
+
+
+def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
+    """kvtest orchestration: deploy the C++ mooncake_kvtest instances with
+    the SAME topology as pipeline (dual client block or separate
+    writer/reader blocks, count_per_node x N, one k8s Deployment per role),
+    then run one full measurement per data_size:
+
+      1. per-instance JSON config pushed via base64 (differs per instance:
+         instance_id / listen_port / role / per-node QPS split / nodes view)
+      2. readers first, health-gated, then writers (kvtest README rule);
+         dual clients launch together (one process hosts both roles)
+      3. writers write from process boot — there is no /start; the measured
+         window starts when the LAST health gate passes and lasts `duration`
+      4. POST /summary (flush summary.json) then POST /stop (graceful exit)
+      5. flatten artifacts, pull logs, verify exit codes
+
+    kvtest needs no etcd rendezvous and no value.bin (the binary fills its
+    own registered buffers)."""
+    apply_cli_overrides(cfg, args)
+    scenario = cfg["scenario"]
+    cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
+    dry = args.dry_run
+    work_mode = cfg.get("work_mode", cfg.get("mode", ""))
+    is_k8s = cluster.get("_controller") is not None
+    # ---- cluster-oriented node set (same as pipeline) ----
+    if is_k8s:
+        k8s_nodes = _k8s_pipeline_nodes(cluster, dry)
+        n_nodes = len(k8s_nodes)
+        plan = kvtest_plan(cfg, node_count=n_nodes)
+    else:
+        node_names = sorted(n for n in (cluster.get("nodes") or {})
+                            if not str(n).startswith("_"))
+        if not node_names:
+            raise RuntimeError(
+                "kvtest requires a non-empty cluster node set (N): put worker "
+                "nodes in cluster.json (ssh) or use a k8s cluster with Ready "
+                "nodes")
+        n_nodes = len(node_names)
+        plan = kvtest_plan(cfg, node_count=n_nodes)
+        pool = plan["clients"] if plan.get("dual") else \
+            plan["writers"] + plan["readers"]
+        for entry in pool:
+            entry["node"] = node_names[entry["slot"]]
+    # record the REAL cluster-wide process counts for the CSV
+    cfg["_writer_count"] = len(plan["writers"])
+    cfg["_reader_count"] = len(plan["readers"])
+    # ---- validation (fail before any cluster resource is touched) ----
+    if plan["notify_count"] < 1:
+        raise RuntimeError("kvtest config requires notify_count >= 1")
+    if plan.get("dual"):
+        # a dual instance never notifies itself -> sampling pool is C-1
+        if plan["notify_count"] > len(plan["clients"]) - 1:
+            raise RuntimeError(
+                "notify_count={} exceeds the dual-role sampling pool {} "
+                "(client.count_per_node x N - 1; own reader excluded)".format(
+                    plan["notify_count"], len(plan["clients"]) - 1))
+    elif plan["notify_count"] > len(plan["readers"]):
+        raise RuntimeError("notify_count={} exceeds reader count {} "
+                           "(reader.count_per_node x N)".format(
+                               plan["notify_count"], len(plan["readers"])))
+    cfg_duration = cfg.get("duration", None)
+    if not cfg_duration or float(cfg_duration) <= 0:
+        raise RuntimeError("kvtest config requires duration > 0 "
+                           "(missing or invalid)")
+    writer_op = (cfg.get("writer", {}) or {}).get("operation", "") or "upsert_from"
+    reader_op = (cfg.get("reader", {}) or {}).get("operation", "") or "get_buffer"
+    if writer_op not in KVTEST_WRITER_OPS:
+        raise RuntimeError("kvtest writer operation must be one of {} (got {})"
+                           "".format(sorted(KVTEST_WRITER_OPS), writer_op))
+    if reader_op not in KVTEST_READER_OPS:
+        raise RuntimeError("kvtest reader operation must be one of {} (got {})"
+                           "".format(sorted(KVTEST_READER_OPS), reader_op))
+    kv_binary = (cfg.get("kvtest", {}) or {}).get("binary", "mooncake_kvtest")
+    # health gate budget: covers the C++ store client setup (ub can take
+    # tens of seconds); same knob as the pipeline rendezvous timeout
+    health_timeout_s = int(globals_cfg.get("rendezvous_timeout_s", 120) or 120)
+    if is_k8s:
+        involved_nodes = []
+        primary_node_name = None
+        node = None
+        host = None
+        topology = "remote_node"
+    else:
+        involved_nodes = []
+        seen_nodes = set()
+        for p in plan["writers"] + plan["readers"]:
+            if p["node"] not in seen_nodes:
+                seen_nodes.add(p["node"])
+                involved_nodes.append(p["node"])
+        primary_node_name = involved_nodes[0] if involved_nodes else cfg.get("store_node", "")
+        node = get_node(cluster, primary_node_name)
+        host = node["ip"]
+        store_node_ips = resolve_store_node_ips(
+            cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+        topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
+    ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+    local_result_dir = getattr(args, "_result_dir_path", None) or \
+        os.path.join(RESULTS_DIR, ts)
+    remote_dir, remote_scripts, remote_log_dir, remote_runner_basic, \
+        remote_runner_pipeline, local_log_dir = \
+        scenario_paths(globals_cfg, ts, cfg_name, local_result_dir)
+    remote_runner_kvtest = remote_scripts + "/run_kvtest.sh"
+    if not dry:
+        os.makedirs(local_log_dir, exist_ok=True)
+    log("=== scenario {} (kvtest, op={}+{}, topo={}, protocol={}) "
+        "primary_node={} ===".format(cfg_name, writer_op, reader_op,
+                                     topology, cfg["protocol"], host))
+    # ---- key pool per sweep size, resolved BEFORE any cluster resource is
+    # touched (a missing store source or a too-small store fails in seconds
+    # with zero leftovers) ----
+    sizes = data_size_list(cfg)
+    _a, _b, _eff, _src = _store_capacity_resolution(globals_cfg)
+    pools = {}
+    for _ds in sizes:
+        pools[_ds] = _kvtest_key_pool(
+            cfg, globals_cfg, plan, len(plan["writers"]),
+            parse_data_size(_ds), _ds)
+    cfg["_kvtest_key_pool"] = {str(_ds): _p for _ds, _p in pools.items()}
+    log("kvtest key pool (store source={}, configured={}, probed={}, "
+        "effective={}):".format(_src, _fmt_gib(_a), _fmt_gib(_b), _fmt_gib(_eff)))
+    for _ds in sizes:
+        log("    {}: {} writers x {} keys = {}".format(
+            _ds, len(plan["writers"]), pools[_ds],
+            _fmt_gib(len(plan["writers"]) * pools[_ds] * parse_data_size(_ds))))
+    scenario_params = base_scenario_params(cfg, work_mode, topology,
+                                           primary_node_name)
+    scenario_params.update({
+        "BENCH_WRITER_COUNT": str(len(plan["writers"])),
+        "BENCH_READER_COUNT": str(len(plan["readers"])),
+        "BENCH_NOTIFY_COUNT": str(plan["notify_count"]),
+        "BENCH_NOTIFY_THREADS": str(plan["notify_threads"]),
+        "BENCH_DURATION": str(cfg.get("duration", 30)),
+        "BENCH_BATCH_SIZE": str(cfg.get("batch_size", 1)),
+        "BENCH_OPERATION": "",
+    })
+    cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
+    ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
+    instance_pids = []
+    duration = float(cfg.get("duration", 30))
+    try:
+        if is_k8s:
+            # ---- per-role Deployments (pod = process): replicas = cpn x N ----
+            _k8s = k8s_settings(cluster)
+            _run_label = k8s_run_label(ts, cfg_name)
+            for role, entries, base in _pipeline_k8s_roles(plan):
+                ensure_k8s_deployment(cluster, ts, cfg_name, role,
+                                      len(entries), dry)
+                if dry:
+                    pods = ["{}-{}-{:03d}".format(_run_label, role, i)
+                            for i in range(len(entries))]
+                else:
+                    pods = _k8s_deployment_pods(cluster, _run_label, role)
+                    if len(pods) < len(entries):
+                        raise RuntimeError(
+                            "deployment role={} has {}/{} pods (run={})".format(
+                                role, len(pods), len(entries), _run_label))
+                for entry, pod in zip(entries, pods):
+                    entry["node"] = pod
+                    # every pod has its own network namespace: ALL pods of a
+                    # role listen on the SAME port
+                    entry["port"] = base
+                    ip = "0.0.0.0" if dry else _k8s_pod_ip(
+                        cluster["_controller"], _k8s["namespace"], pod)
+                    cluster.setdefault("nodes", {})[pod] = {
+                        "kind": "k8s-pod", "_pod": pod, "_ns": _k8s["namespace"],
+                        "_ctx": cluster["_controller"].get("_ctx", ""),
+                        "_controller": cluster["_controller"],
+                        "_controller_workspace": _k8s["controller_workspace"],
+                        "_run_label": _run_label, "_role": role,
+                        "ip": ip, "fabric_ip": ip}
+            involved_nodes = []
+            for e in plan["writers"] + plan["readers"]:
+                if e["node"] not in involved_nodes:
+                    involved_nodes.append(e["node"])
+            primary_node_name = (plan["writers"] or plan["readers"])[0]["node"]
+            node = get_node(cluster, primary_node_name)
+            host = node["ip"]
+            if plan.get("dual"):
+                log("[k8s] kvtest pods ready: {} dual instances "
+                    "(N={}, spread maxSkew=1, run={})".format(
+                        len(plan["clients"]), n_nodes, _run_label))
+            else:
+                log("[k8s] kvtest pods ready: {} writers + {} readers "
+                    "(N={}, spread maxSkew=1, run={})".format(
+                        len(plan["writers"]), len(plan["readers"]),
+                        n_nodes, _run_label))
+        deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
+                       remote_scripts, remote_log_dir, dry)
+        # kvtest.binary_local: push the C++ binary to every node/pod; the
+        # pushed path then overrides kvtest.binary for the launch commands
+        _pushed_binary = _kvtest_deploy_binary(
+            cluster, involved_nodes,
+            (cfg.get("kvtest", {}) or {}).get("binary_local", ""),
+            remote_scripts, globals_cfg.get("_pod_workspace"), is_k8s, dry)
+        if _pushed_binary:
+            kv_binary = _pushed_binary
+        # optional NUMA binding (ssh only): same machinery as pipeline —
+        # numactl prefix for cpu+mem binding, cpu_affinity in the JSON so the
+        # binary re-confirms the affinity itself
+        numa_bind = cfg.get("numa_bind")
+        if numa_bind is None:
+            numa_bind = globals_cfg.get("numa_bind")
+        numa_bind = True if numa_bind is None else bool(numa_bind)
+        cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
+        if cpu_shard > 0 and not numa_bind:
+            numa_bind = True  # sharding needs the NUMA topology probes
+        if is_k8s and (numa_bind or cpu_shard > 0):
+            numa_bind = False
+            cpu_shard = 0
+            log("k8s kvtest pods: numa/cpu binding disabled (containers)")
+        membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
+        numa_node_count = {}
+        numa_counter = {}
+        shard_ordinals = {}
+        numa_topo = {}
+        numactl_ok = {}
+
+        def shard_ordinal(node_name, numa):
+            key = (node_name, numa)
+            idx = shard_ordinals.get(key, 0)
+            shard_ordinals[key] = idx + 1
+            return idx
+
+        if numa_bind:
+            for node_name in involved_nodes:
+                n = get_node(cluster, node_name)
+                if not dry:
+                    k, topo = probe_numa_topology(n["ip"], n)
+                    numa_node_count[node_name] = k
+                    numa_topo[node_name] = topo
+                    numactl_ok[node_name] = probe_numactl(n["ip"], n)
+                    if not numactl_ok[node_name]:
+                        numa_node_check(node_name, numa_strict)
+                else:
+                    numa_node_count[node_name] = 1
+                    numa_topo[node_name] = {0: "0"}
+                    numactl_ok[node_name] = False
+                numa_counter[node_name] = 0
+
+        def _entry_host(entry):
+            """Fabric-network host for the kvtest nodes[] view (ssh: node
+            fabric_ip; k8s: pod IP — pods reach each other directly)."""
+            n = get_node(cluster, entry["node"])
+            return n.get("fabric_ip", n.get("ip", ""))
+
+        def _instance_view():
+            """Full-cluster instance list for every instance's nodes array
+            (kvtest derives notify peers from it; writers pick reader/dual
+            roles, everyone excludes themselves by instance_id)."""
+            view = []
+            if plan.get("dual"):
+                for c in plan["clients"]:
+                    view.append({"iid": c["iid"], "port": c["port"],
+                                 "role": "dual", "host": _entry_host(c)})
+            else:
+                for w in plan["writers"]:
+                    view.append({"iid": w["iid"], "port": w["port"],
+                                 "role": "writer", "host": _entry_host(w)})
+                for r in plan["readers"]:
+                    view.append({"iid": r["iid"], "port": r["port"],
+                                 "role": "reader", "host": _entry_host(r)})
+            return view
+
+        log("scenario {} (kvtest, {}): N={}, writers={}, readers={}, "
+            "notify_count={}, total_qps={}, per_node_qps={}, binary={}, "
+            "health_timeout={}s, sizes={}".format(
+                cfg_name, work_mode, n_nodes, len(plan["writers"]),
+                len(plan["readers"]), plan["notify_count"], plan["total_qps"],
+                plan["per_node_qps"], kv_binary, health_timeout_s, sizes))
+
+        def _launch_instance(entry, role, ds, key_pool, all_instances,
+                             lhost_counter):
+            """Write the per-instance config (base64 over ssh so the k8s
+            ConfigMap stays shared/read-only) and nohup-launch the runner.
+            Returns the ledger pid."""
+            n = get_node(cluster, entry["node"])
+            base = "{}.{}_i{}_p{}.kvtest_{}".format(
+                cfg_name, entry["node"], entry["iid"], entry["port"], ds)
+            entry["_base"] = base
+            entry["_out_dir"] = "{}/kvtest_out/{}".format(remote_log_dir, base)
+            cfg_file = "{}/{}.json".format(remote_log_dir, base)
+            log_file = "{}/{}.log".format(remote_log_dir, base)
+            nohup_log = "{}/{}.nohup".format(remote_log_dir, base)
+            # unique local_hostname port per node (tcp protocol binds it)
+            cnt = lhost_counter.get(entry["node"], 0)
+            lhost_counter[entry["node"]] = cnt + 1
+            entry["_lhost_port"] = 12345 + cnt
+            # per-instance integer QPS split of the node's rate
+            if role in ("writer", "dual"):
+                cpn = int((cfg.get("client", {}) or {}).get("count_per_node", 1)) \
+                    if plan.get("dual") else \
+                    int((cfg.get("writer", {}) or {}).get("count_per_node", 1))
+                entry["_qps"] = _kvtest_split_qps(plan["per_node_qps"], cpn,
+                                                  entry["local"])
+            else:
+                entry["_qps"] = 0
+            # NUMA binding (ssh only): numactl prefix + JSON cpu_affinity
+            launch_prefix = ""
+            if (cpu_shard > 0 or numa_bind) and not dry \
+                    and not is_k8s_node(n):
+                nn = numa_counter[entry["node"]] % numa_node_count[entry["node"]]
+                numa_counter[entry["node"]] += 1
+                idx = shard_ordinal(entry["node"], nn) if cpu_shard > 0 else 0
+                cl = numa_binding_spec(numa_topo[entry["node"]][nn],
+                                       node_exclude(cluster, n),
+                                       cpu_shard, idx)
+                entry["_cpu_affinity"] = cl
+                if numactl_ok.get(entry["node"]):
+                    launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
+            else:
+                entry["_cpu_affinity"] = ""
+            inst_cfg = build_kvtest_instance_config(
+                cfg, globals_cfg, cluster_session, plan, entry, role, ds,
+                key_pool, all_instances)
+            payload = base64.b64encode(
+                json.dumps(inst_cfg).encode("utf-8")).decode("ascii")
+            if dry:
+                log("[dry-run] kvtest {} i{} on {}: config {} ({} B), "
+                    "qps={}, out {}".format(
+                        role, entry["iid"], entry["node"], cfg_file,
+                        len(payload), entry["_qps"], entry["_out_dir"]))
+            else:
+                ssh_check_output(
+                    n["ip"], n,
+                    "printf '%s' '{b}' | base64 -d > '{f}'".format(
+                        b=payload, f=cfg_file), quiet=True)
+            ccmd = ("nohup {p}bash {runner} {log} {cfgf} {bin} "
+                    "> {nohup} 2>&1 & echo $!").format(
+                p=launch_prefix, runner=remote_runner_kvtest, log=log_file,
+                cfgf=cfg_file, bin=kv_binary, nohup=nohup_log)
+            pid = ssh_check_output(n["ip"], n, ccmd, dry_run=dry)
+            instance_pids.append((entry, pid))
+            if not dry and pid:
+                state_append([{
+                    "ip": n["ip"], "node": entry["node"], "port": entry["port"],
+                    "fabric_host": n.get("fabric_ip", n.get("ip", "")),
+                    "pid": pid.strip(),
+                    "label": "kvtest {} i{}".format(role, entry["iid"]),
+                    "marker": _KVTEST_PID_MARKER,
+                    "cfg": cfg_name,
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+
+        current_ds = None
+        for ds in sizes:
+            # fresh store per size: full remove-all (kvtest keys use the
+            # hardcoded mooncake_kvtest_ prefix, but scope=full clears them)
+            run_stage(host, node, remote_runner_pipeline,
+                      "remove-keys", remote_log_dir, cfg_name,
+                      extra="--scope full", dry_run=dry, pull_to=local_log_dir,
+                      node_name=primary_node_name)
+            if not dry:
+                _verify_store_clean(cluster, globals_cfg, cfg_name,
+                                    "{} start".format(ds))
+            current_ds = ds
+            instance_pids = []
+            key_pool = pools[ds]
+            all_instances = _instance_view()
+            lhost_counter = {}
+            if plan.get("dual"):
+                # one process hosts writer+reader: launch together, gate once
+                for c in plan["clients"]:
+                    _launch_instance(c, "dual", ds, key_pool, all_instances,
+                                     lhost_counter)
+                log("launched {} dual kvtest instances".format(
+                    len(plan["clients"])))
+                if not dry:
+                    _kvtest_health_gate(cluster, plan["clients"],
+                                        health_timeout_s, "dual instances")
+            else:
+                # kvtest README rule: readers before writers, so the first
+                # writer notify already finds every consumer bound
+                for r in plan["readers"]:
+                    _launch_instance(r, "reader", ds, key_pool, all_instances,
+                                     lhost_counter)
+                log("launched {} kvtest readers".format(len(plan["readers"])))
+                if not dry:
+                    _kvtest_health_gate(cluster, plan["readers"],
+                                        health_timeout_s, "readers")
+                for w in plan["writers"]:
+                    _launch_instance(w, "writer", ds, key_pool, all_instances,
+                                     lhost_counter)
+                log("launched {} kvtest writers".format(len(plan["writers"])))
+                if not dry:
+                    _kvtest_health_gate(cluster, plan["writers"],
+                                        health_timeout_s, "writers")
+            # ---- measurement window: writers write from process boot; the
+            # window starts when the last health gate passed ----
+            if not dry:
+                log("kvtest measurement window: {}s (all instances healthy; "
+                    "ETA {})".format(
+                        int(duration),
+                        time.strftime("%H:%M:%S",
+                                      time.localtime(time.time() + duration))))
+                t0 = time.time()
+                while time.time() - t0 < duration:
+                    _check_stop()
+                    time.sleep(min(1.0, max(0.05,
+                                            duration - (time.time() - t0))))
+            # ---- end of window: flush summary.json, then graceful stop ----
+            items = [(get_node(cluster, e["node"]), e["port"], "",
+                      "kvtest i{}".format(e["iid"]))
+                     for e, _pid in instance_pids if "node" in e]
+            for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
+                                                            "/summary",
+                                                            timeout=10):
+                if not _ok:
+                    log("[WARN] {} /summary: {} (exitrc check below decides "
+                        "failure)".format(_what, _err))
+            for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
+                                                            "/stop",
+                                                            timeout=10):
+                if not _ok:
+                    log("[WARN] {} /stop: {}".format(_what, _err))
+            # ---- wait for exit + exit-code ledger ----
+            _t0, _exited = time.time(), 0
+            for entry, pid in instance_pids:
+                if not dry and pid:
+                    exited = wait_process_exit(
+                        cluster, entry["node"], pid,
+                        "kvtest i{}".format(entry["iid"]),
+                        120, dry_run=dry, expected_s=30,
+                        marker=_KVTEST_PID_MARKER)
+                    if exited:
+                        _exited += 1
+                        _check_exitrc(
+                            cluster, entry["node"],
+                            "{}/{}.log.exitrc".format(remote_log_dir,
+                                                      entry["_base"]),
+                            "kvtest i{}".format(entry["iid"]))
+            if not dry:
+                log("kvtest instances exited: {}/{} ({:.1f}s)".format(
+                    _exited, len(instance_pids), time.time() - _t0))
+            # ---- flatten artifacts to unique names + pull ----
+            _groups = []
+            for entry, _pid in instance_pids:
+                n = get_node(cluster, entry["node"])
+                base = entry["_base"]
+                if not dry:
+                    out = ssh_check_output(
+                        n["ip"], n,
+                        "cp '{o}/summary.json' '{d}/{b}.summary.json' && "
+                        "cp '{o}/latency_timeseries.csv' "
+                        "'{d}/{b}.timeseries.csv' && echo OK || echo MISSING"
+                        "".format(o=entry["_out_dir"], d=remote_log_dir,
+                                  b=base), quiet=True)
+                    if out != "OK":
+                        raise RuntimeError(
+                            "kvtest i{} produced no summary.json/"
+                            "latency_timeseries.csv in {} (crashed before "
+                            "/summary? see the pulled logs)".format(
+                                entry["iid"], entry["_out_dir"]))
+                _groups.append((n,
+                                ["{}/{}.json".format(remote_log_dir, base),
+                                 "{}/{}.log".format(remote_log_dir, base),
+                                 "{}/{}.log.glog".format(remote_log_dir, base),
+                                 "{}/{}.log.exitrc".format(remote_log_dir, base),
+                                 "{}/{}.summary.json".format(remote_log_dir, base),
+                                 "{}/{}.timeseries.csv".format(remote_log_dir, base)],
+                                "kvtest i{}".format(entry["iid"])))
+            _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+            log("logs: {} files / {} instances pulled".format(
+                sum(len(f) for _n, f, _l in _groups), len(_groups)))
+            # remove empty .nohup redirect files (non-empty kept for
+            # diagnostics and pulled by the {cfg}.* glob)
+            if not dry:
+                for node_name in involved_nodes:
+                    n = get_node(cluster, node_name)
+                    nohup_files = ["{}/{}.nohup".format(remote_log_dir,
+                                                        e["_base"])
+                                   for e, _p in instance_pids
+                                   if e["node"] == node_name]
+                    if nohup_files:
+                        cleanup_cmd = ("for f in {}; do [ -s \"$f\" ] || "
+                                       "rm -f \"$f\"; done").format(
+                                           " ".join(nohup_files))
+                        ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+        # Config end: remove-all — clears everything this config's writers
+        # wrote (kvtest keys share the store with nothing else here)
+        remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
+        command = "bash {} remove-keys {} --scope full".format(remote_runner_pipeline, remove_log)
+        run_ssh(host, node, command, dry_run=dry)
+        if not dry:
+            _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
+        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
+        # All kvtest instances exited naturally -> drop their ledger rows.
+        if not dry:
+            state_remove_cfg(cfg_name)
+        # k8s pods stay alive past this return: main()'s sweep-end
+        # remove-keys still needs a live pod; cleanup_pods runs in main()
+        # after sweep-end. Hand the sweep-end pass this config's coordinates.
+        return {"host": host, "node": primary_node_name, "runner": remote_runner_pipeline,
+                "remote_log_dir": remote_log_dir}
+    except Exception:
+        # FAIL path: preserve every remote log (summary.json is flushed by
+        # /stop) and free ports, then re-raise for main's [FAIL]
+        if not dry:
+            fail_cleanup_kvtest(cluster, instance_pids, involved_nodes,
+                                remote_log_dir, cfg_name, local_log_dir,
+                                remove_host=locals().get("host"),
+                                remove_node=locals().get("primary_node_name"),
+                                remove_runner=locals().get("remote_runner_pipeline"),
+                                globals_cfg=globals_cfg)
+            reap_state_entries(cluster)
+            if is_k8s:
+                cluster["_k8s_keep_ns"] = True
+                _k8s_scene_dump(cluster)
+                _k8s_debug_hints(cluster, involved_nodes, cfg_name)
+            else:
+                cleanup_pods(cluster, involved_nodes, dry)
+        raise
+
+
 def _pod_template_path(cluster):
     k8s = cluster.get("k8s") or {}
     return k8s.get("template") or os.path.join(
@@ -4405,6 +5274,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         "{}.csv".format(name))
     rows = []
     is_pipeline = cfg.get("scenario") == "pipeline"
+    is_kvtest = cfg.get("scenario") == "kvtest"
     if is_pipeline:
         plan = pipeline_plan(cfg)
         batch_size = int(cfg.get("batch_size", 1))
@@ -4645,6 +5515,189 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                                  (f for _n, f in reader_src.values()),
                                  "pipeline_read", ds_bytes))
                 rows.append(row)
+    elif is_kvtest:
+        # kvtest rows come from the per-instance summary.json artifacts
+        # (pulled as {cfg}.{node}_i{iid}_p{port}.kvtest_{ds}.summary.json).
+        # Throughput/qps use the wall-clock window: kvtest instances write
+        # from process boot, the window is the orchestrator's duration.
+        plan = kvtest_plan(cfg)
+        duration = float(cfg.get("duration", 0) or 0)
+        writer_op = KVTEST_WRITER_OPS[
+            (cfg.get("writer", {}) or {}).get("operation", "")]
+        reader_op = KVTEST_READER_OPS[
+            (cfg.get("reader", {}) or {}).get("operation", "")]
+        lat_keys = ("avg_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms",
+                    "p9999_ms", "max_ms")
+
+        def base_row(role, instance, nodename, ds):
+            op = writer_op if role == "writer" else reader_op
+            role_key = "_writer_count" if role == "writer" else "_reader_count"
+            if cfg.get(role_key) is not None:
+                client_count = int(cfg[role_key])
+            else:
+                role_cfg = (cfg.get(role, {}) or {}) or (cfg.get("client", {}) or {})
+                client_count = "N*{}".format(role_cfg.get("count_per_node", 1))
+            try:
+                node_ip = get_node(cluster, nodename)["ip"] if cluster else nodename
+            except (KeyError, RuntimeError):
+                node_ip = nodename
+            return {
+                "config_name": name,
+                "scenario": cfg["scenario"],
+                "work_mode": cfg.get("work_mode", cfg.get("mode", "")),
+                "operation": op,
+                "role": role,
+                "node": node_ip,
+                "instance": instance,
+                "topology": topo_of(nodename) if nodename else "",
+                "protocol": cfg["protocol"],
+                "num_threads": plan["writer_threads"] if role == "writer"
+                               else plan["reader_threads"],
+                "notify_threads": plan["notify_threads"] if role == "writer" else "",
+                "data_size": ds,
+                # effective pool: auto value recorded at run time, else the
+                # explicit kvtest.key_pool_size config value
+                "key_pool_size": (cfg.get("_kvtest_key_pool", {}).get(str(ds))
+                                  or (cfg.get("kvtest", {}) or {}).get(
+                                      "key_pool_size", "") or ""),
+                "batch_size": cfg.get("batch_size", ""),
+                "duration": cfg.get("duration", ""),
+                "client_count": client_count,
+                "notify_count": plan["notify_count"],
+                "store_count": ("N*{}".format(cfg.get("store_count_per_node"))
+                                if cfg.get("store_count_per_node") else ""),
+                "base_qps": cfg.get("base_qps", ""),
+                "qps_multiple": cfg.get("qps_multiple", ""),
+                "target_qps": plan["total_qps"],
+            }
+
+        def op_stats(summary, op):
+            return (summary.get("operations", {}) or {}).get(op) or {}
+
+        def fill_metrics(row, st, wall):
+            total = int(st.get("total", 0) or 0)
+            ok = int(st.get("success", 0) or 0)
+            fail = int(st.get("failure", 0) or 0)
+            row["total"] = total
+            row["success"] = ok
+            row["fail"] = fail
+            row["fail_rate"] = (fail * 100.0 / total) if total else 0.0
+            row["total_bytes"] = int(st.get("bytes", 0) or 0)
+            row["wall_s"] = wall
+            row["qps"] = (total / wall) if wall > 0 else 0.0
+            row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
+                                      if wall > 0 else 0.0)
+            row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
+            for k in lat_keys:
+                row[k] = round(float(st.get(k, 0) or 0), 4)
+            for k in ("qps", "fail_rate", "throughput_mb_s",
+                      "throughput_gb_s"):
+                row[k] = round(row[k], 2)
+
+        def fill_notify(row, summary):
+            nt = op_stats(summary, "notify_http")
+            row["notify_submitted"] = int(nt.get("total", 0) or 0)
+            row["notify_ok"] = int(nt.get("success", 0) or 0)
+            row["notify_fail"] = int(nt.get("failure", 0) or 0)
+            row["notify_avg_ms"] = round(float(nt.get("avg_ms", 0) or 0), 4)
+            row["notify_max_ms"] = round(float(nt.get("max_ms", 0) or 0), 4)
+
+        def fill_queue(row, summary):
+            q = op_stats(summary, "notify_queue_wait")
+            row["queue_wait_avg_ms"] = round(float(q.get("avg_ms", 0) or 0), 4)
+            row["queue_wait_max_ms"] = round(float(q.get("max_ms", 0) or 0), 4)
+
+        def avg_of(vals):
+            vals = [v for v in vals if v is not None]
+            return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+        def total_row(role, inst_rows, ds, wall):
+            # TOTAL over per-instance rows: counts/bytes sum exactly;
+            # latency percentiles average across instances (summary.json
+            # keeps no raw samples, so an exact merge is impossible)
+            row = base_row(role, "TOTAL", "", ds)
+            total = sum(r["total"] for r in inst_rows)
+            fail = sum(r["fail"] for r in inst_rows)
+            row["total"] = total
+            row["success"] = sum(r["success"] for r in inst_rows)
+            row["fail"] = fail
+            row["fail_rate"] = (fail * 100.0 / total) if total else 0.0
+            row["total_bytes"] = sum(r["total_bytes"] for r in inst_rows)
+            row["wall_s"] = wall
+            row["qps"] = (total / wall) if wall > 0 else 0.0
+            row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
+                                      if wall > 0 else 0.0)
+            row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
+            for k in lat_keys:
+                row[k] = avg_of([r.get(k) for r in inst_rows])
+            for k in ("qps", "fail_rate", "throughput_mb_s",
+                      "throughput_gb_s"):
+                row[k] = round(row[k], 2)
+            return row
+
+        # one block of rows per data_size: writer rows, writer TOTAL,
+        # reader rows, reader TOTAL (dual instances emit both sides)
+        summary_re = re.compile(
+            r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
+            r"(?P<ds>.+)\.summary\.json$".format(re.escape(name)))
+        summaries = {}   # ds -> [(iid, node, summary_dict)]
+        for p in sorted(glob.glob(os.path.join(
+                local_log_dir, "{}.*.kvtest_*.summary.json".format(
+                    glob.escape(name))))):
+            m = summary_re.match(os.path.basename(p))
+            if not m:
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    summary = json.load(f)
+            except (OSError, ValueError) as exc:
+                log("[WARN] kvtest summary {}: {} (skipped)".format(
+                    os.path.basename(p), exc))
+                continue
+            summaries.setdefault(m.group("ds"), []).append(
+                (int(m.group("iid")), m.group("node"), summary))
+        for ds in data_size_list(cfg):
+            wall = duration
+            writer_rows, reader_rows = [], []
+            for iid, nodename, summary in sorted(summaries.get(ds, [])):
+                ops = summary.get("operations") or {}
+                if writer_op in ops:
+                    row = base_row("writer", "i{}".format(iid), nodename, ds)
+                    fill_metrics(row, op_stats(summary, writer_op), wall)
+                    fill_notify(row, summary)
+                    writer_rows.append(row)
+                if reader_op in ops:
+                    row = base_row("reader", "i{}".format(iid), nodename, ds)
+                    fill_metrics(row, op_stats(summary, reader_op), wall)
+                    fill_queue(row, summary)
+                    # data verification runs on the read path
+                    row["verify_failures"] = int(
+                        summary.get("verify_failures", 0) or 0)
+                    reader_rows.append(row)
+            # grouped like the pipeline CSV: all writers + TOTAL, then all
+            # readers + TOTAL
+            rows.extend(writer_rows)
+            if writer_rows:
+                row = total_row("writer", writer_rows, ds, wall)
+                for k in ("notify_submitted", "notify_ok", "notify_fail"):
+                    row[k] = sum(r.get(k, 0) for r in writer_rows)
+                row["notify_avg_ms"] = avg_of(
+                    [r.get("notify_avg_ms") for r in writer_rows])
+                row["notify_max_ms"] = max(
+                    (r.get("notify_max_ms", 0) or 0 for r in writer_rows),
+                    default=0)
+                rows.append(row)
+            rows.extend(reader_rows)
+            if reader_rows:
+                row = total_row("reader", reader_rows, ds, wall)
+                row["verify_failures"] = sum(
+                    r.get("verify_failures", 0) for r in reader_rows)
+                row["queue_wait_avg_ms"] = avg_of(
+                    [r.get("queue_wait_avg_ms") for r in reader_rows])
+                row["queue_wait_max_ms"] = max(
+                    (r.get("queue_wait_max_ms", 0) or 0 for r in reader_rows),
+                    default=0)
+                rows.append(row)
     else:
         def fill_basic_row(row, agg, op_label):
             row["operation"] = op_label
@@ -4721,10 +5774,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 row = dict(base_row_vals)
                 fill_basic_row(row, agg, op_label)
                 rows.append(row)
-    if is_pipeline:
+    if is_pipeline or is_kvtest:
         write_rows = collapse_config_name(rows)
+        header = PIPELINE_CSV_HEADER if is_pipeline else KVTEST_CSV_HEADER
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=PIPELINE_CSV_HEADER)
+            writer = csv.DictWriter(f, fieldnames=header)
             writer.writeheader()
             for row in write_rows:
                 writer.writerow(row)
@@ -4774,7 +5828,7 @@ def load_scenario_config(cfg_path):
             "{} is a shared-defaults fragment, not a runnable scenario".format(cfg_path))
     cfg_dir = os.path.normpath(os.path.dirname(os.path.abspath(cfg_path)))
     merged = {}
-    for category in ("basic", "pipeline"):
+    for category in ("basic", "pipeline", "kvtest"):
         category_dir = os.path.normpath(os.path.join(CONFIGS_DIR, category))
         if cfg_dir == category_dir or cfg_dir.startswith(category_dir + os.sep):
             # directory chain: category root -> ... -> the config's own dir
@@ -5128,6 +6182,8 @@ def main(args, cfg_paths):
         try:
             if cfg.get("scenario") == "pipeline":
                 sweep_remove = run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
+            elif cfg.get("scenario") == "kvtest":
+                sweep_remove = run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args)
             else:
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
@@ -5138,6 +6194,10 @@ def main(args, cfg_paths):
                     cluster, store_nodes, result_dir=ts_dir)
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
+                    # detail keeps only the aggregated writer/reader TOTAL rows
+                    all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
+                elif cfg.get("scenario") == "kvtest":
+                    categories.add("kvtest")
                     # detail keeps only the aggregated writer/reader TOTAL rows
                     all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
                 else:
@@ -5190,13 +6250,19 @@ def main(args, cfg_paths):
     if categories == {"pipeline"}:
         detail_header = PIPELINE_CSV_HEADER
         detail_rows = collapse_config_name(all_rows)
+    elif categories == {"kvtest"}:
+        detail_header = KVTEST_CSV_HEADER
+        detail_rows = collapse_config_name(all_rows)
     elif categories == {"basic"}:
         detail_header = BASIC_CSV_HEADER
         detail_rows = all_rows
     else:
-        # mixed (not reachable through normal CLI): ordered union of both headers
-        detail_header = [c for c in BASIC_CSV_HEADER] + \
-                        [c for c in PIPELINE_CSV_HEADER if c not in BASIC_CSV_HEADER]
+        # mixed (not reachable through normal CLI): ordered union of headers
+        detail_header = [c for c in BASIC_CSV_HEADER]
+        for extra in (PIPELINE_CSV_HEADER, KVTEST_CSV_HEADER):
+            for c in extra:
+                if c not in detail_header:
+                    detail_header.append(c)
         detail_rows = all_rows
     detail_csv = os.path.join(ts_dir, "benchmark_detail.csv")
     with open(detail_csv, "w", newline="", encoding="utf-8") as f:

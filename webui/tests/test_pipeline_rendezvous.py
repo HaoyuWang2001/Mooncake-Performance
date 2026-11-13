@@ -518,7 +518,7 @@ def test_pipeline_http_parallel_results(monkeypatch):
 
     # all OK
     monkeypatch.setattr(bm, "_pipeline_http_call",
-                        lambda n, p, path, timeout=5, dry=False: True)
+                        lambda n, p, path, timeout=5, dry=False, **kw: True)
     res = bm._pipeline_http_parallel(
         None, [(node, 9301, "", "c0"), (node, 9302, "", "c1")], "/start")
     assert [(w, ok) for w, ok, _ in res] == [("c0", True), ("c1", True)]
@@ -526,7 +526,7 @@ def test_pipeline_http_parallel_results(monkeypatch):
     # one fails on both attempts -> exactly 2 calls, reported
     calls = {"n": 0}
 
-    def flaky(n, p, path, timeout=5, dry=False):
+    def flaky(n, p, path, timeout=5, dry=False, **kw):
         calls["n"] += 1
         if p == 9302:
             raise RuntimeError("boom")
