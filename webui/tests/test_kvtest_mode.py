@@ -485,6 +485,11 @@ def test_kvtest_loader_inherits_fragment():
     # smoke overrides key_pool_size to 256 over the root default "auto"
     assert merged["kvtest"]["key_pool_size"] == 256
     assert merged["kvtest"]["notify_queue_max"] == 65536  # YuanRong baseline
+    plan = bm.kvtest_plan(merged, node_count=4)
+    assert plan["split_pod"] is True
+    assert len(plan["clients"]) == 4
+    assert len(plan["writers"]) == len(plan["readers"]) == 4
+    assert plan["notify_count"] == 1
 
 
 def test_webui_validate_and_inventory():
