@@ -1,0 +1,13 @@
+{
+  "scenario": "kvtest",
+  "protocol": "ub",
+  "duration": 30,
+  "batch_size": 1,
+  "kvtest": {
+    "binary": "mooncake_kvtest",
+    "key_pool_size": 0,
+    "notify_queue_max": 8192,
+    "verify_level": "size",
+    "metrics_interval_ms": 3000
+  }
+}

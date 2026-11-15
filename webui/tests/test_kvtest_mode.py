@@ -285,6 +285,46 @@ def test_kvtest_csv_skips_bad_summary_json(tmp_path, capsys):
     assert "(skipped)" in capsys.readouterr().out
 
 
+# -------------------------------------------------- rank+recall parallel
+
+def _smoke_path(name):
+    return os.path.join(ROOT, "configs", "kvtest", "smoke", name)
+
+
+def test_kvtest_parallel_smoke_partition():
+    # the rank_recall launcher (and the WebUI pre-launch validation)
+    # partitions by work_mode: the two kvtest smoke files mirror
+    # rank_smoke/recall_smoke and must land in the expected groups while
+    # still inheriting scenario=kvtest
+    from scripts.run_rank_recall import partition_configs
+    groups = partition_configs(
+        [], [_smoke_path("kvtest_rank_smoke.json"),
+             _smoke_path("kvtest_recall_smoke.json")])
+    assert [os.path.basename(p) for p in groups["rank"]] == \
+        ["kvtest_rank_smoke.json"]
+    assert [os.path.basename(p) for p in groups["recall"]] == \
+        ["kvtest_recall_smoke.json"]
+    for p in groups["rank"] + groups["recall"]:
+        assert bm.load_scenario_config(p)["scenario"] == "kvtest"
+
+
+def test_kvtest_parallel_smoke_plan_shapes():
+    # rank shape mirrors pipeline rank_smoke; recall shape mirrors
+    # recall_smoke; both deploy dual processes per the kvtest README
+    rank = bm.load_scenario_config(_smoke_path("kvtest_rank_smoke.json"))
+    recall = bm.load_scenario_config(_smoke_path("kvtest_recall_smoke.json"))
+    assert rank["work_mode"] == "rank" and recall["work_mode"] == "recall"
+    plan = bm.kvtest_plan(rank, node_count=6)
+    assert plan["dual"] and len(plan["clients"]) == 12   # 2 per node x 6
+    assert plan["notify_count"] == 10                    # <= clients - 1
+    assert plan["per_node_qps"] == 105 and plan["total_qps"] == 105 * 6
+    assert plan["writer_threads"] == 1
+    plan = bm.kvtest_plan(recall, node_count=6)
+    assert plan["dual"] and len(plan["clients"]) == 36   # 6 per node x 6
+    assert plan["notify_count"] == 1
+    assert plan["per_node_qps"] == 35 and plan["total_qps"] == 35 * 6
+
+
 # -------------------------------------------------- loader / webui wiring
 
 def test_kvtest_loader_inherits_fragment():

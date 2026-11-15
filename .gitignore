@@ -12,6 +12,7 @@ configs/*
 !configs/global.example.json
 !configs/basic
 !configs/pipeline
+!configs/kvtest
 !configs/_spdiag_trees
 !configs/_ssh
 !configs/_k8s
@@ -26,9 +27,4 @@ mock/cluster.json
 
 webui/data/
 webui/backups/
-configs/_ssh/cluster.json
-configs/_ssh/global.json
-configs/_ssh/profile.json
-configs/_k8s/cluster.json
-configs/_k8s/global.json
-configs/_k8s/profile.json
+

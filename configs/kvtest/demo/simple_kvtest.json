@@ -1,0 +1,24 @@
+{
+  "work_mode": "kvtest",
+  "base_qps": 35,
+  "qps_multiple": 1,
+  "notify_count": 1,
+  "writer": {
+    "count_per_node": 1,
+    "operation": "upsert_from",
+    "num_threads": 1,
+    "notify_threads": 1,
+    "port_base": 9101
+  },
+  "reader": {
+    "count_per_node": 1,
+    "operation": "get_buffer",
+    "num_threads": 4,
+    "port_base": 9201
+  },
+  "store_count_per_node": 1,
+  "data_size": [
+    "3.5MB"
+  ],
+  "duration": 30
+}

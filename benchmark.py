@@ -4739,11 +4739,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 len(plan["readers"]), plan["notify_count"], plan["total_qps"],
                 plan["per_node_qps"], kv_binary, health_timeout_s, sizes))
 
-        def _launch_instance(entry, role, ds, key_pool, all_instances,
-                             lhost_counter):
-            """Write the per-instance config (base64 over ssh so the k8s
-            ConfigMap stays shared/read-only) and nohup-launch the runner.
-            Returns the ledger pid."""
+        def _prepare_instance(entry, role, ds, key_pool, all_instances,
+                              lhost_counter):
+            """Per-instance naming / QPS split / NUMA binding / config build
+            plus the INERT base64 config push (base64 over ssh so the k8s
+            ConfigMap stays shared/read-only). Nothing runs yet — the nohup
+            command is stored on the entry for _fire_instances."""
             n = get_node(cluster, entry["node"])
             base = "{}.{}_i{}_p{}.kvtest_{}".format(
                 cfg_name, entry["node"], entry["iid"], entry["port"], ds)
@@ -4795,21 +4796,50 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     n["ip"], n,
                     "printf '%s' '{b}' | base64 -d > '{f}'".format(
                         b=payload, f=cfg_file), quiet=True)
-            ccmd = ("nohup {p}bash {runner} {log} {cfgf} {bin} "
-                    "> {nohup} 2>&1 & echo $!").format(
+            entry["_role"] = role
+            entry["_ccmd"] = ("nohup {p}bash {runner} {log} {cfgf} {bin} "
+                              "> {nohup} 2>&1 & echo $!").format(
                 p=launch_prefix, runner=remote_runner_kvtest, log=log_file,
                 cfgf=cfg_file, bin=kv_binary, nohup=nohup_log)
-            pid = ssh_check_output(n["ip"], n, ccmd, dry_run=dry)
-            instance_pids.append((entry, pid))
-            if not dry and pid:
-                state_append([{
-                    "ip": n["ip"], "node": entry["node"], "port": entry["port"],
-                    "fabric_host": n.get("fabric_ip", n.get("ip", "")),
-                    "pid": pid.strip(),
-                    "label": "kvtest {} i{}".format(role, entry["iid"]),
-                    "marker": _KVTEST_PID_MARKER,
-                    "cfg": cfg_name,
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+
+        def _fire_instances(entries):
+            """Fire PREPARED kvtest instances with bounded parallelism.
+
+            kvtest writes from process boot, so the fire IS the pressure
+            start: in rank+recall parallel mode the cross-child barrier sits
+            between prepare and fire, and a pooled fire keeps the launch ramp
+            (and hence the two children's measurement-window starts) tight.
+            The pid ledger and state append stay on the main thread in
+            submission order."""
+            if not entries:
+                return
+
+            def _fire(entry):
+                n = get_node(cluster, entry["node"])
+                return ssh_check_output(n["ip"], n, entry["_ccmd"],
+                                        dry_run=dry)
+
+            if dry:
+                pids = ["" for _ in entries]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                workers = max(1, min(_PIPELINE_PARALLEL, len(entries)))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    pids = list(pool.map(_fire, entries))
+            for entry, pid in zip(entries, pids):
+                instance_pids.append((entry, pid))
+                if not dry and pid:
+                    n = get_node(cluster, entry["node"])
+                    state_append([{
+                        "ip": n["ip"], "node": entry["node"],
+                        "port": entry["port"],
+                        "fabric_host": n.get("fabric_ip", n.get("ip", "")),
+                        "pid": pid.strip(),
+                        "label": "kvtest {} i{}".format(entry["_role"],
+                                                        entry["iid"]),
+                        "marker": _KVTEST_PID_MARKER,
+                        "cfg": cfg_name,
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
 
         current_ds = None
         for ds in sizes:
@@ -4828,10 +4858,16 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             all_instances = _instance_view()
             lhost_counter = {}
             if plan.get("dual"):
-                # one process hosts writer+reader: launch together, gate once
+                # one process hosts writer+reader: prepare all configs (and
+                # the peer child's remove-keys/setup) BEFORE any process
+                # exists, then align at the parallel barrier and fire
+                # together — dual processes write from boot, so the fire is
+                # the shared pressure start
                 for c in plan["clients"]:
-                    _launch_instance(c, "dual", ds, key_pool, all_instances,
-                                     lhost_counter)
+                    _prepare_instance(c, "dual", ds, key_pool, all_instances,
+                                      lhost_counter)
+                _parallel_start_barrier(args)
+                _fire_instances(plan["clients"])
                 log("launched {} dual kvtest instances".format(
                     len(plan["clients"])))
                 if not dry:
@@ -4841,15 +4877,21 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # kvtest README rule: readers before writers, so the first
                 # writer notify already finds every consumer bound
                 for r in plan["readers"]:
-                    _launch_instance(r, "reader", ds, key_pool, all_instances,
-                                     lhost_counter)
+                    _prepare_instance(r, "reader", ds, key_pool, all_instances,
+                                      lhost_counter)
+                _fire_instances(plan["readers"])
                 log("launched {} kvtest readers".format(len(plan["readers"])))
                 if not dry:
                     _kvtest_health_gate(cluster, plan["readers"],
                                         health_timeout_s, "readers")
+                # writers write from process boot -> hold at the cross-child
+                # barrier AFTER the inert config pushes (both children have
+                # finished remove-keys by then), then fire together
                 for w in plan["writers"]:
-                    _launch_instance(w, "writer", ds, key_pool, all_instances,
-                                     lhost_counter)
+                    _prepare_instance(w, "writer", ds, key_pool, all_instances,
+                                      lhost_counter)
+                _parallel_start_barrier(args)
+                _fire_instances(plan["writers"])
                 log("launched {} kvtest writers".format(len(plan["writers"])))
                 if not dry:
                     _kvtest_health_gate(cluster, plan["writers"],
