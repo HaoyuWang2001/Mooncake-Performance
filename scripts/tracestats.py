@@ -91,6 +91,22 @@ def _start_epoch(value):
         return None
 
 
+def _truncated(line):
+    """True when a trace line was cut mid-field (glog caps a message at
+    ~30KB; a long trace line loses its tail and would otherwise be parsed as
+    a valid shorter request)."""
+    text = line.rstrip("\n")
+    # the glog prefix itself ends with "...:123] " -> count brackets only in
+    # the payload that starts at the trace marker
+    i = text.find("trace_id[")
+    if i < 0:
+        i = text.find("breakdown[")
+    if i < 0:
+        return False
+    seg = text[i:]
+    return seg.count("[") != seg.count("]") or not seg.endswith("]")
+
+
 def _group_of(pairs):
     """read / write / other for one parsed line.
 
@@ -187,6 +203,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             lines_total += 1
+            if "breakdown[" in line and _truncated(line):
+                parse_errors += 1
+                continue
             pairs = parse_line(line)
             if pairs is None:
                 continue

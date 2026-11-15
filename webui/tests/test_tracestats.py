@@ -235,3 +235,14 @@ def test_direction_falls_back_to_op_name(tmp_path):
     assert op["count"] == 1 and op["fail"] == 1
     assert op["residual"]["n"] == 1          # 第二遍扫描同样归类为 write
     assert "put" not in (st["groups"].get("other") or {}).get("ops", {})
+
+
+def test_truncated_line_counts_parse_errors(tmp_path):
+    """glog 单行上限会截断超长 trace 行：必须计 parse_errors 而不是静默半解析。"""
+    cut = WRITE_OK[:WRITE_OK.index("total_us[401]") + len("total_us[40")]
+    p = _write(tmp_path, "cut.glog", [WRITE_OK, cut])
+    st = ts.compute_trace_stats(p)
+    m = st["meta"]
+    assert m["parse_errors"] == 1
+    assert m["trace_lines"] == 1
+    assert st["groups"]["write"]["ops"]["put"]["count"] == 1
