@@ -252,3 +252,82 @@ def test_top_n_zero_does_not_crash(tmp_path):
     p = _write(tmp_path, "t0.glog", [WRITE_OK])
     st = ts.compute_trace_stats(p, top_n=0)
     assert len(st["groups"]["write"]["ops"]["put"]["top"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# phase classification (MC_PHASE markers): setup / warmup / measured / teardown
+# ---------------------------------------------------------------------------
+
+GLOGP = "I20261115 09:27:33.000000 1 te.cc:1] "
+
+
+def _trace(t, op, total=100):
+    return (GLOGP + "trace_id[1] breakdown[{}] key[k] status[ok] size[1] "
+            "start_time[{}] total_us[{}] query_total_us[{}]"
+            .format(op, t, total, total))
+
+
+def _mark(phase, action, t):
+    return "MC_PHASE {} {} {:.6f}".format(phase, action, t)
+
+
+def test_phase_markers_four_buckets(tmp_path):
+    base = ts._start_epoch("2026-11-15 09:27:33.000000")
+    lines = [
+        _trace("2026-11-15 09:27:33.100000", "put", 10),       # setup
+        _mark("warmup", "start", base + 0.3),
+        _trace("2026-11-15 09:27:33.500000", "put", 20),        # warmup
+        _trace("2026-11-15 09:27:34.000000", "put", 30),        # warmup
+        _mark("measured", "start", base + 1.5),
+        _trace("2026-11-15 09:27:35.000000", "put", 40),        # measured
+        _mark("measured", "end", base + 3.0),
+        _trace("2026-11-15 09:27:37.000000", "put", 50),        # teardown
+    ]
+    st = ts.compute_trace_stats(_write(tmp_path, "p.glog", lines))
+    m = st["meta"]
+    assert m["markers"] is True
+    assert m["phase_counts"] == {"setup": 1, "warmup": 2, "measured": 1,
+                                 "teardown": 1}
+    # only the measured row is aggregated
+    op = st["groups"]["write"]["ops"]["put"]
+    assert op["count"] == 1
+    assert op["fields"]["total_us"]["max"] == 40
+    assert op["seconds"] and op["seconds"][0][1] == 1
+
+
+def test_phase_no_markers_legacy_all_measured(tmp_path):
+    lines = [
+        _trace("2026-11-15 09:27:33.100000", "put", 10),
+        _trace("2026-11-15 09:27:35.000000", "put", 40),
+    ]
+    st = ts.compute_trace_stats(_write(tmp_path, "l.glog", lines))
+    m = st["meta"]
+    assert m["markers"] is False
+    assert m["phase_counts"]["measured"] == 2
+    assert st["groups"]["write"]["ops"]["put"]["count"] == 2
+
+
+def test_phase_warmup_disabled(tmp_path):
+    base = ts._start_epoch("2026-11-15 09:27:33.000000")
+    lines = [
+        _trace("2026-11-15 09:27:32.000000", "put", 5),     # setup (before measured)
+        _mark("measured", "start", base),
+        _trace("2026-11-15 09:27:35.000000", "put", 40),
+        _mark("measured", "end", base + 3.0),
+    ]
+    st = ts.compute_trace_stats(_write(tmp_path, "nw.glog", lines))
+    assert st["meta"]["phase_counts"] == {"setup": 1, "warmup": 0,
+                                          "measured": 1, "teardown": 0}
+    assert st["groups"]["write"]["ops"]["put"]["count"] == 1
+
+
+def test_phase_of_window_math():
+    marks = {("warmup", "start"): 100.0, ("measured", "start"): 200.0,
+             ("measured", "end"): 300.0}
+    assert ts._phase_of(50, marks) == "setup"
+    assert ts._phase_of(100, marks) == "warmup"
+    assert ts._phase_of(199.9, marks) == "warmup"
+    assert ts._phase_of(200, marks) == "measured"
+    assert ts._phase_of(300, marks) == "measured"
+    assert ts._phase_of(301, marks) == "teardown"
+    assert ts._phase_of(1, {}) is None          # legacy -> measured by caller

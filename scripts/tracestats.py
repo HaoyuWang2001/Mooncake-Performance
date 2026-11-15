@@ -140,6 +140,50 @@ def parse_line(line):
     return pairs
 
 
+PHASE_MARK_RE = re.compile(
+    r"^MC_PHASE (warmup|measured) (start|end) (\d+\.\d+)")
+
+
+def parse_phase_markers(path):
+    """Collect MC_PHASE markers from one glog: {('warmup','start'): t, ...}.
+    Written by the client to stderr (same fd2 -> glog stream)."""
+    marks = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = PHASE_MARK_RE.match(line.strip())
+                if m:
+                    key = (m.group(1), m.group(2))
+                    if key not in marks:          # first occurrence wins
+                        marks[key] = float(m.group(3))
+    except OSError:
+        pass
+    return marks
+
+
+def _phase_of(t, marks):
+    """Classify one trace timestamp into setup / warmup / measured / teardown
+    by the marker windows. No markers at all (legacy clients) -> None (the
+    caller treats every row as measured to keep the old behaviour)."""
+    if not marks:
+        return None
+    w0 = marks.get(("warmup", "start"))
+    m0 = marks.get(("measured", "start"))
+    m1 = marks.get(("measured", "end"))
+    if w0 is not None and t < w0:
+        return "setup"
+    if w0 is not None and m0 is not None and w0 <= t < m0:
+        return "warmup"
+    if w0 is None and m0 is not None and t < m0:
+        return "setup"            # warmup disabled: pre-measured = setup
+    if m0 is not None and (m1 is None or t <= m1):
+        return "measured"
+    if m1 is not None and t > m1:
+        return "teardown"
+    # markers exist but this row predates all of them
+    return "setup"
+
+
 def _bucket_new():
     return {"n": 0, "ok": 0, "fail": 0, "sum": 0.0, "max": 0.0, "h": {},
             "neg": 0}
@@ -201,6 +245,11 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             }
         return st
 
+    # phase markers first (one pass): classification windows for the C++
+    # trace rows. Legacy clients (no markers) -> every row is measured.
+    marks = parse_phase_markers(path)
+    phase_counts = {"setup": 0, "warmup": 0, "measured": 0, "teardown": 0}
+
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             lines_total += 1
@@ -218,6 +267,18 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             status = pairs.get("status", "")
             ok = status == "ok"
             group = _group_of(pairs)
+            # phase bucket: only MEASURED rows feed the op aggregates; the
+            # rest (setup / warmup prefill+reads / teardown) are counted and
+            # dropped — the report footnote shows the excluded sample counts.
+            ep = _start_epoch(pairs.get("start_time", ""))
+            if ep is None:
+                ep = 0.0
+            phase = _phase_of(ep, marks)
+            if phase is None:
+                phase = "measured"      # legacy: no markers in this glog
+            phase_counts[phase] += 1
+            if phase != "measured":
+                continue
             st = op_state(group, bd)
             st["count"] += 1
             if ok:
@@ -384,6 +445,11 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         # histogram ladder this product was built with; report refuses to
         # interpret legacy files (which used the ms ladder for µs values)
         "bins": "us-v1",
+        # phase classification (MC_PHASE markers from the client):
+        # `markers` False = legacy glog, every row was counted as measured.
+        "markers": bool(marks),
+        "phase_counts": phase_counts,
+        "phases": { "{}_{}".format(ph, act): t for (ph, act), t in marks.items() },
     }
     return {"meta": meta, "groups": groups}
 
