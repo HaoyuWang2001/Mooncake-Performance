@@ -4522,6 +4522,63 @@ def _kvtest_kill_tree(cluster, node_name, pid):
             pid, node_name, exc))
 
 
+def _wait_kvtest_processes(cluster, instance_pids, timeout_s, expected_s=None,
+                           label_prefix="kvtest"):
+    """Wait for kvtest wrappers in parallel under one shared deadline.
+
+    The old per-instance loop multiplied the timeout by the number of
+    instances (two stuck processes cost 240+ seconds).  Each wrapper owns one
+    binary child, so independent polling is safe and keeps the wall timeout
+    bounded by ``timeout_s``.
+    """
+    if not instance_pids:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(pair):
+        entry, pid = pair
+        if not pid:
+            return True
+        return wait_process_exit(
+            cluster, entry["node"], pid,
+            "{} i{}".format(label_prefix, entry["iid"]), timeout_s,
+            expected_s=expected_s, marker=_KVTEST_PID_MARKER)
+
+    workers = max(1, min(_PIPELINE_PARALLEL, len(instance_pids)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_one, instance_pids))
+
+
+def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
+                              retry_s=0):
+    """Copy one instance's nested artifacts into the pullable log root.
+
+    Return ``(ok, status)``.  Summary and timeseries are copied independently
+    so a late summary can no longer hide an already-present timeseries file.
+    """
+    n = get_node(cluster, entry["node"])
+    base = entry["_base"]
+    command = (
+        "summary=OK; timeseries=OK; "
+        "cp '{o}/summary.json' '{d}/{b}.summary.json' 2>/dev/null || "
+        "summary=MISSING; "
+        "cp '{o}/latency_timeseries.csv' '{d}/{b}.timeseries.csv' "
+        "2>/dev/null || timeseries=MISSING; "
+        "printf 'summary=%s timeseries=%s' \"$summary\" \"$timeseries\""
+    ).format(o=entry["_out_dir"], d=remote_log_dir, b=base)
+    last = "not attempted"
+    for attempt in range(max(1, int(attempts))):
+        try:
+            last = ssh_check_output(n["ip"], n, command, quiet=True).strip()
+        except Exception as exc:
+            last = "copy command failed: {}".format(exc)
+        if last == "summary=OK timeseries=OK":
+            return True, last
+        if attempt + 1 < attempts and retry_s:
+            time.sleep(retry_s)
+    return False, last
+
+
 def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                         cfg_name, local_log_dir, remove_host=None,
                         remove_node=None, remove_runner=None, globals_cfg=None):
@@ -4543,18 +4600,18 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                                                     timeout=5):
         if not _ok:
             log("[WARN] fail-cleanup: {} /stop failed: {}".format(_what, _err))
-    # 2. short wait so graceful exits finish and final logs flush
-    for entry, pid in instance_pids:
-        if pid:
-            try:
-                wait_process_exit(cluster, entry["node"], pid,
-                                  "fail-cleanup kvtest i{}".format(entry["iid"]),
-                                  30, marker=_KVTEST_PID_MARKER)
-            except Exception:
-                pass
+    # 2. short, cluster-wide wait so graceful exits finish and final logs
+    # flush without multiplying the timeout by the number of instances.
+    try:
+        exit_results = _wait_kvtest_processes(
+            cluster, instance_pids, 30,
+            label_prefix="fail-cleanup kvtest")
+    except Exception as exc:
+        log("[WARN] fail-cleanup: exit wait failed: {}".format(exc))
+        exit_results = [False for _ in instance_pids]
     # 3. tree-kill any still-alive instance
-    for entry, pid in instance_pids:
-        if pid:
+    for (entry, pid), exited in zip(instance_pids, exit_results):
+        if pid and not exited:
             _kvtest_kill_tree(cluster, entry["node"], pid)
     # 4. flatten per-instance artifacts best-effort (pull_logs' {cfg}.* glob
     # only sees flat names; the raw output dirs live under kvtest_out/)
@@ -4563,17 +4620,17 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
         if not base or "node" not in entry:
             continue
         try:
-            n = get_node(cluster, entry["node"])
-            out_dir = entry.get("_out_dir") or "{}/kvtest_out/{}".format(
-                remote_log_dir, base)
-            ssh_check_output(
-                n["ip"], n,
-                "cp '{o}/summary.json' '{d}/{b}.summary.json' 2>/dev/null; "
-                "cp '{o}/latency_timeseries.csv' '{d}/{b}.timeseries.csv "
-                "2>/dev/null; true".format(o=out_dir, d=remote_log_dir, b=base),
-                quiet=True)
-        except Exception:
-            pass
+            entry["_out_dir"] = entry.get("_out_dir") or \
+                "{}/kvtest_out/{}".format(remote_log_dir, base)
+            ok, status = _kvtest_flatten_artifacts(
+                cluster, entry, remote_log_dir, attempts=5, retry_s=1)
+            if not ok:
+                log("[WARN] fail-cleanup: kvtest i{} artifacts unavailable: "
+                    "{} ({})".format(entry.get("iid", "?"), status,
+                                     entry["_out_dir"]))
+        except Exception as exc:
+            log("[WARN] fail-cleanup: artifact flatten failed for kvtest "
+                "i{}: {}".format(entry.get("iid", "?"), exc))
     # 5. best-effort store remove-all: a FAILED run must not leave objects
     # behind (the success path removes at config end)
     if remove_host and remove_node and remove_runner:
@@ -5067,43 +5124,74 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 if not _ok:
                     log("[WARN] {} /stop: {}".format(_what, _err))
             # ---- wait for exit + exit-code ledger ----
-            _t0, _exited = time.time(), 0
-            for entry, pid in instance_pids:
-                if not dry and pid:
-                    exited = wait_process_exit(
-                        cluster, entry["node"], pid,
-                        "kvtest i{}".format(entry["iid"]),
-                        120, dry_run=dry, expected_s=30,
-                        marker=_KVTEST_PID_MARKER)
-                    if exited:
-                        _exited += 1
-                        _check_exitrc(
-                            cluster, entry["node"],
-                            "{}/{}.log.exitrc".format(remote_log_dir,
-                                                      entry["_base"]),
-                            "kvtest i{}".format(entry["iid"]))
+            # One shared 30s grace period replaces the old serial 120s per
+            # instance waits.  A second /stop is an idempotent recovery probe
+            # for older kvtest binaries whose blocking accept() needed a wake
+            # connection before listener teardown could finish.
+            _t0 = time.time()
+            if dry:
+                _exit_results = [True for _ in instance_pids]
+            else:
+                _exit_results = _wait_kvtest_processes(
+                    cluster, instance_pids, 30, expected_s=30)
+                _remaining = [pair for pair, exited in
+                              zip(instance_pids, _exit_results) if not exited]
+                if _remaining:
+                    log("[WARN] kvtest {}/{} instances still alive 30s after "
+                        "/stop; retrying /stop once".format(
+                            len(_remaining), len(instance_pids)))
+                    _retry_items = [
+                        (get_node(cluster, entry["node"]), entry["port"], "",
+                         "kvtest retry-stop i{}".format(entry["iid"]))
+                        for entry, _pid in _remaining]
+                    for _what, _ok, _err in _pipeline_http_parallel(
+                            cluster, _retry_items, "/stop", timeout=5):
+                        if not _ok:
+                            log("[WARN] {}: {}".format(_what, _err))
+                    _retry_results = _wait_kvtest_processes(
+                        cluster, _remaining, 30,
+                        label_prefix="kvtest retry-stop")
+                    _retry_by_iid = {
+                        entry["iid"]: exited
+                        for (entry, _pid), exited in
+                        zip(_remaining, _retry_results)}
+                    _exit_results = [
+                        exited or _retry_by_iid.get(entry["iid"], False)
+                        for (entry, _pid), exited in
+                        zip(instance_pids, _exit_results)]
+            _exited = sum(1 for exited in _exit_results if exited)
+            for (entry, pid), exited in zip(instance_pids, _exit_results):
+                if not dry and pid and exited:
+                    _check_exitrc(
+                        cluster, entry["node"],
+                        "{}/{}.log.exitrc".format(remote_log_dir,
+                                                  entry["_base"]),
+                        "kvtest i{}".format(entry["iid"]))
             if not dry:
                 log("kvtest instances exited: {}/{} ({:.1f}s)".format(
                     _exited, len(instance_pids), time.time() - _t0))
+                if _exited != len(instance_pids):
+                    _alive = ["i{} on {}".format(entry["iid"], entry["node"])
+                              for (entry, _pid), exited in
+                              zip(instance_pids, _exit_results) if not exited]
+                    raise RuntimeError(
+                        "kvtest shutdown timed out after two /stop attempts; "
+                        "still alive: {}".format(", ".join(_alive)))
             # ---- flatten artifacts to unique names + pull ----
             _groups = []
             for entry, _pid in instance_pids:
                 n = get_node(cluster, entry["node"])
                 base = entry["_base"]
                 if not dry:
-                    out = ssh_check_output(
-                        n["ip"], n,
-                        "cp '{o}/summary.json' '{d}/{b}.summary.json' && "
-                        "cp '{o}/latency_timeseries.csv' "
-                        "'{d}/{b}.timeseries.csv' && echo OK || echo MISSING"
-                        "".format(o=entry["_out_dir"], d=remote_log_dir,
-                                  b=base), quiet=True)
-                    if out != "OK":
+                    ok, status = _kvtest_flatten_artifacts(
+                        cluster, entry, remote_log_dir,
+                        attempts=5, retry_s=2)
+                    if not ok:
                         raise RuntimeError(
-                            "kvtest i{} produced no summary.json/"
-                            "latency_timeseries.csv in {} (crashed before "
-                            "/summary? see the pulled logs)".format(
-                                entry["iid"], entry["_out_dir"]))
+                            "kvtest i{} exited but final artifacts were not "
+                            "both available after retries: {} in {}"
+                            "".format(entry["iid"], status,
+                                      entry["_out_dir"]))
                 _groups.append((n,
                                 ["{}/{}.json".format(remote_log_dir, base),
                                  "{}/{}.log".format(remote_log_dir, base),
