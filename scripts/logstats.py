@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import time
 
 TS_PREFIX = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}")
 RESULT_PREFIX = "RESULT\t"
@@ -46,20 +47,28 @@ EXCERPT_CAP = 16 * 1024        # 错误摘录字节上限
 
 
 def _ts_to_epoch(ts):
-    """'YYYY-MM-DD HH:MM:SS.micro' -> epoch float; legacy 'HH:MM:SS.micro'
+    """'YYYY-MM-DD HH:MM:SS.micro' -> local epoch float.
+
+    The timestamp is node LOCAL wall clock (mktime, same basis as
+    tracestats._start_epoch — timegm would shift every bucket by the UTC
+    offset and disagree with the C++ trace timeline). Legacy 'HH:MM:SS.micro'
     -> None (undated: time buckets skipped, global stats still complete)."""
-    if " " in ts:
-        import calendar
-        import time as _time
-        date_part, hms = ts.split(" ", 1)
-        y, mo, d = (int(x) for x in date_part.split("-"))
-        h, m, rest = hms.split(":")
+    if " " not in ts:
+        return None
+    date_part, hms = ts.strip().split(" ", 1)
+    frac = 0.0
+    if "." in hms:
+        hms, _, micro = hms.partition(".")
         try:
-            base = calendar.timegm((y, mo, d, int(h), int(m), 0, 0, 0, 0))
-        except Exception:
-            return None
-        return base + float(rest)
-    return None
+            frac = float("0." + micro)
+        except ValueError:
+            frac = 0.0
+    try:
+        y, mo, d = (int(x) for x in date_part.split("-"))
+        h, m, s = (int(x) for x in hms.split(":"))
+        return time.mktime((y, mo, d, h, m, s, 0, 0, -1)) + frac
+    except (ValueError, OverflowError):
+        return None
 
 
 def iter_rows(path):

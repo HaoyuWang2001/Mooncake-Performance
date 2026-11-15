@@ -64,12 +64,27 @@ def _num(value):
 
 
 def _start_epoch(value):
-    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+    """'YYYY-MM-DD HH:MM:SS[.micro]' (node local wall clock) -> epoch float.
+
+    Keeps the fractional part so the value matches logstats._ts_to_epoch
+    exactly (the two timelines must share one basis)."""
+    text = (value or "").strip()
+    if " " not in text:
+        return None
+    date_part, hms = text.split(" ", 1)
+    frac = 0.0
+    if "." in hms:
+        hms, _, micro = hms.partition(".")
         try:
-            return time.mktime(time.strptime(value.strip(), fmt))
-        except (ValueError, OverflowError):
-            continue
-    return None
+            frac = float("0." + micro)
+        except ValueError:
+            frac = 0.0
+    try:
+        y, mo, d = (int(x) for x in date_part.split("-"))
+        h, m, s = (int(x) for x in hms.split(":"))
+        return time.mktime((y, mo, d, h, m, s, 0, 0, -1)) + frac
+    except (ValueError, OverflowError):
+        return None
 
 
 def parse_line(line):

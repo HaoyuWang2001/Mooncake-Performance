@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -190,3 +191,23 @@ def test_minute_buckets_are_epoch_seconds(tmp_path):
     assert {r[0] for r in st["minutes"]} == sec_minutes
     assert len(st["minutes"]) == 2                  # 10:00 与 10:01
     assert sum(r[1] for r in st["minutes"]) == 3
+
+
+def test_dated_timestamp_is_local_epoch(tmp_path, monkeypatch):
+    """RESULT 墙钟按本地时区解析（曾用 timegm 当 UTC，CST 下偏 8 小时）。"""
+    if not hasattr(time, "tzset"):
+        print("  [skip] time.tzset not available")
+        return
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    time.tzset()
+    try:
+        st = ls.compute_stats(_write(
+            tmp_path, "RESULT\t2026-11-15 10:00:00.500000\tput\tk1\t1.0\tOK\n"))
+        expected = time.mktime((2026, 11, 15, 10, 0, 0, 0, 0, -1)) + 0.5
+        assert abs(st["meta"]["ts_from"] - expected) < 0.001
+        import tracestats as ts_
+        assert abs(ts_._start_epoch("2026-11-15 10:00:00.500000")
+                   - st["meta"]["ts_from"]) < 0.001
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()
