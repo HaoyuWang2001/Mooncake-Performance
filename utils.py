@@ -524,15 +524,26 @@ def _drain_chan(chan, relay, out):
         # else: discard (parity with the old CLI capture: stdout only)
 
 
-def _ssh_exec(node, command, relay=False):
+def _ssh_exec(node, command, relay=False, timeout=None):
     """Execute one command on the cached connection -> (stdout_text, rc).
-    A broken cached connection is dropped so the next call reconnects."""
+    A broken cached connection is dropped so the next call reconnects.
+    `timeout` (seconds) aborts a hung command instead of blocking forever."""
     out = []
+    deadline = time.time() + timeout if timeout else None
     try:
         client = _ssh_client(node)
         stdin, stdout, stderr = client.exec_command(command)
         chan = stdout.channel
         while not chan.exit_status_ready():
+            if deadline is not None and time.time() > deadline:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                _ssh_drop(node)
+                raise RuntimeError(
+                    "ssh command timed out after {}s: {}".format(
+                        timeout, command))
             if stop_requested():
                 try:
                     chan.close()
@@ -583,7 +594,8 @@ def run_ssh(host, node, command, dry_run=False):
             "".format(rc, host, command))
 
 
-def ssh_check_output(host, node, command, dry_run=False, quiet=False):
+def ssh_check_output(host, node, command, dry_run=False, quiet=False,
+                     timeout=None):
     if is_k8s_node(node):
         if not quiet:
             log_detail("[k8s] $ {}".format(kubectl_exec_line(node, command)))
@@ -604,7 +616,7 @@ def ssh_check_output(host, node, command, dry_run=False, quiet=False):
     if dry_run:
         log_detail("      (dry-run, skipped)")
         return ""
-    out, rc = _ssh_exec(node, command)
+    out, rc = _ssh_exec(node, command, timeout=timeout)
     if rc != 0:
         raise RuntimeError(
             "ssh command failed (rc={}) on {}: {}\n  output: {}".format(

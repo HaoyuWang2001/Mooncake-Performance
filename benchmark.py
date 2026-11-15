@@ -1936,6 +1936,15 @@ def _trace_module():
     return _TRACE_MOD[0]
 
 
+def _map_timeout():
+    """Per-file timeout for the in-pod map stage (generous: a GB glog costs
+    tens of seconds). MC_MAP_TIMEOUT overrides, 0 disables."""
+    try:
+        return float(os.environ.get("MC_MAP_TIMEOUT", "900") or 0)
+    except ValueError:
+        return 900.0
+
+
 def _hifreq_sample_rate():
     """MC_HIFREQ_LOG_SAMPLE_RATE from scripts/env.mooncake.sh (the same file
     staged to every node), default 0.1 when absent. Only used to annotate the
@@ -1979,6 +1988,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
         if sample_rate is not None:
             cmd += " --sample-rate {}".format(sample_rate)
         ok = True
+        t0 = time.time()
         if dry:
             log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
         elif node.get("_pod"):
@@ -1986,7 +1996,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
             o, rc = controller_run(
                 cluster["_controller"],
                 ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
-                check=False)
+                check=False, timeout=_map_timeout() or None)
             if rc != 0:
                 ok = False
                 log("[WARN] [map] tracestats failed on pod {}: {}".format(
@@ -1994,11 +2004,14 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
         else:
             try:
                 ssh_check_output(node["ip"], node, cmd, dry_run=dry,
-                                 quiet=True)
+                                 quiet=True, timeout=_map_timeout() or None)
             except Exception as exc:
                 ok = False
                 log("[WARN] [map] tracestats failed on {}: {}".format(
                     node.get("ip"), exc))
+        if not dry:
+            log_detail("[map] tracestats {} {:.1f}s".format(
+                os.path.basename(log_path), time.time() - t0))
         if ok:
             out.append(trace_file)     # never request a file that wasn't made
     return out
@@ -2029,6 +2042,7 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             cmd += " --size {}".format(shlex.quote(str(size)))
         cmd += " --remote-path {}".format(shlex.quote(log_path))
         ok = True
+        t0 = time.time()
         if dry:
             log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
         elif node.get("_pod"):
@@ -2036,7 +2050,7 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             out, rc = controller_run(
                 cluster["_controller"],
                 ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
-                check=False)
+                check=False, timeout=_map_timeout() or None)
             if rc != 0:
                 ok = False
                 log("[WARN] [map] logstats failed on pod {}: {}".format(
@@ -2044,11 +2058,14 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
         else:
             try:
                 ssh_check_output(node["ip"], node, cmd, dry_run=dry,
-                                 quiet=True)
+                                 quiet=True, timeout=_map_timeout() or None)
             except Exception as exc:
                 ok = False
                 log("[WARN] [map] logstats failed on {}: {}".format(
                     node.get("ip"), exc))
+        if not dry:
+            log_detail("[map] logstats {} {:.1f}s".format(
+                os.path.basename(log_path), time.time() - t0))
         if ok:
             stats.append(stats_file)   # never request a file that wasn't made
     return stats

@@ -132,3 +132,26 @@ def test_small_run_threshold_counts_glog(monkeypatch, tmp_path):
                "w", "n1")]
     bm._map_and_pull_logs({}, groups, str(local), False, {}, "/s", size="8MB")
     assert len(calls) == 2 and "/r/b.log" in calls[1]   # 3MB -> 连 raw 一起拉
+
+
+def test_map_timeout_env_and_passthrough(monkeypatch):
+    """map 超时可配（MC_MAP_TIMEOUT），并真正传给 ssh/exec。"""
+    monkeypatch.delenv("MC_MAP_TIMEOUT", raising=False)
+    assert bm._map_timeout() == 900.0
+    monkeypatch.setenv("MC_MAP_TIMEOUT", "42")
+    assert bm._map_timeout() == 42.0
+    monkeypatch.setenv("MC_MAP_TIMEOUT", "0")
+    assert bm._map_timeout() == 0.0
+    seen = []
+    monkeypatch.setenv("MC_MAP_TIMEOUT", "123")
+
+    def fake_ssh(ip, node, cmd, dry_run=False, quiet=False, timeout=None):
+        seen.append(timeout)
+        return ""
+
+    monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
+    monkeypatch.setattr(bm, "log_detail", lambda m: None)
+    monkeypatch.setattr(bm, "resolve_venv", lambda *a, **k: "python3")
+    bm.run_logstats_map({}, {"ip": "10.0.0.1"}, ["/r/a.log"], "/s", {})
+    bm.run_tracestats_map({}, {"ip": "10.0.0.1"}, ["/r/a.glog"], "/s", {})
+    assert seen == [123.0, 123.0]
