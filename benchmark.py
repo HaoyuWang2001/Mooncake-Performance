@@ -3202,6 +3202,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
         "involved_nodes": involved_nodes, "mode": "basic",
     }
+    # Resolved BEFORE the try: the FAIL handler passes it to the report, and
+    # a failure in the very first stage would otherwise mask the real error
+    # with UnboundLocalError (re-assigned inside the try below).
+    total_target_qps = float(cfg.get("target_qps", 0) or 0)
     # The try MUST start here (before any stage): a failure in generate-data /
     # remove-keys / prepare-store previously raised before the try block, so
     # the FAIL path never pulled the remote logs — silent failure with no
