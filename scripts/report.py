@@ -384,12 +384,15 @@ def _merge_value_counts(a, b, cap=24):
 
 
 def _merge_bucket_rows(dst, rows):
-    """dst: {t: [n, ok, fail, sum, max, 0, 0, hist]} <- trace bucket rows."""
+    """dst: {t: [n, ok, fail, sum, max, 0, 0, hist, neg]} <- trace bucket rows.
+
+    neg (index 8) counts -1 sentinel samples: they are part of n but carry no
+    duration, so the bucket average divides by n-neg."""
     for r in rows or []:
         t = int(r[0])
         b = dst.get(t)
         if b is None:
-            b = dst[t] = [0, 0, 0, 0.0, 0.0, 0.0, 0.0, {}]
+            b = dst[t] = [0, 0, 0, 0.0, 0.0, 0.0, 0.0, {}, 0]
         b[0] += int(r[1])
         b[1] += int(r[2])
         b[2] += int(r[3])
@@ -399,6 +402,8 @@ def _merge_bucket_rows(dst, rows):
         b[6] = max(b[6], float(r[7]))
         for k, n in (r[8] or {}).items():
             b[7][int(k)] = b[7].get(int(k), 0) + int(n)
+        if len(r) > 9:
+            b[8] += int(r[9] or 0)
     return dst
 
 
@@ -465,9 +470,10 @@ def reduce_trace_size(trace_list):
                 for t, b in sorted(bmap.items()):
                     n, okc, failc, ssum, mx = b[0], b[1], b[2], b[3], b[4]
                     hb = b[7]
+                    valid = n - (b[8] if len(b) > 8 else 0)
                     rows.append([
                         int(t), n, okc, failc,
-                        round(ssum / n, 3) if n else 0.0,
+                        round(ssum / valid, 3) if valid > 0 else 0.0,
                         round(mx, 6),
                         (round(ls.hist_percentile(hb, 0.50, trace_edges), 4)
                          if trace_hist_ok and hb else None),

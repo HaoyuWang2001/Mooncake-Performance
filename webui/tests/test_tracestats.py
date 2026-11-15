@@ -208,3 +208,16 @@ def test_minute_buckets_are_epoch_seconds(tmp_path):
     sec_minutes = {t - t % 60 for t in (r[0] for r in op["seconds"])}
     assert {r[0] for r in op["minutes"]} == sec_minutes
     assert len(op["minutes"]) == 2
+
+
+def test_negative_total_not_in_top_and_bucket_counts_neg(tmp_path):
+    """total_us=-1 的样本不应进 Top-50，桶里只计 neg 不计时延。"""
+    bad = WRITE_OK.replace("total_us[401]", "total_us[-1]")
+    p = _write(tmp_path, "neg.glog", [WRITE_OK, bad])
+    st = ts.compute_trace_stats(p)
+    op = st["groups"]["write"]["ops"]["put"]
+    assert [e["total_us"] for e in op["top"]] == [401]
+    assert len(op["seconds"]) == 1
+    assert op["seconds"][0][1] == 2      # 两个样本都计入 n
+    assert op["seconds"][0][9] == 1      # 其中 1 个是 neg
+    assert op["seconds"][0][4] == 401.0  # avg 只按有效样本

@@ -102,10 +102,13 @@ def parse_line(line):
 
 
 def _bucket_new():
-    return {"n": 0, "ok": 0, "fail": 0, "sum": 0.0, "max": 0.0, "h": {}}
+    return {"n": 0, "ok": 0, "fail": 0, "sum": 0.0, "max": 0.0, "h": {},
+            "neg": 0}
 
 
 def _bucket_add(b, total_us, ok):
+    """Count one request into a time bucket. total_us < 0 is the SDK's
+    "no timestamp" sentinel: it counts as neg (n) but never as duration."""
     b["n"] += 1
     b["ok"] += 1 if ok else 0
     b["fail"] += 0 if ok else 1
@@ -114,6 +117,8 @@ def _bucket_add(b, total_us, ok):
         b["max"] = max(b["max"], total_us)
         hb = ls.bin_of(total_us, ls.BIN_EDGES_US)
         b["h"][hb] = b["h"].get(hb, 0) + 1
+    else:
+        b["neg"] += 1
 
 
 def _bucket_rows(bmap, base=1):
@@ -122,7 +127,7 @@ def _bucket_rows(bmap, base=1):
     for t in sorted(bmap):
         b = bmap[t]
         out.append([t * base, b["n"], b["ok"], b["fail"], round(b["sum"], 3),
-                    round(b["max"], 6), 0.0, 0.0, b["h"]])
+                    round(b["max"], 6), 0.0, 0.0, b["h"], b["neg"]])
     return out
 
 
@@ -230,8 +235,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             if sc not in (None, ""):
                 st["slice_count"][sc] = st["slice_count"].get(sc, 0) + 1
 
-            # top-N slow requests (+ dominant stages for the report table)
-            if total is not None:
+            # top-N slow requests (+ dominant stages for the report table);
+            # total_us=-1 (no timestamp) has no duration -> never a "slowest"
+            if total is not None and total >= 0:
                 st["_top_seq"] += 1
                 stage_tree = READ_TOP if group == "read" else WRITE_TOP
                 stages = {f: parsed[f] for f in stage_tree if f in parsed
