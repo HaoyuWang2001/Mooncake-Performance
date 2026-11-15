@@ -101,11 +101,12 @@ def _bucket_add(b, total_us, ok):
         b["h"][hb] = b["h"].get(hb, 0) + 1
 
 
-def _bucket_rows(bmap):
+def _bucket_rows(bmap, base=1):
+    """bucket rows; t is emitted as epoch-seconds (base=60 for minute keys)."""
     out = []
     for t in sorted(bmap):
         b = bmap[t]
-        out.append([t, b["n"], b["ok"], b["fail"], round(b["sum"], 3),
+        out.append([t * base, b["n"], b["ok"], b["fail"], round(b["sum"], 3),
                     round(b["max"], 6), 0.0, 0.0, b["h"]])
     return out
 
@@ -255,7 +256,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             "count": st["count"], "ok": st["ok"], "fail": st["fail"],
             "status": st["status"], "fields": fields,
             "seconds": _bucket_rows(st["seconds"]),
-            "minutes": _bucket_rows(st["minutes"]),
+            "minutes": _bucket_rows(st["minutes"], 60),
             "size_values": _value_hist(st["size_values"]),
             "replicas": _value_hist(st["replicas"]),
             "slice_count": _value_hist(st["slice_count"]),
@@ -319,6 +320,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         "parse_errors": parse_errors,
         "ts_from": ts_from, "ts_to": ts_to,
         "dated": ts_from is not None,
+        "bucket_unit": "s",
     }
     return {"meta": meta, "groups": groups}
 

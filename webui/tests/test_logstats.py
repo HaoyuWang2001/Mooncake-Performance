@@ -173,3 +173,20 @@ def test_summaries_and_per_op_stats(tmp_path):
     assert put["ok"] == 3 and put["p50_ms"] == 2.0 and put["max_ms"] == 3.0
     get = st["ops"]["get"]
     assert get["ok"] == 2 and get["avg_ms"] == 8.5 and get["min_ms"] == 8.0
+
+
+def test_minute_buckets_are_epoch_seconds(tmp_path):
+    """minutes 桶的 t 必须是 epoch 秒（历史上误存 epoch 分钟 -> 报表显示 1970）。"""
+    text = (
+        "RESULT\t2026-11-12 10:00:05.000000\tput\tk1\t1.000000\tOK\n"
+        "RESULT\t2026-11-12 10:00:35.000000\tput\tk2\t2.000000\tOK\n"
+        "RESULT\t2026-11-12 10:01:10.000000\tput\tk3\t3.000000\tOK\n"
+    )
+    st = ls.compute_stats(_write(tmp_path, text))
+    assert st["meta"]["bucket_unit"] == "s"
+    assert all(r[0] % 60 == 0 for r in st["minutes"])
+    # 每个分钟桶的起点 = 其覆盖的秒桶起点向下取整到分钟
+    sec_minutes = {t - t % 60 for t in (r[0] for r in st["seconds"])}
+    assert {r[0] for r in st["minutes"]} == sec_minutes
+    assert len(st["minutes"]) == 2                  # 10:00 与 10:01
+    assert sum(r[1] for r in st["minutes"]) == 3

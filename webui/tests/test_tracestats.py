@@ -195,3 +195,16 @@ def test_cli_writes_trace_json(tmp_path):
     assert d["meta"]["size"] == "8MB" and d["meta"]["sample_rate"] == 1.0
     assert set(d["groups"]) == {"read", "write"}
     assert "[tracestats]" in r.stdout
+
+
+def test_minute_buckets_are_epoch_seconds(tmp_path):
+    """trace 的 minutes 桶 t 也必须是 epoch 秒（与 logstats 一致）。"""
+    read2 = READ_OK.replace("10:23:41.882310", "10:24:01.500000")
+    p = _write(tmp_path, "tr.glog", [READ_OK, read2])
+    st = ts.compute_trace_stats(p)
+    assert st["meta"]["bucket_unit"] == "s"
+    op = st["groups"]["read"]["ops"]["get_buffer"]
+    assert all(r[0] % 60 == 0 for r in op["minutes"])
+    sec_minutes = {t - t % 60 for t in (r[0] for r in op["seconds"])}
+    assert {r[0] for r in op["minutes"]} == sec_minutes
+    assert len(op["minutes"]) == 2

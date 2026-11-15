@@ -363,11 +363,13 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             mb["h"][b] = mb["h"].get(b, 0) + n
 
     def buckets_to_list(bmap, base):
+        # bucket keys are epoch-seconds (1s) or epoch-minutes (1min); the
+        # emitted t is ALWAYS epoch-seconds so every consumer shares one unit
         out = []
         for t in sorted(bmap):
             b = bmap[t]
             out.append([
-                t, b["c"], b["ok"], b["fail"],
+                t * base, b["c"], b["ok"], b["fail"],
                 round(b["sum"], 3), round(b["max"], 6),
                 round(b["qsum"], 3), round(b["qmax"], 6),
                 b["h"]])
@@ -399,6 +401,9 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "ts_from": ts_from, "ts_to": ts_to,
             "wall_s": round(ts_to - ts_from, 3) if ts_from and ts_to else None,
             "dated": ts_from is not None,
+            # time-bucket t unit; "s" = epoch seconds (absent in old products,
+            # whose minutes used epoch minutes -> reduce multiplies by 60)
+            "bucket_unit": "s",
         },
         "global": {
             "total": total, "ok": ok, "fail": fail,

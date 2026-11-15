@@ -239,3 +239,37 @@ def test_render_without_trace_keeps_card_hidden(tmp_path):
     src = open(html, encoding="utf-8").read()
     # card exists but hidden by default; JS hides it when data.trace is absent
     assert 'id="tracecard" style="display:none"' in src
+
+
+def _minimal_stats(seconds_t, minutes_t, bucket_unit=None):
+    st = {
+        "meta": {"source": "x.writer.log", "bytes": 1, "node": "n1",
+                 "role": "writer", "size": "8MB", "ts_from": 0,
+                 "ts_to": 90000, "wall_s": 90000, "dated": True},
+        "global": {"total": 10, "ok": 10, "fail": 0, "key_total": 10,
+                   "key_ok": 10, "key_fail": 0, "avg_ms": 1.0,
+                   "min_ms": 0.9, "max_ms": 2.0, "p50_ms": 1.0,
+                   "p95_ms": 1.5, "p99_ms": 1.8, "p999_ms": 1.9,
+                   "p9999_ms": 1.99, "qw_avg_ms": None, "qw_max_ms": None,
+                   "exact": True},
+        "histogram": {"30": 10}, "ops": {}, "errors": {},
+        "error_excerpt": None, "slowest": [], "anomalies": [],
+        "summaries": [],
+        "seconds": [[t, 1, 1, 0, 1.0, 2.0, 0.0, 0.0, {"30": 1}]
+                    for t in seconds_t],
+        "minutes": [[t, 1, 1, 0, 1.0, 2.0, 0.0, 0.0, {"30": 1}]
+                    for t in minutes_t],
+    }
+    if bucket_unit:
+        st["meta"]["bucket_unit"] = bucket_unit
+    return st
+
+
+def test_old_stats_minutes_compat(tmp_path):
+    """无 bucket_unit 的旧 stats（minutes.t 是 epoch 分钟）合并时需 ×60 兼容。"""
+    old = _minimal_stats([3600, 3660], [60, 61])
+    z = rp.reduce_size([old], {"config": "c"})
+    assert z["series"]["writer"]["step60"]["t"] == [3600, 3660]
+    new = _minimal_stats([3600, 3660], [3600, 3660], bucket_unit="s")
+    z2 = rp.reduce_size([new], {"config": "c"})
+    assert z2["series"]["writer"]["step60"]["t"] == [3600, 3660]

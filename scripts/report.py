@@ -56,6 +56,22 @@ def _role_of(st, fallback="all"):
     return (st.get("meta") or {}).get("role") or fallback
 
 
+def _minutes_rows(st):
+    """Minute-bucket rows with t normalized to epoch seconds.
+
+    New products carry meta.bucket_unit="s"; older ones stored epoch MINUTES
+    in the minute buckets (report.py used to plot them as seconds -> 1970)."""
+    rows = st.get("minutes") or []
+    if (st.get("meta") or {}).get("bucket_unit") == "s":
+        return rows
+    out = []
+    for row in rows:
+        r = list(row)
+        r[0] = int(r[0]) * 60
+        out.append(r)
+    return out
+
+
 def _merge_buckets(bucket_lists):
     """Merge [t,c,ok,fail,sum,max,qsum,qmax,hist] bucket rows across clients."""
     merged = {}
@@ -185,7 +201,7 @@ def _client_entry(st, role):
                            for k, p in st.get("summaries") or []
                            if k == "summary"), 0),
         "minutes": _series_columns(
-            _merge_buckets([st.get("minutes") or []]), 60),
+            _merge_buckets([_minutes_rows(st)]), 60),
         "slowest": st.get("slowest") or [],
         "errors": st.get("errors") or {},
     }
@@ -200,7 +216,7 @@ def _role_series(stats):
     out = {}
     for role, group in by_role.items():
         s1 = _merge_buckets([st.get("seconds") or [] for st in group])
-        s60 = _merge_buckets([st.get("minutes") or [] for st in group])
+        s60 = _merge_buckets([_minutes_rows(st) for st in group])
         out[role] = {"step1": _series_columns(s1, 1),
                      "step60": _series_columns(s60, 60)}
     return out
