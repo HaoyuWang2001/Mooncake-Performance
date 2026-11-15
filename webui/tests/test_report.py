@@ -487,3 +487,17 @@ def test_overview_sums_all_data_sizes(tmp_path):
     src = open(ov, encoding="utf-8").read()
     assert '<div class="k">成功</div><div class="v">20</div>' in src
     assert '<div class="k">失败</div><div class="v">0</div>' in src
+
+
+def test_qw_average_divides_by_ok_rows(tmp_path):
+    """队列等待均值只对成功行取平均（qw 仅 OK 行累计，分母原为全部行）。"""
+    p = tmp_path / "r.reader.log"
+    p.write_text(
+        "RESULT\t2026-11-15 10:00:01.000000\tpipeline_read\tk1\t2.0\tOK\t0.5\t4\n"
+        "RESULT\t2026-11-15 10:00:01.500000\tpipeline_read\tk2\t0.0\t"
+        "MISS/MISMATCH\t0.0\t4\n", encoding="utf-8")
+    st = ls.compute_stats(str(p), role="reader", size="8MB")
+    z = rp.reduce_size([st], {"config": "c"})
+    col = z["series"]["reader"]["step1"]
+    assert col["c"][0] == 2 and col["ok"][0] == 1
+    assert col["qw"][0] == 0.5          # 不是 0.25

@@ -108,7 +108,9 @@ def _series_columns(merged, step):
         out["p99"].append(round(ls.hist_percentile(h, 0.99), 4) if h else 0.0)
         out["p999"].append(round(ls.hist_percentile(h, 0.999), 4) if h else 0.0)
         out["max"].append(round(mx, 4))
-        out["qw"].append(round(qs / c, 4) if c else 0.0)
+        # logstats accumulates queue wait on successful rows only -> divide
+        # by ok (not by every row, which understated it by the failure rate)
+        out["qw"].append(round(qs / ok, 4) if ok else 0.0)
         out["qwmax"].append(round(qm, 4))
     return out
 
