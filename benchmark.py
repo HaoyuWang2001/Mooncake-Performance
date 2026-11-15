@@ -1958,7 +1958,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
                        sample_rate=None):
     """map 阶段（C++ trace）：在节点/pod 内对每个 .glog 执行 tracestats，
     就地生成 <glog>.trace.json（只回传统计，glog 原始文件留远端）。"""
-    py = resolve_venv(cluster, globals_cfg)
+    py = resolve_venv(cluster, globals_cfg) or "python3"
     out = []
     # NOTE: the loop variable must NOT be named `log` (it would shadow the
     # module-level log() used by the failure branches below).
@@ -2010,7 +2010,7 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
     """map 阶段：在节点/pod 内对每个 RESULT 日志执行 logstats，就地生成
     <log>.stats.json（编排器默认只回传统计产物，原始日志留在节点上）。
     产物 meta 里写入 node/pod/role/远程路径，供报表分节点统计与现场索引。"""
-    py = resolve_venv(cluster, globals_cfg)
+    py = resolve_venv(cluster, globals_cfg) or "python3"
     stats = []
     for log_path in log_paths:
         stats_file = log_path + ".stats.json"

@@ -81,3 +81,18 @@ def test_role_filename_fallback_still_works(monkeypatch, tmp_path):
     bm._map_and_pull_logs({}, groups, str(tmp_path), False, {}, "/s",
                           size="8MB")
     assert seen["role"] == "writer" and seen["roles"] == {}
+
+
+def test_empty_venv_falls_back_to_python3(monkeypatch):
+    """venv 留空时 runner 回退 python3，map 也必须回退（曾经是空命令 rc=127）。"""
+    msgs = []
+    monkeypatch.setattr(bm, "log_detail", lambda m: msgs.append(m))
+    out = bm.run_logstats_map({"venvs": {}, "venv": ""}, {"ip": "10.0.0.1"},
+                              ["/r/a.log"], "/s", {}, dry=True)
+    assert out == ["/r/a.log.stats.json"]
+    assert any("python3 /s/logstats.py" in m for m in msgs), msgs
+    msgs.clear()
+    out2 = bm.run_tracestats_map({"venvs": {}, "venv": ""}, {"ip": "10.0.0.1"},
+                                 ["/r/a.glog"], "/s", {}, dry=True)
+    assert out2 == ["/r/a.glog.trace.json"]
+    assert any("python3 /s/tracestats.py" in m for m in msgs), msgs
