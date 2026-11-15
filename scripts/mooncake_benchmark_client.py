@@ -118,6 +118,36 @@ def unbuffer_stdio():
         pass
 
 
+# ---------------------------------------------------------------------------
+# Phase markers for C++ trace analysis (tracestats.py consumes these).
+#
+# One single line per (phase, action) per PROCESS, written to STDERR: the
+# runners redirect fd1+fd2 into the .glog file, so the markers land next to
+# the SDK trace stream (they never touch the RESULT/role logs on stdout).
+# tracestats classifies every breakdown row into setup / warmup / measured /
+# teardown by these timestamps — the C++ report then shows MEASURED-only
+# statistics (warmup prefill puts & reads no longer pollute them).
+#
+# Once-semantics matter for dual-role clients: the writer thread and the
+# reader-side HTTP handler both race to mark "measured start"; first wins,
+# the other side's call becomes a no-op.
+# ---------------------------------------------------------------------------
+_PHASE_MARK_LOCK = threading.Lock()
+_PHASE_MARKED = set()
+
+
+def _phase_marker(phase, action):
+    """Emit `MC_PHASE <phase> <action> <epoch_us>` once per (phase, action)."""
+    key = (phase, action)
+    with _PHASE_MARK_LOCK:
+        if key in _PHASE_MARKED:
+            return
+        _PHASE_MARKED.add(key)
+        sys.stderr.write("MC_PHASE {} {} {:.6f}\n".format(
+            phase, action, time.time()))
+        sys.stderr.flush()
+
+
 # --------------------------------------------------------------------------
 # Three-stream log separation (read / writer / client-glog)
 #
@@ -949,6 +979,7 @@ def cmd_benchmark(args, store):
             print("[ERROR] register_buffer failed, cannot use zero-copy interfaces")
             sys.exit(1)
     if args.warmup == "true":
+        _phase_marker("warmup", "start")   # warmup window opens (incl. prefill puts)
         run_warmup(args, store, value, ctx)
     end_idx = args.key_end if args.key_end is not None else len(keys)
     chunk = keys[args.key_start:end_idx]
@@ -974,6 +1005,7 @@ def cmd_benchmark(args, store):
             op, len(chunk), args.num_threads, duration or 0, args.target_qps or 0))
         results = []
         wall_t0 = time.perf_counter()
+        _phase_marker("measured", "start")   # measured window opens
         if chunk:
             per_thread = _split_even(chunk, args.num_threads)
             with ThreadPoolExecutor(max_workers=args.num_threads) as pool:
@@ -982,6 +1014,7 @@ def cmd_benchmark(args, store):
                 for f in futures:
                     f.result()
         wall_s = time.perf_counter() - wall_t0
+        _phase_marker("measured", "end")     # measured window closed
     finally:
         try:
             if ctx is not None:
@@ -1324,14 +1357,17 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
             warmup_duration, target_qps))
         emit("META", {"mode": "pipeline_warmup_start", "writer_id": writer_id,
                       "duration": warmup_duration, "ts": time.time()})
+        _phase_marker("warmup", "start")   # warmup window opens
         _run_phase(time.time() + warmup_duration, True)
         emit("META", {"mode": "pipeline_warmup_end", "writer_id": writer_id,
                       "ts": time.time()})
         log("pipeline writer warmup done")
     log("pipeline writer measured start (duration={}s)".format(duration))
+    _phase_marker("measured", "start")     # measured window opens
     _run_phase(time.time() + duration, False)
     log("pipeline writer measured done (keys_ok={}, keys_fail={})".format(
         stats["keys_ok"], stats["keys_fail"]))
+    _phase_marker("measured", "end")       # measured window closed
     sys.stdout.flush()
     if ctx is not None:
         ctx.teardown(store)
@@ -1466,6 +1502,11 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             writer_id = params.get("writer_id", ["0"])[0]
             write_ts = float(params.get("write_ts", ["0"])[0])
             is_warmup = params.get("warmup", ["0"])[0] == "1"
+            # phase markers from the notify stream itself: the first warmup
+            # notify opens the warmup window, the first regular notify opens
+            # the measured window (once-semantics: in dual clients the
+            # writer thread usually already emitted them)
+            _phase_marker("warmup" if is_warmup else "measured", "start")
             # one queue item per notify batch (the writer's whole batch); the
             # queue depth unit therefore counts pending notify batches
             if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
@@ -1675,6 +1716,7 @@ def _pipeline_reader(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
+    _phase_marker("measured", "end")   # reader window closed (pure-reader pods)
     log("pipeline reader done (items={})".format(len(results)))
     if ctx is not None:
         ctx.teardown(store)
@@ -1859,6 +1901,7 @@ def _pipeline_dual(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
+    _phase_marker("measured", "end")   # no-op when the writer already ended
     wthread.join(timeout=60)
     log("pipeline dual client done (reader items={})".format(len(results)))
     if rctx is not None:
