@@ -1950,12 +1950,14 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
     就地生成 <glog>.trace.json（只回传统计，glog 原始文件留远端）。"""
     py = resolve_venv(cluster, globals_cfg)
     out = []
-    for log in glog_paths:
-        trace_file = log + ".trace.json"
+    # NOTE: the loop variable must NOT be named `log` (it would shadow the
+    # module-level log() used by the failure branches below).
+    for log_path in glog_paths:
+        trace_file = log_path + ".trace.json"
         cmd = "{} {} --log {}".format(
             shlex.quote(py),
             shlex.quote(remote_scripts + "/tracestats.py"),
-            shlex.quote(log))
+            shlex.quote(log_path))
         if node_name:
             cmd += " --node {}".format(shlex.quote(str(node_name)))
         if node.get("_pod"):
@@ -1995,12 +1997,12 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
     产物 meta 里写入 node/pod/role/远程路径，供报表分节点统计与现场索引。"""
     py = resolve_venv(cluster, globals_cfg)
     stats = []
-    for log in log_paths:
-        stats_file = log + ".stats.json"
+    for log_path in log_paths:
+        stats_file = log_path + ".stats.json"
         cmd = "{} {} --log {}".format(
             shlex.quote(py),
             shlex.quote(remote_scripts + "/logstats.py"),
-            shlex.quote(log))
+            shlex.quote(log_path))
         if node_name:
             cmd += " --node {}".format(shlex.quote(str(node_name)))
         if node.get("_pod"):
@@ -2009,7 +2011,7 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             cmd += " --role {}".format(shlex.quote(str(role)))
         if size:
             cmd += " --size {}".format(shlex.quote(str(size)))
-        cmd += " --remote-path {}".format(shlex.quote(log))
+        cmd += " --remote-path {}".format(shlex.quote(log_path))
         if dry:
             log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
         elif node.get("_pod"):
