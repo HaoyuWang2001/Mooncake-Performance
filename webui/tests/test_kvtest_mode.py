@@ -58,6 +58,56 @@ def test_kvtest_plan_separate_iids_are_global():
     assert plan["writer_threads"] == 2
 
 
+def test_kvtest_plan_split_pairs_processes_in_client_pods():
+    cfg = _kv_cfg()
+    cfg["client"]["process_mode"] = "split"
+    cfg["writer"]["port_base"] = 9101
+    cfg["reader"]["port_base"] = 9201
+    plan = bm.kvtest_plan(cfg, node_count=2)
+
+    assert not plan["dual"] and plan["split_pod"] is True
+    assert plan["process_mode"] == "split"
+    assert len(plan["clients"]) == 4
+    assert len(plan["writers"]) == len(plan["readers"]) == 4
+    assert [w["iid"] for w in plan["writers"]] == [0, 1, 2, 3]
+    assert [r["iid"] for r in plan["readers"]] == [4, 5, 6, 7]
+    # SSH uses per-node port_base+local; k8s rebases each process to the same
+    # two in-pod ports after the client pods are materialized.
+    assert [w["port"] for w in plan["writers"]] == [9101, 9102, 9101, 9102]
+    assert [r["port"] for r in plan["readers"]] == [9201, 9202, 9201, 9202]
+    assert bm._pipeline_k8s_roles(plan) == (
+        ("client", plan["clients"], 9101),)
+
+    for index, client in enumerate(plan["clients"]):
+        client["node"] = "pod-{}".format(index)
+    bm._kvtest_bind_split_pods(plan)
+    assert [w["node"] for w in plan["writers"]] == [
+        "pod-0", "pod-1", "pod-2", "pod-3"]
+    assert [r["node"] for r in plan["readers"]] == [
+        "pod-0", "pod-1", "pod-2", "pod-3"]
+    assert all(w["port"] == 9101 for w in plan["writers"])
+    assert all(r["port"] == 9201 for r in plan["readers"])
+
+
+def test_kvtest_plan_rejects_invalid_split_shape():
+    cfg = _kv_cfg()
+    cfg["client"]["process_mode"] = "invalid"
+    try:
+        bm.kvtest_plan(cfg, node_count=2)
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "process_mode" in str(exc)
+
+    cfg["client"]["process_mode"] = "split"
+    cfg["writer"]["port_base"] = 9101
+    cfg["reader"]["port_base"] = 9101
+    try:
+        bm.kvtest_plan(cfg, node_count=2)
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "different" in str(exc)
+
+
 def test_kvtest_split_qps_matches_binary_rate_gate():
     # 105 across 2 instances: 53 + 52 (the binary's own thread split)
     assert [bm._kvtest_split_qps(105, 2, i) for i in range(2)] == [53, 52]
@@ -93,6 +143,7 @@ def test_build_kvtest_instance_config_http_master():
     assert inst["num_total_threads"] == 1 + plan["reader_threads"] == 5
     assert inst["notify_count"] == 10 and inst["notify_threads"] == 10
     assert inst["key_pool_size"] == 256
+    assert inst["start_paused"] is True
     # late-bound placeholders (filled by run_kvtest.sh per pod)
     assert inst["store"]["rdma_devices"] == "__UB_DEVICE__"
     assert inst["store"]["local_hostname"] == "__FABRIC_IP__:12345"
@@ -119,12 +170,63 @@ def test_build_kvtest_instance_config_etcd_master():
     assert inst["store"]["master_server_address"] == "http://10.0.0.10:2379"
 
 
+def test_build_kvtest_split_pair_keeps_four_plus_twelve_budget():
+    cfg = _kv_cfg()
+    cfg["client"]["process_mode"] = "split"
+    cfg["writer"].update({"num_threads": 4, "port_base": 9101})
+    cfg["reader"].update({"num_threads": 12, "port_base": 9201})
+    plan = bm.kvtest_plan(cfg, node_count=6)
+    session = {"SETUP_MASTER_ADDR": "10.0.0.10:50051",
+               "SETUP_METADATA_SERVER": ""}
+    built = []
+    for role, entry in (("writer", plan["writers"][0]),
+                        ("reader", plan["readers"][0])):
+        entry["_qps"] = 53 if role == "writer" else 0
+        entry["_out_dir"] = "/remote/kvtest_out/{}".format(role)
+        entry["_lhost_port"] = 12345 if role == "writer" else 12346
+        built.append(bm.build_kvtest_instance_config(
+            cfg, {"local_buffer_size": "1GB"}, session, plan, entry, role,
+            "8MB", 256, []))
+
+    writer, reader = built
+    assert writer["role"] == "writer" and reader["role"] == "reader"
+    assert writer["target_qps"] == 53 and reader["target_qps"] == 0
+    assert writer["num_threads"] == reader["num_threads"] == 4
+    assert writer["num_total_threads"] == reader["num_total_threads"] == 16
+
+
 def test_kvtest_store_targets_require_endpoints():
     try:
         bm._kvtest_store_targets({"master_type": "etcd"}, {})
         raise AssertionError("should raise")
     except RuntimeError as exc:
         assert "etcd_endpoints" in str(exc)
+
+
+def test_kvtest_key_pool_zero_and_auto_have_distinct_semantics():
+    plan = bm.kvtest_plan(_kv_cfg(), node_count=2)
+    zero = _kv_cfg(kvtest={"key_pool_size": 0})
+    assert bm._kvtest_key_pool(zero, {}, plan, 4, 8 << 20, "8MB") == 0
+    auto = _kv_cfg(kvtest={"key_pool_size": "auto"})
+    pool = bm._kvtest_key_pool(
+        auto, {"store_total_size": "20GB"}, plan, 4, 8 << 20, "8MB")
+    assert pool > 0
+
+
+def test_kvtest_operation_maps_cover_documented_native_names():
+    assert bm.KVTEST_WRITER_OPS["upsert"] == "upsert"
+    assert bm.KVTEST_WRITER_OPS["batch_upsert_from"] == \
+        "batch_upsert_from"
+    assert bm.KVTEST_WRITER_OPS["remove"] == "remove"
+    assert bm.KVTEST_READER_OPS["batch_get_buffer"] == "batch_get_buffer"
+    assert bm.KVTEST_READER_OPS["exist"] == "exist"
+
+
+def test_kvtest_runner_replaces_both_runtime_placeholders():
+    runner = open(os.path.join(ROOT, "scripts", "run_kvtest.sh"),
+                  encoding="utf-8").read()
+    assert "s/__FABRIC_IP__/${fabric_escaped}/g" in runner
+    assert "s/__UB_DEVICE__/${device_escaped}/g" in runner
 
 
 # ------------------------------------------------------ binary_local push
@@ -180,12 +282,42 @@ def test_kvtest_deploy_binary_local(tmp_path, monkeypatch):
     assert ("scp", "10.0.0.1", str(binary), "/pod/ws/kvtest-bin") in calls
 
 
+def test_kvtest_deploy_binary_local_includes_sibling_libraries(
+        tmp_path, monkeypatch):
+    cluster = {"nodes": {"n1": {"ip": "10.0.0.1"}}}
+    binary_dir = tmp_path / "outputs" / "bin"
+    library_dir = tmp_path / "outputs" / "lib"
+    binary_dir.mkdir(parents=True)
+    library_dir.mkdir(parents=True)
+    binary = binary_dir / "mooncake_kvtest"
+    binary.write_bytes(b"ELF")
+    asio = library_dir / "libasio.so"
+    asio.write_bytes(b"SO")
+    calls = []
+
+    monkeypatch.setattr(
+        bm, "run_ssh",
+        lambda host, node, cmd, dry_run=False:
+            calls.append(("ssh", node["ip"], cmd)))
+    monkeypatch.setattr(
+        bm, "scp_push",
+        lambda host, node, files, path, dry_run=False:
+            calls.append(("scp", node["ip"], list(files), path)))
+
+    path = bm._kvtest_deploy_binary(
+        cluster, ["n1"], str(binary), "/ws/scripts", None, False, False)
+    assert path == "/ws/scripts/mooncake_kvtest"
+    assert ("ssh", "10.0.0.1", "mkdir -p /ws/scripts/lib") in calls
+    assert ("scp", "10.0.0.1", [str(asio)], "/ws/scripts/lib") in calls
+
+
 # ------------------------------------------------------ CSV summary rows
 
 def _summary(iid, up_total, get_total, verify):
     mb = 8 * 1024 * 1024
     return {
         "instance_id": iid,
+        "elapsed_seconds": 30.0,
         "verify_failures": verify,
         "operations": {
             "upsert_from": {"count": up_total, "avg_ms": 1.0, "min_ms": 0.1,
@@ -219,8 +351,10 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     for node, iid, port, up, get, verify in cases:
         fn = "kvtest_csv.{}_i{}_p{}.kvtest_8MB.summary.json".format(
             node, iid, port)
-        (local_logs / fn).write_text(
-            json.dumps(_summary(iid, up, get, verify)), encoding="utf-8")
+        summary = _summary(iid, up, get, verify)
+        if iid == 1:
+            summary["operations"]["upsert_from"]["avg_ms"] = 3.0
+        (local_logs / fn).write_text(json.dumps(summary), encoding="utf-8")
     cfg = _kv_cfg()
     # run-time records the auto pool + real client counts
     cfg["_kvtest_key_pool"] = {"8MB": 256}
@@ -248,6 +382,7 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     assert wT["total"] == 2800 and wT["success"] == 2800
     assert wT["notify_submitted"] == 28000 and wT["notify_fail"] == 20
     assert wT["notify_avg_ms"] == 1.5 and wT["notify_max_ms"] == 9.0
+    assert wT["avg_ms"] == round((1500 * 1.0 + 1300 * 3.0) / 2800, 4)
     assert wT["p50_ms"] == 0.8                   # identical inputs -> same
     assert wT["throughput_mb_s"] == round(2800 * 8 / 30, 2)   # MB per second
     # reader rows: queue wait + verify failures (read-path verification)
@@ -309,20 +444,31 @@ def test_kvtest_parallel_smoke_partition():
 
 
 def test_kvtest_parallel_smoke_plan_shapes():
-    # rank shape mirrors pipeline rank_smoke; recall shape mirrors
-    # recall_smoke; both deploy dual processes per the kvtest README
+    # Keep the original pod counts (rank 2/node, recall 6/node), but run one
+    # writer plus one reader process inside each pod.
     rank = bm.load_scenario_config(_smoke_path("kvtest_rank_smoke.json"))
     recall = bm.load_scenario_config(_smoke_path("kvtest_recall_smoke.json"))
     assert rank["work_mode"] == "rank" and recall["work_mode"] == "recall"
     plan = bm.kvtest_plan(rank, node_count=6)
-    assert plan["dual"] and len(plan["clients"]) == 12   # 2 per node x 6
-    assert plan["notify_count"] == 10                    # <= clients - 1
+    assert plan["split_pod"] and len(plan["clients"]) == 12
+    assert len(plan["writers"]) == len(plan["readers"]) == 12
+    assert plan["notify_count"] == 10                    # <= 12 readers
     assert plan["per_node_qps"] == 105 and plan["total_qps"] == 105 * 6
-    assert plan["writer_threads"] == 1
+    assert plan["writer_threads"] == 4
+    assert plan["reader_threads"] == 12
+    assert plan["writer_port_base"] == 9101
+    assert plan["reader_port_base"] == 9201
+    assert rank["kvtest"]["local_port_base"] == 12345
     plan = bm.kvtest_plan(recall, node_count=6)
-    assert plan["dual"] and len(plan["clients"]) == 36   # 6 per node x 6
+    assert plan["split_pod"] and len(plan["clients"]) == 36
+    assert len(plan["writers"]) == len(plan["readers"]) == 36
     assert plan["notify_count"] == 1
     assert plan["per_node_qps"] == 35 and plan["total_qps"] == 35 * 6
+    assert plan["writer_threads"] == 4
+    assert plan["reader_threads"] == 12
+    assert plan["writer_port_base"] == 9301
+    assert plan["reader_port_base"] == 9401
+    assert recall["kvtest"]["local_port_base"] == 13345
 
 
 # -------------------------------------------------- loader / webui wiring
@@ -336,9 +482,9 @@ def test_kvtest_loader_inherits_fragment():
         pytest.skip("configs/kvtest/smoke/kvtest_smoke.json not present")
     merged = bm.load_scenario_config(path)
     assert merged["scenario"] == "kvtest"
-    # smoke overrides key_pool_size to 256 over the root default 0
+    # smoke overrides key_pool_size to 256 over the root default "auto"
     assert merged["kvtest"]["key_pool_size"] == 256
-    assert merged["kvtest"]["notify_queue_max"] == 8192   # from _configs.json
+    assert merged["kvtest"]["notify_queue_max"] == 65536  # YuanRong baseline
 
 
 def test_webui_validate_and_inventory():

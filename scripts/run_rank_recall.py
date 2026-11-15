@@ -66,7 +66,8 @@ def _unique_parent():
 def _child_argv(args, work_mode, files, parent, ready_dir):
     cluster = getattr(args, work_mode + "_cluster")
     global_cfg = getattr(args, work_mode + "_global")
-    argv = [sys.executable, os.path.join(ROOT, "benchmark.py"), "--k8s",
+    mode = getattr(args, "mode", "k8s") or "k8s"
+    argv = [sys.executable, os.path.join(ROOT, "benchmark.py"), "--" + mode,
             "--cluster", cluster, "--global", global_cfg,
             "--profile", args.profile, "-f", ",".join(files)]
     # Internal cross-child barrier: each benchmark child runs setup (Pods,
@@ -127,6 +128,14 @@ def _child_env(work_mode):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="run inherited rank and recall configs concurrently")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ssh", dest="mode", action="store_const",
+                      const="ssh",
+                      help="run both workloads on bare-metal SSH clusters")
+    mode.add_argument("--k8s", dest="mode", action="store_const",
+                      const="k8s",
+                      help="run both workloads on k8s (default)")
+    parser.set_defaults(mode="k8s")
     parser.add_argument("--config-dir", default="")
     parser.add_argument("-f", "--config", default="")
     parser.add_argument("--rank-cluster", required=True)

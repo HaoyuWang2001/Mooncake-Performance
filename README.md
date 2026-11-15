@@ -871,6 +871,11 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   两类测试；父任务按继承后的 `work_mode` 自动分组并同时启动两个 benchmark。统一日志以
   `[rank]` / `[recall]` 标记，产物收在同一 run 的 `rank/`、`recall/` 子目录；STOP 会同时
   通知两边并按各自 namespace 清理。该模式要求选择中两类配置均非空
+- **Rank + Recall 并行（真机 CLI）**：使用
+  `python3 scripts/run_rank_recall.py --ssh ...`；rank/recall 可共用 worker
+  cluster 配置，但必须指向两套独立 Store/global 配置，避免两边的 remove-keys
+  互相删除数据。kvtest smoke 已为两边配置不同的 HTTP 与传输端口基址。完整命令见
+  `configs/kvtest/README.md`。
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
   并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
   匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（profiling 指标占位：

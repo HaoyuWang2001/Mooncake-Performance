@@ -52,6 +52,21 @@ def test_children_share_ready_dir_with_distinct_roles(tmp_path):
     assert recall[recall.index("--parallel-ready-dir") + 1] == ready_dir
     assert rank[rank.index("--parallel-ready-role") + 1] == "rank"
     assert recall[recall.index("--parallel-ready-role") + 1] == "recall"
+    assert "--k8s" in rank and "--k8s" in recall
+
+
+def test_children_support_bare_metal_ssh_mode(tmp_path):
+    args = SimpleNamespace(
+        mode="ssh",
+        rank_cluster="rank-cluster.json", rank_global="rank-global.json",
+        recall_cluster="recall-cluster.json",
+        recall_global="recall-global.json", profile="profile.json",
+        dry_run=False, no_warmup=False, no_plot=False, verbose=False,
+        protocol=None, stop_file=None)
+    argv = _child_argv(args, "rank", ["rank.json"], "parent",
+                       str(tmp_path / "ready"))
+    assert "--ssh" in argv
+    assert "--k8s" not in argv
 
 
 def test_parallel_start_barrier_waits_for_peer(tmp_path, monkeypatch):
@@ -122,6 +137,7 @@ def test_dual_webui_command():
     }
     argv = _build_run_argv(body)
     assert argv[1].endswith(os.path.join("scripts", "run_rank_recall.py"))
+    assert "--k8s" in argv
     assert "--rank-cluster" in argv and "--recall-global" in argv
     assert "--dry-run" in argv
 

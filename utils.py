@@ -441,7 +441,18 @@ _SSH_LOCK = threading.Lock()
 
 
 def node_passwd(node):
-    return node.get("passwd") or ""
+    password = node.get("passwd") or ""
+    if password:
+        return password
+    env_name = node.get("passwd_env") or ""
+    if not env_name:
+        return ""
+    password = os.environ.get(env_name, "")
+    if not password:
+        raise RuntimeError(
+            "SSH password environment variable {} is not set"
+            "".format(env_name))
+    return password
 
 
 def _ssh_cache_key(node):

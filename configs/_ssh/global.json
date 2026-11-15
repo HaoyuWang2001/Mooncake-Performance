@@ -1,0 +1,24 @@
+{
+  "_master_type_comment": "master_type（必填）可选 \"http\" 或 \"etcd\"：etcd 激活 etcd_endpoints（同一 etcd:// URI 传给 setup 的 metadata_server 与 master_server_addr）；http 激活 master_addr + metadata_server（metadata_server 可省略，默认 http://{master_addr}/metadata）。两套地址可同时填写，仅被选中的一套生效，另一套仅存档。venv 字段填 cluster.json venvs 中的名称。",
+  "master_type": "etcd",
+  "etcd_endpoints": "etcd://141.61.84.151:18889",
+  "master_addr": "192.168.84.151:50058",
+  "metadata_server": "etcd://141.61.84.151:18889/metadata",
+  "mooncake_store_nodes": [
+    "reader_node1"
+  ],
+  "venv": "submaster",
+  "numa_bind": true,
+  "protocol": {
+    "ub": {
+      "device": "bonding_dev_0"
+    }
+  },
+  "local_buffer_size": 1073741824,
+  "store_total_size":"20GB",
+  "tenant_id": "default",
+  "random_seed": 42,
+  "remote_dir": "/tmp/mooncake_bench",
+  "remote_data_dir": "/tmp/mooncake_bench/data",
+  "remote_results_dir": "/tmp/mooncake_bench/results"
+}

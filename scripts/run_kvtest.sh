@@ -41,11 +41,33 @@ fi
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
-# Late-bind the UB device name: every pod discovers its own bonding_dev_*
-# via the env.sh urma_admin probe (SETUP_UB_DEVICE). Empty for tcp/rdma
-# without an explicit device — same value the Python client would pass.
+# Late-bind the per-process fabric address and UB device. In k8s POD_IP wins;
+# in ssh mode SETUP_FABRIC_IP comes from the generated per-node env.sh.
+FABRIC_IP=${POD_IP:-${SETUP_FABRIC_IP:-}}
+if [ -z "$FABRIC_IP" ]; then
+  echo "[FATAL] POD_IP/SETUP_FABRIC_IP is empty" >&2
+  exit 1
+fi
 FINAL_CONFIG="$CONFIG.final.json"
-sed "s/__UB_DEVICE__/${SETUP_UB_DEVICE:-}/g" "$CONFIG" > "$FINAL_CONFIG"
+fabric_escaped=${FABRIC_IP//&/\\&}
+device_escaped=${SETUP_UB_DEVICE:-}
+device_escaped=${device_escaped//&/\\&}
+sed -e "s/__FABRIC_IP__/${fabric_escaped}/g" \
+    -e "s/__UB_DEVICE__/${device_escaped}/g" \
+    "$CONFIG" > "$FINAL_CONFIG"
+
+# binary_local deployments place shared objects beside the binary under lib/.
+RESOLVED_BINARY=$(command -v "$BINARY" 2>/dev/null || printf '%s' "$BINARY")
+BINARY_DIR=$(cd "$(dirname "$RESOLVED_BINARY")" && pwd)
+export LD_LIBRARY_PATH="${BINARY_DIR}/lib:${BINARY_DIR}/../lib:${LD_LIBRARY_PATH:-}"
+if command -v ldd >/dev/null 2>&1; then
+  missing_libs=$(ldd "$RESOLVED_BINARY" 2>/dev/null | awk '/not found/ {print}')
+  if [ -n "$missing_libs" ]; then
+    echo "[FATAL] mooncake_kvtest has missing shared libraries:" >&2
+    echo "$missing_libs" >&2
+    exit 1
+  fi
+fi
 
 # stdout (kvtest narrative) and stderr (C++ glog, FLAGS_logtostderr=1) are
 # kept in SEPARATE files, mirroring run_benchmark_pipeline.sh.

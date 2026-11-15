@@ -5,8 +5,8 @@
   "batch_size": 1,
   "kvtest": {
     "binary": "mooncake_kvtest",
-    "key_pool_size": 0,
-    "notify_queue_max": 8192,
+    "key_pool_size": "auto",
+    "notify_queue_max": 65536,
     "verify_level": "size",
     "metrics_interval_ms": 3000
   }

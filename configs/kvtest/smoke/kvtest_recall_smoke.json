@@ -5,16 +5,18 @@
   "notify_count": 1,
   "client": {
     "count_per_node": 6,
-    "port_base": 9301
+    "process_mode": "split"
   },
   "writer": {
     "operation": "upsert_from",
-    "num_threads": 1,
-    "notify_threads": 1
+    "num_threads": 4,
+    "notify_threads": 1,
+    "port_base": 9301
   },
   "reader": {
     "operation": "get_buffer",
-    "num_threads": 1
+    "num_threads": 12,
+    "port_base": 9401
   },
   "store_count_per_node": 2,
   "data_size": [
@@ -22,6 +24,7 @@
   ],
   "duration": 30,
   "kvtest": {
-    "key_pool_size": 256
+    "key_pool_size": 256,
+    "local_port_base": 13345
   }
 }
