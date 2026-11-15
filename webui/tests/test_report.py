@@ -472,3 +472,18 @@ def test_summary_throughput_uses_bytes(tmp_path):
     assert s["bytes"] == 8192                 # 2 x SUMMARY bytes=4096
     assert abs(s["throughput_mb_s"]
                - 8192 / s["wall_s"] / 1048576.0) < 1e-6
+
+
+def test_overview_sums_all_data_sizes(tmp_path):
+    """overview 卡片要汇总所有 data_size（原只取第一个 size）。"""
+    a = _minimal_stats([3600], [3600], bucket_unit="s")
+    b = json.loads(json.dumps(a))
+    b["meta"]["size"] = "64MB"
+    sc = rp.reduce_scenario([a, b], {"config": "multi", "mode": "basic"})
+    assert set(sc["sizes"]) == {"8MB", "64MB"}
+    ov = rp.render_overview({"run": "r", "mode": "ssh", "nodes": []},
+                            [dict(sc, report_rel="logs/m/report/report.html")],
+                            str(tmp_path / "ov"))
+    src = open(ov, encoding="utf-8").read()
+    assert '<div class="k">成功</div><div class="v">20</div>' in src
+    assert '<div class="k">失败</div><div class="v">0</div>' in src

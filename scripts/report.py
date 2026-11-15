@@ -1515,8 +1515,31 @@ def render_overview(run_meta, scenarios, out_dir):
     cards = []
     for sc in scenarios:
         m = sc.get("meta") or {}
-        z = next(iter((sc.get("sizes") or {}).values()), {})
-        s = (z or {}).get("summary") or {}
+        # aggregate EVERY data_size of the scenario: ok/fail/bytes/total sum,
+        # wall sums (sizes run sequentially) -> qps from the sums;
+        # percentiles take the worst size across the sweep (labelled below).
+        blocks = [z.get("summary") for z in (sc.get("sizes") or {}).values()
+                  if z and z.get("summary")]
+        if blocks:
+            s = {
+                "ok": sum(int(b.get("ok") or 0) for b in blocks),
+                "fail": sum(int(b.get("fail") or 0) for b in blocks),
+                "total": sum(int(b.get("total") or 0) for b in blocks),
+                "bytes": sum(int(b.get("bytes") or 0) for b in blocks),
+                "wall_s": sum(float(b.get("wall_s") or 0) for b in blocks),
+                "p50_ms": max((b.get("p50_ms") or 0) for b in blocks),
+                "p99_ms": max((b.get("p99_ms") or 0) for b in blocks),
+                "p999_ms": max((b.get("p999_ms") or 0) for b in blocks),
+                "clients": len({c.get("name") for z in sc["sizes"].values()
+                                for c in (z.get("clients") or [])}),
+            }
+            s["qps"] = (round(s["total"] / s["wall_s"], 2)
+                        if s["wall_s"] > 0 else 0.0)
+            s["fail_rate"] = (s["fail"] / s["total"]) if s["total"] else 0.0
+            if len(blocks) > 1:
+                s["pct_note"] = "跨 {} 个 data_size 取最差值".format(len(blocks))
+        else:
+            s = {}
         link = sc.get("report_rel") or ""
         ms = (sc.get("monitors") or {}).get("summary") or {}
         bits = []
@@ -1549,6 +1572,7 @@ def render_overview(run_meta, scenarios, out_dir):
 <div class="kv"><div class="k">p999</div><div class="v">{p999}<span class="u"> ms</span></div></div>
 <div class="kv"><div class="k">失败率</div><div class="v">{fr}<span class="u"> %</span></div></div>
 </div>
+{pctnote}
 {monline}
 <div style="margin-top:10px"><a href="{link}">打开场景完整报表 →</a></div>
 </div>""".format(
@@ -1561,6 +1585,9 @@ def render_overview(run_meta, scenarios, out_dir):
             qps=s.get("qps", "-"), p50=s.get("p50_ms", "-"),
             p99=s.get("p99_ms", "-"), p999=s.get("p999_ms", "-"),
             fr=round((s.get("fail_rate") or 0) * 100, 2),
+            pctnote=('<div class="note">' + s["pct_note"] +
+                     '；QPS 按各 size 时长之和计</div>')
+            if s.get("pct_note") else "",
             link=html.escape(str(link), quote=True),
             monline=monline))
     nodes = run_meta.get("nodes") or []
