@@ -17,6 +17,7 @@ map 阶段（节点/pod 内 logstats.py）产出每个客户端日志的 <log>.s
 """
 import argparse
 import csv
+import html
 import json
 import os
 import sys
@@ -874,6 +875,8 @@ function renderSummary(){
 }
 function renderTable(){
   const z=Z(); if(!z) return;
+  const note=document.getElementById('datanote');
+  if(note&&window.__mcDataMissing)note.style.display='';
   const tb=document.querySelector('#ctable tbody'); tb.innerHTML='';
   const clients=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&
     FULL.sizes[curSize].clients)||z.clients;
@@ -1283,9 +1286,9 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
     data_literal = json.dumps(data_json, ensure_ascii=False,
                               separators=(",", ":")).replace("</", "<\\/")
     loader = ""
-    if full_loader:
+    if full_loader and data_js_path:
         loader = ('<script src="{}" onerror="window.__mcDataMissing=1">'
-                  '</script>'.format(full_loader))
+                  '</script>'.format(html.escape(str(data_js_path), quote=True)))
     return """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1379,7 +1382,10 @@ memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total
 <th>客户端</th><th>角色</th><th>节点</th><th class="n">总数</th><th class="n">成功</th>
 <th class="n">失败</th><th class="n">平均</th><th class="n">p50</th><th class="n">p99</th>
 <th class="n">p999</th><th class="n">最大</th><th class="n">队列等待均</th><th class="n">日志</th>
-</tr></thead><tbody></tbody></table></div></div>
+</tr></thead><tbody></tbody></table></div>
+<div class="note" id="datanote" style="display:none">全量数据 data.js 未加载（例如通过
+WebUI/HTTP 直接打开）：客户端表仅显示 Top-20，点击行只能叠加已内嵌的客户端。
+把 data.js 与 report.html 放在同一目录后重新打开即可查看全量。</div></div>
 <div class="card"><h2>错误与异常</h2><div id="errors"></div></div>
 <div class="card"><h2>现场索引</h2><div id="sources"></div></div>
 <div class="note">数据文件：report.html（自包含）+ data.js（全量，深查用）。

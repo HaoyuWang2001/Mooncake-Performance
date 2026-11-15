@@ -83,6 +83,19 @@ def test_render_self_contained_and_data_js(tmp_path):
     assert "</script>" not in embedded.replace("<\\/", "")
 
 
+def test_data_js_loader_points_to_real_file(tmp_path):
+    """report.html 必须引用同目录 data.js（曾经写成 format(True) -> src="True"）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+    out = str(tmp_path / "report")
+    html, dj = rp.render_scenario(data, out, ECHARTS, topk=1)
+    src = open(html, encoding="utf-8").read()
+    assert '<script src="data.js"' in src
+    assert 'src="True"' not in src
+    assert 'id="datanote"' in src          # 加载失败时的降级提示容器
+    assert os.path.basename(dj) == "data.js"
+
+
 def test_embed_step_switch(tmp_path):
     """>1 天 1s 桶 -> 内嵌 1 分钟粒度。"""
     st = {
