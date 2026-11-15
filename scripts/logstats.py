@@ -218,6 +218,7 @@ def _scan_summaries(path, cap=128, meta_cap=2):
 
 def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                   role=None, remote_path=None, size=None):
+    top_n = max(1, int(top_n or 0))   # a 0-capacity heap indexes slowest[0]
     rows = 0
     total = ok = fail = 0
     key_total = key_ok = key_fail = 0

@@ -258,3 +258,11 @@ def test_summaries_not_starved_by_meta_lines(tmp_path):
     sums = [p for k, p in st["summaries"] if k == "summary"]
     assert len(sums) == 6
     assert sum(int(p.get("bytes", 0)) for p in sums) == 600
+
+
+def test_top_n_zero_does_not_crash(tmp_path):
+    """--top-n 0 曾被当成容量 0 的堆，slowest[0] 直接 IndexError。"""
+    st = ls.compute_stats(_write(
+        tmp_path, "RESULT\t2026-11-12 10:00:01.000000\tput\tk1\t1.0\tOK\n"),
+        top_n=0)
+    assert len(st["slowest"]) == 1

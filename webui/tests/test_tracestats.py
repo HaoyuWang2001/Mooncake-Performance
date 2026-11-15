@@ -246,3 +246,9 @@ def test_truncated_line_counts_parse_errors(tmp_path):
     assert m["parse_errors"] == 1
     assert m["trace_lines"] == 1
     assert st["groups"]["write"]["ops"]["put"]["count"] == 1
+
+
+def test_top_n_zero_does_not_crash(tmp_path):
+    p = _write(tmp_path, "t0.glog", [WRITE_OK])
+    st = ts.compute_trace_stats(p, top_n=0)
+    assert len(st["groups"]["write"]["ops"]["put"]["top"]) == 1

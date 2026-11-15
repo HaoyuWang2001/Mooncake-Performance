@@ -182,6 +182,7 @@ def _value_hist(value_counts, cap=24):
 
 def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                         sample_rate=None, top_n=TOP_N):
+    top_n = max(1, int(top_n or 0))
     ops = {}                       # (group, op) -> aggregate dict
     lines_total = lines_trace = lines_slice = parse_errors = 0
     ts_from = ts_to = None
