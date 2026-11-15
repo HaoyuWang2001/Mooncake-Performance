@@ -805,7 +805,7 @@ function kv(k,v,u){const w=el('div','kv');w.appendChild(el('div','k',k));
 const vv=el('div','v',v);if(u)vv.appendChild(el('span','u',' '+u));
 w.appendChild(vv);return w;}
 const S = D.sizes || {}; let curSize = Object.keys(S)[0]||''; 
-let curRole = 'all'; let curStep = 0;
+let curRole = 'all'; let curStep = 1;   // 1=1 秒粒度，60=1 分钟粒度
 function Z(){return S[curSize]||null;}
 function rolesOf(z){return Object.keys((z&&z.series)||{});}
 function rolesOrder(z){const r=rolesOf(z);const o=['all','writer','reader'];
@@ -821,7 +821,7 @@ function buildChart(){
   if(!chart) chart=echarts.init(box);
   const col=seriesFor(curStep);
   if(!col||!col.t.length){chart.clear();return;}
-  const step = curStep===1?1:60;
+  const step = curStep === 60 ? 60 : 1;
   const qps = col.c.map((c,i)=>Math.round(c/step*100)/100);
   const x = col.t.map(t=>t*1000);
   const opt={
@@ -1076,7 +1076,7 @@ function mount(){
   if(sizeSel){
     Object.keys(S).forEach(k=>{const o=el('option',null,k);o.value=k;sizeSel.appendChild(o);});
     sizeSel.value=curSize;
-    sizeSel.onchange=()=>{curSize=sizeSel.value;curRole='all';curStep=0;
+    sizeSel.onchange=()=>{curSize=sizeSel.value;curRole='all';curStep=1;
       renderRoleButtons(); renderAll();};
   }
   renderRoleButtons(); renderAll(); renderMonitors();
@@ -1097,8 +1097,8 @@ function renderRoleButtons(){
   const box2=document.getElementById('steps');
   box2.innerHTML='';
   steps.forEach(([v,label])=>{
-    const b=el('button', (v===1&&curStep===0)||(v===60&&curStep===1)?'on':'', label);
-    b.onclick=()=>{curStep=v===1?0:1;renderRoleButtons();buildChart();};
+    const b=el('button', v===curStep?'on':'', label);
+    b.onclick=()=>{curStep=v;renderRoleButtons();buildChart();};
     box2.appendChild(b);
   });
 }

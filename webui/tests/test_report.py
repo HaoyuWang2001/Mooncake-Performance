@@ -3,6 +3,8 @@
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +16,7 @@ import logstats as ls    # noqa: E402
 import report as rp      # noqa: E402
 
 ECHARTS = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _stats(tmp_path, name, role, node="n1", lat=1.0, n=40, secs=4):
@@ -273,3 +276,33 @@ def test_old_stats_minutes_compat(tmp_path):
     new = _minimal_stats([3600, 3660], [3600, 3660], bucket_unit="s")
     z2 = rp.reduce_size([new], {"config": "c"})
     assert z2["series"]["writer"]["step60"]["t"] == [3600, 3660]
+
+
+def _js_check(tmp_path, data, *args):
+    """用桩 DOM 执行 report 的 app JS；无 node 时跳过（返回 None）。"""
+    node = shutil.which("node")
+    if not node:
+        print("  [skip] node not found")
+        return None
+    app = tmp_path / "app.js"
+    app.write_text(rp._APP_JS, encoding="utf-8")
+    dj = tmp_path / "data.json"
+    dj.write_text(json.dumps(data), encoding="utf-8")
+    r = subprocess.run([node, os.path.join(HERE, "report_js_check.js"),
+                        str(app), str(dj)] + list(args),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+def test_granularity_buttons_match_series(tmp_path):
+    """默认应画 1s 系列；点「1 分钟粒度」才切到分钟系列（曾整体颠倒）。"""
+    st = _minimal_stats([3600 + i for i in range(60)], [3600], bucket_unit="s")
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["init_len"] == 60          # 默认 1 秒粒度
+    assert res["init_x0"] == 3600 * 1000  # x 轴用 epoch 毫秒
+    assert res["min_len"] == 1            # 切到 1 分钟粒度
