@@ -211,3 +211,18 @@ def test_dated_timestamp_is_local_epoch(tmp_path, monkeypatch):
     finally:
         monkeypatch.delenv("TZ", raising=False)
         time.tzset()
+
+
+def test_exact_limit_degrade_keeps_exact_min_max(tmp_path, monkeypatch):
+    """超过精确窗口后不再累积样本，但 min/max 仍必须精确（原由直方图插值）。"""
+    monkeypatch.setattr(ls, "EXACT_LIMIT", 10)
+    text = "".join(
+        "RESULT\t2026-11-12 10:00:{:02d}.{:06d}\tput\tk{}\t{:.1f}\tOK\n".format(
+            i % 60, i, i, 1.0 + i) for i in range(100))
+    st = ls.compute_stats(_write(tmp_path, text))
+    g = st["global"]
+    assert g["exact"] is False
+    assert g["min_ms"] == 1.0 and g["max_ms"] == 100.0
+    op = st["ops"]["put"]
+    assert op["min_ms"] == 1.0 and op["max_ms"] == 100.0
+    assert 90.0 <= g["p99_ms"] <= 130.0     # 分位由直方图近似

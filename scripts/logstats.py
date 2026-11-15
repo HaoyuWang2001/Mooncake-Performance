@@ -210,6 +210,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     total = ok = fail = 0
     key_total = key_ok = key_fail = 0
     lats = []                       # OK-only (exact percentile window)
+    lat_min = lat_max = None        # exact extremes, kept past the window
+    exact_ok = True                 # still holding every OK sample?
     lat_sum = 0.0
     qw_sum = 0.0
     qw_n = 0
@@ -233,7 +235,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         total += 1
         key_total += kc
         opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0,
-                                   "_lats": [], "_h": {}, "_sum": 0.0})
+                                   "_lats": [], "_h": {}, "_sum": 0.0,
+                                   "_min": None, "_max": None, "_exact": True})
         opd["count"] += 1
         opd["keys"] += kc
         if okrow:
@@ -241,8 +244,16 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             ob = bin_of(row["lat"])
             opd["_h"][ob] = opd["_h"].get(ob, 0) + 1
             opd["_sum"] += row["lat"]
+            opd["_min"] = (row["lat"] if opd["_min"] is None
+                           else min(opd["_min"], row["lat"]))
+            opd["_max"] = (row["lat"] if opd["_max"] is None
+                           else max(opd["_max"], row["lat"]))
             if len(opd["_lats"]) < EXACT_LIMIT:
-                opd["_lats"].append(row["lat"])
+                if opd["_exact"]:
+                    opd["_lats"].append(row["lat"])
+            elif opd["_exact"]:
+                opd["_exact"] = False
+                opd["_lats"] = []          # free the window, keep histogram
         else:
             opd["fail"] += 1
         ep = _ts_to_epoch(row["ts"])
@@ -271,8 +282,14 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         key_ok += kc
         lat = row["lat"]
         lat_sum += lat
+        lat_min = lat if lat_min is None else min(lat_min, lat)
+        lat_max = lat if lat_max is None else max(lat_max, lat)
         if len(lats) < EXACT_LIMIT:
-            lats.append(lat)
+            if exact_ok:
+                lats.append(lat)
+        elif exact_ok:
+            exact_ok = False
+            lats = []                      # free the window, keep histogram
         b = bin_of(lat)
         hist[b] = hist.get(b, 0) + 1
         qw = row["qw"]
@@ -330,8 +347,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                     "status": row["status"],
                     "qw_ms": (round(row["qw"], 6) if row["qw"] is not None else None)})
 
-    # exact or histogram percentiles
-    exact = len(lats) == ok and ok > 0
+    # exact or histogram percentiles (min/max stay exact either way)
+    exact = exact_ok and ok > 0
     if exact and lats:
         lats.sort()
         def pct(q):
@@ -343,16 +360,15 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     # per-op finalized stats (counts + latency percentiles per op name)
     ops_out = {}
     for op, opd in ops.items():
-        if opd["_lats"] and len(opd["_lats"]) == opd["ok"]:
+        if opd["_exact"] and opd["_lats"]:
             ls = sorted(opd["_lats"])
             def opct(q, _ls=ls):
                 return round(_exact_percentile(_ls, q), 6)
-            opmin, opmax = round(ls[0], 6), round(ls[-1], 6)
         else:
             def opct(q, _h=opd["_h"]):
                 return round(hist_percentile(_h, q), 6)
-            opmin = round(hist_percentile(opd["_h"], 0.0), 6)
-            opmax = round(hist_percentile(opd["_h"], 1.0), 6)
+        opmin = round(opd["_min"], 6) if opd["_min"] is not None else 0.0
+        opmax = round(opd["_max"], 6) if opd["_max"] is not None else 0.0
         ops_out[op] = {
             "count": opd["count"], "ok": opd["ok"], "fail": opd["fail"],
             "keys": opd["keys"],
@@ -427,10 +443,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "total": total, "ok": ok, "fail": fail,
             "key_total": key_total, "key_ok": key_ok, "key_fail": key_fail,
             "avg_ms": round(avg_ms, 6) if ok else 0.0,
-            "min_ms": round(min(lats), 6) if exact and lats else round(
-                hist_percentile(hist, 0.0), 6),
-            "max_ms": round(max(lats), 6) if exact and lats else round(
-                hist_percentile(hist, 1.0), 6),
+            "min_ms": round(lat_min, 6) if lat_min is not None else 0.0,
+            "max_ms": round(lat_max, 6) if lat_max is not None else 0.0,
             "p50_ms": pct(0.50), "p95_ms": pct(0.95), "p99_ms": pct(0.99),
             "p999_ms": pct(0.999), "p9999_ms": pct(0.9999),
             "qw_avg_ms": round(qw_sum / qw_n, 6) if qw_n else None,
