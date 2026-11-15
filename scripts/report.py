@@ -465,12 +465,19 @@ def reduce_trace_size(trace_list):
     clients = []
     tops = []
     metad = {"files": 0, "lines": 0, "trace_lines": 0, "slice_lines": 0,
-             "parse_errors": 0, "sample_rates": {}, "bins": "us-v1"}
+             "parse_errors": 0, "sample_rates": {}, "bins": "us-v1",
+             "markers": False,
+             "phase_counts": {"setup": 0, "warmup": 0, "measured": 0,
+                              "teardown": 0}}
     for st in trace_list:
         m = st.get("meta") or {}
         metad["files"] += 1
         if m.get("bins") != "us-v1":
             metad["bins"] = "legacy"     # histogram unit unknown -> no pcts
+        if m.get("markers"):
+            metad["markers"] = True       # any marked file enables the note
+        for pk, pn in (m.get("phase_counts") or {}).items():
+            metad["phase_counts"][pk] = metad["phase_counts"].get(pk, 0) + pn
         for k in TRACE_META_KEYS:
             metad[k] += m.get(k) or 0
         if m.get("sample_rate") is not None:
@@ -1228,10 +1235,19 @@ function renderTrace(){
   card.style.display="";
   const m=t.meta||{};
   const rates=Object.keys(m.sample_rates||{});
+  var phaseTxt="";
+  if(m.markers){
+    var pc=m.phase_counts||{};
+    phaseTxt=" · 已按阶段标记剔除：预热 "+(pc.warmup||0)+
+      " / 启动 "+(pc.setup||0)+" / 收尾 "+(pc.teardown||0)+
+      "（计入统计 "+(pc.measured||0)+"）";
+  }else{
+    phaseTxt=" · 无阶段标记（旧客户端），样本未分阶段";
+  }
   document.getElementById("tmeta").textContent=
     "trace 文件 "+m.files+" · 解析行 "+m.trace_lines+
     " · slice 行（仅计数）"+m.slice_lines+" · 解析失败 "+m.parse_errors+
-    (rates.length?(" · 采样率 "+rates.join("/")):"");
+    (rates.length?(" · 采样率 "+rates.join("/")):"")+phaseTxt;
   const gbox=document.getElementById("tgroups");gbox.innerHTML="";
   tGroupsList().forEach(function(g){
     const b=el("button",g===tGroup?"on":"",
@@ -1385,12 +1401,47 @@ function renderTraceStatus(cur){
   t.appendChild(tb);box.appendChild(t);
 }
 
+window.__MC_FULL_READY__=function(){renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """
 
 
+# Runtime link adapter: pages stay standalone (file:// relative links work)
+# but when served through the WebUI (/api/file?path=<rel>&mode=raw) every
+# relative href resolves against /api/file — breaking ../logs/... links and
+# the data.js script. The adapter rewrites them to /api/file URLs.
+_PAGE_ADAPTER_JS = """
+(function(){
+  var base=(window.__MC_REL__||'');
+  if(location.protocol==='file:'||!base) return;
+  function api(rel){
+    var parts=(base+'/'+rel).split('/');
+    var out=[];
+    for(var i=0;i<parts.length;i++){
+      var sg=parts[i];
+      if(sg==='..') out.pop();
+      else if(sg!=='.'&&sg!=='') out.push(sg);
+    }
+    return '/api/file?path='+encodeURIComponent(out.join('/'))+'&mode=raw';
+  }
+  document.querySelectorAll('a[href^="../"]').forEach(function(a){
+    a.href=api(a.getAttribute('href').slice(3));
+  });
+  if(window.__MC_DATA_REL__&&!window.__MC_FULL__){
+    var u=api(window.__MC_DATA_REL__);
+    fetch(u).then(function(r){return r.ok?r.text():null;})
+      .then(function(t){
+        if(!t) return;
+        (0,eval)(t);
+        window.__MC_FULL_READY__&&window.__MC_FULL_READY__();
+      }).catch(function(){});
+  }
+})();
+"""
+
+
 def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
-               full_loader):
+               full_loader, rel_base=None, data_rel=None):
     # JSON is embedded as a JS literal; escape the closing-script sequence.
     data_literal = json.dumps(data_json, ensure_ascii=False,
                               separators=(",", ":")).replace("</", "<\\/")
@@ -1398,6 +1449,15 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
     if full_loader and data_js_path:
         loader = ('<script src="{}" onerror="window.__mcDataMissing=1">'
                   '</script>'.format(html.escape(str(data_js_path), quote=True)))
+    rel_vars = ""
+    if rel_base:
+        rel_vars = ('<script>window.__MC_REL__ = {}'
+                    .format(json.dumps(rel_base)))
+        if data_rel:
+            rel_vars += (';window.__MC_DATA_REL__ = {}'
+                         .format(json.dumps(data_rel)))
+        rel_vars += ';</script>\n'
+    adapter = '<script>{}</script>\n'.format(_PAGE_ADAPTER_JS.strip())
     return """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1408,16 +1468,18 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
 </div>
 <script>{echarts}</script>
 <script>window.__MC_REPORT__ = {data};</script>
-{loader}
+{rel_vars}{loader}{adapter}
 <script>{app}</script>
+<script>if(window.__MC_FULL__){{}}/* placeholder for consistency */</script>
 </body></html>
 """.format(title=html.escape(str(title), quote=True),
            subtitle=html.escape(str(subtitle), quote=True), body=body_html,
            css=_PAGE_CSS, echarts=echarts_js, data=data_literal,
-           loader=loader, app=_APP_JS)
+           rel_vars=rel_vars, loader=loader, adapter=adapter, app=_APP_JS)
 
 
-def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT):
+def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
+                     rel_base=None):
     """Write report.html (self-contained) + data.js (full per-client data)."""
     os.makedirs(out_dir, exist_ok=True)
     meta = data.get("meta") or {}
@@ -1523,7 +1585,8 @@ WebUI/HTTP 直接打开）：客户端表仅显示 Top-20，点击行只能叠�
 """
     echarts_js = _read_echarts(echarts_path)
     html = _page_html("场景报表", subtitle, body, embedded, echarts_js,
-                      "data.js", True)
+                      "data.js", True, rel_base=rel_base,
+                      data_rel="data.js")
     html_path = os.path.join(out_dir, "report.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -1535,7 +1598,7 @@ WebUI/HTTP 直接打开）：客户端表仅显示 Top-20，点击行只能叠�
     return html_path, full_js
 
 
-def render_overview(run_meta, scenarios, out_dir):
+def render_overview(run_meta, scenarios, out_dir, rel_base=None):
     """run 级总览：各场景摘要卡 + 链接 + 现场索引 + 节点日志量。"""
     os.makedirs(out_dir, exist_ok=True)
     cards = []
@@ -1636,7 +1699,7 @@ def render_overview(run_meta, scenarios, out_dir):
         ("开始 " + run_meta["started"]) if run_meta.get("started") else "",
         "生成于 " + time.strftime("%Y-%m-%d %H:%M:%S")]))
     page = _page_html("运行总览", subtitle, body, {"meta": run_meta},
-                      "", None, False)
+                      "", None, False, rel_base=rel_base)
     path = os.path.join(out_dir, "overview.html")
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)

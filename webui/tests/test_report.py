@@ -548,3 +548,95 @@ def test_extended_ms_ladder_keeps_second_scale_tail(tmp_path):
     # CSV 的 stats-first 聚合同样按版本选阶梯
     agg = bm._merge_stats_aggs([st, st2])
     assert 4200 <= agg["p99_ms"] <= 6500
+
+
+# ---------------------------------------------------------------------------
+# ③ phase footnote + WebUI raw-endpoint link adapter
+# ---------------------------------------------------------------------------
+
+def _trace_stats_with_markers(tmp_path, name, warmup_n=2):
+    import tracestats
+    base = tracestats._start_epoch("2026-11-15 09:27:33.000000")
+    lines = ["MC_PHASE warmup start {:.6f}".format(base)]
+    for i in range(warmup_n):
+        lines.append(
+            "I20261115 09:27:33.000000 1 te.cc:1] trace_id[1] breakdown[put] "
+            "key[mc_warmup*{}] status[ok] size[1] replicas[1] "
+            "start_time[2026-11-15 09:27:33.{:06d}] prep_total_us[1] "
+            "total_us[100]".format(i, i * 10000))
+    lines.append("MC_PHASE measured start {:.6f}".format(base + 1.0))
+    lines.append(
+        "I20261115 09:27:35.000000 1 te.cc:1] trace_id[1] breakdown[put] "
+        "key[k] status[ok] size[1] replicas[1] "
+        "start_time[2026-11-15 09:27:35.000000] prep_total_us[1] "
+        "total_us[100]")
+    lines.append("MC_PHASE measured end {:.6f}".format(base + 3.0))
+    p = tmp_path / name
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return tracestats.compute_trace_stats(str(p), node="n1", size="8MB")
+
+
+def test_reduce_trace_phase_counts_and_markers(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    tr = _trace_stats_with_markers(tmp_path, "m.glog", warmup_n=2)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    tm = data["sizes"]["8MB"]["trace"]["meta"]
+    assert tm["markers"] is True
+    assert tm["phase_counts"]["warmup"] == 2
+    assert tm["phase_counts"]["measured"] == 1
+    op = data["sizes"]["8MB"]["trace"]["groups"]["write"]["ops"]["put"]
+    assert op["count"] == 1            # only the measured row aggregated
+
+
+def test_render_report_has_rel_base_and_adapter(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    tr = _trace_stats_with_markers(tmp_path, "m.glog")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    html, dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS,
+                                   rel_base="outputs/t1/logs/cfg/report")
+    src = open(html, encoding="utf-8").read()
+    # WebUI link adapter wired with the outputs-relative base
+    assert 'window.__MC_REL__ = "outputs/t1/logs/cfg/report"' in src
+    assert "__MC_DATA_REL__" in src
+    assert "__MC_FULL_READY__" in src
+    assert 'api/file?path=' in src
+    # file:// path unchanged: static data.js tag still there
+    assert 'src="data.js"' in src
+    # phase footnote: built at runtime by the app JS from phase_counts —
+    # the JS source carries the template and __MC_FULL_READY__ hook
+    assert "已按阶段标记剔除" in src
+    assert "phase_counts" in src and "pc.warmup||0" in src
+
+
+def test_render_overview_has_rel_base_and_adapter(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+    ov = rp.render_overview(
+        {"run": "t1", "mode": "ssh", "nodes": [{"node": "n1", "pods": 1,
+                                                "bytes": 100}]},
+        [dict(data, report_rel="logs/x/report/report.html")],
+        str(tmp_path / "ov"), rel_base="outputs/t1")
+    src = open(ov, encoding="utf-8").read()
+    assert 'window.__MC_REL__ = "outputs/t1"' in src
+    assert 'a[href^="../"]' in src           # the adapter rewrites scenario links
+    # no data.js loader on the overview page: the adapter script mentions
+    # __MC_DATA_REL__ (shared source) but there is no assignment
+    assert "window.__MC_DATA_REL__ = " not in src
+
+
+def test_legacy_trace_no_marker_note(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    import tracestats
+    p = tmp_path / "legacy.glog"
+    p.write_text(
+        "I20261115 09:27:33.000000 1 te.cc:1] trace_id[1] breakdown[put] "
+        "key[k] status[ok] size[1] replicas[1] "
+        "start_time[2026-11-15 09:27:33.000000] total_us[100]\n",
+        encoding="utf-8")
+    tr = tracestats.compute_trace_stats(str(p), node="n1", size="8MB")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    tm = data["sizes"]["8MB"]["trace"]["meta"]
+    assert tm["markers"] is False
+    assert tm["phase_counts"]["measured"] == 1   # legacy: all measured
+    html, _ = rp.render_scenario(data, str(tmp_path / "out2"), ECHARTS)
+    assert "无阶段标记" in open(html, encoding="utf-8").read()

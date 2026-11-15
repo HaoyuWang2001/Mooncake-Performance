@@ -2318,7 +2318,9 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
         echarts = os.path.join(ROOT, "webui", "web", "vendor",
                                "echarts.min.js")
         out_dir = os.path.join(local_log_dir, "report")
-        html, _datajs = rp.render_scenario(data, out_dir, echarts)
+        html, _datajs = rp.render_scenario(
+            data, out_dir, echarts,
+            rel_base=os.path.relpath(out_dir, ROOT).replace(os.sep, "/"))
         log("[report] {} -> {}".format(
             cfg_name, os.path.relpath(html, ROOT)))
         _REPORT_ACC.append({"data": data, "report_html": html})
@@ -2352,7 +2354,9 @@ def _render_run_overview(ts_dir, mode=""):
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "nodes": sorted(by_node.values(), key=lambda x: -(x.get("bytes") or 0)),
     }
-    return rp.render_overview(run_meta, scenarios, ov_dir)
+    return rp.render_overview(run_meta, scenarios, ov_dir,
+                               rel_base=os.path.relpath(
+                                   ov_dir, ROOT).replace(os.sep, "/"))
 
 
 def _stop_reports():
@@ -5745,8 +5749,10 @@ def rebuild_reports(ts):
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "early_stop": False,          # unknown for historical runs
         }, monitors=rp.reduce_monitors(d), traces=rp.load(traces))
-        html, _dj = rp.render_scenario(data, os.path.join(d, "report"),
-                                       echarts)
+        out_d = os.path.join(d, "report")
+        html, _dj = rp.render_scenario(
+            data, out_d, echarts,
+            rel_base=os.path.relpath(out_d, ROOT).replace(os.sep, "/"))
         log("[report] rebuilt {} -> {}".format(
             name, os.path.relpath(html, ROOT)))
         scenarios.append(dict(data, report_rel=os.path.relpath(
@@ -5763,10 +5769,12 @@ def rebuild_reports(ts):
                                                    "pods": 0, "bytes": 0})
             e["pods"] += n.get("pods") or 0
             e["bytes"] += n.get("bytes") or 0
+    ov_d = os.path.join(ts_dir, "report")
     ov = rp.render_overview({
         "run": ts, "mode": "", "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "nodes": sorted(by_node.values(), key=lambda x: -(x.get("bytes") or 0)),
-    }, scenarios, os.path.join(ts_dir, "report"))
+    }, scenarios, ov_d, rel_base=os.path.relpath(
+        ov_d, ROOT).replace(os.sep, "/"))
     log("[report] overview -> {}".format(os.path.relpath(ov, ROOT)))
     return 0
 
