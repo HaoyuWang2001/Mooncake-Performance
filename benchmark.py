@@ -2241,6 +2241,87 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
         return None
 
 
+def _render_run_overview(ts_dir, mode=""):
+    """Render the run-level overview.html from the scenarios accumulated so
+    far (also used by the STOP path). WARN-only, never raises outward."""
+    if not _REPORT_ACC:
+        return None
+    rp = _report_module()
+    ov_dir = os.path.join(ts_dir, "report")
+    scenarios = []
+    for acc in _REPORT_ACC:
+        rel = os.path.relpath(acc["report_html"], ov_dir)
+        scenarios.append(dict(acc["data"], report_rel=rel.replace(os.sep, "/")))
+    by_node = {}
+    for sc in scenarios:
+        for n in sc.get("nodes") or []:
+            e = by_node.setdefault(n.get("node"),
+                                   {"node": n.get("node"), "pods": 0,
+                                    "bytes": 0})
+            e["pods"] += n.get("pods") or 0
+            e["bytes"] += n.get("bytes") or 0
+    run_meta = {
+        "run": os.path.basename(ts_dir), "mode": mode,
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "nodes": sorted(by_node.values(), key=lambda x: -(x.get("bytes") or 0)),
+    }
+    return rp.render_overview(run_meta, scenarios, ov_dir)
+
+
+def _stop_reports():
+    """Partial report for the scenario in flight when a STOP arrives.
+
+    The scenario's exception path cannot run for StopRequested (BaseException
+    by design), so this is the only chance to turn a stopped run into
+    evidence: pull the raw logs while the remote processes/pods are still
+    alive, reduce locally (no remote map — a stop must not wait for it), then
+    render the scenario report and the run overview. WARN-only; disable with
+    MC_STOP_REPORT=0."""
+    if os.environ.get("MC_STOP_REPORT", "1") == "0":
+        log_detail("[STOP] partial report disabled (MC_STOP_REPORT=0)")
+        return
+    args = _STOP_CTX.get("args")
+    if args is not None and (getattr(args, "no_plot", False)
+                             or getattr(args, "dry_run", False)):
+        return
+    cluster = _STOP_CTX.get("cluster")
+    ctx = _STOP_CTX.get("report")
+    if not cluster or not ctx:
+        log_detail("[STOP] no scenario in flight; nothing to report")
+        return
+    clear_stop()          # the pull must be allowed to run
+    log("[STOP] collecting logs for a partial report ...")
+    try:
+        pull_logs(cluster, ctx["involved_nodes"], ctx["remote_log_dir"],
+                  ctx["cfg_name"], ctx["local_log_dir"], False)
+    except Exception as exc:
+        log("[WARN] [STOP] log pull for report failed: {}".format(exc))
+    qps_target, launch_mode = 0, "single"
+    if ctx.get("mode") == "pipeline":
+        try:
+            plan = pipeline_plan(ctx["cfg"])
+            qps_target = plan["total_qps"]
+            launch_mode = "rank_recall" if plan.get("dual") else "single"
+        except Exception:
+            pass
+    else:
+        try:
+            qps_target = float(ctx["cfg"].get("target_qps", 0) or 0)
+        except Exception:
+            qps_target = 0
+    try:
+        data = _generate_reports(ctx["cfg"], ctx["local_log_dir"], args,
+                                 early_stop=True, qps_target=qps_target,
+                                 launch_mode=launch_mode,
+                                 mode=ctx.get("mode", "pipeline"))
+        if data is not None:
+            _render_run_overview(ctx["result_dir"],
+                                 getattr(args, "mode", "") if args else "")
+            log("[STOP] partial report written (early_stop flagged)")
+    except Exception as exc:
+        log("[WARN] [STOP] report failed: {}".format(exc))
+
+
 def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
     """Pull every <cfg>.* file from each involved node. Retried ONCE (with a
     reconnect) because scp_pull now verifies byte sizes: a channel killed
@@ -3114,6 +3195,13 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cfg_name, op, topology, cfg["protocol"], host))
     deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                    remote_scripts, remote_log_dir, dry)
+    # STOP context: lets the StopRequested handler pull logs while the remote
+    # side is still alive and render a partial (early_stop) report.
+    _STOP_CTX["report"] = {
+        "cfg": cfg, "cfg_name": cfg_name, "result_dir": local_result_dir,
+        "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
+        "involved_nodes": involved_nodes, "mode": "basic",
+    }
     # The try MUST start here (before any stage): a failure in generate-data /
     # remove-keys / prepare-store previously raised before the try block, so
     # the FAIL path never pulled the remote logs — silent failure with no
@@ -3789,6 +3877,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         n_nodes, _run_label))
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
+        _STOP_CTX["report"] = {
+            "cfg": cfg, "cfg_name": cfg_name, "result_dir": local_result_dir,
+            "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
+            "involved_nodes": involved_nodes, "mode": "pipeline",
+        }
         # optional NUMA binding: per node, round-robin the node's client
         # processes (readers launched first, then writers) across its NUMA nodes.
         # Resolution: case/layer explicit value > global.json ("numa_bind",
@@ -5726,29 +5819,7 @@ def main(args, cfg_paths):
     if not args.no_plot:
         if _REPORT_ACC:
             try:
-                rp = _report_module()
-                ov_dir = os.path.join(ts_dir, "report")
-                scenarios = []
-                for acc in _REPORT_ACC:
-                    d = acc["data"]
-                    rel = os.path.relpath(acc["report_html"], ov_dir)
-                    scenarios.append(dict(d, report_rel=rel.replace(os.sep, "/")))
-                by_node = {}
-                for sc in scenarios:
-                    for n in sc.get("nodes") or []:
-                        e = by_node.setdefault(n.get("node"),
-                                               {"node": n.get("node"),
-                                                "pods": 0, "bytes": 0})
-                        e["pods"] += n.get("pods") or 0
-                        e["bytes"] += n.get("bytes") or 0
-                run_meta = {
-                    "run": os.path.basename(ts_dir),
-                    "mode": args.mode,
-                    "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "nodes": sorted(by_node.values(),
-                                    key=lambda x: -(x.get("bytes") or 0)),
-                }
-                ov = rp.render_overview(run_meta, scenarios, ov_dir)
+                ov = _render_run_overview(ts_dir, args.mode)
                 log("[report] overview -> {}".format(
                     os.path.relpath(ov, ROOT)))
             except Exception as exc:
@@ -5883,8 +5954,15 @@ if __name__ == "__main__":
     try:
         main(args, cfg_paths)
     except (StopRequested, KeyboardInterrupt) as exc:
-        log("[STOP] requested ({}); cleaning up ...".format(
+        log("[STOP] requested ({}); collecting a partial report ...".format(
             exc.__class__.__name__))
+        try:
+            _stop_reports()
+        except KeyboardInterrupt:
+            raise
+        except Exception as ce:
+            log("[WARN] [STOP] partial report failed: {}".format(ce))
+        log("[STOP] cleaning up ...")
         try:
             cleanup_on_stop()
         except Exception as ce:
