@@ -6578,10 +6578,13 @@ def main(args, cfg_paths):
     # it must never run on remote nodes. Skip when a failed run produced no logs.
     if not args.no_plot:
         log_dir = os.path.join(ts_dir, "logs")
-        has_logs = bool(glob.glob(os.path.join(log_dir, "**", "*.log"),
-                                  recursive=True))
-        if not has_logs:
-            log("[WARN] auto-plot skipped (no *.log under {})".format(log_dir))
+        has_plot_inputs = bool(
+            glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True)
+            or glob.glob(os.path.join(log_dir, "**", "*.timeseries.csv"),
+                         recursive=True))
+        if not has_plot_inputs:
+            log("[WARN] auto-plot skipped (no *.log or *.timeseries.csv "
+                "under {})".format(log_dir))
         else:
             plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
             # Plotting is 100% local (on this orchestrator machine). Cap the

@@ -6,6 +6,7 @@
 因此绘图进程必须限制 BLAS/OpenMP 线程数。
 """
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -93,3 +94,53 @@ def test_plot_file_stem_avoids_regression_windows_max_path():
     assert len(old_path) >= 260
     assert len(new_path) < 260
     assert "client-c52d4w2" not in new_path
+
+
+def test_kvtest_timeseries_generates_operation_pngs(tmp_path):
+    pl = _load_plot_module()
+    path = tmp_path / "kvtest_smoke.node_i0_p9101.kvtest_8MB.timeseries.csv"
+    path.write_text(
+        "elapsed_ms,instance_id,operation,count,success,failure,bytes,"
+        "avg_ms,p50_ms,p90_ms,p99_ms,p999_ms,p9999_ms,max_ms\n"
+        "3000,0,upsert_from,300,299,1,2508193792,"
+        "0.36,0.35,0.39,0.42,0.52,0.67,0.71\n"
+        "3000,0,notify_queue_wait,299,299,0,0,"
+        "0.007,0.007,0.009,0.010,0.020,0.030,0.031\n"
+        "6000,0,upsert_from,280,280,0,2348810240,"
+        "0.37,0.36,0.40,0.43,0.54,0.68,0.72\n"
+        "6000,0,notify_queue_wait,280,280,0,0,"
+        "0.008,0.008,0.010,0.012,0.022,0.032,0.034\n",
+        encoding="utf-8")
+
+    groups = pl.parse_kvtest_timeseries(str(path))
+    assert sorted(groups) == ["notify_queue_wait", "upsert_from"]
+    assert [p["elapsed_ms"] for p in groups["upsert_from"]] == [3000, 6000]
+    assert groups["upsert_from"][0]["failure"] == 1
+
+    args = SimpleNamespace(out=None, type="both", outlier=None)
+    outputs = pl.process_kvtest_timeseries(str(path), args)
+    assert sorted(os.path.basename(p) for p in outputs) == [
+        "kvtest_smoke.node_i0_p9101.kvtest_8MB."
+        "notify_queue_wait.queuewait.png",
+        "kvtest_smoke.node_i0_p9101.kvtest_8MB.upsert_from.latency.png",
+    ]
+    assert all(os.path.getsize(p) > 0 for p in outputs)
+    assert str(path) in pl.collect_inputs(str(tmp_path))
+
+
+def test_kvtest_timeseries_type_filter(tmp_path):
+    pl = _load_plot_module()
+    path = tmp_path / "one.timeseries.csv"
+    path.write_text(
+        "elapsed_ms,instance_id,operation,count,success,failure,bytes,"
+        "avg_ms,p50_ms,p90_ms,p99_ms,p999_ms,p9999_ms,max_ms\n"
+        "3000,1,get_buffer,100,100,0,104857600,"
+        "0.2,0.2,0.3,0.4,0.5,0.6,0.7\n"
+        "3000,1,notify_queue_wait,100,100,0,0,"
+        "0.01,0.01,0.02,0.03,0.04,0.05,0.06\n",
+        encoding="utf-8")
+
+    outputs = pl.process_kvtest_timeseries(
+        str(path), SimpleNamespace(out=None, type="queue-wait", outlier=None))
+    assert len(outputs) == 1
+    assert outputs[0].endswith("notify_queue_wait.queuewait.png")

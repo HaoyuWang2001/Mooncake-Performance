@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plot_latency.py — 从 benchmark 客户端日志绘制时延统计图。
+"""plot_latency.py — 从 benchmark 日志/kvtest 时序 CSV 绘制时延统计图。
 
 RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟时间戳）：
   basic/mixed : RESULT  <ts>  <op>  <key>  <lat_ms>  <status>                       (6 字段)
@@ -11,9 +11,15 @@ RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟�
 存在离群值时每个统计量出两幅图：原名图（包含离群值，红 x 标注）+ .trimmed.png
 （剔除离群值，分位线按剔除后数据重算）。
 
+kvtest C++ 客户端没有逐请求 RESULT 行，而是输出
+``*.kvtest_*.timeseries.csv``。脚本会按 operation 分组，绘制窗口级
+avg/p50/p90/p99/max 时延和 success/failure ops/s；notify_queue_wait 使用
+``.queuewait.png`` 后缀，其余操作使用 ``.latency.png``。
+
 用法：
   python plot_latency.py --log <日志文件|目录> [--out DIR] [--outlier MS] [--type both]
-    --log      单个日志文件，或目录（递归扫描其中含 RESULT 行的 *.log，逐文件出图）
+    --log      单个日志/kvtest timeseries 文件，或目录（递归扫描 *.log 与
+               *.timeseries.csv，逐文件出图）
     --out      输出目录，缺省 = 日志所在目录（即 outputs/<ts>/logs/<配置名>/）
     --outlier  离群阈值 ms；缺省自动 = p99 × 10 取整（p99 不会被尾部离群值自身抬高）
     --type     both（缺省）| latency | queue-wait
@@ -26,6 +32,7 @@ benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用�
 （--no-plot 关闭）。依赖：matplotlib（pip install matplotlib）。
 """
 import argparse
+import csv
 import os
 import re
 import sys
@@ -63,6 +70,16 @@ _PIPELINE_POD_STEM_PATTERNS = (
     re.compile(r"^(?P<prefix>.*\.reader)_.+(?P<suffix>_r\d+_p\d+)$"),
     # split writer: ...writer_<pod>_w0
     re.compile(r"^(?P<prefix>.*\.writer)_.+(?P<suffix>_w\d+)$"),
+)
+KVTEST_TIMESERIES_SUFFIX = ".timeseries.csv"
+KVTEST_PERCENTILES = (
+    ("avg_ms", "avg", 1, "tab:blue", "-"),
+    ("p50_ms", "p50", 1, "tab:cyan", "-"),
+    ("p90_ms", "p90", 10, "tab:orange", "-"),
+    ("p99_ms", "p99", 100, "tab:red", "-"),
+    ("p999_ms", "p999", 1000, "tab:green", "--"),
+    ("p9999_ms", "p9999", 10000, "tab:purple", "--"),
+    ("max_ms", "max", 1, "black", ":"),
 )
 
 
@@ -311,21 +328,155 @@ def process_file(path, args):
                     f"{len(qws)} samples")
 
 
-def collect_logs(path):
+def parse_kvtest_timeseries(path):
+    """Return ``{operation: [window, ...]}`` from a kvtest timeseries CSV.
+
+    Corrupt/incomplete rows are skipped so a partially copied tail cannot
+    prevent plots for earlier complete windows.
+    """
+    groups = {}
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"elapsed_ms", "operation", "count", "success", "failure",
+                    "bytes", "avg_ms", "p50_ms", "p90_ms", "p99_ms",
+                    "p999_ms", "p9999_ms", "max_ms"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            return groups
+        for row in reader:
+            operation = (row.get("operation") or "").strip()
+            if not operation:
+                continue
+            try:
+                point = {
+                    "elapsed_ms": float(row["elapsed_ms"]),
+                    "count": int(row["count"]),
+                    "success": int(row["success"]),
+                    "failure": int(row["failure"]),
+                    "bytes": int(row["bytes"]),
+                }
+                for field, _label, _minimum, _color, _style in KVTEST_PERCENTILES:
+                    point[field] = float(row[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            groups.setdefault(operation, []).append(point)
+    for points in groups.values():
+        points.sort(key=lambda p: p["elapsed_ms"])
+    return groups
+
+
+def _safe_plot_component(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "operation"
+
+
+def _kvtest_is_queue_wait(operation):
+    return operation == "notify_queue_wait" or operation.endswith("queue_wait")
+
+
+def plot_kvtest_operation(path, operation, points, args):
+    """Plot one kvtest operation's window percentiles and operation rate."""
+    is_queue_wait = _kvtest_is_queue_wait(operation)
+    if args.type == "latency" and is_queue_wait:
+        return None
+    if args.type == "queue-wait" and not is_queue_wait:
+        return None
+
+    out_dir = args.out or os.path.dirname(os.path.abspath(path))
+    os.makedirs(out_dir, exist_ok=True)
+    name = os.path.basename(path)
+    stem = name[:-len(KVTEST_TIMESERIES_SUFFIX)] \
+        if name.endswith(KVTEST_TIMESERIES_SUFFIX) else os.path.splitext(name)[0]
+    suffix = "queuewait" if is_queue_wait else "latency"
+    out_png = os.path.join(
+        out_dir, "{}.{}.{}.png".format(
+            stem, _safe_plot_component(operation), suffix))
+
+    xs = [p["elapsed_ms"] / 1000.0 for p in points]
+    fig, (lat_ax, rate_ax) = plt.subplots(
+        2, 1, figsize=(12, 8), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]})
+    plotted = []
+    for field, label, minimum, color, style in KVTEST_PERCENTILES:
+        values = [p[field] if p["count"] >= minimum else None for p in points]
+        if not any(v is not None for v in values):
+            continue
+        lat_ax.plot(xs, values, label=label, color=color, linestyle=style,
+                    linewidth=1.3, marker="." if label in ("avg", "p99") else None,
+                    markersize=3)
+        plotted.extend(v for v in values if v is not None)
+    ylabel = "Queue wait (ms)" if is_queue_wait else "Latency (ms)"
+    lat_ax.set_ylabel(ylabel)
+    lat_ax.grid(True, alpha=0.25)
+    lat_ax.legend(loc="upper left", ncol=4, fontsize=8)
+    if plotted:
+        for value, label in REF_LINES:
+            if max(plotted) >= value:
+                lat_ax.axhline(value, linestyle="-.", linewidth=0.8,
+                               color="gray", alpha=0.65)
+                lat_ax.annotate(label, xy=(0.003, value),
+                                xycoords=("axes fraction", "data"),
+                                ha="left", va="bottom", fontsize=8,
+                                color="gray")
+
+    success_rates, failure_rates = [], []
+    previous_ms = 0.0
+    for point in points:
+        interval_s = max((point["elapsed_ms"] - previous_ms) / 1000.0, 1e-9)
+        success_rates.append(point["success"] / interval_s)
+        failure_rates.append(point["failure"] / interval_s)
+        previous_ms = point["elapsed_ms"]
+    rate_ax.plot(xs, success_rates, label="success ops/s", color="tab:green",
+                 linewidth=1.2, marker=".", markersize=3)
+    if any(failure_rates):
+        rate_ax.plot(xs, failure_rates, label="failure ops/s", color="tab:red",
+                     linewidth=1.2, marker="x", markersize=4)
+    rate_ax.set_xlabel("elapsed time (s)")
+    rate_ax.set_ylabel("ops/s")
+    rate_ax.grid(True, alpha=0.25)
+    rate_ax.legend(loc="upper left", fontsize=8)
+
+    total_success = sum(p["success"] for p in points)
+    total_failure = sum(p["failure"] for p in points)
+    fig.suptitle("{} — {}  (success={}, failure={})".format(
+        stem, operation, total_success, total_failure))
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print("[{}] {} windows: {} -> {}".format(
+        name, operation, len(points), out_png))
+    return out_png
+
+
+def process_kvtest_timeseries(path, args):
+    groups = parse_kvtest_timeseries(path)
+    if not groups:
+        print("[{}] skip (no valid kvtest timeseries rows)".format(
+            os.path.basename(path)))
+        return []
+    outputs = []
+    for operation in sorted(groups):
+        output = plot_kvtest_operation(path, operation, groups[operation], args)
+        if output:
+            outputs.append(output)
+    return outputs
+
+
+def collect_inputs(path):
     if os.path.isfile(path):
         return [path]
     found = []
     for root, _dirs, files in os.walk(path):
         for f in sorted(files):
-            if f.endswith(".log"):
+            if f.endswith(".log") or f.endswith(KVTEST_TIMESERIES_SUFFIX):
                 found.append(os.path.join(root, f))
     return found
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Plot latency stats from RESULT log lines")
+    parser = argparse.ArgumentParser(
+        description="Plot latency stats from RESULT logs or kvtest timeseries CSV")
     parser.add_argument("--log", required=True,
-                        help="log file or directory (recursive *.log scan)")
+                        help="file or directory (recursive *.log and "
+                             "*.timeseries.csv scan)")
     parser.add_argument("--out", default=None,
                         help="output dir; default = each log's own directory")
     parser.add_argument("--outlier", type=float, default=None,
@@ -335,11 +486,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not os.path.exists(args.log):
         sys.exit(f"[ERROR] log path not found: {args.log}")
-    logs = collect_logs(args.log)
-    if not logs:
-        sys.exit(f"[ERROR] no *.log under {args.log}")
-    for path in logs:
-        process_file(path, args)
+    inputs = collect_inputs(args.log)
+    if not inputs:
+        sys.exit(f"[ERROR] no *.log or *.timeseries.csv under {args.log}")
+    for path in inputs:
+        if path.endswith(KVTEST_TIMESERIES_SUFFIX):
+            process_kvtest_timeseries(path, args)
+        else:
+            process_file(path, args)
     print("done")
 
 
