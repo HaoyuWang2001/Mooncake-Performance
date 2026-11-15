@@ -365,3 +365,21 @@ def test_html_meta_is_escaped(tmp_path):
     ohead = osrc[:osrc.index("window.__MC_REPORT__")]
     assert "<img src=x" not in ohead
     assert "&lt;img src=x" in ohead
+
+
+def test_zero_wall_has_no_infinity(tmp_path):
+    """旧日志无日期（wall=0）时卡片不能出现 Infinity/NaN。"""
+    st = _minimal_stats([], [], bucket_unit="s")
+    st["meta"].update({"ts_from": None, "ts_to": None, "wall_s": 0,
+                       "dated": False})
+    data = rp.reduce_scenario([st], {"config": "c"})
+    s = data["sizes"]["8MB"]["summary"]
+    assert s["throughput_mb_s"] is None
+    assert s["qps"] == 0.0
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert "Infinity" not in res["cards_text"]
+    assert "NaN" not in res["cards_text"]
+    assert "吞吐" in res["cards_text"]

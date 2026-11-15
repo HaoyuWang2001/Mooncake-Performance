@@ -169,6 +169,10 @@ def _summary_of(stats):
         "max_depth": max_depth,
         "wall_s": round(wall, 3),
         "qps": round(total / wall, 2) if wall > 0 else 0.0,
+        # None when the logs carry no timestamps (legacy) -> the card shows
+        # "-" instead of Infinity (JS must not divide by a zero wall)
+        "throughput_mb_s": (round(total / wall / 1048576.0, 2)
+                            if wall > 0 else None),
         "clients": len(stats),
         "ts_from": ts_from, "ts_to": ts_to,
     }
@@ -897,8 +901,9 @@ function renderSummary(){
   if(s.qw_avg_ms!=null)g.appendChild(kv('队列等待均', s.qw_avg_ms, 'ms'));
   if(s.qw_max_ms!=null)g.appendChild(kv('队列等待峰', s.qw_max_ms, 'ms'));
   if(s.max_depth)g.appendChild(kv('最大队列深度', s.max_depth));
-  g.appendChild(kv('吞吐', (s.total/s.wall_s/1048576).toFixed(1), 'MB/s'));
-  g.appendChild(kv('时长', fmtDur(s.wall_s)));
+  g.appendChild(kv('吞吐', s.throughput_mb_s==null?'-':
+    Number(s.throughput_mb_s).toFixed(1), 'MB/s'));
+  g.appendChild(kv('时长', s.wall_s>0?fmtDur(s.wall_s):'-'));
   g.appendChild(kv('客户端', s.clients));
 }
 function renderTable(){

@@ -115,7 +115,13 @@ try {
 }
 
 const out = { errors: errs, init_len: null, min_len: null, init_x0: null,
-              switched_error: false, trace_visible: null };
+              switched_error: false, trace_visible: null, cards_text: "" };
+
+function textOf(el) {
+  if (!el) return "";
+  if (el._text) return String(el._text);
+  return (el.children || []).map(textOf).join(" ");
+}
 
 function mainOpt() {
   const seq = charts.mainchart || [];
@@ -132,6 +138,7 @@ function seriesX0(opt, name) {
   return s && s.data.length ? s.data[0][0] : null;
 }
 if (!errs.length) {
+  out.cards_text = textOf(getEl("cards"));
   out.init_len = seriesLen(mainOpt(), "p50");
   out.init_x0 = seriesX0(mainOpt(), "p50");
 
