@@ -341,3 +341,27 @@ def test_trace_only_size_does_not_break_page(tmp_path):
     assert res["errors"] == []
     assert res["switched_error"] is False
     assert res["trace_visible"] is True
+
+
+def test_html_meta_is_escaped(tmp_path):
+    """配置名/run 名/节点名进入 HTML 前必须转义（防注入 & 防破版）。"""
+    bad = '<img src=x onerror=alert(1)>'
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": bad, "mode": bad,
+                                             "launch_mode": bad})
+    out = str(tmp_path / "report")
+    html, _dj = rp.render_scenario(data, out, ECHARTS, topk=5)
+    src = open(html, encoding="utf-8").read()
+    # 展示区（数据 JSON 之前）必须转义；JSON 里的原值在 <script> 内无害
+    head = src[:src.index("window.__MC_REPORT__")]
+    assert "<img src=x" not in head
+    assert "&lt;img src=x" in head
+    ov = rp.render_overview(
+        {"run": bad, "mode": bad,
+         "nodes": [{"node": bad, "pods": 1, "bytes": 10}]},
+        [dict(data, report_rel="logs/x/report/report.html")],
+        str(tmp_path / "ov"))
+    osrc = open(ov, encoding="utf-8").read()
+    ohead = osrc[:osrc.index("window.__MC_REPORT__")]
+    assert "<img src=x" not in ohead
+    assert "&lt;img src=x" in ohead

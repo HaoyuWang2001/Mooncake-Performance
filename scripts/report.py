@@ -1330,7 +1330,8 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
 {loader}
 <script>{app}</script>
 </body></html>
-""".format(title=title, subtitle=subtitle, body=body_html,
+""".format(title=html.escape(str(title), quote=True),
+           subtitle=html.escape(str(subtitle), quote=True), body=body_html,
            css=_PAGE_CSS, echarts=echarts_js, data=data_literal,
            loader=loader, app=_APP_JS)
 
@@ -1479,6 +1480,8 @@ def render_overview(run_meta, scenarios, out_dir):
             bits.append("端口峰值 {} GiB/s".format(pu["value"]))
         monline = ('<div class="note">监控：' + " · ".join(bits) +
                    "</div>") if bits else ""
+        name = html.escape(str(m.get("config") or "scenario"))
+        mode = html.escape(str(m.get("mode") or ""))
         cards.append("""
 <div class="card"><h2>{name}</h2>
 <div class="sub">{mode} · {clients} 客户端 · 时长 {dur} {early}</div>
@@ -1494,7 +1497,7 @@ def render_overview(run_meta, scenarios, out_dir):
 {monline}
 <div style="margin-top:10px"><a href="{link}">打开场景完整报表 →</a></div>
 </div>""".format(
-            name=m.get("config") or "scenario", mode=m.get("mode") or "",
+            name=name, mode=mode,
             clients=m.get("clients") or "-",
             dur=_fmt_dur(s.get("wall_s") or 0),
             early='<span class="tag warn">提前停止/异常</span>'
@@ -1502,13 +1505,15 @@ def render_overview(run_meta, scenarios, out_dir):
             ok=s.get("ok", "-"), fail=s.get("fail", "-"),
             qps=s.get("qps", "-"), p50=s.get("p50_ms", "-"),
             p99=s.get("p99_ms", "-"), p999=s.get("p999_ms", "-"),
-            fr=round((s.get("fail_rate") or 0) * 100, 2), link=link,
+            fr=round((s.get("fail_rate") or 0) * 100, 2),
+            link=html.escape(str(link), quote=True),
             monline=monline))
     nodes = run_meta.get("nodes") or []
     node_rows = "".join(
         "<tr><td class='mono'>{n}</td><td class='n'>{p}</td>"
         "<td class='n'>{b}</td></tr>".format(
-            n=n.get("node"), p=n.get("pods", ""), b=_fmt_bytes(n.get("bytes")))
+            n=html.escape(str(n.get("node")), quote=True), p=n.get("pods", ""),
+            b=_fmt_bytes(n.get("bytes")))
         for n in nodes)
     body = "".join(cards)
     if node_rows:
@@ -1522,11 +1527,11 @@ def render_overview(run_meta, scenarios, out_dir):
         run_meta.get("run"), run_meta.get("mode"),
         ("开始 " + run_meta["started"]) if run_meta.get("started") else "",
         "生成于 " + time.strftime("%Y-%m-%d %H:%M:%S")]))
-    html = _page_html("运行总览", subtitle, body, {"meta": run_meta},
+    page = _page_html("运行总览", subtitle, body, {"meta": run_meta},
                       "", None, False)
     path = os.path.join(out_dir, "overview.html")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(page)
     return path
 
 
