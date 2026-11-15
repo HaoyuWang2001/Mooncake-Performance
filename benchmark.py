@@ -2095,8 +2095,11 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
                 if os.path.isfile(os.path.join(local_log_dir,
                                                os.path.basename(f))))
         elif not dry:
+            # raw-log volume = python logs (stats.meta.bytes) + SDK glog
+            # (trace.meta.bytes): deciding on the .log alone pulled GB-sized
+            # glogs back on "small" runs
             total = 0
-            for sf in stats:
+            for sf in list(stats) + list(traces):
                 lp = os.path.join(local_log_dir, os.path.basename(sf))
                 if os.path.isfile(lp):
                     try:
@@ -3373,14 +3376,16 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             # inspection + local stats recompute); large runs stay stats-only
             if not dry and not (getattr(args, "pull_raw_logs", False)
                                 or getattr(args, "png", False)):
-                _sp = os.path.join(local_log_dir,
-                                   os.path.basename(remote_log) + ".stats.json")
                 _b = 0
-                try:
-                    with open(_sp, "r", encoding="utf-8") as _f:
-                        _b = json.load(_f).get("meta", {}).get("bytes", 0)
-                except (OSError, ValueError):
-                    _b = 0
+                for _base in (remote_log + ".stats.json",
+                              remote_log + ".glog.trace.json"):
+                    _lp = os.path.join(local_log_dir,
+                                       os.path.basename(_base))
+                    try:
+                        with open(_lp, "r", encoding="utf-8") as _f:
+                            _b += json.load(_f).get("meta", {}).get("bytes", 0)
+                    except (OSError, ValueError):
+                        continue
                 if 0 < _b <= RAW_AUTO_PULL_MAX:
                     pull_stage_logs(host, node,
                                     [remote_log, remote_log + ".glog"],

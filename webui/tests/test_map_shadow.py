@@ -96,3 +96,39 @@ def test_empty_venv_falls_back_to_python3(monkeypatch):
                                  ["/r/a.glog"], "/s", {}, dry=True)
     assert out2 == ["/r/a.glog.trace.json"]
     assert any("python3 /s/tracestats.py" in m for m in msgs), msgs
+
+
+def _meta_file(path, **meta):
+    path.write_text(__import__("json").dumps({"meta": meta,
+                                              "global": {}, "ops": {},
+                                              "summaries": []}),
+                    encoding="utf-8")
+    return path
+
+
+def test_small_run_threshold_counts_glog(monkeypatch, tmp_path):
+    """自动回拉阈值必须把 .glog 体积算进去（原只算 .log，会把 GB glog 一起拉回）。"""
+    local = tmp_path
+    stats_p = _meta_file(local / "a.log.stats.json", bytes=80 * 1024 ** 2)
+    trace_p = _meta_file(local / "a.log.glog.trace.json",
+                         bytes=40 * 1024 ** 2)
+    calls = []
+    monkeypatch.setattr(bm, "run_logstats_map", lambda *a, **k: [str(stats_p)])
+    monkeypatch.setattr(bm, "run_tracestats_map",
+                        lambda *a, **k: [str(trace_p)])
+    monkeypatch.setattr(bm, "_pipeline_pull_parallel",
+                        lambda cluster, groups, d, dry, workers=None:
+                        calls.append(list(groups[0][1])) or 0)
+    node = {"ip": "10.0.0.1"}
+    groups = [(node, [("/r/a.log", "writer"), ("/r/a.log.glog", "writer")],
+               "w", "n1")]
+    bm._map_and_pull_logs({}, groups, str(local), False, {}, "/s", size="8MB")
+    assert len(calls) == 1          # 120MB > 100MB：只拉统计，不拉 raw/glog
+
+    trace_p = _meta_file(local / "b.log.glog.trace.json", bytes=1 * 1024 ** 2)
+    stats_p = _meta_file(local / "b.log.stats.json", bytes=2 * 1024 ** 2)
+    calls.clear()
+    groups = [(node, [("/r/b.log", "writer"), ("/r/b.log.glog", "writer")],
+               "w", "n1")]
+    bm._map_and_pull_logs({}, groups, str(local), False, {}, "/s", size="8MB")
+    assert len(calls) == 2 and "/r/b.log" in calls[1]   # 3MB -> 连 raw 一起拉
