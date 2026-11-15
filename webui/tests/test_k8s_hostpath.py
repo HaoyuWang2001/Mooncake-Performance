@@ -116,3 +116,32 @@ def test_cleanup_mentions_host_log_root():
     src = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
     assert "宿主机日志留存于各节点" in src
     assert "CLEAN-UP 不删除" in src
+
+
+def test_basic_log_paths_include_pod_subdir():
+    """basic 的 benchmark/remove-keys 日志也必须落在 <pod>/ 下（与回拉 glob 一致）。"""
+    pod = {"ip": "1.2.3.4", "_pod": "mc-x-client-abc"}
+    assert bm.remote_log_path_pod("/r/logs/ts", "cfg", "benchmark_c1_t1_8MB",
+                                  pod) == \
+        "/r/logs/ts/mc-x-client-abc/cfg.benchmark_c1_t1_8MB.log"
+    assert bm.remote_log_path_pod("/r/logs/ts", "cfg", "remove-keys-end",
+                                  pod) == \
+        "/r/logs/ts/mc-x-client-abc/cfg.remove-keys-end.log"
+    # ssh 节点保持平铺
+    assert bm.remote_log_path_pod("/r/logs/ts", "cfg", "benchmark_c1_t1_8MB",
+                                  {"ip": "1.2.3.4"}) == \
+        "/r/logs/ts/cfg.benchmark_c1_t1_8MB.log"
+
+
+def test_pull_logs_glob_matches_pod_paths(monkeypatch):
+    seen = []
+    monkeypatch.setattr(bm, "scp_pull",
+                        lambda ip, node, g, local, dry_run=False:
+                        seen.append(g))
+    cluster = {"nodes": {"pod1": {"ip": "1.2.3.4", "_pod": "mc-pod-1"}}}
+    bm.pull_logs(cluster, ["pod1"], "/r/logs/ts", "cfg", "/tmp/x", False)
+    assert seen == ["/r/logs/ts/mc-pod-1/cfg.*"]
+    path = bm.remote_log_path_pod("/r/logs/ts", "cfg",
+                                  "benchmark_c1_t1_8MB",
+                                  {"ip": "1.2.3.4", "_pod": "mc-pod-1"})
+    assert path.startswith("/r/logs/ts/mc-pod-1/")

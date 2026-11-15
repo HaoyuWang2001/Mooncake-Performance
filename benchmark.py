@@ -162,6 +162,16 @@ def _pod_base(base_noext, node):
     return "{}/{}/{}".format(head, node["_pod"], tail)
 
 
+def remote_log_path_pod(remote_log_dir, scenario, name, node):
+    """<dir>/<scenario>.<name>.log with the k8s pod subdirectory inserted.
+
+    k8s stages/pods write into <log_dir>/<pod>/...; using the flat form for
+    the basic benchmark / remove-keys logs made pull_logs' per-pod glob miss
+    them (and split the on-node layout)."""
+    base = remote_log_path(remote_log_dir, scenario, name)[:-len(".log")]
+    return _pod_base(base, node) + ".log"
+
+
 def data_size_list(cfg):
     """Validate and return the scenario's data_size entries.
 
@@ -3308,7 +3318,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             # data_size is always part of the run file name, so different
             # sizes under the same (c, t) never collide
             name = "benchmark_c{}_t{}_{}".format(c, t, ds)
-            remote_log = remote_log_path(remote_log_dir, cfg_name, name)
+            remote_log = remote_log_path_pod(remote_log_dir, cfg_name, name,
+                                             node)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
             if numa_bind:
@@ -3383,7 +3394,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # sweep is deferred to the sweep-end remove-all in main(). The log
         # name is distinct (<cfg>.remove-keys-end.log) so it sits next to the
         # config-start remove-keys log instead of overwriting it.
-        remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
+        remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
+                                         "remove-keys-end", node)
         command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
         # raw-log full pull only on explicit request (stats already pulled
@@ -4432,7 +4444,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # no key count to work with; a full sweep here is short and precise
         # enough. The log name is distinct (<cfg>.remove-keys-end.log) so it
         # sits next to the config-start remove-keys log.
-        remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
+        remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
+                                         "remove-keys-end", node)
         command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
         run_ssh(host, node, command, dry_run=dry)
         if not dry:
@@ -5879,8 +5892,9 @@ def main(args, cfg_paths):
                       extra="--scope full", dry_run=False,
                       cfg_name="final", node_name=sweep_remove["node"])
             scp_pull(sweep_remove["host"], nd,
-                     "{}/final.remove-keys.log*".format(
-                         sweep_remove["remote_log_dir"]),
+                     "{}*".format(_pod_base("{}/final".format(
+                         sweep_remove["remote_log_dir"]), nd)
+                         + ".remove-keys.log"),
                      os.path.join(ts_dir, "logs"), dry_run=False)
             _verify_store_clean(cluster, globals_cfg, "final", "sweep end")
             log("sweep-end remove-keys -> {}".format(
