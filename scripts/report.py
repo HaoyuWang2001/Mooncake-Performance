@@ -359,7 +359,13 @@ TRACE_META_KEYS = ("lines", "trace_lines", "slice_lines", "parse_errors")
 
 def _merge_field(a, b):
     if a is None:
-        return dict(b) if b else None
+        if not b:
+            return None
+        # deep-copy hist: the returned dict is merged into by the NEXT file,
+        # and a shallow copy would write straight back into the loaded stats
+        out = dict(b)
+        out["hist"] = dict(b.get("hist") or {})
+        return out
     out = a
     out["n"] = (out.get("n") or 0) + (b.get("n") or 0)
     out["neg"] = (out.get("neg") or 0) + (b.get("neg") or 0)

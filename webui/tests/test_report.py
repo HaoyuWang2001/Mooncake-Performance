@@ -501,3 +501,17 @@ def test_qw_average_divides_by_ok_rows(tmp_path):
     col = z["series"]["reader"]["step1"]
     assert col["c"][0] == 2 and col["ok"][0] == 1
     assert col["qw"][0] == 0.5          # 不是 0.25
+
+
+def test_merge_field_does_not_mutate_source(tmp_path):
+    """_merge_field 首次合并必须深拷贝 hist：两个 trace 文件 reduce 两次会
+    把第一个文件的源直方图累加进去，污染后续 reduce/重建。"""
+    tr1 = _trace_stats(tmp_path, "a.glog")
+    tr2 = _trace_stats(tmp_path, "b.glog")
+    before1 = json.loads(json.dumps(tr1))["groups"]["read"]["ops"][
+        "get_buffer"]["fields"]["total_us"]["hist"]
+    rp.reduce_trace_size([tr1, tr2])
+    rp.reduce_trace_size([tr1, tr2])
+    after1 = tr1["groups"]["read"]["ops"]["get_buffer"]["fields"][
+        "total_us"]["hist"]
+    assert after1 == before1
