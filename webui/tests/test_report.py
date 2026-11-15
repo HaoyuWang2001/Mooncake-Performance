@@ -442,3 +442,23 @@ def test_trace_avg_excludes_neg_sentinel(tmp_path):
     assert fd["n"] == 2 and fd["neg"] == 1
     assert fd["avg"] == 148.0       # 只有 148 一个有效样本（不是 74）
     assert fd["avg_n"] == 1
+
+
+def test_summary_percentiles_consistent_with_csv(tmp_path):
+    """报表 summary 的 max 取精确值、分位不超过 max；单实例与 CSV 同口径。"""
+    p = tmp_path / "u.log"
+    p.write_text("".join(
+        "RESULT\t2026-11-15 10:00:{:02d}.{:06d}\tput\tk{}\t{:.6f}\tOK\n".format(
+            i % 60, i, i, 1.0 + i) for i in range(100)), encoding="utf-8")
+    st = ls.compute_stats(str(p), size="8MB", role="writer")
+    s = rp.reduce_size([st], {"config": "c"})["summary"]
+    agg = bm._merge_stats_aggs([st])
+    assert s["max_ms"] == 100.0 and s["min_ms"] == 1.0
+    assert s["p50_ms"] == agg["p50_ms"] == 51.0
+    assert s["p99_ms"] == agg["p99_ms"] == 99.0
+    assert s["p999_ms"] <= s["max_ms"]
+    # 多客户端：max 仍取精确最大，分位按合并直方图且不超过 max
+    st2 = json.loads(json.dumps(st))
+    st2["meta"]["source"] = "b.writer.log"
+    s2 = rp.reduce_size([st, st2], {"config": "c"})["summary"]
+    assert s2["max_ms"] == 100.0 and s2["p999_ms"] <= s2["max_ms"]

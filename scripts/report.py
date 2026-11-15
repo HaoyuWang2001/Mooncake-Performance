@@ -124,9 +124,19 @@ def _summary_of(stats):
     ts_from = ts_to = None
     hist = {}
     wall = 0.0
+    gmax = gmin = None
+    single = None
     for st in stats:
         g = st.get("global") or {}
         meta = st.get("meta") or {}
+        if g.get("max_ms") is not None:
+            gmax = float(g["max_ms"]) if gmax is None else max(gmax,
+                                                               float(g["max_ms"]))
+        if g.get("min_ms") is not None:
+            gmin = float(g["min_ms"]) if gmin is None else min(gmin,
+                                                               float(g["min_ms"]))
+        if len(stats) == 1:
+            single = g
         total += g.get("key_total") or 0
         ok += g.get("key_ok") or 0
         fail += g.get("key_fail") or 0
@@ -154,16 +164,29 @@ def _summary_of(stats):
             wall = max(wall, float(payload.get("wall_s", 0) or 0))
     span = (ts_to - ts_from) if (ts_from is not None and ts_to is not None) else 0.0
     wall = wall or span
+
+    def pct(q, key):
+        # single client: the map product already holds EXACT percentiles (the
+        # CSV uses the same values); otherwise reconstruct from the merged
+        # histogram and never report more than the true maximum.
+        if single is not None and single.get("exact") and single.get(key) is not None:
+            return round(float(single[key]), 4)
+        if not hist:
+            return 0.0
+        v = ls.hist_percentile(hist, q)
+        return round(min(v, gmax) if gmax is not None else v, 4)
+
     return {
         "total": total, "ok": ok, "fail": fail,
         "fail_rate": (fail / total) if total else 0.0,
         "avg_ms": round(lat_sum / ok_rows, 4) if ok_rows else 0.0,
-        "p50_ms": round(ls.hist_percentile(hist, 0.50), 4) if hist else 0.0,
-        "p95_ms": round(ls.hist_percentile(hist, 0.95), 4) if hist else 0.0,
-        "p99_ms": round(ls.hist_percentile(hist, 0.99), 4) if hist else 0.0,
-        "p999_ms": round(ls.hist_percentile(hist, 0.999), 4) if hist else 0.0,
-        "p9999_ms": round(ls.hist_percentile(hist, 0.9999), 4) if hist else 0.0,
-        "max_ms": round(ls.hist_percentile(hist, 1.0), 4) if hist else 0.0,
+        "min_ms": round(gmin, 4) if gmin is not None else 0.0,
+        "p50_ms": pct(0.50, "p50_ms"),
+        "p95_ms": pct(0.95, "p95_ms"),
+        "p99_ms": pct(0.99, "p99_ms"),
+        "p999_ms": pct(0.999, "p999_ms"),
+        "p9999_ms": pct(0.9999, "p9999_ms"),
+        "max_ms": round(gmax, 4) if gmax is not None else 0.0,
         "qw_avg_ms": round(qw_sum / qw_n, 4) if qw_n else None,
         "qw_max_ms": round(qw_max, 4) if qw_n else None,
         "max_depth": max_depth,
