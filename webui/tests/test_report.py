@@ -163,6 +163,16 @@ def test_rebuild_reports_local(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 GLOG = "I20261112 10:23:41.000000 12345 te.cc:88] "
+WRITE_OK_TRACE = (GLOG + "trace_id[1] breakdown[put] key[bench/ok] status[ok] "
+                  "size[1048576] replicas[2] start_time[2026-11-12 10:23:43.110220] "
+                  "prep_total_us[54] checksum_us[31] prepare_us[4] query_us[0] "
+                  "put_start_us[58] memwrite_total_us[188] memwrite_urma_min_us[148] "
+                  "put_end_us[66] total_us[401]")
+WRITE_FAIL_TRACE = (GLOG + "trace_id[2] breakdown[put] key[bench/bad] status[TRANSFER_FAIL] "
+                    "size[1048576] replicas[2] start_time[2026-11-12 10:23:44.002981] "
+                    "prep_total_us[55] checksum_us[30] prepare_us[5] query_us[0] "
+                    "put_start_us[63] memwrite_total_us[40012] memwrite_urma_min_us[-1] "
+                    "put_end_us[0] total_us[40170]")
 TRACE_READ = (GLOG + "trace_id[18446744073] breakdown[get_buffer] key[bench/obj] "
               "status[ok] size[262144] type[memory_remote] replica_count[2] "
               "remote_endpoint[10.20.1.9:50051] local_endpoint[10.20.1.7:50051] "
@@ -418,3 +428,17 @@ def test_trace_percentiles_not_clamped_by_ms_ladder(tmp_path):
     ltot = rp.reduce_trace_size([legacy])["groups"]["write"]["ops"]["put"][
         "fields"]["total_us"]
     assert ltot["p50"] is None and ltot["max"] == 50000
+
+
+def test_trace_avg_excludes_neg_sentinel(tmp_path):
+    """-1 哨兵不参与时延统计：平均值的分母应为 n-neg（原为 n，被稀释）。"""
+    from tracestats import compute_trace_stats
+    p = tmp_path / "neg.glog"
+    p.write_text(WRITE_FAIL_TRACE + "\n" + WRITE_OK_TRACE + "\n",
+                 encoding="utf-8")
+    tr = compute_trace_stats(str(p))
+    blk = rp.reduce_trace_size([tr])
+    fd = blk["groups"]["write"]["ops"]["put"]["fields"]["memwrite_urma_min_us"]
+    assert fd["n"] == 2 and fd["neg"] == 1
+    assert fd["avg"] == 148.0       # 只有 148 一个有效样本（不是 74）
+    assert fd["avg_n"] == 1

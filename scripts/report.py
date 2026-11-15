@@ -360,9 +360,11 @@ def _field_pcts(fd, edges=None, hist_ok=True):
             return None
         return round(ls.hist_percentile(hist, q, edges), 4)
 
+    neg = fd.get("neg") or 0
+    avg_n = n - neg          # -1 sentinel samples carry no duration
     return {
-        "n": n, "neg": fd.get("neg") or 0,
-        "avg": round((fd.get("sum") or 0.0) / n, 4) if n else 0.0,
+        "n": n, "neg": neg, "avg_n": avg_n,
+        "avg": round((fd.get("sum") or 0.0) / avg_n, 4) if avg_n else 0.0,
         "min": fd.get("min"), "max": fd.get("max"),
         "p50": pct(0.50), "p95": pct(0.95),
         "p99": pct(0.99), "p999": pct(0.999),
