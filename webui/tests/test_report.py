@@ -306,3 +306,23 @@ def test_granularity_buttons_match_series(tmp_path):
     assert res["init_len"] == 60          # 默认 1 秒粒度
     assert res["init_x0"] == 3600 * 1000  # x 轴用 epoch 毫秒
     assert res["min_len"] == 1            # 切到 1 分钟粒度
+
+
+def test_long_run_embeds_minutes_only(tmp_path):
+    """>1 天的 run：HTML 内嵌只留 1min（1s 仍完整留在 data.js）。"""
+    st = _minimal_stats([3600, 3660, 3720], [3600], bucket_unit="s")
+    st["meta"]["ts_from"] = 0
+    st["meta"]["ts_to"] = 90000          # 25h 跨度，但只有 3 个桶
+    data = rp.reduce_scenario([st], {"config": "long"})
+    assert data["sizes"]["8MB"]["embed_step"] == 60
+    out = str(tmp_path / "report")
+    html, dj = rp.render_scenario(data, out, ECHARTS, topk=5)
+    import re as _re
+    emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
+                                open(html, encoding="utf-8").read(), _re.S).group(1))
+    series = emb["sizes"]["8MB"]["series"]["writer"]
+    assert series["step1"]["t"] == []            # 1s 不内嵌
+    assert len(series["step60"]["t"]) == 1
+    full = json.loads(open(dj, encoding="utf-8").read()[
+        len("window.__MC_FULL__ = "):].rstrip().rstrip(";"))
+    assert len(full["sizes"]["8MB"]["series"]["writer"]["step1"]["t"]) == 3

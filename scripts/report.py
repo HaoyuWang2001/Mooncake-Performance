@@ -255,13 +255,22 @@ def reduce_size(stats, meta):
             best = n
             excerpt = st["error_excerpt"]
             excerpt_status = st.get("error_excerpt_status")
+    summary = _summary_of(stats)
+    # granularity is judged by the run SPAN (>1 day -> embed minutes only);
+    # undated runs fall back to the bucket count.
+    span = 0.0
+    if summary.get("ts_from") is not None and summary.get("ts_to") is not None:
+        span = float(summary["ts_to"]) - float(summary["ts_from"])
     embed_step = 1
-    max_seconds = max((len((role_series[r]["step1"]["t"]))
-                       for r in role_series), default=0)
-    if max_seconds > EMBED_SECONDS_MAX:
+    if span > EMBED_SECONDS_MAX:
         embed_step = 60
+    elif span <= 0:
+        max_seconds = max((len((role_series[r]["step1"]["t"]))
+                           for r in role_series), default=0)
+        if max_seconds > EMBED_SECONDS_MAX:
+            embed_step = 60
     return {
-        "summary": _summary_of(stats),
+        "summary": summary,
         "embed_step": embed_step,
         "series": role_series,
         "clients": clients,
@@ -1338,6 +1347,14 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT):
         keep = [c for c in clients[:topk]]
         slim = dict(z)
         slim["clients"] = keep
+        if z.get("embed_step") == 60 and z.get("series"):
+            # >1 day: 1s series only lives in data.js (HTML stays small)
+            empty = {"t": [], "c": [], "ok": [], "fail": [], "avg": [],
+                     "p50": [], "p99": [], "p999": [], "max": [], "qw": [],
+                     "qwmax": []}
+            slim["series"] = {
+                role: {"step1": empty, "step60": v.get("step60") or empty}
+                for role, v in z["series"].items()}
         embedded["sizes"][size] = slim
     meta_bits = []
     if meta.get("config"):
