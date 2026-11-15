@@ -4658,7 +4658,7 @@ def parse_benchmark_log(paths, op_filter=None):
         if st is not None:
             stats.append(st)
     if stats and len(stats) == len(paths):
-        return _merge_stats_aggs(stats)
+        return _merge_stats_aggs(stats, op_filter=op_filter)
     latencies = []
     lat_sum_ms = 0.0
     ok = fail = 0
@@ -4776,12 +4776,108 @@ def _logstats_module():
     return _LOGSTATS_MOD[0]
 
 
-def _merge_stats_aggs(stats_list):
+def _merge_stats_op(stats_list, op, ls):
+    """Aggregate ONE op across stats files (CSV rows of mixed put/get runs)."""
+    total = ok = fail = 0
+    ok_rows = 0
+    lat_sum = 0.0
+    hist = {}
+    gmin = gmax = None
+    total_bytes = 0
+    wall = 0.0
+    max_depth = 0
+    versions = set()
+    ts_from = ts_to = None
+    for st in stats_list:
+        o = (st.get("ops") or {}).get(op) or {}
+        n_ok = int(o.get("ok") or 0)
+        ok += int(o.get("keys_ok", n_ok) or 0)
+        fail += int(o.get("keys_fail", o.get("fail") or 0) or 0)
+        total += int(o.get("keys") or 0)
+        ok_rows += n_ok
+        lat_sum += float(o.get("avg_ms") or 0.0) * n_ok
+        for b, n in (o.get("hist") or {}).items():
+            hist[int(b)] = hist.get(int(b), 0) + int(n)
+        if o.get("min_ms") is not None:
+            gmin = (float(o["min_ms"]) if gmin is None
+                    else min(gmin, float(o["min_ms"])))
+        if o.get("max_ms") is not None:
+            gmax = (float(o["max_ms"]) if gmax is None
+                    else max(gmax, float(o["max_ms"])))
+        meta = st.get("meta") or {}
+        if isinstance(meta.get("hist_version"), int):
+            versions.add(meta["hist_version"])
+        if meta.get("ts_from") is not None:
+            ts_from = meta["ts_from"] if ts_from is None else min(
+                ts_from, meta["ts_from"])
+        if meta.get("ts_to") is not None:
+            ts_to = meta["ts_to"] if ts_to is None else max(
+                ts_to, meta["ts_to"])
+        for kind, payload in st.get("summaries") or []:
+            if kind != "summary":
+                continue
+            max_depth = max(max_depth, int(payload.get("max_depth", 0) or 0))
+            total_bytes += int(payload.get("bytes", 0) or 0)
+            wall = max(wall, float(payload.get("wall_s", 0) or 0))
+    span = (ts_to - ts_from) if (ts_from is not None and ts_to is not None) else 0.0
+    wall = wall or span
+    edges = ls.EDGES_BY_VERSION.get(max(versions), ls.BIN_EDGES) if versions \
+        else ls.BIN_EDGES
+    single_op = None
+    if len(stats_list) == 1:
+        single_op = (stats_list[0].get("ops") or {}).get(op) or {}
+
+    def pct(q, key):
+        # single file with exact per-op percentiles -> use them verbatim
+        if single_op and single_op.get("exact") and single_op.get(key) is not None:
+            return round(float(single_op[key]), 4)
+        if not hist:
+            return 0.0
+        v = ls.hist_percentile(hist, q, edges)
+        return round(min(v, gmax) if gmax is not None else v, 4)
+
+    return {
+        "total": total,
+        "total_bytes": total_bytes,
+        "wall_s": wall,
+        "throughput_mb_s": (total_bytes / wall / 1024.0 ** 2)
+        if wall > 0 else 0.0,
+        "throughput_gb_s": (total_bytes / wall / 1024.0 ** 3)
+        if wall > 0 else 0.0,
+        "avg_ms": (lat_sum / ok_rows) if ok_rows else 0.0,
+        "min_ms": gmin if gmin is not None else 0.0,
+        "max_ms": gmax if gmax is not None else 0.0,
+        "p50_ms": pct(0.50, "p50_ms"), "p95_ms": pct(0.95, "p95_ms"),
+        "p99_ms": pct(0.99, "p99_ms"), "p999_ms": pct(0.999, "p999_ms"),
+        "p9999_ms": pct(0.9999, "p9999_ms"),
+        "lat_sum_ms": lat_sum,
+        "ok": ok, "fail": fail,
+        "qps": (total / wall) if wall > 0 else 0.0,
+        "fail_rate": (fail / total) if total else 0.0,
+        "queue_wait_avg_ms": 0.0,
+        "queue_wait_max_ms": 0.0,
+        "max_depth": max_depth,
+    }
+
+
+def _merge_stats_aggs(stats_list, op_filter=None):
     """Merge one or more per-instance stats into the agg dict shape that
     parse_benchmark_log returns (CSV TOTAL rows / multi-file aggregates):
     key-based counts sum, wall = timestamp span, percentiles from the merged
-    histogram, queue-wait weighted by qw sample count."""
+    histogram, queue-wait weighted by qw sample count.
+
+    op_filter (mixed basic runs: separate put/get rows) is honoured from the
+    per-op aggregates instead of silently returning the combined numbers."""
     ls = _logstats_module()
+    if op_filter is not None:
+        # true mixed logs (several ops in one file) need per-op aggregation;
+        # role-filtered pipeline logs contain only that op, so the combined
+        # merge stays authoritative (queue-wait / bytes / max_depth included)
+        ops_seen = set()
+        for st in stats_list:
+            ops_seen.update((st.get("ops") or {}).keys())
+        if ops_seen - {op_filter}:
+            return _merge_stats_op(stats_list, op_filter, ls)
     # single instance: the stats global fields are already exact (or
     # histogram-derived by the same ladder) — use them verbatim instead of
     # re-deriving from the rounded histogram buckets

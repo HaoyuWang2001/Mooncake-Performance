@@ -258,12 +258,14 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         total += 1
         key_total += kc
         opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0,
+                                   "_keys_ok": 0, "_keys_fail": 0,
                                    "_lats": [], "_h": {}, "_sum": 0.0,
                                    "_min": None, "_max": None, "_exact": True})
         opd["count"] += 1
         opd["keys"] += kc
         if okrow:
             opd["ok"] += 1
+            opd["_keys_ok"] += kc
             ob = bin_of(row["lat"], BIN_EDGES_V2)
             opd["_h"][ob] = opd["_h"].get(ob, 0) + 1
             opd["_sum"] += row["lat"]
@@ -279,6 +281,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                 opd["_lats"] = []          # free the window, keep histogram
         else:
             opd["fail"] += 1
+            opd["_keys_fail"] += kc
         ep = _ts_to_epoch(row["ts"])
         if ep is not None:
             if ts_from is None or ep < ts_from:
@@ -394,7 +397,12 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         opmax = round(opd["_max"], 6) if opd["_max"] is not None else 0.0
         ops_out[op] = {
             "count": opd["count"], "ok": opd["ok"], "fail": opd["fail"],
-            "keys": opd["keys"],
+            "keys": opd["keys"], "keys_ok": opd["_keys_ok"],
+            "keys_fail": opd["_keys_fail"],
+            # per-op histogram: CSV's stats-first path must be able to filter
+            # by op (mixed put/get runs) without falling back to raw logs
+            "hist": {str(b): n for b, n in sorted(opd["_h"].items())},
+            "exact": bool(opd["_exact"]),
             "avg_ms": round(opd["_sum"] / opd["ok"], 6) if opd["ok"] else 0.0,
             "min_ms": opmin, "max_ms": opmax,
             "p50_ms": opct(0.50), "p95_ms": opct(0.95), "p99_ms": opct(0.99),

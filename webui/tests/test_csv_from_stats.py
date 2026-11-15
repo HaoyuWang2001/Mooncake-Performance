@@ -106,3 +106,22 @@ def test_write_scenario_csv_from_stats_only(tmp_path, monkeypatch):
     r = [r for r in rows if r["role"] == "reader" and r["instance"] == "c0"][0]
     assert r["queue_wait_avg_ms"] == 0.5
     assert r["max_depth"] == 5
+
+
+def test_mixed_op_filter_splits_put_and_get(tmp_path):
+    """mixed 配置的 put/get 两行必须各用各的 op 统计（曾两行完全相同）。"""
+    import logstats as _ls
+    rows = "".join(
+        "RESULT\t2026-11-12 10:00:{:02d}.{:06d}\t{}\tk{}\t{:.4f}\tOK\n".format(
+            i, i, "put" if i < 10 else "get", i,
+            2.0 if i < 10 else 5.0) for i in range(20))
+    raw = tmp_path / "mixed.log"
+    raw.write_text(rows, encoding="utf-8")
+    st = _ls.compute_stats(str(raw))
+    sp = tmp_path / "mixed.log.stats.json"
+    sp.write_text(json.dumps(st), encoding="utf-8")
+    put = bm.parse_benchmark_log([str(sp)], op_filter="put")
+    get = bm.parse_benchmark_log([str(sp)], op_filter="get")
+    assert put["total"] == 10 and get["total"] == 10
+    assert put["p50_ms"] == 2.0 and get["p50_ms"] == 5.0
+    assert put["p99_ms"] == 2.0 and get["p99_ms"] == 5.0
