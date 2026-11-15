@@ -42,6 +42,10 @@ STRING_FIELDS = {"trace_id", "breakdown", "key", "status", "type",
                  "remote_endpoint", "local_endpoint", "src", "dst"}
 META_FIELDS = {"start_time", "slice_idx", "offset", "bytes"}
 
+READ_OPS = {"get", "get_batch", "get_into", "get_buffer", "batch_get"}
+WRITE_OPS = {"put", "put_batch", "put_from", "upsert", "upsert_from",
+             "batch_put"}
+
 READ_TOP = ("query_total_us", "select_us", "buf_alloc_us", "memread_total_us")
 WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
              "put_start_us", "memwrite_total_us", "put_end_us", "finalize_us",
@@ -85,6 +89,25 @@ def _start_epoch(value):
         return time.mktime((y, mo, d, h, m, s, 0, 0, -1)) + frac
     except (ValueError, OverflowError):
         return None
+
+
+def _group_of(pairs):
+    """read / write / other for one parsed line.
+
+    Field presence is authoritative (it implies which stage tree applies);
+    an early-exit request may be missing the telling field, so the op name
+    is the fallback — otherwise a failed put silently lands in 'other' and
+    loses its residual."""
+    bd = pairs.get("breakdown", "")
+    if "memread_total_us" in pairs:
+        return "read"
+    if "memwrite_total_us" in pairs:
+        return "write"
+    if bd in READ_OPS:
+        return "read"
+    if bd in WRITE_OPS:
+        return "write"
+    return "other"
 
 
 def parse_line(line):
@@ -174,12 +197,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             lines_trace += 1
             status = pairs.get("status", "")
             ok = status == "ok"
-            if "memread_total_us" in pairs:
-                group = "read"
-            elif "memwrite_total_us" in pairs:
-                group = "write"
-            else:
-                group = "other"
+            group = _group_of(pairs)
             st = op_state(group, bd)
             st["count"] += 1
             if ok:
@@ -296,10 +314,11 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 bd = pairs.get("breakdown", "")
                 if bd.endswith(".slice"):
                     continue
-                if "memread_total_us" in pairs:
-                    group, tops = "read", READ_TOP
-                elif "memwrite_total_us" in pairs:
-                    group, tops = "write", WRITE_TOP
+                group = _group_of(pairs)
+                if group == "read":
+                    tops = READ_TOP
+                elif group == "write":
+                    tops = WRITE_TOP
                 else:
                     continue
                 total = _num(pairs.get("total_us", ""))

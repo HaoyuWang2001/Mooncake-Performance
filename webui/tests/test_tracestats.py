@@ -221,3 +221,17 @@ def test_negative_total_not_in_top_and_bucket_counts_neg(tmp_path):
     assert op["seconds"][0][1] == 2      # 两个样本都计入 n
     assert op["seconds"][0][9] == 1      # 其中 1 个是 neg
     assert op["seconds"][0][4] == 401.0  # avg 只按有效样本
+
+
+def test_direction_falls_back_to_op_name(tmp_path):
+    """早退/字段缺失的 put 行（无 memwrite_total_us）不能落进 other。"""
+    trunc = (GLOG + "trace_id[9] breakdown[put] key[bench/x] status[TRANSFER_FAIL] "
+             "size[1048576] replicas[2] start_time[2026-11-12 10:23:47.000000] "
+             "prep_total_us[54] put_start_us[58] put_end_us[66] total_us[124]")
+    p = _write(tmp_path, "dir.glog", [trunc])
+    st = ts.compute_trace_stats(p)
+    assert "put" in st["groups"]["write"]["ops"]
+    op = st["groups"]["write"]["ops"]["put"]
+    assert op["count"] == 1 and op["fail"] == 1
+    assert op["residual"]["n"] == 1          # 第二遍扫描同样归类为 write
+    assert "put" not in (st["groups"].get("other") or {}).get("ops", {})
