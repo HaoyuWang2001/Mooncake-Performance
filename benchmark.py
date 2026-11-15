@@ -1995,7 +1995,8 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
 
 
 def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
-                     dry=False, node_name=None, role=None, size=None):
+                     dry=False, node_name=None, role=None, size=None,
+                     roles=None):
     """map 阶段：在节点/pod 内对每个 RESULT 日志执行 logstats，就地生成
     <log>.stats.json（编排器默认只回传统计产物，原始日志留在节点上）。
     产物 meta 里写入 node/pod/role/远程路径，供报表分节点统计与现场索引。"""
@@ -2011,8 +2012,9 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             cmd += " --node {}".format(shlex.quote(str(node_name)))
         if node.get("_pod"):
             cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
-        if role:
-            cmd += " --role {}".format(shlex.quote(str(role)))
+        file_role = (roles or {}).get(log_path, role)
+        if file_role:
+            cmd += " --role {}".format(shlex.quote(str(file_role)))
         if size:
             cmd += " --size {}".format(shlex.quote(str(size)))
         cmd += " --remote-path {}".format(shlex.quote(log_path))
@@ -2050,10 +2052,17 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
     node_bytes = {}
     sample_rate = _hifreq_sample_rate()
     for node, files, label, name in groups:
-        result_logs = [f for f in files if not f.endswith(".glog")]
-        glog_logs = [f for f in files if f.endswith(".glog")]
+        # files entries are either a path (legacy) or (path, role): the role
+        # is authoritative (filename sniffing fails for .writer_<node>_w0.log
+        # and mislabels a dual client's reader log as writer).
+        entries = [(f, None) if not isinstance(f, tuple) else (f[0], f[1])
+                   for f in files]
+        paths = [f for f, _r in entries]
+        roles = {f: r for f, r in entries if r}
+        result_logs = [f for f in paths if not f.endswith(".glog")]
+        glog_logs = [f for f in paths if f.endswith(".glog")]
         role = None
-        if result_logs:
+        if not roles and result_logs:
             base = os.path.basename(result_logs[0])
             for _r in ("writer", "reader"):
                 if ".{}.log".format(_r) in base:
@@ -2061,18 +2070,18 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
                     break
         stats = run_logstats_map(cluster, node, result_logs, remote_scripts,
                                  globals_cfg, dry=dry, node_name=name,
-                                 role=role, size=size)
+                                 role=role, size=size, roles=roles)
         traces = run_tracestats_map(
             cluster, node, glog_logs, remote_scripts, globals_cfg, dry=dry,
             node_name=name, role=role, size=size, sample_rate=sample_rate)
-        pull_files = stats + traces + (list(files) if pull_raw else [])
+        pull_files = stats + traces + (paths if pull_raw else [])
         _pipeline_pull_parallel(
             cluster, [(node, pull_files, label)], local_log_dir, dry)
         if not dry and pull_raw:
             node_bytes[name] = sum(
                 os.path.getsize(os.path.join(local_log_dir,
                                              os.path.basename(f)))
-                for f in files
+                for f in paths
                 if os.path.isfile(os.path.join(local_log_dir,
                                                os.path.basename(f))))
         elif not dry:
@@ -2096,8 +2105,11 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
             log_detail("[map] raw logs {} -> pulling raw too (<= {})".format(
                 _fmt_gib(total_bytes), _fmt_gib(RAW_AUTO_PULL_MAX)))
             for node, files, label, name in groups:
+                _raw = [(f, None) if not isinstance(f, tuple) else f
+                        for f in files]
                 _pipeline_pull_parallel(
-                    cluster, [(node, list(files), label)], local_log_dir, dry)
+                    cluster, [(node, [f for f, _r in _raw], label)],
+                    local_log_dir, dry)
     return node_bytes
 
 
@@ -4134,12 +4146,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         _rn = get_node(cluster, c["node"])
                         _pb = _pod_base(base_noext, _rn)
                         _groups.append((_rn,
-                                        ["{}.dual_{}_c{}_p{}.writer.log".format(
+                                        [("{}.dual_{}_c{}_p{}.writer.log".format(
                                             _pb, c["node"], c["id"], c["port"]),
-                                         "{}.dual_{}_c{}_p{}.reader.log".format(
+                                          "writer"),
+                                         ("{}.dual_{}_c{}_p{}.reader.log".format(
                                             _pb, c["node"], c["id"], c["port"]),
-                                         "{}.dual_{}_c{}_p{}.glog".format(
-                                            _pb, c["node"], c["id"], c["port"])],
+                                          "reader"),
+                                         ("{}.dual_{}_c{}_p{}.glog".format(
+                                            _pb, c["node"], c["id"], c["port"]),
+                                          None)],
                                         "dual c{}".format(c["id"]),
                                         c["node"]))
                     _nb = _map_and_pull_logs(
@@ -4308,12 +4323,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("writers exited: {}/{} ({:.1f}s)".format(
                         _wex, len(writer_pids), time.time() - _wt0))
                 _groups = [(get_node(cluster, w["node"]),
-                            ["{}.writer_{}_w{}.log".format(
+                            [("{}.writer_{}_w{}.log".format(
                                 _pod_base(base_noext, get_node(cluster, w["node"])),
-                                w["node"], w["gid"]),
-                             "{}.writer_{}_w{}.glog".format(
+                                w["node"], w["gid"]), "writer"),
+                             ("{}.writer_{}_w{}.glog".format(
                                 _pod_base(base_noext, get_node(cluster, w["node"])),
-                                w["node"], w["gid"])],
+                                w["node"], w["gid"]), "writer")],
                             "writer w{}".format(w["gid"]),
                             w["node"])
                            for w in plan["writers"]]
@@ -4360,12 +4375,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("readers exited: {}/{} ({:.1f}s)".format(
                         _rex, len(reader_pids), time.time() - _rt0))
                 _groups = [(get_node(cluster, r["node"]),
-                            ["{}.reader_{}_r{}_p{}.log".format(
+                            [("{}.reader_{}_r{}_p{}.log".format(
                                 _pod_base(base_noext, get_node(cluster, r["node"])),
-                                r["node"], r["index"], r["port"]),
-                             "{}.reader_{}_r{}_p{}.glog".format(
+                                r["node"], r["index"], r["port"]), "reader"),
+                             ("{}.reader_{}_r{}_p{}.glog".format(
                                 _pod_base(base_noext, get_node(cluster, r["node"])),
-                                r["node"], r["index"], r["port"])],
+                                r["node"], r["index"], r["port"]), "reader")],
                             "reader r{}".format(r["index"]),
                             r["node"])
                            for r in plan["readers"]]
