@@ -4767,6 +4767,11 @@ def _merge_stats_aggs(stats_list):
     # connection setup); multi-instance: the common timestamp span
     wall = wall_summary if len(stats_list) == 1 and wall_summary > 0 else span
     n_rows = ok_rows
+    hist_versions = {(st.get("meta") or {}).get("hist_version")
+                     for st in stats_list}
+    hist_edges = ls.EDGES_BY_VERSION.get(
+        max(v for v in hist_versions if isinstance(v, int)), ls.BIN_EDGES) \
+        if any(isinstance(v, int) for v in hist_versions) else ls.BIN_EDGES
     return {
         "total": total,
         "total_bytes": total_bytes,
@@ -4774,13 +4779,13 @@ def _merge_stats_aggs(stats_list):
         "throughput_mb_s": (total_bytes / wall / 1024.0 ** 2) if wall > 0 else 0.0,
         "throughput_gb_s": (total_bytes / wall / 1024.0 ** 3) if wall > 0 else 0.0,
         "avg_ms": (lat_sum / n_rows) if n_rows else 0.0,
-        "min_ms": (ls.hist_percentile(hist, 0.0) if hist else 0.0),
-        "max_ms": (ls.hist_percentile(hist, 1.0) if hist else 0.0),
-        "p50_ms": (ls.hist_percentile(hist, 0.50) if hist else 0.0),
-        "p95_ms": (ls.hist_percentile(hist, 0.95) if hist else 0.0),
-        "p99_ms": (ls.hist_percentile(hist, 0.99) if hist else 0.0),
-        "p999_ms": (ls.hist_percentile(hist, 0.999) if hist else 0.0),
-        "p9999_ms": (ls.hist_percentile(hist, 0.9999) if hist else 0.0),
+        "min_ms": (ls.hist_percentile(hist, 0.0, hist_edges) if hist else 0.0),
+        "max_ms": (ls.hist_percentile(hist, 1.0, hist_edges) if hist else 0.0),
+        "p50_ms": (ls.hist_percentile(hist, 0.50, hist_edges) if hist else 0.0),
+        "p95_ms": (ls.hist_percentile(hist, 0.95, hist_edges) if hist else 0.0),
+        "p99_ms": (ls.hist_percentile(hist, 0.99, hist_edges) if hist else 0.0),
+        "p999_ms": (ls.hist_percentile(hist, 0.999, hist_edges) if hist else 0.0),
+        "p9999_ms": (ls.hist_percentile(hist, 0.9999, hist_edges) if hist else 0.0),
         "lat_sum_ms": lat_sum,
         "ok": ok,
         "fail": fail,

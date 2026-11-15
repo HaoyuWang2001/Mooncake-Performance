@@ -38,10 +38,17 @@ RESULT_PREFIX = "RESULT\t"
 SUMMARY_PREFIX = "SUMMARY\t"
 META_PREFIX = "META\t"
 
-# 对数定梯：0.001ms 起、ratio 1.2、80 档（到 2160ms）。所有客户端共用
-# 同一阶梯 -> 直方图按 bin 相加即可无损合并，集群分位数由此还原。
+# 对数定梯：0.001ms 起、ratio 1.2。所有客户端共用同一阶梯 -> 直方图按 bin
+# 相加即可无损合并，集群分位数由此还原。
+# v1（历史产物，读取旧 stats.json 用）：81 档到 2160ms
 BIN_EDGES = [0.001 * (1.2 ** i) for i in range(81)]
 BIN_EDGES[0] = 0.0
+# v2（当前产物）：同一 ratio、108 档到 ~250s——多秒级停顿（超时/存储耗尽/
+# GC）不再全挤进末桶，p99/p999 保持真实量级。products 带 meta.hist_version。
+BIN_EDGES_V2 = [0.001 * (1.2 ** i) for i in range(108)]
+BIN_EDGES_V2[0] = 0.0
+HIST_VERSION = 2
+EDGES_BY_VERSION = {1: BIN_EDGES, 2: BIN_EDGES_V2}
 
 # C++ SDK trace 的阶段时延单位是 MICROSECOND：必须用 µs 阶梯（0.001µs 起、
 # ratio 1.2、120 档到 ~3.4e6µs=3.4s），否则 >2.16ms 的请求全落末桶、分位被
@@ -147,17 +154,20 @@ def hist_percentile(hist, q, edges=None):
     if not total:
         return 0.0
     target = q * (total - 1)
+    last = len(edges) - 1
     acc = 0
     for b in sorted(hist):
         c = hist[b]
         if acc + c > target:
-            # linear interpolation inside the bin
+            # linear interpolation inside the bin (bin index clamped: a product
+            # with an unexpected ladder must not crash the report)
+            b = min(b, last)
             edge_lo = edges[b]
             edge_hi = edges[b + 1] if b + 1 < len(edges) else edge_lo * 1.2
             frac = (target - acc) / c if c else 0.0
             return edge_lo + (edge_hi - edge_lo) * frac
         acc += c
-    return edges[max(hist)]
+    return edges[min(max(hist), last)]
 
 
 def _exact_percentile(sorted_vals, q):
@@ -254,7 +264,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         opd["keys"] += kc
         if okrow:
             opd["ok"] += 1
-            ob = bin_of(row["lat"])
+            ob = bin_of(row["lat"], BIN_EDGES_V2)
             opd["_h"][ob] = opd["_h"].get(ob, 0) + 1
             opd["_sum"] += row["lat"]
             opd["_min"] = (row["lat"] if opd["_min"] is None
@@ -303,7 +313,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         elif exact_ok:
             exact_ok = False
             lats = []                      # free the window, keep histogram
-        b = bin_of(lat)
+        b = bin_of(lat, BIN_EDGES_V2)
         hist[b] = hist.get(b, 0) + 1
         qw = row["qw"]
         if qw is not None:
@@ -327,7 +337,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             buck["ok"] += 1
             buck["sum"] += lat
             buck["max"] = max(buck["max"], lat)
-            hb = bin_of(lat)
+            hb = bin_of(lat, BIN_EDGES_V2)
             buck["h"][hb] = buck["h"].get(hb, 0) + 1
             if qw is not None:
                 buck["qsum"] += qw
@@ -368,7 +378,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             return round(_exact_percentile(lats, q), 6)
     else:
         def pct(q):
-            return round(hist_percentile(hist, q), 6)
+            return round(hist_percentile(hist, q, BIN_EDGES_V2), 6)
 
     # per-op finalized stats (counts + latency percentiles per op name)
     ops_out = {}
@@ -379,7 +389,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                 return round(_exact_percentile(_ls, q), 6)
         else:
             def opct(q, _h=opd["_h"]):
-                return round(hist_percentile(_h, q), 6)
+                return round(hist_percentile(_h, q, BIN_EDGES_V2), 6)
         opmin = round(opd["_min"], 6) if opd["_min"] is not None else 0.0
         opmax = round(opd["_max"], 6) if opd["_max"] is not None else 0.0
         ops_out[op] = {
@@ -451,6 +461,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             # time-bucket t unit; "s" = epoch seconds (absent in old products,
             # whose minutes used epoch minutes -> reduce multiplies by 60)
             "bucket_unit": "s",
+            # histogram ladder of this product (1 = legacy 81-bin ms ladder)
+            "hist_version": HIST_VERSION,
         },
         "global": {
             "total": total, "ok": ok, "fail": fail,

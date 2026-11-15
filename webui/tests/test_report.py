@@ -254,6 +254,12 @@ def test_render_without_trace_keeps_card_hidden(tmp_path):
     assert 'id="tracecard" style="display:none"' in src
 
 
+def _write_rows(tmp_path, name, rows):
+    p = tmp_path / name
+    p.write_text(rows, encoding="utf-8")
+    return str(p)
+
+
 def _minimal_stats(seconds_t, minutes_t, bucket_unit=None):
     st = {
         "meta": {"source": "x.writer.log", "bytes": 1, "node": "n1",
@@ -515,3 +521,30 @@ def test_merge_field_does_not_mutate_source(tmp_path):
     after1 = tr1["groups"]["read"]["ops"]["get_buffer"]["fields"][
         "total_us"]["hist"]
     assert after1 == before1
+
+
+def test_extended_ms_ladder_keeps_second_scale_tail(tmp_path):
+    """v2 阶梯覆盖到 ~250s：多秒停顿的 p99 不再被 2160ms 末桶钳死。"""
+    rows = "".join(
+        "RESULT\t2026-11-15 10:00:0{}.000000\tput\tk\t{:.1f}\tOK\n".format(i, v)
+        for i, v in enumerate([5000.0, 5000.0]))
+    st = ls.compute_stats(_write_rows(tmp_path, "a.log", rows),
+                          role="writer", size="8MB")
+    assert st["meta"]["hist_version"] == 2
+    st2 = json.loads(json.dumps(st))
+    st2["meta"]["source"] = "b.writer.log"
+    s = rp.reduce_size([st, st2], {"config": "c"})["summary"]
+    assert 4200 <= s["p99_ms"] <= 6500, s
+    # 旧产物（无 hist_version、按 v1 阶梯分桶）仍按 v1 解释，不误读
+    old = json.loads(json.dumps(st))
+    old["meta"].pop("hist_version")
+    old["histogram"] = {"80": 2}
+    old["seconds"] = []        # 旧产物整份都是 v1 分桶
+    old["minutes"] = []
+    old2 = json.loads(json.dumps(old))
+    old2["meta"]["source"] = "d.writer.log"
+    so = rp.reduce_size([old, old2], {"config": "c"})["summary"]
+    assert so["p99_ms"] < 3000
+    # CSV 的 stats-first 聚合同样按版本选阶梯
+    agg = bm._merge_stats_aggs([st, st2])
+    assert 4200 <= agg["p99_ms"] <= 6500

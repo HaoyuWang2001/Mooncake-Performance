@@ -56,6 +56,17 @@ def _role_of(st, fallback="all"):
     return (st.get("meta") or {}).get("role") or fallback
 
 
+def _hist_edges(stats):
+    """Ladder for these map products (v2 unless any legacy v1 file is mixed in).
+
+    Legacy stats.json carries no meta.hist_version and was binned with the
+    81-bin 2160ms ladder; new products use the extended 250s ladder."""
+    versions = {(st.get("meta") or {}).get("hist_version") for st in stats}
+    if versions and versions <= {2}:
+        return ls.BIN_EDGES_V2
+    return ls.BIN_EDGES
+
+
 def _minutes_rows(st):
     """Minute-bucket rows with t normalized to epoch seconds.
 
@@ -93,8 +104,9 @@ def _merge_buckets(bucket_lists):
     return merged
 
 
-def _series_columns(merged, step):
+def _series_columns(merged, step, edges=None):
     """Columnar series for the chart (compact JSON, fixed key order)."""
+    edges = ls.BIN_EDGES if edges is None else edges
     out = {"t": [], "c": [], "ok": [], "fail": [], "avg": [], "p50": [],
            "p99": [], "p999": [], "max": [], "qw": [], "qwmax": []}
     for t in sorted(merged):
@@ -104,9 +116,12 @@ def _series_columns(merged, step):
         out["ok"].append(int(ok))
         out["fail"].append(int(fail))
         out["avg"].append(round(s / ok, 4) if ok else 0.0)
-        out["p50"].append(round(ls.hist_percentile(h, 0.50), 4) if h else 0.0)
-        out["p99"].append(round(ls.hist_percentile(h, 0.99), 4) if h else 0.0)
-        out["p999"].append(round(ls.hist_percentile(h, 0.999), 4) if h else 0.0)
+        out["p50"].append(round(ls.hist_percentile(h, 0.50, edges), 4)
+                          if h else 0.0)
+        out["p99"].append(round(ls.hist_percentile(h, 0.99, edges), 4)
+                          if h else 0.0)
+        out["p999"].append(round(ls.hist_percentile(h, 0.999, edges), 4)
+                           if h else 0.0)
         out["max"].append(round(mx, 4))
         # logstats accumulates queue wait on successful rows only -> divide
         # by ok (not by every row, which understated it by the failure rate)
@@ -169,6 +184,8 @@ def _summary_of(stats):
     span = (ts_to - ts_from) if (ts_from is not None and ts_to is not None) else 0.0
     wall = wall or span
 
+    edges = _hist_edges(stats)
+
     def pct(q, key):
         # single client: the map product already holds EXACT percentiles (the
         # CSV uses the same values); otherwise reconstruct from the merged
@@ -177,7 +194,7 @@ def _summary_of(stats):
             return round(float(single[key]), 4)
         if not hist:
             return 0.0
-        v = ls.hist_percentile(hist, q)
+        v = ls.hist_percentile(hist, q, edges)
         return round(min(v, gmax) if gmax is not None else v, 4)
 
     return {
@@ -233,7 +250,7 @@ def _client_entry(st, role):
                            for k, p in st.get("summaries") or []
                            if k == "summary"), 0),
         "minutes": _series_columns(
-            _merge_buckets([_minutes_rows(st)]), 60),
+            _merge_buckets([_minutes_rows(st)]), 60, _hist_edges([st])),
         "slowest": st.get("slowest") or [],
         "errors": st.get("errors") or {},
     }
@@ -249,8 +266,9 @@ def _role_series(stats):
     for role, group in by_role.items():
         s1 = _merge_buckets([st.get("seconds") or [] for st in group])
         s60 = _merge_buckets([_minutes_rows(st) for st in group])
-        out[role] = {"step1": _series_columns(s1, 1),
-                     "step60": _series_columns(s60, 60)}
+        edges = _hist_edges(group)
+        out[role] = {"step1": _series_columns(s1, 1, edges),
+                     "step60": _series_columns(s60, 60, edges)}
     return out
 
 
