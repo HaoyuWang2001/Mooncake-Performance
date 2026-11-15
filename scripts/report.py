@@ -347,17 +347,25 @@ def _merge_field(a, b):
     return out
 
 
-def _field_pcts(fd):
+def _field_pcts(fd, edges=None, hist_ok=True):
+    """Field stats -> report row. `edges` is the ladder the bins were built
+    with (default ms); trace values are µs. When a legacy trace product is
+    present (no meta.bins) histogram percentiles are left None instead of
+    being silently misread."""
     hist = {int(k): v for k, v in (fd.get("hist") or {}).items()}
     n = fd.get("n") or 0
+
+    def pct(q):
+        if not hist_ok or not hist:
+            return None
+        return round(ls.hist_percentile(hist, q, edges), 4)
+
     return {
         "n": n, "neg": fd.get("neg") or 0,
         "avg": round((fd.get("sum") or 0.0) / n, 4) if n else 0.0,
         "min": fd.get("min"), "max": fd.get("max"),
-        "p50": round(ls.hist_percentile(hist, 0.50), 4) if hist else 0.0,
-        "p95": round(ls.hist_percentile(hist, 0.95), 4) if hist else 0.0,
-        "p99": round(ls.hist_percentile(hist, 0.99), 4) if hist else 0.0,
-        "p999": round(ls.hist_percentile(hist, 0.999), 4) if hist else 0.0,
+        "p50": pct(0.50), "p95": pct(0.95),
+        "p99": pct(0.99), "p999": pct(0.999),
     }
 
 
@@ -398,10 +406,12 @@ def reduce_trace_size(trace_list):
     clients = []
     tops = []
     metad = {"files": 0, "lines": 0, "trace_lines": 0, "slice_lines": 0,
-             "parse_errors": 0, "sample_rates": {}}
+             "parse_errors": 0, "sample_rates": {}, "bins": "us-v1"}
     for st in trace_list:
         m = st.get("meta") or {}
         metad["files"] += 1
+        if m.get("bins") != "us-v1":
+            metad["bins"] = "legacy"     # histogram unit unknown -> no pcts
         for k in TRACE_META_KEYS:
             metad[k] += m.get(k) or 0
         if m.get("sample_rate") is not None:
@@ -437,11 +447,15 @@ def reduce_trace_size(trace_list):
                                                    o["residual"])
                 tops.extend(o.get("top") or [])
         clients.append(cl)
+    trace_edges = ls.BIN_EDGES_US if metad["bins"] == "us-v1" else None
+    trace_hist_ok = metad["bins"] == "us-v1"
     for _gname, g in groups.items():
         for _op, o in g["ops"].items():
-            o["fields"] = {k: _field_pcts(fd) for k, fd in o["fields"].items()}
-            o["residual"] = _field_pcts(o["residual"]) if o.get("residual") \
-                else None
+            o["fields"] = {k: _field_pcts(fd, trace_edges, trace_hist_ok)
+                           for k, fd in o["fields"].items()}
+            o["residual"] = (_field_pcts(o["residual"], trace_edges,
+                                         trace_hist_ok)
+                             if o.get("residual") else None)
             buckets = o.pop("_buckets")
             for bk in ("seconds", "minutes"):
                 bmap = buckets[bk]
@@ -453,8 +467,10 @@ def reduce_trace_size(trace_list):
                         int(t), n, okc, failc,
                         round(ssum / n, 3) if n else 0.0,
                         round(mx, 6),
-                        round(ls.hist_percentile(hb, 0.50), 4) if hb else 0.0,
-                        round(ls.hist_percentile(hb, 0.99), 4) if hb else 0.0])
+                        (round(ls.hist_percentile(hb, 0.50, trace_edges), 4)
+                         if trace_hist_ok and hb else None),
+                        (round(ls.hist_percentile(hb, 0.99, trace_edges), 4)
+                         if trace_hist_ok and hb else None)])
                 o[bk] = rows
     tops.sort(key=lambda e: -float(e.get("total_us") or 0))
     return {"meta": metad, "groups": groups, "top": tops[:50],

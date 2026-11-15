@@ -383,3 +383,38 @@ def test_zero_wall_has_no_infinity(tmp_path):
     assert "Infinity" not in res["cards_text"]
     assert "NaN" not in res["cards_text"]
     assert "吞吐" in res["cards_text"]
+
+
+def test_trace_percentiles_not_clamped_by_ms_ladder(tmp_path):
+    """trace 是 µs；>2.16ms 的请求不能被 ms 阶梯钳到 2.4ms 附近。"""
+    from tracestats import compute_trace_stats
+    lines = []
+    for i in range(100):
+        lines.append(
+            GLOG + "trace_id[1] breakdown[put] key[k%d] status[ok] size[1048576] "
+            "replicas[2] start_time[2026-11-12 10:23:4%d.000000] "
+            "prep_total_us[54] prep_buf_alloc_us[9] prep_memcpy_us[42] "
+            "prep_split_us[3] checksum_us[31] prepare_us[4] query_us[0] "
+            "put_start_us[58] memwrite_total_us[39400] memwrite_submit_us[11] "
+            "memwrite_queue_us[39000] memwrite_urma_us[152] "
+            "memwrite_teardown_us[11] slice_count[2] memwrite_urma_min_us[148] "
+            "memwrite_urma_avg_us[150] put_end_us[414] finalize_us[0] "
+            "cache_invalidate_us[0] revoke_us[0] total_us[50000]"
+            % (i, i % 10))
+    p = tmp_path / "slow.glog"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tr = compute_trace_stats(str(p))
+    assert tr["meta"]["bins"] == "us-v1"
+    blk = rp.reduce_trace_size([tr])
+    tot = blk["groups"]["write"]["ops"]["put"]["fields"]["total_us"]
+    assert tot["max"] == 50000
+    assert 40000 <= tot["p50"] <= 65000, tot
+    assert 40000 <= tot["p99"] <= 65000, tot
+    bucket = blk["groups"]["write"]["ops"]["put"]["seconds"][0]
+    assert 40000 <= bucket[6] <= 65000 and 40000 <= bucket[7] <= 65000
+    # 旧 trace.json（无 bins）无法安全解释直方图 -> 分位留空，不静默错读
+    legacy = json.loads(json.dumps(tr))
+    legacy["meta"].pop("bins")
+    ltot = rp.reduce_trace_size([legacy])["groups"]["write"]["ops"]["put"][
+        "fields"]["total_us"]
+    assert ltot["p50"] is None and ltot["max"] == 50000

@@ -112,7 +112,7 @@ def _bucket_add(b, total_us, ok):
     if total_us is not None and total_us >= 0:
         b["sum"] += total_us
         b["max"] = max(b["max"], total_us)
-        hb = ls.bin_of(total_us)
+        hb = ls.bin_of(total_us, ls.BIN_EDGES_US)
         b["h"][hb] = b["h"].get(hb, 0) + 1
 
 
@@ -204,7 +204,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 fd["sum"] += num
                 fd["min"] = num if fd["min"] is None else min(fd["min"], num)
                 fd["max"] = num if fd["max"] is None else max(fd["max"], num)
-                hb = ls.bin_of(num)
+                hb = ls.bin_of(num, ls.BIN_EDGES_US)
                 fd["hist"][hb] = fd["hist"].get(hb, 0) + 1
 
             total = parsed.get("total_us")
@@ -312,7 +312,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 rd["sum"] += r
                 rd["min"] = r if rd["min"] is None else min(rd["min"], r)
                 rd["max"] = r if rd["max"] is None else max(rd["max"], r)
-                rb = ls.bin_of(max(r, 0.0))
+                rb = ls.bin_of(max(r, 0.0), ls.BIN_EDGES_US)
                 rd["hist"][rb] = rd["hist"].get(rb, 0) + 1
         for (group, op), rd in res.items():
             g = groups.get(group, {}).get("ops", {}).get(op)
@@ -336,6 +336,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         "ts_from": ts_from, "ts_to": ts_to,
         "dated": ts_from is not None,
         "bucket_unit": "s",
+        # histogram ladder this product was built with; report refuses to
+        # interpret legacy files (which used the ms ladder for µs values)
+        "bins": "us-v1",
     }
     return {"meta": meta, "groups": groups}
 

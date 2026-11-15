@@ -38,10 +38,16 @@ RESULT_PREFIX = "RESULT\t"
 SUMMARY_PREFIX = "SUMMARY\t"
 META_PREFIX = "META\t"
 
-# 对数定梯：0.001ms 起、ratio 1.2、80 档（约到 2000s）。所有客户端共用
+# 对数定梯：0.001ms 起、ratio 1.2、80 档（到 2160ms）。所有客户端共用
 # 同一阶梯 -> 直方图按 bin 相加即可无损合并，集群分位数由此还原。
 BIN_EDGES = [0.001 * (1.2 ** i) for i in range(81)]
 BIN_EDGES[0] = 0.0
+
+# C++ SDK trace 的阶段时延单位是 MICROSECOND：必须用 µs 阶梯（0.001µs 起、
+# ratio 1.2、120 档到 ~3.4e6µs=3.4s），否则 >2.16ms 的请求全落末桶、分位被
+# 钳在 2.4ms 附近（max 仍精确，造成 p99 < max 的荒谬结果）。
+BIN_EDGES_US = [0.001 * (1.2 ** i) for i in range(121)]
+BIN_EDGES_US[0] = 0.0
 EXACT_LIMIT = 5_000_000        # 样本数上限内用精确分位数，超出用直方图
 EXCERPT_CAP = 16 * 1024        # 错误摘录字节上限
 
@@ -112,24 +118,27 @@ def iter_rows(path):
                    "qw": qw, "kc": kc, "lineno": lineno}
 
 
-def bin_of(lat):
-    """Histogram bin index for a latency (ms)."""
-    lo, hi = 0, len(BIN_EDGES) - 1
+def bin_of(lat, edges=None):
+    """Histogram bin index for a value (ms by default; pass edges for µs)."""
+    edges = BIN_EDGES if edges is None else edges
+    lo, hi = 0, len(edges) - 1
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if lat >= BIN_EDGES[mid]:
+        if lat >= edges[mid]:
             lo = mid
         else:
             hi = mid - 1
     return lo
 
 
-def hist_percentile(hist, q):
+def hist_percentile(hist, q, edges=None):
     """Percentile from a (sparse) histogram dict {bin: count}.
 
     Bin keys may be ints (in-memory) or numeric strings (merged from the
     persisted stats JSON) — normalized here so the reduce stage can merge
-    straight from disk."""
+    straight from disk. `edges` must be the ladder used to build the bins
+    (ms BIN_EDGES by default; BIN_EDGES_US for C++ trace values)."""
+    edges = BIN_EDGES if edges is None else edges
     hist = {int(k): v for k, v in hist.items()}
     total = sum(hist.values())
     if not total:
@@ -140,12 +149,12 @@ def hist_percentile(hist, q):
         c = hist[b]
         if acc + c > target:
             # linear interpolation inside the bin
-            edge_lo = BIN_EDGES[b]
-            edge_hi = BIN_EDGES[b + 1] if b + 1 < len(BIN_EDGES) else edge_lo * 1.2
+            edge_lo = edges[b]
+            edge_hi = edges[b + 1] if b + 1 < len(edges) else edge_lo * 1.2
             frac = (target - acc) / c if c else 0.0
             return edge_lo + (edge_hi - edge_lo) * frac
         acc += c
-    return BIN_EDGES[max(hist)]
+    return edges[max(hist)]
 
 
 def _exact_percentile(sorted_vals, q):
