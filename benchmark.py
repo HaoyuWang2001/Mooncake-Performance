@@ -2152,6 +2152,44 @@ def _report_module():
     return _REPORT_MOD[0]
 
 
+_LOG_SIZE_RE = re.compile(r"_(\d+(?:\.\d+)?)(KB|MB|GB)(?=[._]|$)", re.I)
+_LOG_ROLE_RE = re.compile(r"\.(?:dual|writer|reader)_([^/]*?)_(?:c|w|r)\d+"
+                          r"(?:_p\d+)?(?:\.(?:writer|reader))?\.log$")
+
+
+def _derive_log_meta(path, local_log_dir):
+    """Best-effort provenance for a LOCALLY recomputed log/glog.
+
+    Raw logs pulled on the failure/stop path have no map-produced stats, so
+    the recompute used to lose size/role/node: every data_size collapsed into
+    "all", role tabs vanished and --rebuild-report misread pipeline runs as
+    basic. Derive what the filename/layout carries."""
+    base = os.path.basename(str(path))
+    size = None
+    stem = base[:-4] if base.endswith(".log") else (
+        base[:-5] if base.endswith(".glog") else base)
+    m = _LOG_SIZE_RE.search(stem)
+    if m:
+        size = m.group(1) + m.group(2).upper()
+    role = None
+    if ".writer.log" in base or re.search(r"\.writer_[^/]*\.log$", base):
+        role = "writer"
+    elif ".reader.log" in base or re.search(r"\.reader_[^/]*\.log$", base):
+        role = "reader"
+    node = None
+    m = _LOG_ROLE_RE.search(base)
+    if m:
+        node = m.group(1)
+    pod = None
+    try:
+        rel = os.path.relpath(str(path), str(local_log_dir))
+        if rel and not rel.startswith("..") and os.sep in rel:
+            pod = rel.split(os.sep)[0] or None
+    except ValueError:
+        pass
+    return {"size": size, "role": role, "node": node, "pod": pod}
+
+
 def _is_client_log(name):
     """True for measured client logs (per role/combo), false for stage logs."""
     if not name.endswith(".log"):
@@ -2183,7 +2221,11 @@ def _collect_local_stats(local_log_dir):
             if sp in have:
                 continue
             try:
-                st = _logstats_module().compute_stats(p)
+                mi = _derive_log_meta(p, local_log_dir)
+                st = _logstats_module().compute_stats(
+                    p, size=mi["size"], role=mi["role"], node=mi["node"],
+                    pod=mi["pod"], remote_path=p)
+                st["meta"]["recomputed"] = True
                 with open(sp, "w", encoding="utf-8") as f:
                     json.dump(st, f, ensure_ascii=False,
                               separators=(",", ":"))
@@ -2212,8 +2254,11 @@ def _collect_local_traces(local_log_dir):
             if tp in have:
                 continue
             try:
+                mi = _derive_log_meta(p, local_log_dir)
                 st = _trace_module().compute_trace_stats(
-                    p, sample_rate=_hifreq_sample_rate())
+                    p, sample_rate=_hifreq_sample_rate(), size=mi["size"],
+                    role=mi["role"], node=mi["node"], pod=mi["pod"])
+                st["meta"]["recomputed"] = True
                 with open(tp, "w", encoding="utf-8") as f:
                     json.dump(st, f, ensure_ascii=False,
                               separators=(",", ":"))
