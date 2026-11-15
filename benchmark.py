@@ -5603,11 +5603,13 @@ def parse_arguments(argv=None):
     parser.add_argument("--pull-raw-logs", action="store_true",
                         help="pull the raw client logs back (default: only the "
                              "compact *.stats.json produced by remote logstats)")
-    parser.add_argument("--rebuild-report", default=None, metavar="OUTPUTS_TS",
-                        help="re-run the map/reduce for an existing run "
-                             "(outputs/<ts>): re-execute remote logstats, pull "
-                             "the stats and regenerate the reports; k8s uses a "
-                             "one-off pod reading the hostPath log root")
+    parser.add_argument("--rebuild-report", default=None, metavar="TS",
+                        help="rebuild the reports for an existing LOCAL run "
+                             "from its timestamp directory name (e.g. "
+                             "20261110-1308, NOT outputs/<ts>): merges the "
+                             "local stats and/or raw logs and re-renders "
+                             "report.html + overview.html (remote map is NOT "
+                             "re-run; pull raw logs first if stats are absent)")
     parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
                         help="override protocol (tcp/rdma/ub); highest priority, "
                              "overrides the JSON config value")

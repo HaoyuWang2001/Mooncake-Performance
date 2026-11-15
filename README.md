@@ -759,6 +759,9 @@ WebUI 点击「停止」或命令行 Ctrl+C 时，benchmark **不会立即被杀
 - **SSH**：按 `.state` 台账终止远端 client/stage/profiling 进程（reader 先 HTTP /shutdown）；
 - 默认等待 60s（环境变量 `MCWEB_STOP_GRACE` 可调），超时才强制 kill；后台再做一次兜底清理；
 - 第二次 Ctrl+C 立即强制退出（跳过剩余清理）；
+- **停止也会出报表**：清理前先把当前场景的原始日志回拉并本地重算，产出
+  `logs/<配置名>/report/report.html` 与 `report/overview.html`（`early_stop` 标注
+  「提前停止/数据不完整」）；`MC_STOP_REPORT=0` 可关闭（大 run 停止时会多花几十秒拉日志）；
 - 普通停止**保留**远端日志/数据与 controller workspace；只有 `--clean-up` 才删除；
 - 本地 `webui/data/runs/<id>.log` / `outputs/` 保留用于排查；run 状态先 `stopping`，最终 `stopped`；
 - scheduler 执行中的任务同样走优雅停止（stop 文件 + 信号 + grace）。
@@ -812,22 +815,36 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
 - **map（远端就地）**：`scripts/logstats.py` 在节点/pod 内逐客户端日志统计，产出
   `<log>.stats.json`（全局精确计数/分位数、对数定梯直方图、1s/1min 桶、per-op 统计、
   SUMMARY 字段、错误码 + 首错误 ±20 行摘录、Top-100 慢点、异常窗口自检）。编排器默认
-  **只回传 stats**；原始日志留在节点（失败路径、`--pull-raw-logs` 或原始日志 ≤100MB 的
-  小 run 会回拉原始日志）。
+  **只回传 stats**，且只回传**真正产出的**文件——map 失败（远端 python 异常/venv 为空/
+  超时）只 WARN 并让报表缺该客户端，不会把跑完的性能测试判失败；每文件超时
+  `MC_MAP_TIMEOUT`（默认 900s，0=不限）并打印 `[map] … 1.2s` 耗时。
+  原始日志留在节点（失败路径、`--pull-raw-logs`，或「`.log` + `.glog` 合计 ≤100MB」的
+  小 run 才自动回拉——阈值把 SDK glog 体积算在内，避免把 GB 级 glog 拖回来）。
 - **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
   渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
-  `overview.html`（run 总览）。
-- **展示方式**：主时间线按 **1s 桶**（≤1 天；>1 天自动用 1min 桶、1s 留 data.js）——
+  `overview.html`（run 总览）。**`data.js` 必须与 report.html 同目录**：从磁盘双击打开时
+  自动加载全量客户端；经 WebUI「在新标签页打开报表」（`/api/file?mode=raw`）时相对路径
+  取不到 data.js，客户端表退化为 p99 前 20 名并在卡片里明确提示。
+- **展示方式**：主时间线默认 **1s 桶**（跨度 >1 天自动切 1min 桶，此时 HTML 只内嵌
+  分钟序列、1s 完整留在 data.js）——
   QPS 柱 + p50/p99/p999/最大 线 + 失败柱，悬停查看该桶全部统计量、滚轮缩放；点击客户端
   行叠加其分钟曲线；异常窗口在图上以黄色竖线标注；Top-100 慢点表保留单点级证据。
   不再逐点画散点（数十万点会遮挡且无法读数）。
-- **三路径**：done / failed / stopped（STOP 优雅停）都会出报表，报表标注「提前停止/异常」。
-- **重建**：`benchmark.py --rebuild-report outputs/<ts>` 仅用本地 stats/原始日志重建报表
-  （覆盖「run 正常结束但报表阶段失败」；远端重建需重新 map，暂未自动实现）。
+- **三路径**：done / failed / stopped 都会出报表。done/failed 走远端 map；stopped 在清理
+  前回拉原始日志、本地重算（不再静默无产物）。三种路径的报表都标注「提前停止/异常」。
+- **重建**：`benchmark.py --rebuild-report <ts>`（传时间戳目录名，**不要**带 `outputs/`
+  前缀）仅用本地 stats/原始日志重建报表，覆盖「run 正常结束但报表阶段失败」；远端重建
+  需重新 map，暂未自动实现。本地重算会从文件名/目录回填 `size/role/node`（如
+  `<cfg>.<run>_8MB.dual_<node>_c0_p9301.reader.log`），因此多 data_size 与读写角色
+  仍能正确分块。
 - **开关**：`--no-report`（`--no-plot` 同义）跳过；`--png` 保留旧 PNG 绘图流程
   （会连带回拉原始日志，仅小 run 实用）。
 - **待办（已记录）**：store 容量周期采样时间线（P3）、增量 map / 节点日志轮转上限、
   按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。
+- **产物版本标记**（旧 run 兼容）：`stats.json` 带 `meta.bucket_unit`（时间桶 t 恒为
+  epoch 秒）与 `meta.hist_version`（v2 = 0.001ms 起 ratio 1.2、108 档到 ~250s；无标记的
+  旧产物按 v1 的 81 档 2.16s 解释）；`trace.json` 带 `meta.bins="us-v1"`（µs 值用 µs
+  阶梯，无标记的旧 trace 不显示直方图分位，避免把 µs 当 ms 误读）。
 - 依赖：无第三方库（ECharts 5.5.1 已 vendor 在 `webui/web/vendor/echarts.min.js`）。
 
 #### SDK 全链路（C++ trace）—— 报表内的第二层统计
@@ -844,8 +861,14 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   独立 1s/1min 时间线（样本数柱 + 端到端 p50/p99）、**树形阶段分位表（含残差
   total−阶段和）**、Top-50 慢请求（含前三耗时阶段）、状态分布；未知的 `*_us` 字段
   自动归入「其它阶段」。
+- **数值口径**：`*_us` 单位是微秒，直方图用独立 µs 阶梯（0.001µs 起、ratio 1.2、
+  120 档到 ~3.4s）；`-1` 表示该阶段拿不到时间戳，只计入样本数与 neg，不参与
+  平均/分位（平均分母为「有效样本数」）；读写方向优先按字段判定、字段缺失时按 op 名兜底。
 - **采样门控**：主行仅在采样命中（`MC_HIFREQ_LOG_SAMPLE_RATE`）或失败时出现，
-  **样本数 ≠ 请求总数**，报表显示实际采样率（仓库当前配置为 `1`，长跑需降采样）。
+  **样本数 ≠ 请求总数**，报表显示实际采样率。仓库当前配置为 `1`：若 SDK 语义是
+  「全量」，每请求约 0.4–0.6KB trace，50k QPS 约 30MB/s、单小时上百 GB，会明显干扰
+  磁盘/日志 I/O 与 map 耗时（map 还要两遍扫 glog）——**长跑前请先按需下调**（如 0.01），
+  并在真实环境确认该变量的采样语义。
 - **多副本限制**：put/upsert 的 `memwrite_*` 与 slice 明细仅代表最后一个副本的传输，
   `memwrite_total_us` 为全部副本合计（SDK 侧限制，报表脚注说明）。
 - **slice 明细行**（`breakdown[<op>.slice]`）P1 仅计数，逐 slice 分析后续补充。
