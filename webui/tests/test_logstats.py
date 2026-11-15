@@ -239,3 +239,22 @@ def test_rows_without_timestamp_are_counted(tmp_path):
     assert g["p50_ms"] == 1.0 and g["max_ms"] == 2.0
     assert st["meta"]["rows"] == 3 and st["meta"]["dated"] is False
     assert st["seconds"] == [] and st["errors"] == {"ERR:-200": 1}
+
+
+def test_summaries_not_starved_by_meta_lines(tmp_path):
+    """summary 的截断额度不能被 META 行占用（6 客户端 basic 合并日志）。"""
+    seg = []
+    for i in range(6):
+        seg.append("META\t" + json.dumps({"mode": "benchmark", "start_ts": i}))
+        seg.append("RESULT\t2026-11-12 10:00:0{}.000000\tput\tk{}\t1.0\tOK"
+                   .format(i, i))
+        seg.append("SUMMARY\t" + json.dumps(
+            {"mode": "benchmark", "wall_s": 10.0, "bytes": 100,
+             "max_depth": 0}))
+    # 再加 9 条 META（真机 writer 会打很多 META）压测额度
+    seg.extend("META\t" + json.dumps({"mode": "pipeline_writer"})
+               for _ in range(9))
+    st = ls.compute_stats(_write(tmp_path, "\n".join(seg) + "\n"))
+    sums = [p for k, p in st["summaries"] if k == "summary"]
+    assert len(sums) == 6
+    assert sum(int(p.get("bytes", 0)) for p in sums) == 600

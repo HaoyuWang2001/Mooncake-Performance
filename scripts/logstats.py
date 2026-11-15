@@ -181,27 +181,36 @@ def _read_context(path, center_line, context):
     return text[:EXCERPT_CAP]
 
 
-def _scan_summaries(path, cap=8):
-    """SUMMARY/META lines of one log (JSON payloads). A dual legacy mixed
-    log carries writer + reader summaries; keep all (capped)."""
+def _scan_summaries(path, cap=128, meta_cap=2):
+    """SUMMARY/META lines of one log (JSON payloads).
+
+    SUMMARYs are what downstream needs (bytes / wall / max_depth): every
+    client of a merged basic log writes one, so they get their own generous
+    budget. META lines are diagnostics only — they must NOT consume the
+    SUMMARY quota (a writer log alone prints 5-6 of them)."""
     out = []
+    n_sum = n_meta = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 if line.startswith(SUMMARY_PREFIX):
+                    if n_sum >= cap:
+                        continue
                     try:
                         out.append(("summary",
                                     json.loads(line[len(SUMMARY_PREFIX):])))
+                        n_sum += 1
                     except ValueError:
                         continue
                 elif line.startswith(META_PREFIX):
+                    if n_meta >= meta_cap:
+                        continue
                     try:
                         out.append(("meta",
                                     json.loads(line[len(META_PREFIX):])))
+                        n_meta += 1
                     except ValueError:
                         continue
-                if len(out) >= cap:
-                    break
     except OSError:
         pass
     return out
