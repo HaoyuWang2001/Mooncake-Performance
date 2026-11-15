@@ -326,3 +326,18 @@ def test_long_run_embeds_minutes_only(tmp_path):
     full = json.loads(open(dj, encoding="utf-8").read()[
         len("window.__MC_FULL__ = "):].rstrip().rstrip(";"))
     assert len(full["sizes"]["8MB"]["series"]["writer"]["step1"]["t"]) == 3
+
+
+def test_trace_only_size_does_not_break_page(tmp_path):
+    """只有 trace 的 data_size（summary 为空）不能把整页 JS 打挂。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    tr = _trace_stats(tmp_path, "c.glog", size="all")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    assert data["sizes"]["all"]["summary"] is None
+    res = _js_check(tmp_path, data, "--switch-size", "all",
+                    "--expect-trace", "1")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["switched_error"] is False
+    assert res["trace_visible"] is True

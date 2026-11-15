@@ -878,6 +878,9 @@ function renderSummary(){
   const z=Z(); if(!z) return;
   const s=z.summary; const g=document.getElementById('cards');
   g.innerHTML='';
+  if(!s){g.appendChild(el('div','note',
+    '该 data_size 只有 C++ trace 统计（无 logstats 数据），下方仍可查看全链路区。'));
+    return;}
   const target=D.meta&&D.meta.qps_target?Number(D.meta.qps_target):0;
   g.appendChild(kv('成功', s.ok));
   g.appendChild(kv('失败', s.fail));
@@ -904,7 +907,7 @@ function renderTable(){
   if(note&&window.__mcDataMissing)note.style.display='';
   const tb=document.querySelector('#ctable tbody'); tb.innerHTML='';
   const clients=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&
-    FULL.sizes[curSize].clients)||z.clients;
+    FULL.sizes[curSize].clients)||z.clients||[];
   clients.slice().sort((a,b)=>(b.p99_ms-a.p99_ms)).forEach(c=>{
     const tr=el('tr');
     [c.name,c.role,c.node,c.total,c.ok,c.fail,
