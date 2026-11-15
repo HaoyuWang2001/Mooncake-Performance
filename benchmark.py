@@ -1968,6 +1968,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
             cmd += " --size {}".format(shlex.quote(str(size)))
         if sample_rate is not None:
             cmd += " --sample-rate {}".format(sample_rate)
+        ok = True
         if dry:
             log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
         elif node.get("_pod"):
@@ -1977,6 +1978,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
                 ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
                 check=False)
             if rc != 0:
+                ok = False
                 log("[WARN] [map] tracestats failed on pod {}: {}".format(
                     node["_pod"], (o or "").strip()[:200]))
         else:
@@ -1984,9 +1986,11 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
                 ssh_check_output(node["ip"], node, cmd, dry_run=dry,
                                  quiet=True)
             except Exception as exc:
+                ok = False
                 log("[WARN] [map] tracestats failed on {}: {}".format(
                     node.get("ip"), exc))
-        out.append(trace_file)
+        if ok:
+            out.append(trace_file)     # never request a file that wasn't made
     return out
 
 
@@ -2012,6 +2016,7 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
         if size:
             cmd += " --size {}".format(shlex.quote(str(size)))
         cmd += " --remote-path {}".format(shlex.quote(log_path))
+        ok = True
         if dry:
             log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
         elif node.get("_pod"):
@@ -2021,6 +2026,7 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
                 ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
                 check=False)
             if rc != 0:
+                ok = False
                 log("[WARN] [map] logstats failed on pod {}: {}".format(
                     node["_pod"], (out or "").strip()[:200]))
         else:
@@ -2028,9 +2034,11 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
                 ssh_check_output(node["ip"], node, cmd, dry_run=dry,
                                  quiet=True)
             except Exception as exc:
+                ok = False
                 log("[WARN] [map] logstats failed on {}: {}".format(
                     node.get("ip"), exc))
-        stats.append(stats_file)
+        if ok:
+            stats.append(stats_file)   # never request a file that wasn't made
     return stats
 
 
@@ -3233,15 +3241,14 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             # map (remote logstats) + stats-only pull by default — the
             # CSV/report consume *.stats.json; raw logs (+pids) only when
             # explicitly requested (--pull-raw-logs / --png)
-            run_logstats_map(cluster, node, [remote_log], remote_scripts,
-                             globals_cfg, dry=dry,
-                             node_name=primary_node_name, size=ds)
-            run_tracestats_map(cluster, node, [remote_log + ".glog"],
-                               remote_scripts, globals_cfg, dry=dry,
-                               node_name=primary_node_name, size=ds,
-                               sample_rate=_hifreq_sample_rate())
-            _pull_files = [remote_log + ".stats.json",
-                           remote_log + ".glog.trace.json"]
+            _stats_files = run_logstats_map(
+                cluster, node, [remote_log], remote_scripts, globals_cfg,
+                dry=dry, node_name=primary_node_name, size=ds)
+            _trace_files = run_tracestats_map(
+                cluster, node, [remote_log + ".glog"], remote_scripts,
+                globals_cfg, dry=dry, node_name=primary_node_name, size=ds,
+                sample_rate=_hifreq_sample_rate())
+            _pull_files = list(_stats_files) + list(_trace_files)
             if getattr(args, "pull_raw_logs", False) \
                     or getattr(args, "png", False):
                 _pull_files += [remote_log, remote_log + ".glog"] + (
