@@ -226,3 +226,16 @@ def test_exact_limit_degrade_keeps_exact_min_max(tmp_path, monkeypatch):
     op = st["ops"]["put"]
     assert op["min_ms"] == 1.0 and op["max_ms"] == 100.0
     assert 90.0 <= g["p99_ms"] <= 130.0     # 分位由直方图近似
+
+
+def test_rows_without_timestamp_are_counted(tmp_path):
+    """最老格式 RESULT 行（无任何时间戳，op 在第二列）不能被整行丢弃。"""
+    text = ("RESULT\tput\tk1\t1.000000\tOK\n"
+            "RESULT\tput\tk2\t2.000000\tOK\n"
+            "RESULT\tput\tk3\t5.000000\tERR:-200\n")
+    st = ls.compute_stats(_write(tmp_path, text))
+    g = st["global"]
+    assert g["total"] == 3 and g["ok"] == 2 and g["fail"] == 1
+    assert g["p50_ms"] == 1.0 and g["max_ms"] == 2.0
+    assert st["meta"]["rows"] == 3 and st["meta"]["dated"] is False
+    assert st["seconds"] == [] and st["errors"] == {"ERR:-200": 1}

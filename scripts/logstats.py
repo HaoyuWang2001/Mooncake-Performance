@@ -84,15 +84,18 @@ def iter_rows(path):
             if not line.startswith(RESULT_PREFIX):
                 continue
             parts = line.rstrip("\n").split("\t")
-            if len(parts) < 2 or not TS_PREFIX.match(parts[1]):
+            if len(parts) < 5:
                 continue
-            off = 1
+            # legacy rows start with the op name (no timestamp at all);
+            # dated/dateless-time rows keep the timestamp at parts[1]
+            off = 1 if TS_PREFIX.match(parts[1]) else 0
             if len(parts) < 5 + off:
                 continue
             op = parts[1 + off]
+            ts = parts[1] if off else ""
             if op == "pipeline_notify":
                 # notify 诊断行：无时延样本，错误计数交给 errors 流
-                yield {"ts": parts[1], "op": op, "key": parts[2 + off] if len(parts) > 2 + off else "",
+                yield {"ts": ts, "op": op, "key": parts[2 + off] if len(parts) > 2 + off else "",
                        "lat": None, "status": parts[4 + off] if len(parts) > 4 + off else "",
                        "qw": None, "kc": 0, "lineno": lineno}
                 continue
@@ -113,7 +116,7 @@ def iter_rows(path):
                         kc = int(parts[6 + off]) or 1
             except ValueError:
                 pass
-            yield {"ts": parts[1], "op": op,
+            yield {"ts": ts, "op": op,
                    "key": parts[2 + off], "lat": lat, "status": status,
                    "qw": qw, "kc": kc, "lineno": lineno}
 
