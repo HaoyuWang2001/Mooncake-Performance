@@ -462,3 +462,13 @@ def test_summary_percentiles_consistent_with_csv(tmp_path):
     st2["meta"]["source"] = "b.writer.log"
     s2 = rp.reduce_size([st, st2], {"config": "c"})["summary"]
     assert s2["max_ms"] == 100.0 and s2["p999_ms"] <= s2["max_ms"]
+
+
+def test_summary_throughput_uses_bytes(tmp_path):
+    """吞吐卡必须用字节数（原用 key 数/1MiB，相当于随便一个数）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    b = _stats(tmp_path, "b.writer", "writer")
+    s = rp.reduce_size(rp.load([a, b]), {"config": "c"})["summary"]
+    assert s["bytes"] == 8192                 # 2 x SUMMARY bytes=4096
+    assert abs(s["throughput_mb_s"]
+               - 8192 / s["wall_s"] / 1048576.0) < 1e-6

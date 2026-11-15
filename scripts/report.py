@@ -120,6 +120,7 @@ def _summary_of(stats):
     qw_sum = 0.0
     qw_n = 0
     qw_max = 0.0
+    total_bytes = 0
     max_depth = 0
     ts_from = ts_to = None
     hist = {}
@@ -161,6 +162,7 @@ def _summary_of(stats):
             if kind != "summary":
                 continue
             max_depth = max(max_depth, int(payload.get("max_depth", 0) or 0))
+            total_bytes += int(payload.get("bytes", 0) or 0)
             wall = max(wall, float(payload.get("wall_s", 0) or 0))
     span = (ts_to - ts_from) if (ts_from is not None and ts_to is not None) else 0.0
     wall = wall or span
@@ -194,7 +196,8 @@ def _summary_of(stats):
         "qps": round(total / wall, 2) if wall > 0 else 0.0,
         # None when the logs carry no timestamps (legacy) -> the card shows
         # "-" instead of Infinity (JS must not divide by a zero wall)
-        "throughput_mb_s": (round(total / wall / 1048576.0, 2)
+        "bytes": total_bytes,
+        "throughput_mb_s": (round(total_bytes / wall / 1048576.0, 6)
                             if wall > 0 else None),
         "clients": len(stats),
         "ts_from": ts_from, "ts_to": ts_to,
