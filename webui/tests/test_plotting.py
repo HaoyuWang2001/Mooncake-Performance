@@ -98,6 +98,7 @@ def test_plot_file_stem_avoids_regression_windows_max_path():
 
 def test_kvtest_samples_generate_one_request_per_point_png(tmp_path):
     pl = _load_plot_module()
+    assert "ax.plot(xs, latencies" in _read("scripts/plot_latency.py")
     path = tmp_path / "kvtest_smoke.node_i0_p9101.kvtest_8MB.samples.csv"
     path.write_text(
         "elapsed_us,instance_id,operation,request_index,latency_ms,status,bytes\n"

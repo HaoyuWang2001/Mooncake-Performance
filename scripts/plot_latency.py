@@ -372,8 +372,14 @@ def plot_kvtest_samples(path, operation, points, args):
     threshold = float("inf") if threshold is None else threshold
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    normal_x, normal_y, outlier_x, outlier_y, failed_x, failed_y = \
-        [], [], [], [], [], []
+    latencies = [p["latency_ms"] for p in points]
+    # Draw the complete request sequence as a point-line series. Failures and
+    # outliers are overlaid below so they stay visible without breaking the
+    # chronological connecting line.
+    ax.plot(xs, latencies, linewidth=0.45, marker=".", markersize=2,
+            color="tab:gray", alpha=0.8,
+            label="requests ({})".format(len(points)))
+    outlier_x, outlier_y, failed_x, failed_y = [], [], [], []
     for x, point in zip(xs, points):
         latency = point["latency_ms"]
         if point["status"] != "OK":
@@ -382,18 +388,14 @@ def plot_kvtest_samples(path, operation, points, args):
         elif latency > threshold:
             outlier_x.append(x)
             outlier_y.append(latency)
-        else:
-            normal_x.append(x)
-            normal_y.append(latency)
-    if normal_x:
-        ax.scatter(normal_x, normal_y, s=7, marker=".", color="tab:gray",
-                   label="OK requests ({})".format(len(normal_x)))
     if outlier_x:
         ax.scatter(outlier_x, outlier_y, s=25, marker="x", color="tab:orange",
+                   zorder=5,
                    label="OK outliers ({}, >{:g}ms)".format(
                        len(outlier_x), threshold))
     if failed_x:
         ax.scatter(failed_x, failed_y, s=28, marker="x", color="red",
+                   zorder=6,
                    label="failed requests ({})".format(len(failed_x)))
 
     if values:

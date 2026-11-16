@@ -153,7 +153,8 @@ kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 
 
 kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
 内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其
-拉回为 `*.samples.csv`，`scripts/plot_latency.py` 按 operation 生成一请求一点的
+拉回为 `*.samples.csv`，`scripts/plot_latency.py` 按 operation 生成一请求一点、
+并按完成时间顺序连接的点线图
 `<实例>.<operation>.latency.png`；`notify_queue_wait` 使用
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
 request #i。`latency_timeseries.csv` 仍会保留和拉回作为聚合原始数据，但不再
