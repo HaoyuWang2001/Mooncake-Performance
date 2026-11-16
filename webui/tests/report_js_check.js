@@ -29,6 +29,8 @@ if (!appPath || !dataPath) {
 }
 const switchSize = arg("--switch-size", null);
 const expectTrace = arg("--expect-trace", null) === "1";
+const tierLabel = arg("--tier-label", null);
+const addObjKey = arg("--add-obj", null);
 
 const elements = {};
 function makeEl(id) {
@@ -138,19 +140,52 @@ function seriesX0(opt, name) {
   return s && s.data.length ? s.data[0][0] : null;
 }
 if (!errs.length) {
-  out.cards_text = textOf(getEl("cards"));
+  out.cards_text = [textOf(getEl("perfcards")), textOf(getEl("infocards")),
+                    textOf(getEl("params"))].join(" ");
   out.init_len = seriesLen(mainOpt(), "p50");
   out.init_x0 = seriesX0(mainOpt(), "p50");
 
-  // 点击「1 分钟粒度」按钮（第二个 step 按钮，若存在）
-  const stepBox = getEl("steps");
-  const btn = (stepBox.children || []).find(
-    (b) => String(b._text) === "1 分钟粒度");
-  if (btn && btn.onclick) {
-    try { btn.onclick(); out.min_len = seriesLen(mainOpt(), "p50"); }
-    catch (e) { errs.push("step switch: " + String(e)); }
+  // 点击一个比默认更粗的粒度按钮（时间分桶阶梯），验证切档
+  const stepBox = getEl("tierBtns");
+  const btns = (stepBox.children || []).filter(
+    (b) => b && b.onclick && !b.disabled && String(b._text) !== "");
+  const cur = btns.find((b) => b.className === "on");
+  const target = tierLabel
+    ? btns.find((b) => String(b._text) === tierLabel)
+    : btns.find((b) => b !== cur);
+  if (target && target.onclick) {
+    try { target.onclick(); out.min_len = seriesLen(mainOpt(), "p50"); }
+    catch (e) { errs.push("tier switch: " + String(e)); }
   } else {
     out.min_len = out.init_len;
+  }
+
+  if (addObjKey) {
+    try {
+      const sel = getEl("objAdd");
+      sel.value = addObjKey;
+      sel.onchange();
+      const opt = mainOpt();
+      out.overlay_names = (opt && opt.series || []).map((s) => s.name);
+      out.overlay_len = opt && opt.series && opt.series.length
+        ? opt.series[0].data.length : null;
+    } catch (e) { errs.push("add obj: " + String(e && e.stack || e)); }
+  }
+
+  const hsizes = data.sizes || {};
+  const hsize = Object.keys(hsizes)[0];
+  const zz = hsize ? hsizes[hsize] : null;
+  if (zz && zz.trace) {
+    out.levels_text = textOf(getEl("levels"));
+    out.tree_text = textOf(getEl("ttree"));
+    let clicked = false;
+    (getEl("ttree").children || []).forEach((row) => {
+      if (clicked) return;
+      const name = (row.children || []).find((c) => c.className === "tname");
+      if (name && name.onclick) { name.onclick(); clicked = true; }
+    });
+    out.modal_visible = getEl("nodeModal").style.display !== "none";
+    out.modal_text = textOf(getEl("modalBody"));
   }
 
   if (switchSize) {

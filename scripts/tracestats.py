@@ -51,6 +51,13 @@ WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
              "put_start_us", "memwrite_total_us", "put_end_us", "finalize_us",
              "cache_invalidate_us", "revoke_us")
 
+# 段3：阶段曲线（图2）采样字段 = L1 顶层 + total + residual。
+# L2 子阶段（query_route/read_urma/...）不再逐时间采样（体积随字段数线性膨胀，
+# 512 客户端不可控）；L2 细粒度分析在阶段树/指标套件里提供全局统计。
+CHART_FIELDS = set(READ_TOP) | set(WRITE_TOP) | {"residual"}
+FIELD_MIN_SECONDS = 60        # 阶段时间桶初档：1 分钟
+FIELD_MAX_BUCKETS = 1440      # 单字段桶数上限（超出自动降档到 10 分钟）
+
 TOP_N = 50
 
 
@@ -204,6 +211,46 @@ def _bucket_add(b, total_us, ok):
         b["neg"] += 1
 
 
+def _fmb_add(bmap, field, mkey, value):
+    """Add one stage sample into its per-minute bucket [n, sum, max]."""
+    fb = bmap.setdefault(field, {})
+    b = fb.get(mkey)
+    if b is None:
+        fb[mkey] = [1, value, value]
+    else:
+        b[0] += 1
+        b[1] += value
+        if value > b[2]:
+            b[2] = value
+
+
+def _fmb_rows(fbuckets):
+    """{min_epoch: [n,sum,max]} -> [[t, n, avg, max], ...] with an automatic
+    coarsening step (10 min) when the bucket count would exceed the cap."""
+    if not fbuckets:
+        return [], FIELD_MIN_SECONDS
+    step = FIELD_MIN_SECONDS
+    if len(fbuckets) > FIELD_MAX_BUCKETS:
+        step = FIELD_MIN_SECONDS * 10
+        agg = {}
+        for t, b in fbuckets.items():
+            k = int(t) // step * step
+            a = agg.get(k)
+            if a is None:
+                agg[k] = [b[0], b[1], b[2]]
+            else:
+                a[0] += b[0]
+                a[1] += b[1]
+                a[2] = max(a[2], b[2])
+        fbuckets = agg
+    rows = []
+    for t in sorted(fbuckets):
+        n, ssum, mx = fbuckets[t]
+        rows.append([int(t), int(n), round(ssum / n, 3) if n else 0.0,
+                     round(mx, 3)])
+    return rows, step
+
+
 def _bucket_rows(bmap, base=1):
     """bucket rows; t is emitted as epoch-seconds (base=60 for minute keys)."""
     out = []
@@ -238,7 +285,8 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             st = ops[key] = {
                 "group": group, "op": op,
                 "count": 0, "ok": 0, "fail": 0, "status": {},
-                "fields": {},          # field -> {n, sum, min, max, neg, hist}
+                "fields": {},          # field -> {n, sum, sumsq, min, max, neg, hist}
+                "field_minutes": {},   # chart field -> {min_epoch: [n, sum, max]}
                 "seconds": {}, "minutes": {},
                 "size_values": {}, "replicas": {}, "slice_count": {},
                 "top": [], "_top_seq": 0,
@@ -287,6 +335,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 st["fail"] += 1
             st["status"][status] = st["status"].get(status, 0) + 1
 
+            ep_pre = _start_epoch(pairs.get("start_time", ""))
             # numeric field statistics (histogram + sum/min/max; -1 counts as neg)
             parsed = {}
             for k, v in pairs.items():
@@ -299,6 +348,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                     continue
                 parsed[k] = num
                 fd = st["fields"].setdefault(k, {"n": 0, "sum": 0.0,
+                                                 "sumsq": 0.0,
                                                  "min": None, "max": None,
                                                  "neg": 0, "hist": {}})
                 fd["n"] += 1
@@ -306,14 +356,29 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                     fd["neg"] += 1
                     continue
                 fd["sum"] += num
+                fd["sumsq"] += num * num
                 fd["min"] = num if fd["min"] is None else min(fd["min"], num)
                 fd["max"] = num if fd["max"] is None else max(fd["max"], num)
                 hb = ls.bin_of(num, ls.BIN_EDGES_US)
                 fd["hist"][hb] = fd["hist"].get(hb, 0) + 1
 
             total = parsed.get("total_us")
+            # 阶段分钟桶（图2）：L1 顶层 + residual（端到端减去 L1 之和）
+            if ep_pre is not None:
+                mkey = int(ep_pre) // FIELD_MIN_SECONDS * FIELD_MIN_SECONDS
+                tops = READ_TOP if group == "read" else (
+                    WRITE_TOP if group == "write" else ())
+                stage_sum = 0.0
+                for cf in tops:
+                    cv = parsed.get(cf)
+                    if cv is not None and cv >= 0:
+                        stage_sum += cv
+                        _fmb_add(st["field_minutes"], cf, mkey, cv)
+                if group in ("read", "write") and total is not None \
+                        and total >= 0:
+                    _fmb_add(st["field_minutes"], "residual", mkey,
+                             total - stage_sum)
             # time buckets from start_time
-            ep = _start_epoch(pairs.get("start_time", ""))
             if ep is not None:
                 ts_from = ep if ts_from is None else min(ts_from, ep)
                 ts_to = ep if ts_to is None else max(ts_to, ep)
@@ -361,8 +426,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         fields = {}
         for k, fd in st["fields"].items():
             fields[k] = {"n": fd["n"], "neg": fd["neg"],
-                         "sum": round(fd["sum"], 3), "min": fd["min"],
-                         "max": fd["max"],
+                         "sum": round(fd["sum"], 3),
+                         "sumsq": round(fd.get("sumsq", 0.0), 3),
+                         "min": fd["min"], "max": fd["max"],
                          "hist": {str(b): n for b, n in sorted(fd["hist"].items())}}
         # residual = total_us - sum(top-level stage values), per request
         res_hist = {}
@@ -382,6 +448,15 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             "slice_count": _value_hist(st["slice_count"]),
             "top": [e for _t, _s, e in sorted(st["top"], key=lambda x: -x[0])],
         }
+        # 段3：阶段时间桶（图2）；同一 op 内统一档位
+        fmin = {}
+        tier = FIELD_MIN_SECONDS
+        for fname, fb in (st.get("field_minutes") or {}).items():
+            rows, tier = _fmb_rows(fb)
+            fmin[fname] = rows
+        if fmin:
+            g["ops"][op]["fminutes"] = fmin
+            g["ops"][op]["ftier"] = tier
 
     # second pass: residual histogram per (group, op) — exact, cheap (local
     # disk, sampled lines); only when trace lines exist

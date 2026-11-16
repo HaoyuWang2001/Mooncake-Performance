@@ -2286,8 +2286,73 @@ def _collect_local_traces(local_log_dir):
     return sorted(set(traces))
 
 
+def _build_report_params(cfg, meta, nodes=0):
+    """Flatten scenario config + run context into an ordered [[label, value]]
+    list for the report's 参数配置 section. Empty fields are omitted."""
+    out = []
+
+    def add(label, value):
+        if value is None or value == "" or value == [] or value == {}:
+            return
+        if isinstance(value, bool):
+            value = "是" if value else "否"
+        out.append([label, value])
+
+    add("场景", cfg.get("scenario"))
+    add("协议", cfg.get("protocol"))
+    add("工作模式", cfg.get("work_mode") or cfg.get("mode"))
+    add("流量模式", cfg.get("traffic_mode"))
+    ds = cfg.get("data_size")
+    if isinstance(ds, (list, tuple)):
+        add("数据大小", "、".join(str(x) for x in ds))
+    else:
+        add("数据大小", ds)
+    if cfg.get("duration"):
+        add("采集时长", "{} s".format(cfg.get("duration")))
+    warm = cfg.get("warmup") or {}
+    if warm.get("duration"):
+        add("预热时长", "{} s".format(warm["duration"]))
+    add("batch_size", cfg.get("batch_size"))
+    add("操作", cfg.get("operation"))
+    add("key_count", cfg.get("key_count"))
+    qps = cfg.get("base_qps") or cfg.get("target_qps")
+    mult = cfg.get("qps_multiple") or 1
+    if qps:
+        try:
+            add("目标 QPS", "{:g} × {:g} = {:g}".format(
+                float(qps), float(mult), float(qps) * float(mult)))
+        except (TypeError, ValueError):
+            add("目标 QPS", qps)
+    add("notify_count", cfg.get("notify_count"))
+    wr = cfg.get("writer") or {}
+    rd = cfg.get("reader") or {}
+    add("notify_threads", cfg.get("notify_threads") or wr.get("notify_threads"))
+    add("writer.operation", wr.get("operation"))
+    add("writer.count_per_node", wr.get("count_per_node"))
+    add("reader.operation", rd.get("operation"))
+    add("reader.count_per_node", rd.get("count_per_node"))
+    add("reader.num_threads", rd.get("num_threads"))
+    add("client.count_per_node", (cfg.get("client") or {}).get("count_per_node"))
+    add("cpu_shard", cfg.get("cpu_shard"))
+    add("numa_bind", cfg.get("numa_bind"))
+    # 运行上下文
+    add("运行模式", {"ssh": "真机", "k8s": "k8s"}.get(
+        meta.get("mode"), meta.get("mode")))
+    add("启动方式", {"single": "单任务", "rank_recall": "Rank+Recall"}.get(
+        meta.get("launch_mode"), meta.get("launch_mode")))
+    if nodes:
+        add("节点数", nodes)
+    add("客户端总数", meta.get("clients"))
+    add("cluster 配置", meta.get("cluster_cfg"))
+    add("global 配置", meta.get("global_cfg"))
+    add("profile 配置", meta.get("profile_cfg"))
+    add("开始时间", meta.get("started"))
+    return out
+
+
 def _generate_reports(cfg, local_log_dir, args, early_stop=False,
-                      qps_target=0, launch_mode="single", mode="pipeline"):
+                      qps_target=0, launch_mode="single", mode="pipeline",
+                      nodes=0):
     """Reduce the map products and render the scenario report. WARN-only —
     never fails the benchmark path."""
     if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
@@ -2307,10 +2372,14 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
             "launch_mode": launch_mode,
             "clients": len(stats),
             "qps_target": qps_target,
-            "protocol": "",
+            "protocol": cfg.get("protocol") or "",
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "early_stop": bool(early_stop),
+            "cluster_cfg": os.path.basename(getattr(args, "cluster", "") or ""),
+            "global_cfg": os.path.basename(getattr(args, "global_cfg", "") or ""),
+            "profile_cfg": os.path.basename(getattr(args, "profile", "") or ""),
         }
+        meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
         traces = _collect_local_traces(local_log_dir)
         data = rp.reduce_scenario(rp.load(stats), meta,
                                   monitors=rp.reduce_monitors(local_log_dir),
@@ -2321,6 +2390,14 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
         html, _datajs = rp.render_scenario(
             data, out_dir, echarts,
             rel_base=os.path.relpath(out_dir, ROOT).replace(os.sep, "/"))
+        # persist meta so --rebuild-report can restore params/context
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "meta.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=1)
+        except OSError as exc:
+            log_detail("[report] meta.json write failed: {}".format(exc))
         log("[report] {} -> {}".format(
             cfg_name, os.path.relpath(html, ROOT)))
         _REPORT_ACC.append({"data": data, "report_html": html})
@@ -3484,7 +3561,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
-        _generate_reports(cfg, local_log_dir, args,
+        _generate_reports(cfg, local_log_dir, args, nodes=len(involved_nodes),
                           qps_target=total_target_qps, mode="basic")
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
                 "remote_log_dir": remote_log_dir}
@@ -3498,6 +3575,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                              nodes=len(involved_nodes),
                               qps_target=total_target_qps, mode="basic")
             reap_state_entries(cluster)
             if is_k8s:
@@ -4539,7 +4617,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
         # config's node; hand it this config's coordinates.
-        _generate_reports(cfg, local_log_dir, args,
+        _generate_reports(cfg, local_log_dir, args, nodes=len(involved_nodes),
                           qps_target=plan["total_qps"],
                           launch_mode="rank_recall" if plan.get("dual") else "single",
                           mode="pipeline")
@@ -4562,6 +4640,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 prof_core.stop_and_collect(cluster, profile_sess,
                                            os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                              nodes=len(involved_nodes),
                               qps_target=plan["total_qps"],
                               launch_mode="rank_recall" if plan.get("dual") else "single",
                               mode="pipeline")
@@ -5744,10 +5823,27 @@ def rebuild_reports(ts):
         roles = {(st.get("meta") or {}).get("role") for st in loaded}
         mode = "pipeline" if roles & {"writer", "reader"} else "basic"
         traces = _collect_local_traces(d)
+        # restore the params/context captured at run time (段1 参数配置卡)
+        saved = {}
+        try:
+            with open(os.path.join(d, "report", "meta.json"),
+                      "r", encoding="utf-8") as f:
+                saved = json.load(f) or {}
+        except (OSError, ValueError):
+            saved = {}
         data = rp.reduce_scenario(loaded, {
-            "config": name, "mode": mode, "clients": len(loaded),
-            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "config": name, "mode": saved.get("mode") or mode,
+            "launch_mode": saved.get("launch_mode") or "",
+            "clients": len(loaded),
+            "qps_target": saved.get("qps_target") or 0,
+            "protocol": saved.get("protocol") or "",
+            "started": saved.get("started")
+            or time.strftime("%Y-%m-%d %H:%M:%S"),
             "early_stop": False,          # unknown for historical runs
+            "cluster_cfg": saved.get("cluster_cfg") or "",
+            "global_cfg": saved.get("global_cfg") or "",
+            "profile_cfg": saved.get("profile_cfg") or "",
+            "params": saved.get("params") or [],
         }, monitors=rp.reduce_monitors(d), traces=rp.load(traces))
         out_d = os.path.join(d, "report")
         html, _dj = rp.render_scenario(

@@ -331,3 +331,37 @@ def test_phase_of_window_math():
     assert ts._phase_of(300, marks) == "measured"
     assert ts._phase_of(301, marks) == "teardown"
     assert ts._phase_of(1, {}) is None          # legacy -> measured by caller
+
+
+# ---------------------------------------------------------------------------
+# 段3：阶段时间桶（图2）+ σ（sumsq）
+# ---------------------------------------------------------------------------
+
+def test_field_minutes_l1_and_residual(tmp_path):
+    p = tmp_path / "f.glog"
+    p.write_text(READ_OK + "\n" + WRITE_OK + "\n", encoding="utf-8")
+    st = ts.compute_trace_stats(str(p))
+    read = st["groups"]["read"]["ops"]["get_buffer"]
+    fm = read["fminutes"]
+    # L1 顶层 + residual；L2 不逐时间采样（体积控制）
+    assert set(fm) == {"query_total_us", "select_us", "buf_alloc_us",
+                       "memread_total_us", "residual"}
+    assert "query_route_us" not in fm
+    rows = fm["query_total_us"]
+    assert len(rows) == 1
+    t, n, avg, mx = rows[0]
+    assert n == 1 and avg == 50 and mx == 50
+    assert t % 60 == 0                    # 1 分钟对齐的 epoch 秒
+    # residual = 266 - (50+4+6+206) = 0
+    assert fm["residual"][0][2] == 0
+    assert read["ftier"] == 60
+    # σ 需要的平方和已累计
+    assert read["fields"]["total_us"]["sumsq"] == 266 ** 2
+
+
+def test_field_minutes_auto_coarsen():
+    fb = {i * 60: [1, 10.0, 12.0] for i in range(1500)}
+    rows, tier = ts._fmb_rows(fb)
+    assert tier == 600                    # 超过 1440 桶 -> 10 分钟档
+    assert len(rows) <= ts.FIELD_MAX_BUCKETS
+    assert sum(r[1] for r in rows) == 1500

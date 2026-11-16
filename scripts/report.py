@@ -91,24 +91,120 @@ def _merge_buckets(bucket_lists):
             t = int(row[0])
             b = merged.get(t)
             if b is None:
-                b = merged[t] = [0, 0, 0, 0.0, 0.0, 0.0, 0.0, {}]
-            b[0] += int(row[1])
-            b[1] += int(row[2])
-            b[2] += int(row[3])
-            b[3] += float(row[4])
-            b[4] = max(b[4], float(row[5]))
-            b[5] += float(row[6])
-            b[6] = max(b[6], float(row[7]))
-            for k, n in (row[8] or {}).items():
-                b[7][int(k)] = b[7].get(int(k), 0) + int(n)
+                b = merged[t] = _new_bucket()
+            _acc_bucket(b, row)
     return merged
 
 
-def _series_columns(merged, step, edges=None):
-    """Columnar series for the chart (compact JSON, fixed key order)."""
+# ---------------------------------------------------------------------------
+# 分桶引擎（段2）：时间阶梯 + 采样数量分桶
+#   成熟方案（Thanos/Grafana）的关键是「每序列点数封顶」+「分级预聚合」，
+#   序列数则靠预算分配控制；横轴永远是真时间轴。
+# ---------------------------------------------------------------------------
+TIER_STEPS = [1, 10, 60, 600, 1800, 3600, 10800, 21600, 86400]
+TIER_LABELS = {1: "1 秒", 10: "10 秒", 60: "1 分钟", 600: "10 分钟",
+               1800: "30 分钟", 3600: "1 小时", 10800: "3 小时",
+               21600: "6 小时", 86400: "1 天"}
+COUNT_KEY = "cnt"
+COUNT_LABEL = "自适应（按样本数）"
+MIN_TIER_BUCKETS = 8          # 少于 8 个桶的粒度没有意义，不提供
+EMBED_POINTS_MAX = 2048       # 每序列嵌入点数上限（Grafana/uPlot 同量级）
+EMBED_ROW_BUDGET = 150000     # report.html 内嵌点行总预算
+DATAJS_AGG_MAX = 100000       # data.js 单个聚合序列点数上限
+DATAJS_ROW_BUDGET = 2000000   # data.js 点行总预算
+CLIENT_MIN_POINTS = 128
+CLIENT_MAX_POINTS = 2048
+COUNT_BUCKETS_MAX = 1024
+EMBED_CLIENTS_TOPK = 20
+
+
+def _new_bucket():
+    return [0, 0, 0, 0.0, 0.0, 0.0, 0.0, {}]
+
+
+def _acc_bucket(b, row):
+    """Accumulate one bucket row into b=[c,ok,fail,sum,max,qsum,qmax,hist]."""
+    b[0] += int(row[1])
+    b[1] += int(row[2])
+    b[2] += int(row[3])
+    b[3] += float(row[4])
+    b[4] = max(b[4], float(row[5]))
+    b[5] += float(row[6])
+    b[6] = max(b[6], float(row[7]))
+    for k, n in (row[8] or {}).items():
+        b[7][int(k)] = b[7].get(int(k), 0) + int(n)
+
+
+def _tier_rows(rows, step):
+    """Aggregate 1s bucket rows into time buckets of `step` seconds."""
+    out = {}
+    for row in rows or []:
+        k = (int(row[0]) // step) * step
+        b = out.get(k)
+        if b is None:
+            b = out[k] = _new_bucket()
+        _acc_bucket(b, row)
+    return out
+
+
+def _count_target(total):
+    """Adaptive sample-count bucketing: ~8 samples/bucket, 64..1024 buckets."""
+    try:
+        t = int(total / 8)
+    except (TypeError, ValueError):
+        t = 0
+    return max(64, min(COUNT_BUCKETS_MAX, t or 64))
+
+
+def _count_rows(rows, target, target_points=None):
+    """Equal-sample buckets: accumulate 1s rows until ~total/target samples,
+    key each bucket by its LAST sample time (横轴仍是时间轴)."""
+    pts = target_points or target
+    ordered = sorted(rows or [], key=lambda r: int(r[0]))
+    total = sum(int(r[1]) for r in ordered)
+    if not ordered or total <= 0 or pts <= 0:
+        return {}
+    per = max(1, int(round(total / float(pts))))
+    out = {}
+    acc = None
+    for row in ordered:
+        if acc is None:
+            acc = _new_bucket()
+        _acc_bucket(acc, row)
+        if acc[0] >= per:
+            out[int(row[0])] = acc
+            acc = None
+    if acc is not None and acc[0] > 0:
+        out[int(ordered[-1][0])] = acc
+    return out
+
+
+def _tier_policy(span):
+    """(offered steps, embed step) for a run span in seconds.
+
+    Offered tiers need >= MIN_TIER_BUCKETS buckets; the embed tier is the
+    finest one with <= EMBED_POINTS_MAX buckets (coarser tiers are cheap and
+    embedded too). 30s runs offer 1s only; 24h runs never offer 1s/10s."""
+    span = float(span or 0)
+    if span <= 0:
+        return [1, 60], 1
+    offered = [s for s in TIER_STEPS if span / s >= MIN_TIER_BUCKETS]
+    if not offered:
+        offered = [1]
+    embed = next((s for s in offered if span / s <= EMBED_POINTS_MAX),
+                 offered[-1])
+    return offered, embed
+
+
+def _series_columns(merged, step, edges=None, with_span=False):
+    """Columnar series for the chart (compact JSON, fixed key order).
+    `with_span` adds per-bucket spans (needed for sample-count buckets)."""
     edges = ls.BIN_EDGES if edges is None else edges
     out = {"t": [], "c": [], "ok": [], "fail": [], "avg": [], "p50": [],
            "p99": [], "p999": [], "max": [], "qw": [], "qwmax": []}
+    if with_span:
+        out["span"] = []
+    prev_t = None
     for t in sorted(merged):
         c, ok, fail, s, mx, qs, qm, h = merged[t]
         out["t"].append(int(t))
@@ -127,6 +223,10 @@ def _series_columns(merged, step, edges=None):
         # by ok (not by every row, which understated it by the failure rate)
         out["qw"].append(round(qs / ok, 4) if ok else 0.0)
         out["qwmax"].append(round(qm, 4))
+        if with_span:
+            span = (t - prev_t) if prev_t is not None and t > prev_t else None
+            out["span"].append(int(span) if span else None)
+        prev_t = t
     return out
 
 
@@ -249,32 +349,57 @@ def _client_entry(st, role):
         "max_depth": next((int(p.get("max_depth", 0) or 0)
                            for k, p in st.get("summaries") or []
                            if k == "summary"), 0),
-        "minutes": _series_columns(
-            _merge_buckets([_minutes_rows(st)]), 60, _hist_edges([st])),
         "slowest": st.get("slowest") or [],
         "errors": st.get("errors") or {},
     }
 
 
-def _role_series(stats):
-    """{role: {step1, step60}} cluster series merged per role."""
-    by_role = {}
-    for st in stats:
-        role = _role_of(st)
-        by_role.setdefault(role, []).append(st)
-    out = {}
-    for role, group in by_role.items():
-        s1 = _merge_buckets([st.get("seconds") or [] for st in group])
-        s60 = _merge_buckets([_minutes_rows(st) for st in group])
-        edges = _hist_edges(group)
-        out[role] = {"step1": _series_columns(s1, 1, edges),
-                     "step60": _series_columns(s60, 60, edges)}
+def _role_label(role):
+    return {"all": "总体（全部）", "writer": "writer", "reader": "reader"}.get(
+        role, role)
+
+
+def _obj_seconds(stats_list):
+    """All 1s bucket rows of a group of clients (merged later)."""
+    out = []
+    for st in stats_list:
+        out.extend(st.get("seconds") or [])
     return out
 
 
+def _samples(rows):
+    return sum(int(r[1]) for r in rows or [])
+
+
+def _obj_tiers(rows, edges, offered, min_step, count_points):
+    """Build the tier dict for one chart object.
+
+    min_step: finest time tier to materialise (= embed tier for nodes,
+    data.js allowance for roles). count_points: bucket count for the
+    sample-count tier (0 disables it)."""
+    tiers = {}
+    for s in offered:
+        if s < min_step:
+            continue
+        tiers[str(s)] = _series_columns(_tier_rows(rows, s), s, edges)
+    if count_points:
+        tiers[COUNT_KEY] = _series_columns(
+            _count_rows(rows, count_points), 1, edges, with_span=True)
+    return tiers
+
+
+def _tier_rowcount(tiers):
+    return sum(len((cols or {}).get("t") or []) for cols in (tiers or {}).values())
+
+
 def reduce_size(stats, meta):
-    """One data-size block: summary / per-role series / clients / errors."""
-    role_series = _role_series(stats)
+    """One data-size block: summary / chart objects (tiered series) / clients."""
+    role_stats = {}
+    node_stats = {}
+    for st in stats:
+        role_stats.setdefault(_role_of(st), []).append(st)
+        node_stats.setdefault((st.get("meta") or {}).get("node") or "?",
+                              []).append(st)
     clients = [_client_entry(st, _role_of(st)) for st in stats]
     errors = {}
     for st in stats:
@@ -306,23 +431,61 @@ def reduce_size(stats, meta):
             excerpt = st["error_excerpt"]
             excerpt_status = st.get("error_excerpt_status")
     summary = _summary_of(stats)
-    # granularity is judged by the run SPAN (>1 day -> embed minutes only);
-    # undated runs fall back to the bucket count.
     span = 0.0
     if summary.get("ts_from") is not None and summary.get("ts_to") is not None:
         span = float(summary["ts_to"]) - float(summary["ts_from"])
-    embed_step = 1
-    if span > EMBED_SECONDS_MAX:
-        embed_step = 60
-    elif span <= 0:
-        max_seconds = max((len((role_series[r]["step1"]["t"]))
-                           for r in role_series), default=0)
-        if max_seconds > EMBED_SECONDS_MAX:
-            embed_step = 60
+    offered, embed = _tier_policy(span)
+    edges = _hist_edges(stats)
+    # roles may carry the finer tiers in data.js when affordable
+    fine_roles = offered[0]
+    if span > 0:
+        fine_roles = next((s for s in offered
+                           if span / s <= DATAJS_AGG_MAX), offered[-1])
+    objects = {}
+    used = 0
+    for role, group in sorted(role_stats.items()):
+        rows = _obj_seconds(group)
+        tiers = _obj_tiers(rows, edges, offered, fine_roles,
+                           _count_target(_samples(rows)))
+        used += _tier_rowcount(tiers)
+        objects[role] = {"label": _role_label(role), "kind": "role",
+                         "tiers": tiers}
+    # nodes: embed-tier upward only (bounded regardless of node count)
+    for node, group in sorted(node_stats.items()):
+        rows = _obj_seconds(group)
+        tiers = _obj_tiers(rows, edges, offered, embed,
+                           _count_target(_samples(rows)))
+        used += _tier_rowcount(tiers)
+        node_bytes = sum(int((st.get("meta") or {}).get("bytes") or 0)
+                         for st in group)
+        objects["node:" + node] = {"label": node, "kind": "node",
+                                   "node": node, "bytes": node_bytes,
+                                   "tiers": tiers}
+    # clients: per-client point budget split from what is left
+    n_clients = len(stats)
+    per_client = CLIENT_MAX_POINTS
+    if n_clients:
+        per_client = int(max(CLIENT_MIN_POINTS,
+                             min(CLIENT_MAX_POINTS,
+                                 (DATAJS_ROW_BUDGET - used) / n_clients)))
+    for st, c in zip(stats, clients):
+        rows = st.get("seconds") or []
+        tiers = {COUNT_KEY: _series_columns(
+            _count_rows(rows, per_client), 1, edges, with_span=True)}
+        objects["client:" + c["name"]] = {
+            "label": c["name"], "kind": "client", "node": c["node"],
+            "p99_ms": c["p99_ms"], "tiers": tiers}
+    tiers_meta = [{"key": str(s), "label": TIER_LABELS[s]} for s in offered]
+    tiers_meta.append({"key": COUNT_KEY, "label": COUNT_LABEL})
+    embed_tiers = [str(s) for s in offered if s >= embed] + [COUNT_KEY]
     return {
         "summary": summary,
-        "embed_step": embed_step,
-        "series": role_series,
+        "span": round(span, 1),
+        "tiers": tiers_meta,
+        "embed_tier": embed,
+        "embed_step": embed,       # compat alias
+        "embed_tiers": embed_tiers,
+        "objects": objects,
         "clients": clients,
         "errors": errors,
         "error_excerpt": excerpt,
@@ -388,6 +551,7 @@ def _merge_field(a, b):
     out["n"] = (out.get("n") or 0) + (b.get("n") or 0)
     out["neg"] = (out.get("neg") or 0) + (b.get("neg") or 0)
     out["sum"] = (out.get("sum") or 0.0) + (b.get("sum") or 0.0)
+    out["sumsq"] = (out.get("sumsq") or 0.0) + (b.get("sumsq") or 0.0)
     for k in ("min", "max"):
         v = b.get(k)
         if v is not None:
@@ -414,9 +578,15 @@ def _field_pcts(fd, edges=None, hist_ok=True):
 
     neg = fd.get("neg") or 0
     avg_n = n - neg          # -1 sentinel samples carry no duration
+    avg = (fd.get("sum") or 0.0) / avg_n if avg_n else 0.0
+    sigma = None
+    sumsq = fd.get("sumsq")
+    if sumsq is not None and avg_n:
+        var = sumsq / avg_n - avg * avg
+        sigma = round(var ** 0.5, 4) if var > 0 else 0.0
     return {
-        "n": n, "neg": neg, "avg_n": avg_n,
-        "avg": round((fd.get("sum") or 0.0) / avg_n, 4) if avg_n else 0.0,
+        "n": n, "neg": neg, "avg_n": avg_n, "avg": round(avg, 4),
+        "sigma": sigma,
         "min": fd.get("min"), "max": fd.get("max"),
         "p50": pct(0.50), "p95": pct(0.95),
         "p99": pct(0.99), "p999": pct(0.999),
@@ -493,6 +663,7 @@ def reduce_trace_size(trace_list):
                 dst = gg["ops"].setdefault(op, {
                     "count": 0, "ok": 0, "fail": 0, "status": {},
                     "fields": {}, "_buckets": {"seconds": {}, "minutes": {}},
+                    "_fmin": {}, "ftier": 60,
                     "size_values": {}, "replicas": {}, "slice_count": {},
                     "residual": None, "top": []})
                 dst["count"] += o.get("count") or 0
@@ -511,6 +682,20 @@ def reduce_trace_size(trace_list):
                 if o.get("residual"):
                     dst["residual"] = _merge_field(dst["residual"],
                                                    o["residual"])
+                for fname, frows in (o.get("fminutes") or {}).items():
+                    fb = dst["_fmin"].setdefault(fname, {})
+                    for r in frows or []:
+                        t = int(r[0])
+                        cur = fb.get(t)
+                        if cur is None:
+                            fb[t] = [int(r[1]), float(r[2]) * int(r[1]),
+                                     float(r[3])]
+                        else:
+                            cur[0] += int(r[1])
+                            cur[1] += float(r[2]) * int(r[1])
+                            cur[2] = max(cur[2], float(r[3]))
+                dst["ftier"] = max(dst.get("ftier") or 0,
+                                   int(o.get("ftier") or 60))
                 tops.extend(o.get("top") or [])
         clients.append(cl)
     trace_edges = ls.BIN_EDGES_US if metad["bins"] == "us-v1" else None
@@ -522,6 +707,16 @@ def reduce_trace_size(trace_list):
             o["residual"] = (_field_pcts(o["residual"], trace_edges,
                                          trace_hist_ok)
                              if o.get("residual") else None)
+            fmin = {}
+            for fname, fb in (o.pop("_fmin") or {}).items():
+                rows = []
+                for t in sorted(fb):
+                    n, ssum, mx = fb[t]
+                    rows.append([int(t), int(n),
+                                 round(ssum / n, 3) if n else 0.0,
+                                 round(mx, 3)])
+                fmin[fname] = rows
+            o["fminutes"] = fmin
             buckets = o.pop("_buckets")
             for bk in ("seconds", "minutes"):
                 bmap = buckets[bk]
@@ -858,6 +1053,63 @@ padding:14px 16px;margin:12px 0}
 .kv .k{color:var(--mut);font-size:11.5px}.kv .v{font-size:17px;font-weight:600;
 font-variant-numeric:tabular-nums}.kv .u{font-size:11.5px;color:var(--mut);font-weight:400}
 .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.tl-label{color:var(--mut);font-size:12px}
+.sec{font-size:13px;font-weight:600;color:var(--mut);margin:14px 0 8px;
+padding-bottom:5px;border-bottom:1px solid var(--line)}
+.sec:first-of-type{margin-top:2px}
+.params{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+gap:2px 22px}
+.prow{display:flex;gap:10px;padding:4px 0;border-bottom:1px dashed var(--line);
+font-size:12.5px;min-width:0}
+.prow .pk{flex:0 0 130px;color:var(--mut)}
+.prow .pv{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap;font-family:'Cascadia Code',Consolas,monospace}
+.chips{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:2px;padding:2px 4px 2px 8px;
+border:1px solid var(--line);border-radius:12px;font-size:12px;background:var(--bg);
+max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip .chip-x{border:none;background:transparent;color:var(--mut);cursor:pointer;
+font-size:12px;padding:0 4px;border-radius:50%}
+.chip .chip-x:hover{color:var(--err)}
+.tb-sep{width:1px;height:18px;background:var(--line);display:inline-block}
+button:disabled{opacity:.4;cursor:not-allowed}
+/* 分级时延图（图1）：每层一行，块宽 sqrt 压缩 + 最小 2% */
+.levels{display:flex;flex-direction:column;gap:6px}
+.lvl-row{display:flex;gap:4px;align-items:stretch;min-height:30px}
+.lvl-blk{display:flex;align-items:center;padding:0 8px;border-radius:3px;
+color:#fff;font-size:11.5px;white-space:nowrap;overflow:hidden;
+text-overflow:ellipsis;cursor:default;min-width:18px}
+.lvl-blk:hover{outline:2px solid var(--fg);outline-offset:-2px}
+/* 阶段树（图3，参照 LinQuickRec Call Tree） */
+.ttree{border:1px solid var(--line);border-radius:5px;padding:6px 10px}
+.tnode{display:flex;align-items:center;gap:8px;padding:2px 0;
+line-height:1.8;user-select:none}
+.tarrow{width:14px;flex:none;color:var(--mut);cursor:pointer}
+.tname{font-size:13px;padding:1px 6px;border-radius:4px;cursor:pointer;
+white-space:nowrap}
+.tname:hover{background:var(--bg)}
+.tname.sel{background:var(--bg);color:var(--pri);font-weight:600}
+.tbar{width:80px;height:8px;flex:none;border-radius:2px;background:var(--line);
+overflow:hidden}
+.tfill{display:block;height:8px;border-radius:2px;min-width:2px;
+transition:width .3s ease-out}
+.tpct{font-size:11.5px;color:var(--mut);min-width:38px;text-align:right;
+font-variant-numeric:tabular-nums}
+.tval{font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+/* 指标套件弹窗（纯 DOM，无 EP 依赖） */
+.modal-mask{position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.45);
+display:flex;align-items:center;justify-content:center;padding:24px}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+width:min(720px,94vw);max-height:86vh;overflow:auto;
+box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.modal-head{display:flex;align-items:center;justify-content:space-between;
+padding:12px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;
+background:var(--panel);z-index:1}
+.modal-head button{border:none;background:transparent;cursor:pointer;
+font-size:14px;color:var(--mut);padding:2px 6px;border-radius:4px}
+.modal-head button:hover{color:var(--fg);background:var(--bg)}
+.modal-body{padding:12px 16px 20px}
+@media (prefers-reduced-motion: reduce){ .tfill{transition:none} }
 button{font:inherit;font-size:12.5px;padding:4px 10px;border:1px solid var(--line);
 background:var(--panel);color:var(--fg);border-radius:4px;cursor:pointer}
 button.on{background:var(--pri);border-color:var(--pri);color:#fff}
@@ -902,94 +1154,199 @@ if(text!==undefined)e.textContent=text;return e;}
 function kv(k,v,u){const w=el('div','kv');w.appendChild(el('div','k',k));
 const vv=el('div','v',v);if(u)vv.appendChild(el('span','u',' '+u));
 w.appendChild(vv);return w;}
-const S = D.sizes || {}; let curSize = Object.keys(S)[0]||''; 
-let curRole = 'all'; let curStep = 1;   // 1=1 秒粒度，60=1 分钟粒度
+const S = D.sizes || {}; let curSize = Object.keys(S)[0]||'';
+let curTier = '';            // 当前粒度 key（"1"/"10"/…/"cnt"）
+let selObjs = ['all'];       // 选中的曲线对象（总体/角色/node:*/client:*）
+let curMetric = 'p99';       // 多对象对比时的指标
 function Z(){return S[curSize]||null;}
-function rolesOf(z){return Object.keys((z&&z.series)||{});}
-function rolesOrder(z){const r=rolesOf(z);const o=['all','writer','reader'];
-return o.filter(x=>r.includes(x)).concat(r.filter(x=>!o.includes(x)));}
-let chart=null;
-function seriesFor(step){
-  const z=Z(); if(!z) return null;
-  const src=z.series[curRole]||z.series[rolesOf(z)[0]]||{};
-  return src[step===1?'step1':'step60']||{t:[],c:[],ok:[],fail:[],avg:[],p50:[],p99:[],p999:[],max:[],qw:[],qwmax:[]};
+function objAll(){
+  const z=Z(); const e=(z&&z.objects)||{};
+  const f=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&FULL.sizes[curSize].objects)||{};
+  const out={}; Object.keys(e).forEach(k=>{out[k]=e[k];});
+  Object.keys(f).forEach(k=>{out[k]=f[k];});
+  return out;
 }
-function buildChart(){
-  const box=document.getElementById('mainchart');
-  if(!chart) chart=echarts.init(box);
-  const col=seriesFor(curStep);
-  if(!col||!col.t.length){chart.clear();return;}
-  const step = curStep === 60 ? 60 : 1;
-  const qps = col.c.map((c,i)=>Math.round(c/step*100)/100);
-  const x = col.t.map(t=>t*1000);
-  const opt={
-    animation:false, textStyle:{fontSize:12},
-    tooltip:{trigger:'axis', confine:true, formatter:function(ps){
-      const i=ps[0].dataIndex; const t=col.t[i];
-      const rows=[['时间',fullts(t)],['请求数',col.c[i]],['成功',col.ok[i]],
-        ['失败',col.fail[i]],['QPS',qps[i]],['平均(ms)',col.avg[i]],
-        ['p50(ms)',col.p50[i]],['p99(ms)',col.p99[i]],['p999(ms)',col.p999[i]],
-        ['最大(ms)',col.max[i]],['队列等待均(ms)',col.qw[i]],['队列等待峰(ms)',col.qwmax[i]]];
-      return '<b>'+fullts(t)+'</b><br>'+rows.map(r=>r[0]+'：'+r[1]).join('<br>');
-    }},
-    legend:{top:0,type:'scroll'},
+function tierList(){const z=Z();return (z&&z.tiers)||[];}
+function colsOf(key,tier){const o=objAll()[key];return o&&o.tiers?o.tiers[tier]:null;}
+function objLabel(key){const o=objAll()[key];return (o&&o.label)||key;}
+function defaultTier(){
+  const z=Z(); if(!z) return 'cnt';
+  const emb=z.embed_tiers||[];
+  const time=emb.filter(function(t){return t!=='cnt';});
+  return time.length?time[0]:(emb.indexOf('cnt')>=0?'cnt':'');
+}
+function currentTier(){return curTier||defaultTier();}
+function tierStep(tier){return tier==='cnt'?1:(Number(tier)||1);}
+function colQps(col,tier){
+  const step=tierStep(tier);
+  return col.c.map(function(c,i){
+    return Math.round(c/((col.span&&col.span[i])||step)*100)/100;});}
+const C = (window.matchMedia &&
+  window.matchMedia('(prefers-color-scheme: dark)').matches)
+  ? {fg:'#e6e9ed',mut:'#8b97a3',line:'#252c34',pri:'#27b3c9',
+     err:'#ff7b7b',ok:'#4cc38a',warn:'#f0b35a'}
+  : {fg:'#1f2329',mut:'#6b7785',line:'#e3e6eb',pri:'#0e7490',
+     err:'#d64545',ok:'#2f9e44',warn:'#e8a33d'};
+const METRICS=[['avg','平均'],['p50','p50'],['p99','p99'],['p999','p999'],
+  ['max','最大'],['qps','QPS'],['fail','失败'],['qw','队列等待']];
+function metricLabel(k){const m=METRICS.find(function(x){return x[0]===k;});
+  return m?m[1]:k;}
+function axisCommon(){
+  return {animation:false,textStyle:{color:C.fg,fontSize:12},
+    tooltip:{trigger:'axis',confine:true},
+    legend:{top:0,type:'scroll',textStyle:{color:C.fg}},
     grid:{left:56,right:20,top:36,bottom:64},
-    xAxis:{type:'time',axisLabel:{formatter:v=>hhmmss(v/1000)}},
-    yAxis:[{type:'value',name:'ms',scale:true},
-           {type:'value',name:'QPS',position:'right',splitLine:{show:false}}],
-    dataZoom:[{type:'inside'},{type:'slider',height:18,bottom:8}],
-    series:[
-      {name:'QPS',type:'bar',yAxisIndex:1,data:x.map((v,i)=>[v,qps[i]]),
-       itemStyle:{color:'rgba(14,116,144,.35)'},barMaxWidth:8,large:true},
-      {name:'失败',type:'bar',yAxisIndex:1,data:x.map((v,i)=>[v,col.fail[i]]),
-       itemStyle:{color:'rgba(214,69,69,.55)'},barMaxWidth:8,large:true},
-      {name:'平均',type:'line',data:x.map((v,i)=>[v,col.avg[i]]),
-       showSymbol:false,lineStyle:{width:1,type:'dashed'}},
-      {name:'p50',type:'line',data:x.map((v,i)=>[v,col.p50[i]]),
-       showSymbol:false,lineStyle:{width:1.5}},
-      {name:'p99',type:'line',data:x.map((v,i)=>[v,col.p99[i]]),
-       showSymbol:false,lineStyle:{width:1.8}},
-      {name:'p999',type:'line',data:x.map((v,i)=>[v,col.p999[i]]),
-       showSymbol:false,lineStyle:{width:1.5}},
-      {name:'最大',type:'line',data:x.map((v,i)=>[v,col.max[i]]),
-       showSymbol:false,lineStyle:{width:1,type:'dotted'}}
-    ]
-  };
+    xAxis:{type:'time',axisLabel:{color:C.mut,
+      formatter:function(v){return hhmmss(v/1000);}},
+      axisLine:{lineStyle:{color:C.line}}},
+    dataZoom:[{type:'inside'},{type:'slider',height:18,bottom:8}]};
+}
+let chart=null;
+function ensureSel(){
+  const all=objAll();
+  if(!Object.keys(all).length) return;
+  selObjs=selObjs.filter(function(k){return !!all[k];});
+  if(!selObjs.length){
+    if(all['all']){selObjs=['all'];}
+    else{
+      const roles=Object.keys(all).filter(function(k){
+        return all[k].kind==='role';});
+      selObjs=roles.length?[roles[0]]:[Object.keys(all)[0]];
+    }
+  }
+}
+function emptyOpt(){const o=axisCommon();o.yAxis={type:'value'};o.series=[];return o;}
+function buildChart(){
+  const box=document.getElementById('mainchart'); if(!box) return;
+  if(!chart) chart=echarts.init(box);
   const z=Z();
-  if(z && z.anomalies && z.anomalies.length){
-    opt.series[0].markLine={symbol:'none',silent:true,data:z.anomalies.slice(0,50)
-      .map(a=>({xAxis:a.t*1000,lineStyle:{color:'rgba(232,163,61,.6)'},
-                label:{show:false}}))};
+  if(!z){chart.clear();return;}
+  ensureSel();
+  const tier=currentTier();
+  const opt=selObjs.length>1?multiOpt(tier):richOpt(tier,selObjs[0]);
+  if(z.anomalies&&z.anomalies.length&&opt.series&&opt.series.length){
+    opt.series[0].markLine={symbol:'none',silent:true,
+      data:z.anomalies.slice(0,50).map(function(a){return {xAxis:a.t*1000,
+        lineStyle:{color:C.warn},label:{show:false}};})};
   }
   chart.setOption(opt,true);
 }
+function richOpt(tier,key){
+  const col=colsOf(key,tier);
+  if(!col||!col.t.length) return emptyOpt();
+  const step=tierStep(tier);
+  const qps=colQps(col,tier);
+  const x=col.t.map(function(t){return t*1000;});
+  const o=axisCommon();
+  o.tooltip.formatter=function(ps){
+    const i=ps[0].dataIndex; const t=col.t[i];
+    const rows=[['时间',fullts(t)],['请求数',col.c[i]],['成功',col.ok[i]],
+      ['失败',col.fail[i]],['QPS',qps[i]],['平均(ms)',col.avg[i]],
+      ['p50(ms)',col.p50[i]],['p99(ms)',col.p99[i]],['p999(ms)',col.p999[i]],
+      ['最大(ms)',col.max[i]],['队列等待均(ms)',col.qw[i]],
+      ['队列等待峰(ms)',col.qwmax[i]]];
+    return '<b>'+fullts(t)+'</b><br>'+
+      rows.map(function(r){return r[0]+'：'+r[1];}).join('<br>');
+  };
+  o.yAxis=[{type:'value',name:'ms',scale:true,axisLabel:{color:C.mut},
+            splitLine:{lineStyle:{color:C.line}}},
+           {type:'value',name:'QPS',position:'right',splitLine:{show:false},
+            axisLabel:{color:C.mut}}];
+  o.series=[
+    {name:'QPS',type:'bar',yAxisIndex:1,data:x.map(function(v,i){return [v,qps[i]];}),
+     itemStyle:{color:C.pri,opacity:0.55},barMaxWidth:8,large:true},
+    {name:'失败',type:'bar',yAxisIndex:1,
+     data:x.map(function(v,i){return [v,col.fail[i]];}),
+     itemStyle:{color:C.err,opacity:0.75},barMaxWidth:8,large:true},
+    {name:'平均',type:'line',data:x.map(function(v,i){return [v,col.avg[i]];}),
+     showSymbol:false,lineStyle:{width:1,type:'dashed'}},
+    {name:'p50',type:'line',data:x.map(function(v,i){return [v,col.p50[i]];}),
+     showSymbol:false,lineStyle:{width:1.5}},
+    {name:'p99',type:'line',data:x.map(function(v,i){return [v,col.p99[i]];}),
+     showSymbol:false,lineStyle:{width:1.8}},
+    {name:'p999',type:'line',data:x.map(function(v,i){return [v,col.p999[i]];}),
+     showSymbol:false,lineStyle:{width:1.5}},
+    {name:'最大',type:'line',data:x.map(function(v,i){return [v,col.max[i]];}),
+     showSymbol:false,lineStyle:{width:1,type:'dotted'}}];
+  return o;
+}
+function multiOpt(tier){
+  const o=axisCommon();
+  o.yAxis=[{type:'value',name:metricLabel(curMetric),scale:true,
+            axisLabel:{color:C.mut},splitLine:{lineStyle:{color:C.line}}}];
+  o.series=[];
+  selObjs.forEach(function(key){
+    const t=colsOf(key,tier)?tier:'cnt';
+    const col=colsOf(key,t);
+    if(!col||!col.t.length) return;
+    const qps=(curMetric==='qps')?colQps(col,t):null;
+    const nm=objLabel(key)+(t!==tier?'（自适应）':'');
+    o.series.push({name:nm,type:'line',showSymbol:false,
+      data:col.t.map(function(tv,i){
+        let v;
+        if(curMetric==='qps') v=qps[i];
+        else if(curMetric==='fail') v=col.fail[i];
+        else v=(col[curMetric]==null?0:col[curMetric][i]);
+        return [tv*1000,v];}),
+      lineStyle:{width:1.8}});
+  });
+  return o;
+}
 function renderSummary(){
   const z=Z(); if(!z) return;
-  const s=z.summary; const g=document.getElementById('cards');
-  g.innerHTML='';
-  if(!s){g.appendChild(el('div','note',
-    '该 data_size 只有 C++ trace 统计（无 logstats 数据），下方仍可查看全链路区。'));
-    return;}
+  const s=z.summary;
+  const pg=document.getElementById('perfcards');
+  const ig=document.getElementById('infocards');
+  const pbox=document.getElementById('params');
+  if(!pg||!ig||!pbox) return;
+  pg.innerHTML=''; ig.innerHTML=''; pbox.innerHTML='';
+  renderParams(pbox);
+  if(!s){
+    pg.appendChild(el('div','note',
+      '该 data_size 只有 C++ trace 统计（无 logstats 数据），下方仍可查看全链路区。'));
+    ig.style.display='none';
+    return;
+  }
+  ig.style.display='';
   const target=D.meta&&D.meta.qps_target?Number(D.meta.qps_target):0;
-  g.appendChild(kv('成功', s.ok));
-  g.appendChild(kv('失败', s.fail));
-  g.appendChild(kv('失败率', (s.fail_rate*100).toFixed(2), '%'));
-  g.appendChild(kv('QPS', s.qps));
-  if(target)g.appendChild(kv('QPS 达成率', (s.qps/target*100).toFixed(1), '%（目标 '+target+'）'));
-  g.appendChild(kv('平均时延', s.avg_ms, 'ms'));
-  g.appendChild(kv('p50', s.p50_ms, 'ms'));
-  g.appendChild(kv('p95', s.p95_ms, 'ms'));
-  g.appendChild(kv('p99', s.p99_ms, 'ms'));
-  g.appendChild(kv('p999', s.p999_ms, 'ms'));
-  g.appendChild(kv('p9999', s.p9999_ms, 'ms'));
-  g.appendChild(kv('最大', s.max_ms, 'ms'));
-  if(s.qw_avg_ms!=null)g.appendChild(kv('队列等待均', s.qw_avg_ms, 'ms'));
-  if(s.qw_max_ms!=null)g.appendChild(kv('队列等待峰', s.qw_max_ms, 'ms'));
-  if(s.max_depth)g.appendChild(kv('最大队列深度', s.max_depth));
-  g.appendChild(kv('吞吐', s.throughput_mb_s==null?'-':
+  // 性能统计：时延/吞吐
+  pg.appendChild(kv('QPS', s.qps));
+  if(target)pg.appendChild(kv('QPS 达成率', (s.qps/target*100).toFixed(1), '%'));
+  pg.appendChild(kv('平均时延', s.avg_ms, 'ms'));
+  pg.appendChild(kv('p50', s.p50_ms, 'ms'));
+  pg.appendChild(kv('p95', s.p95_ms, 'ms'));
+  pg.appendChild(kv('p99', s.p99_ms, 'ms'));
+  pg.appendChild(kv('p999', s.p999_ms, 'ms'));
+  pg.appendChild(kv('p9999', s.p9999_ms, 'ms'));
+  pg.appendChild(kv('最大', s.max_ms, 'ms'));
+  if(s.qw_avg_ms!=null)pg.appendChild(kv('队列等待均', s.qw_avg_ms, 'ms'));
+  if(s.qw_max_ms!=null)pg.appendChild(kv('队列等待峰', s.qw_max_ms, 'ms'));
+  if(s.max_depth)pg.appendChild(kv('最大队列深度', s.max_depth));
+  pg.appendChild(kv('吞吐', s.throughput_mb_s==null?'-':
     Number(s.throughput_mb_s).toFixed(1), 'MB/s'));
-  g.appendChild(kv('时长', s.wall_s>0?fmtDur(s.wall_s):'-'));
-  g.appendChild(kv('客户端', s.clients));
+  // 信息展示：数量/规模
+  ig.appendChild(kv('总数', s.total));
+  ig.appendChild(kv('成功', s.ok));
+  ig.appendChild(kv('失败', s.fail));
+  ig.appendChild(kv('失败率', (s.fail_rate*100).toFixed(2), '%'));
+  ig.appendChild(kv('时长', s.wall_s>0?fmtDur(s.wall_s):'-'));
+  ig.appendChild(kv('客户端', s.clients));
+}
+function renderParams(box){
+  const ps=(D.meta&&D.meta.params)||[];
+  if(!ps.length){
+    box.appendChild(el('div','note','无参数信息（旧报表或未注入）'));
+    return;
+  }
+  ps.forEach(function(p){
+    const row=el('div','prow');
+    row.appendChild(el('span','pk',String(p[0])));
+    const v=el('span','pv');
+    v.textContent=(p[1]==null||p[1]==='')?'-':String(p[1]);
+    v.title=v.textContent;
+    row.appendChild(v);
+    box.appendChild(row);
+  });
 }
 function renderTable(){
   const z=Z(); if(!z) return;
@@ -1006,9 +1363,9 @@ function renderTable(){
       const td=el('td', (i>=3?'n':''), String(v));
       tr.appendChild(td);
     });
-    tr.title='点击叠加该客户端分钟曲线';
+    tr.title='点击加入时延曲线对比（对象选择器）';
     tr.style.cursor='pointer';
-    tr.onclick=()=>overlayClient(c.name);
+    tr.onclick=()=>addObj("client:"+c.name);
     tb.appendChild(tr);
   });
 }
@@ -1092,25 +1449,83 @@ function renderSources(){
     box.appendChild(wrapx);
   }
 }
-function overlayClient(name){
-  const z=Z(); if(!z||!chart) return;
-  const all=((FULL&&FULL.sizes&&FULL.sizes[curSize]&&
-    FULL.sizes[curSize].clients)||z.clients||[]);
-  const c=all.find(x=>x.name===name); if(!c) return;
-  const col=c.minutes||{t:[],p50:[],p99:[],max:[],c:[],qw:[]};
-  const x=col.t.map(t=>t*1000);
-  chart.setOption({series:[
-    {name:name+' p99',type:'line',data:x.map((v,i)=>[v,col.p99[i]]),
-     showSymbol:false,lineStyle:{width:2,type:'dashed'}},
-    {name:name+' max',type:'line',data:x.map((v,i)=>[v,col.max[i]]),
-     showSymbol:false,lineStyle:{width:1,type:'dotted'}}
-  ]});
+function addObj(key){
+  if(!key) return;
+  if(selObjs.indexOf(key)<0) selObjs.push(key);
+  renderObjChips(); renderObjPicker(); renderControls(); buildChart();
+}
+function delObj(key){
+  selObjs=selObjs.filter(function(x){return x!==key;});
+  if(!selObjs.length) selObjs=['all'];
+  renderObjChips(); renderObjPicker(); renderControls(); buildChart();
+}
+function renderObjPicker(){
+  const sel=document.getElementById('objAdd'); if(!sel) return;
+  const all=objAll();
+  const groups={role:[],node:[],client:[]};
+  Object.keys(all).forEach(function(k){
+    const kind=all[k].kind||'client';
+    (groups[kind]||groups.client).push(k);
+  });
+  sel.innerHTML='';
+  function addGroup(label,keys){
+    const vis=keys.filter(function(k){return selObjs.indexOf(k)<0;});
+    if(!vis.length) return;
+    const g=document.createElement('optgroup'); g.label=label;
+    vis.sort(function(x,y){
+      return String(objLabel(x)).localeCompare(String(objLabel(y)));})
+      .forEach(function(k){
+        const op=el('option',null,objLabel(k)); op.value=k; g.appendChild(op);});
+    sel.appendChild(g);
+  }
+  addGroup('总体',groups.role);
+  addGroup('节点',groups.node);
+  addGroup('客户端',groups.client);
+  sel.onchange=function(){
+    const v=sel.value; sel.value=''; if(v) addObj(v);};
+}
+function renderObjChips(){
+  const box=document.getElementById('objChips'); if(!box) return;
+  ensureSel();
+  box.innerHTML='';
+  selObjs.forEach(function(k){
+    const chip=el('span','chip',objLabel(k));
+    const x=el('button','chip-x','×'); x.title='移除该对象';
+    x.onclick=function(){delObj(k);};
+    chip.appendChild(x); box.appendChild(chip);
+  });
+}
+function renderControls(){
+  const box=document.getElementById('tierBtns'); if(!box) return;
+  ensureSel();
+  box.innerHTML='';
+  const active=currentTier();
+  tierList().forEach(function(t){
+    const ok=selObjs.every(function(k){return !!colsOf(k,t.key);});
+    const b=el('button', (t.key===active&&ok)?'on':'', t.label);
+    b.disabled=!ok;
+    if(!ok) b.title='所选对象无该粒度（客户端曲线固定为自适应分桶）';
+    b.onclick=function(){curTier=t.key;renderControls();buildChart();};
+    box.appendChild(b);
+  });
+  const mb=document.getElementById('metricBtns');
+  if(mb){
+    mb.innerHTML='';
+    if(selObjs.length>1){
+      METRICS.forEach(function(m){
+        const b=el('button', m[0]===curMetric?'on':'', m[1]);
+        b.onclick=function(){curMetric=m[0];renderControls();buildChart();};
+        mb.appendChild(b);
+      });
+    }
+  }
 }
 function renderAll(){
   const z=Z(); if(!z) return;
-  document.getElementById('sizeSel').style.display =
-    Object.keys(S).length>1?'inline-block':'none';
-  renderSummary(); buildChart(); renderTable(); renderErrors();
+  const ss=document.getElementById('sizeSel');
+  if(ss) ss.style.display=Object.keys(S).length>1?'inline-block':'none';
+  renderSummary(); renderObjPicker(); renderObjChips(); renderControls();
+  buildChart(); renderTable(); renderErrors();
   renderTrace();
   if(!window.__srcDone){renderSources();window.__srcDone=true;}
 }
@@ -1118,12 +1533,14 @@ let monCharts={};
 function _monChart(id, series, yname){
   const box=document.getElementById(id); if(!box||!series.length) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
-  c.setOption({animation:false,textStyle:{fontSize:12},
+  c.setOption({animation:false,textStyle:{color:C.fg,fontSize:12},
     tooltip:{trigger:'axis',confine:true},
-    legend:{top:0,type:'scroll'},
+    legend:{top:0,type:'scroll',textStyle:{color:C.fg}},
     grid:{left:56,right:20,top:36,bottom:56},
-    xAxis:{type:'time',axisLabel:{formatter:v=>hhmmss(v/1000)}},
-    yAxis:{type:'value',name:yname,scale:true},
+    xAxis:{type:'time',axisLabel:{color:C.mut,formatter:v=>hhmmss(v/1000)},
+      axisLine:{lineStyle:{color:C.line}}},
+    yAxis:{type:'value',name:yname,scale:true,axisLabel:{color:C.mut},
+      splitLine:{lineStyle:{color:C.line}}},
     dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
     series:series}, true);
   return true;
@@ -1176,233 +1593,392 @@ function renderMonitors(){
 function mount(){
   const sizeSel=document.getElementById('sizeSel');
   if(sizeSel){
-    Object.keys(S).forEach(k=>{const o=el('option',null,k);o.value=k;sizeSel.appendChild(o);});
+    Object.keys(S).forEach(function(k){
+      const o=el('option',null,k); o.value=k; sizeSel.appendChild(o);});
     sizeSel.value=curSize;
-    sizeSel.onchange=()=>{curSize=sizeSel.value;curRole='all';curStep=1;
-      renderRoleButtons(); renderAll();};
+    sizeSel.onchange=function(){curSize=sizeSel.value;selObjs=['all'];
+      curTier=''; renderAll();};
   }
-  renderRoleButtons(); renderAll(); renderMonitors();
-  window.addEventListener('resize',()=>{
+  renderAll(); renderMonitors();
+  window.addEventListener('resize',function(){
     if(chart)chart.resize();
-    Object.keys(monCharts).forEach(k=>monCharts[k].resize());
+    Object.keys(monCharts).forEach(function(k){monCharts[k].resize();});
   });
 }
-function renderRoleButtons(){
-  const box=document.getElementById('roles'); box.innerHTML='';
-  const z=Z(); if(!z) return;
-  rolesOrder(z).forEach(r=>{
-    const b=el('button', r===curRole?'on':'', r==='all'?'全部':r);
-    b.onclick=()=>{curRole=r;renderRoleButtons();buildChart();};
+/* ---------------- SDK 全链路（C++ trace）：分级时延 / 阶段曲线 / 阶段树 ---------------- */
+const TREAD=[["total_us",0,""],["query_total_us",1,"total_us"],
+ ["query_route_us",2,"query_total_us"],["query_rpc_us",2,"query_total_us"],
+ ["select_us",1,"total_us"],["buf_alloc_us",1,"total_us"],
+ ["memread_total_us",1,"total_us"],["read_submit_us",2,"memread_total_us"],
+ ["read_queue_us",2,"memread_total_us"],["read_urma_us",2,"memread_total_us"],
+ ["read_teardown_us",2,"memread_total_us"],["residual",1,"total_us"]];
+const TWRITE=[["total_us",0,""],["prep_total_us",1,"total_us"],
+ ["prep_buf_alloc_us",2,"prep_total_us"],["prep_memcpy_us",2,"prep_total_us"],
+ ["prep_split_us",2,"prep_total_us"],["checksum_us",1,"total_us"],
+ ["prepare_us",1,"total_us"],["query_us",1,"total_us"],
+ ["put_start_us",1,"total_us"],["memwrite_total_us",1,"total_us"],
+ ["memwrite_submit_us",2,"memwrite_total_us"],
+ ["memwrite_queue_us",2,"memwrite_total_us"],
+ ["memwrite_urma_us",2,"memwrite_total_us"],
+ ["memwrite_teardown_us",2,"memwrite_total_us"],
+ ["put_end_us",1,"total_us"],["finalize_us",1,"total_us"],
+ ["cache_invalidate_us",1,"total_us"],["revoke_us",1,"total_us"],
+ ["residual",1,"total_us"]];
+function tTree(g){return g==='write'?TWRITE:TREAD;}
+function traceSizes(){return Object.keys(S).filter(function(k){
+  return S[k]&&S[k].trace;});}
+let tSize='',tGroup='',tOp='',tChart=null;
+let tLevelMetric='avg',tStageSel=['total_us'],tStageMetric='avg';
+const tExpand={};
+function traceOf(){
+  const keys=traceSizes(); if(!keys.length) return null;
+  if(tSize&&S[tSize]&&S[tSize].trace) return S[tSize].trace;
+  tSize=keys[0]; return S[tSize].trace;
+}
+function tGroupsList(){const t=traceOf();return t?Object.keys(t.groups||{}):[];}
+function tPick(){
+  const t=traceOf(); if(!t) return null;
+  const gs=tGroupsList(); if(!gs.length) return null;
+  if(tGroup===''||gs.indexOf(tGroup)<0) tGroup=gs[0];
+  const ops=Object.keys((t.groups[tGroup]||{}).ops||{});
+  if(!ops.length) return null;
+  if(tOp===''||ops.indexOf(tOp)<0) tOp=ops[0];
+  return {g:tGroup,op:tOp,data:t.groups[tGroup].ops[tOp]};
+}
+function tStat(key,cur){
+  if(key==='residual') return cur.data.residual||{};
+  return (cur.data.fields||{})[key]||{};
+}
+function tParentKey(key,cur){
+  const it=tTree(cur.g).find(function(x){return x[0]===key;});
+  return (it&&it[2])||'total_us';
+}
+function tLevelMetricOf(st){return st?(st[tLevelMetric]||0):0;}
+function fmtUs(v){v=Number(v)||0;
+  return v>=1000?(v/1000).toFixed(2)+' ms':v.toFixed(1)+' µs';}
+function lvlColor(share){
+  const x=Math.max(0,Math.min(1,share));
+  return 'hsl('+Math.round(200-200*x)+',62%,44%)';
+}
+function renderLevelMetric(){
+  const box=document.getElementById('lvlMetric'); if(!box) return;
+  box.innerHTML='';
+  [['avg','平均'],['p50','p50'],['p99','p99']].forEach(function(m){
+    const b=el('button',m[0]===tLevelMetric?'on':'',m[1]);
+    b.onclick=function(){tLevelMetric=m[0];renderTrace();};
     box.appendChild(b);
   });
-  const steps=z.embed_step===1?[[1,'1 秒粒度'],[60,'1 分钟粒度']]:[[60,'1 分钟粒度']];
-  const box2=document.getElementById('steps');
-  box2.innerHTML='';
-  steps.forEach(([v,label])=>{
-    const b=el('button', v===curStep?'on':'', label);
-    b.onclick=()=>{curStep=v;renderRoleButtons();buildChart();};
-    box2.appendChild(b);
+}
+function renderLevels(cur){
+  const box=document.getElementById('levels'); if(!box) return;
+  box.innerHTML='';
+  const tree=tTree(cur.g);
+  const total=tStat('total_us',cur);
+  [0,1,2].forEach(function(level){
+    const items=tree.filter(function(x){return x[1]===level;});
+    if(!items.length) return;
+    const vals=items.map(function(it){
+      return {key:it[0],parent:it[2],st:tStat(it[0],cur)};});
+    const maxv=Math.max.apply(null,vals.map(function(v){
+      return tLevelMetricOf(v.st);}).concat([0.001]));
+    const row=el('div','lvl-row');
+    vals.forEach(function(v){
+      const m=tLevelMetricOf(v.st);
+      const pm=tLevelMetricOf(tStat(v.parent||'total_us',cur));
+      const share=pm>0?m/pm:0;
+      const b=el('div','lvl-blk');
+      b.style.width=Math.max(2,Math.round(Math.sqrt(m/maxv)*100))+'%';
+      b.style.background=lvlColor(share);
+      const nm=(v.key==='residual')?'残差':v.key;
+      b.textContent=nm+' '+fmtUs(m);
+      const tip=[nm,'样本 '+(v.st.n==null?'-':v.st.n)];
+      ['avg','p50','p95','p99','p999','max','sigma','neg'].forEach(function(k){
+        if(v.st&&v.st[k]!=null) tip.push(k+'：'+v.st[k]+' µs');});
+      if(total&&total.avg>0&&v.st&&v.st.avg!=null)
+        tip.push('占端到端：'+(v.st.avg/total.avg*100).toFixed(1)+'%');
+      b.title=tip.join('\n');
+      row.appendChild(b);
+    });
+    box.appendChild(row);
   });
 }
-/* ---------------- SDK 全链路（C++ trace，breakdown[api] 主行） ---------------- */
-const TREAD = [["total_us",0],["query_total_us",1],["query_route_us",2],
-  ["query_rpc_us",2],["select_us",1],["buf_alloc_us",1],["memread_total_us",1],
-  ["read_submit_us",2],["read_queue_us",2],["read_urma_us",2],
-  ["read_teardown_us",2],["residual",1]];
-const TWRITE = [["total_us",0],["prep_total_us",1],["prep_buf_alloc_us",2],
-  ["prep_memcpy_us",2],["prep_split_us",2],["checksum_us",1],["prepare_us",1],
-  ["query_us",1],["put_start_us",1],["memwrite_total_us",1],
-  ["memwrite_submit_us",2],["memwrite_queue_us",2],["memwrite_urma_us",2],
-  ["memwrite_teardown_us",2],["put_end_us",1],["finalize_us",1],
-  ["cache_invalidate_us",1],["revoke_us",1],["residual",1]];
-let tGroup="", tOp="", tChart=null, tStackChart=null;
-function traceOf(){const z=Z();return z&&z.trace?z.trace:null;}
-function tGroupsList(){const t=traceOf();if(!t)return[];
-  return Object.keys(t.groups||{}).filter(function(g){
-    return Object.keys((t.groups[g]||{}).ops||{}).length;});}
-function tTree(g){if(g==="read")return TREAD;if(g==="write")return TWRITE;
-  return [["total_us",0],["residual",1]];}
-function tPick(){
-  const t=traceOf();if(!t)return null;
-  const gs=tGroupsList();if(!gs.length)return null;
-  if(gs.indexOf(tGroup)<0)tGroup=gs[0];
-  const ops=Object.keys((t.groups[tGroup]||{}).ops||{});
-  if(ops.indexOf(tOp)<0)tOp=ops[0]||"";
-  if(!tOp)return null;
-  return {t:t,g:tGroup,op:tOp,data:t.groups[tGroup].ops[tOp]};}
-function renderTrace(){
-  const card=document.getElementById("tracecard");
-  const t=traceOf();
-  if(!t||!tGroupsList().length){card.style.display="none";return;}
-  card.style.display="";
-  const m=t.meta||{};
-  const rates=Object.keys(m.sample_rates||{});
-  var phaseTxt="";
-  if(m.markers){
-    var pc=m.phase_counts||{};
-    phaseTxt=" · 已按阶段标记剔除：预热 "+(pc.warmup||0)+
-      " / 启动 "+(pc.setup||0)+" / 收尾 "+(pc.teardown||0)+
-      "（计入统计 "+(pc.measured||0)+"）";
-  }else{
-    phaseTxt=" · 无阶段标记（旧客户端），样本未分阶段";
+function totalSeriesData(cur,tier,metric){
+  const rows=cur.data.minutes||[];
+  const agg={};
+  rows.forEach(function(r){
+    const k=Math.floor(r[0]/tier)*tier;
+    const a=agg[k]||(agg[k]={t:k,ok:0,sum:0,max:0});
+    a.ok+=r[2]||0;
+    a.sum+=(r[4]||0)*(r[2]||0);
+    a.max=Math.max(a.max,r[5]||0);
+  });
+  return Object.keys(agg).map(Number).sort(function(x,y){return x-y;})
+    .map(function(k){
+      const a=agg[k];
+      return [a.t*1000, metric==='max'?a.max:(a.ok?a.sum/a.ok:0)];});
+}
+function buildStageChart(cur){
+  const box=document.getElementById('tchart'); if(!box) return;
+  if(!tChart) tChart=echarts.init(box);
+  const tier=cur.data.ftier||60;
+  const fmin=cur.data.fminutes||{};
+  const series=[];
+  tStageSel.forEach(function(key){
+    if(key==='total_us'){
+      series.push({name:'total（端到端）',type:'line',showSymbol:false,
+        data:totalSeriesData(cur,tier,tStageMetric),
+        lineStyle:{width:2}});
+      return;
+    }
+    const rows=fmin[key]||[];
+    if(!rows.length) return;
+    series.push({name:(key==='residual'?'残差':key),
+      type:'line',showSymbol:false,
+      data:rows.map(function(r){
+        return [r[0]*1000, tStageMetric==='max'?r[3]:r[2]];}),
+      lineStyle:{width:1.6}});
+  });
+  tChart.setOption({animation:false,textStyle:{color:C.fg,fontSize:12},
+    tooltip:{trigger:'axis',confine:true,
+      valueFormatter:function(v){return fmtUs(v);}},
+    legend:{top:0,type:'scroll',textStyle:{color:C.fg}},
+    grid:{left:60,right:20,top:36,bottom:56},
+    xAxis:{type:'time',axisLabel:{color:C.mut,
+      formatter:function(v){return hhmmss(v/1000);}},
+      axisLine:{lineStyle:{color:C.line}}},
+    yAxis:{type:'value',name:'µs',scale:true,axisLabel:{color:C.mut},
+      splitLine:{lineStyle:{color:C.line}}},
+    dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
+    series:series},true);
+}
+function renderStageBtns(cur){
+  const box=document.getElementById('stageBtns'); if(!box) return;
+  box.innerHTML='';
+  const tree=tTree(cur.g);
+  const list=['total_us'].concat(tree.filter(function(x){
+    return x[1]===1;}).map(function(x){return x[0];}));
+  list.forEach(function(k){
+    const on=tStageSel.indexOf(k)>=0;
+    const b=el('button',on?'on':'',k==='residual'?'残差':k);
+    b.onclick=function(){
+      const i=tStageSel.indexOf(k);
+      if(i>=0)tStageSel.splice(i,1); else tStageSel.push(k);
+      if(!tStageSel.length) tStageSel=['total_us'];
+      renderStageBtns(cur); buildStageChart(cur);
+    };
+    box.appendChild(b);
+  });
+  const mb=document.getElementById('fmetricBtns'); mb.innerHTML='';
+  [['avg','平均'],['max','最大']].forEach(function(m){
+    const b=el('button',m[0]===tStageMetric?'on':'',m[1]);
+    b.onclick=function(){tStageMetric=m[0];renderStageBtns(cur);
+      buildStageChart(cur);};
+    mb.appendChild(b);
+  });
+  const tb=document.getElementById('ftierBtns'); tb.innerHTML='';
+  const tier=cur.data.ftier||60;
+  tb.appendChild(el('span','tag','粒度：'+(tier>=600?'10 分钟':'1 分钟')));
+}
+function renderTree(cur){
+  const box=document.getElementById('ttree'); if(!box) return;
+  box.innerHTML='';
+  const tree=tTree(cur.g);
+  function addRow(key,level,st,label){
+    const row=el('div','tnode');
+    row.style.paddingLeft=(level*22)+'px';
+    const hasKids=level===1&&tree.some(function(x){
+      return x[1]===2&&x[2]===key;});
+    const arrow=el('span','tarrow',hasKids?(tExpand[key]?'▾':'▸'):'');
+    if(hasKids) arrow.onclick=function(){
+      tExpand[key]=!tExpand[key]; renderTree(cur);};
+    row.appendChild(arrow);
+    const nm=el('span','tname',label);
+    nm.title='点击查看指标套件';
+    nm.onclick=function(){openNodeModal(cur,key,label);};
+    row.appendChild(nm);
+    const pk=(level===0)?'total_us':tParentKey(key,cur);
+    const pm=tStat(pk,cur);
+    const share=(pm&&pm.avg>0&&st&&st.avg!=null)?st.avg/pm.avg:0;
+    const bar=el('span','tbar');
+    const fill=el('span','tfill');
+    fill.style.width=Math.max(2,Math.min(100,Math.round(share*100)))+'%';
+    fill.style.background=lvlColor(share);
+    bar.appendChild(fill); row.appendChild(bar);
+    row.appendChild(el('span','tpct',share>0?Math.round(share*100)+'%':''));
+    row.appendChild(el('span','tval',(st&&st.n!=null)?
+      (Number(st.avg)||0).toFixed(1)+' µs ('+st.n+')':'—'));
+    box.appendChild(row);
   }
-  document.getElementById("tmeta").textContent=
-    "trace 文件 "+m.files+" · 解析行 "+m.trace_lines+
-    " · slice 行（仅计数）"+m.slice_lines+" · 解析失败 "+m.parse_errors+
-    (rates.length?(" · 采样率 "+rates.join("/")):"")+phaseTxt;
-  const gbox=document.getElementById("tgroups");gbox.innerHTML="";
+  addRow('total_us',0,tStat('total_us',cur),'total（端到端）');
+  tree.filter(function(x){return x[1]===1;}).forEach(function(it){
+    addRow(it[0],1,tStat(it[0],cur),
+      it[0]==='residual'?'残差（total − 阶段和）':it[0]);
+    if(tExpand[it[0]]){
+      tree.filter(function(x){return x[1]===2&&x[2]===it[0];})
+        .forEach(function(ch){addRow(ch[0],2,tStat(ch[0],cur),ch[0]);});
+    }
+  });
+}
+let modalChart=null;
+function openNodeModal(cur,key,label){
+  const st=tStat(key,cur);
+  const total=tStat('total_us',cur);
+  document.getElementById('modalTitle').textContent=
+    (key==='residual'?'残差':key)+' · 指标套件';
+  const body=document.getElementById('modalBody'); body.innerHTML='';
+  if(!st||st.n==null){
+    body.appendChild(el('div','note','该阶段无样本'));
+  }else{
+    const g=el('div','grid');
+    [['样本数',st.n],['负值(-1) 样本',st.neg],['平均',st.avg,'µs'],
+     ['p50',st.p50,'µs'],['p95',st.p95,'µs'],['p99',st.p99,'µs'],
+     ['p999',st.p999,'µs'],['最大',st.max,'µs'],['最小',st.min,'µs'],
+     ['标准差 σ',st.sigma,'µs']].forEach(function(x){
+      if(x[1]==null) return;
+      g.appendChild(kv(x[0],x[1],x[2]||''));
+    });
+    if(total&&total.avg>0&&st.avg!=null)
+      g.appendChild(kv('占端到端',(st.avg/total.avg*100).toFixed(1),'%'));
+    const pm=tStat(tParentKey(key,cur),cur);
+    if(pm&&pm.avg>0&&st.avg!=null)
+      g.appendChild(kv('占父阶段',(st.avg/pm.avg*100).toFixed(1),'%'));
+    body.appendChild(g);
+    if(st.hist){
+      body.appendChild(el('h3','sec','时延分布（对数分箱）'));
+      const div=el('div','chart sm');
+      body.appendChild(div);
+      const keys=Object.keys(st.hist).map(Number)
+        .sort(function(a,b){return a-b;});
+      modalChart=echarts.init(div);
+      modalChart.setOption({animation:false,textStyle:{color:C.fg,fontSize:12},
+        tooltip:{trigger:'axis'},grid:{left:56,right:16,top:16,bottom:40},
+        xAxis:{type:'category',data:keys,axisLabel:{color:C.mut}},
+        yAxis:{type:'value',axisLabel:{color:C.mut},
+          splitLine:{lineStyle:{color:C.line}}},
+        series:[{type:'bar',data:keys.map(function(k){return st.hist[k];}),
+          itemStyle:{color:C.pri,opacity:0.7}}]});
+    }
+  }
+  const hasCurve=(key==='total_us'||key==='residual'||
+    !!(cur.data.fminutes||{})[key]);
+  if(hasCurve){
+    const b=el('button','','查看该阶段时间曲线');
+    b.style.marginTop='10px';
+    b.onclick=function(){
+      if(tStageSel.indexOf(key)<0) tStageSel.push(key);
+      closeNodeModal(); renderStageBtns(cur); buildStageChart(cur);
+    };
+    body.appendChild(b);
+  }
+  document.getElementById('nodeModal').style.display='flex';
+}
+function closeNodeModal(){
+  document.getElementById('nodeModal').style.display='none';
+  if(modalChart){modalChart.dispose&&modalChart.dispose(); modalChart=null;}
+}
+function renderTraceTop(cur){
+  const tb=document.querySelector('#ttop tbody'); if(!tb) return;
+  tb.innerHTML='';
+  const top=(traceOf()||{}).top||[];
+  top.forEach(function(r){
+    const tr=el('tr');
+    [r.start_time,r.trace_id,r.key,r.op,r.status,r.size,r.total_us,
+     Object.keys(r.stages||{}).slice(0,3).join(' / ')].forEach(
+      function(v,i){
+        tr.appendChild(el('td',
+          (i===5||i===6)?'n mono':'mono', v==null?'-':String(v)));});
+    tb.appendChild(tr);
+  });
+  if(!top.length){
+    const tr=el('tr'); const td=el('td'); td.colSpan=8;
+    td.textContent='无数据'; tr.appendChild(td); tb.appendChild(tr);
+  }
+}
+function renderTraceStatus(cur){
+  const box=document.getElementById('terrs'); box.innerHTML='';
+  const st=(cur&&cur.data&&cur.data.status)||{};
+  const es=Object.entries(st).sort(function(a,b){return b[1]-a[1];});
+  if(!es.length){box.appendChild(el('div','note','无数据'));return;}
+  const t=el('table'); const thead=el('thead'); const hr=el('tr');
+  hr.appendChild(el('th',null,'状态')); hr.appendChild(el('th','n','次数'));
+  thead.appendChild(hr); t.appendChild(thead);
+  const tbody=el('tbody');
+  es.forEach(function(x){
+    const tr=el('tr'); tr.appendChild(el('td','mono',x[0]));
+    tr.appendChild(el('td','n',String(x[1]))); tbody.appendChild(tr);});
+  t.appendChild(tbody); box.appendChild(t);
+}
+function renderTrace(){
+  const card=document.getElementById('tracecard'); if(!card) return;
+  const keys=traceSizes();
+  if(!keys.length){card.style.display='none';return;}
+  card.style.display='';
+  const tsel=document.getElementById('tsizeSel');
+  if(tsel){
+    if(!tSize||keys.indexOf(tSize)<0) tSize=keys[0];
+    tsel.innerHTML='';
+    keys.forEach(function(k){const o=el('option',null,k);o.value=k;
+      tsel.appendChild(o);});
+    tsel.value=tSize;
+    tsel.onchange=function(){
+      tSize=tsel.value; tGroup=''; tOp=''; tStageSel=['total_us'];
+      renderTrace();};
+  }
+  const t=traceOf();
+  const m=(t&&t.meta)||{};
+  const rates=Object.keys(m.sample_rates||{});
+  let phaseTxt;
+  if(m.markers){
+    const pc=m.phase_counts||{};
+    phaseTxt=' · 已按阶段标记剔除：预热 '+(pc.warmup||0)+
+      ' / 启动 '+(pc.setup||0)+' / 收尾 '+(pc.teardown||0)+
+      '（计入统计 '+(pc.measured||0)+'）';
+  }else{
+    phaseTxt=' · 无阶段标记（旧客户端），样本未分阶段';
+  }
+  document.getElementById('tmeta').textContent=
+    'trace 文件 '+m.files+' · 解析行 '+m.trace_lines+
+    ' · slice 行（仅计数）'+m.slice_lines+' · 解析失败 '+m.parse_errors+
+    (rates.length?(' · 采样率 '+rates.join('/')):'')+phaseTxt;
+  const gbox=document.getElementById('tgroups'); gbox.innerHTML='';
   tGroupsList().forEach(function(g){
-    const b=el("button",g===tGroup?"on":"",
-               g==="read"?"读":(g==="write"?"写":"其它"));
-    b.onclick=function(){tGroup=g;tOp="";renderTrace();};
+    const b=el('button',g===tGroup?'on':'',
+      g==='read'?'读':(g==='write'?'写':'其它'));
+    b.onclick=function(){tGroup=g;tOp='';renderTrace();};
     gbox.appendChild(b);});
-  const sel=document.getElementById("topSel");
+  const sel=document.getElementById('topSel');
   const ops=Object.keys((t.groups[tGroup]||{}).ops||{});
-  sel.style.display=ops.length>1?"inline-block":"none";
+  sel.style.display=ops.length>1?'inline-block':'none';
   if(ops.length>1){
-    sel.innerHTML="";
-    ops.forEach(function(o){const op=el("option",null,o);op.value=o;
+    sel.innerHTML='';
+    ops.forEach(function(o){const op=el('option',null,o);op.value=o;
       sel.appendChild(op);});
     sel.value=tOp||ops[0];
     sel.onchange=function(){tOp=sel.value;renderTrace();};
   }
-  const cur=tPick();if(!cur)return;
-  const d=cur.data;
-  const f=d.fields||{};
-  const tot=f.total_us||{};
-  const cards=document.getElementById("tcards");cards.innerHTML="";
-  cards.appendChild(kv("样本数", d.count));
-  cards.appendChild(kv("失败", d.fail));
-  if(tot.avg!=null)cards.appendChild(kv("平均", tot.avg,"µs"));
-  if(tot.p50!=null)cards.appendChild(kv("p50", tot.p50,"µs"));
-  if(tot.p95!=null)cards.appendChild(kv("p95", tot.p95,"µs"));
-  if(tot.p99!=null)cards.appendChild(kv("p99", tot.p99,"µs"));
-  if(tot.p999!=null)cards.appendChild(kv("p999", tot.p999,"µs"));
-  if(tot.max!=null)cards.appendChild(kv("最大", tot.max,"µs"));
-  buildTraceStack(cur);
-  buildTraceChart(cur);
-  renderTraceTable(cur);
+  const cur=tPick(); if(!cur) return;
+  const d=cur.data; const f=d.fields||{}; const tot=f.total_us||{};
+  const cards=document.getElementById('tcards'); cards.innerHTML='';
+  cards.appendChild(kv('样本数',d.count));
+  cards.appendChild(kv('失败',d.fail));
+  if(tot.avg!=null)cards.appendChild(kv('平均',tot.avg,'µs'));
+  if(tot.p50!=null)cards.appendChild(kv('p50',tot.p50,'µs'));
+  if(tot.p95!=null)cards.appendChild(kv('p95',tot.p95,'µs'));
+  if(tot.p99!=null)cards.appendChild(kv('p99',tot.p99,'µs'));
+  if(tot.p999!=null)cards.appendChild(kv('p999',tot.p999,'µs'));
+  if(tot.max!=null)cards.appendChild(kv('最大',tot.max,'µs'));
+  renderLevelMetric(); renderLevels(cur);
+  renderStageBtns(cur); buildStageChart(cur);
+  renderTree(cur);
   renderTraceTop(cur);
   renderTraceStatus(cur);
 }
-function buildTraceChart(cur){
-  const box=document.getElementById("tchart");
-  if(!tChart)tChart=echarts.init(box);
-  const rows=cur.data.seconds||[];
-  if(!rows.length){tChart.clear();return;}
-  const x=rows.map(function(r){return r[0]*1000;});
-  tChart.setOption({animation:false,textStyle:{fontSize:12},
-    tooltip:{trigger:"axis",confine:true,formatter:function(ps){
-      const r=rows[ps[0].dataIndex];
-      return "<b>"+fullts(r[0])+"</b><br>样本数："+r[1]+"<br>失败："+r[3]+
-        "<br>平均(µs)："+r[4]+"<br>p50(µs)："+r[6]+"<br>p99(µs)："+r[7];}},
-    legend:{top:0,type:"scroll"},grid:{left:56,right:20,top:36,bottom:64},
-    xAxis:{type:"time",axisLabel:{formatter:function(v){return hhmmss(v/1000);}}},
-    yAxis:[{type:"value",name:"µs",scale:true},
-           {type:"value",name:"样本数",position:"right",splitLine:{show:false}}],
-    dataZoom:[{type:"inside"},{type:"slider",height:18,bottom:8}],
-    series:[
-      {name:"样本数",type:"bar",yAxisIndex:1,
-       data:x.map(function(v,i){return [v,rows[i][1]];}),
-       itemStyle:{color:"rgba(14,116,144,.35)"},barMaxWidth:8,large:true},
-      {name:"失败",type:"bar",yAxisIndex:1,
-       data:x.map(function(v,i){return [v,rows[i][3]];}),
-       itemStyle:{color:"rgba(214,69,69,.55)"},barMaxWidth:8,large:true},
-      {name:"平均",type:"line",data:x.map(function(v,i){return [v,rows[i][4]];}),
-       showSymbol:false,lineStyle:{width:1,type:"dashed"}},
-      {name:"p50",type:"line",data:x.map(function(v,i){return [v,rows[i][6]];}),
-       showSymbol:false,lineStyle:{width:1.5}},
-      {name:"p99",type:"line",data:x.map(function(v,i){return [v,rows[i][7]];}),
-       showSymbol:false,lineStyle:{width:1.8}}
-    ]},true);
-}
-function buildTraceStack(cur){
-  const box=document.getElementById("tstack");
-  if(!tStackChart)tStackChart=echarts.init(box);
-  const tree=tTree(cur.g);
-  const f=cur.data.fields||{};
-  const stages=tree.filter(function(t){return t[1]===1&&t[0]!=="residual";});
-  const series=stages.map(function(s){
-    return {name:s[0],type:"bar",stack:"s",barMaxWidth:26,
-      data:[{value:Math.max(0,(f[s[0]]||{}).p50||0)}]};});
-  tStackChart.setOption({animation:false,textStyle:{fontSize:11},
-    tooltip:{trigger:"axis",confine:true,axisPointer:{type:"shadow"},
-      formatter:function(ps){
-        let tot=0;ps.forEach(function(p){tot+=(p.value||0);});
-        return "<b>"+ps[0].name+"</b>（p50 构成，合计 "+tot.toFixed(1)+" µs）<br>"+
-          ps.map(function(p){return p.marker+p.seriesName+"："+
-            (p.value||0)+" µs";}).join("<br>");}},
-    legend:{type:"scroll",top:0},
-    grid:{left:120,right:24,top:36,bottom:24},
-    xAxis:{type:"value",name:"µs"},
-    yAxis:{type:"category",data:[cur.op]},
-    series:series},true);
-}
-function renderTraceTable(cur){
-  const tb=document.querySelector("#ttable tbody");tb.innerHTML="";
-  const f=cur.data.fields||{};
-  const tree=tTree(cur.g);
-  const head=el("tr");
-  ["阶段","n","平均","p50","p95","p99","p999","最大"].forEach(function(h,i){
-    head.appendChild(el("th",i?"n":"",h));});
-  tb.appendChild(head);
-  const known={};tree.forEach(function(t){known[t[0]]=1;});
-  function row(key,label,depth,st){
-    const tr=el("tr");
-    const td=el("td");
-    td.style.paddingLeft=(8+depth*16)+"px";
-    td.textContent=label;
-    tr.appendChild(td);
-    const src=st||{};
-    [src.n==null?"-":src.n, src.avg==null?"-":src.avg,
-     src.p50==null?"-":src.p50, src.p95==null?"-":src.p95,
-     src.p99==null?"-":src.p99, src.p999==null?"-":src.p999,
-     src.max==null?"-":src.max].forEach(function(v){
-      tr.appendChild(el("td","n",String(v)));});
-    tb.appendChild(tr);
-  }
-  tree.forEach(function(t){
-    const k=t[0],depth=t[1];
-    if(k==="residual"){row(k,"残差（total − 阶段和）",1,cur.data.residual);return;}
-    if(f[k])row(k,k,depth,f[k]);
-  });
-  Object.keys(f).filter(function(k){return !known[k]&&k.endsWith("_us");})
-    .forEach(function(k){row(k,k+"（其它阶段）",1,f[k]);});
-}
-function renderTraceTop(cur){
-  const tb=document.querySelector("#ttop tbody");tb.innerHTML="";
-  const top=(cur.t.top||[]).slice(0,50);
-  top.forEach(function(e){
-    const tr=el("tr");
-    const st=Object.entries(e.stages||{}).sort(function(a,b){return b[1]-a[1];})
-      .slice(0,3).map(function(x){return x[0].replace(/_us$/,"")+"="+x[1];})
-      .join(" ");
-    [e.start_time||"",e.trace_id||"",e.key||"",e.op||"",e.status||"",
-     e.size||"",e.total_us==null?"":e.total_us,st].forEach(function(v,i){
-      const td=el("td","mono",String(v));
-      if(i===5||i===6)td.className="n mono";
-      tr.appendChild(td);});
-    tb.appendChild(tr);
-  });
-}
-function renderTraceStatus(cur){
-  const box=document.getElementById("terrs");box.innerHTML="";
-  const st=cur.data.status||{};
-  const es=Object.entries(st).sort(function(a,b){return b[1]-a[1];});
-  if(!es.length){box.appendChild(el("div","note","无数据"));return;}
-  const t=el("table");
-  const thead=el("thead");const hr=el("tr");
-  hr.appendChild(el("th",null,"状态"));hr.appendChild(el("th","n","次数"));
-  thead.appendChild(hr);t.appendChild(thead);
-  const tb=el("tbody");
-  es.forEach(function(x){
-    const tr=el("tr");
-    tr.appendChild(el("td","mono",x[0]));
-    tr.appendChild(el("td","n",String(x[1])));
-    tb.appendChild(tr);});
-  t.appendChild(tb);box.appendChild(t);
-}
-
+document.addEventListener('DOMContentLoaded',function(){
+  const mc=document.getElementById('modalClose');
+  if(mc) mc.onclick=closeNodeModal;
+  const nm=document.getElementById('nodeModal');
+  if(nm) nm.onclick=function(e){if(e.target===nm)closeNodeModal();};
+});
 window.__MC_FULL_READY__=function(){renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """
@@ -1493,17 +2069,45 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     for size, z in (data.get("sizes") or {}).items():
         clients = sorted(z.get("clients") or [],
                          key=lambda c: -float(c.get("p99_ms") or 0))
-        keep = [c for c in clients[:topk]]
+        keep = clients[:topk]
         slim = dict(z)
         slim["clients"] = keep
-        if z.get("embed_step") == 60 and z.get("series"):
-            # >1 day: 1s series only lives in data.js (HTML stays small)
-            empty = {"t": [], "c": [], "ok": [], "fail": [], "avg": [],
-                     "p50": [], "p99": [], "p999": [], "max": [], "qw": [],
-                     "qwmax": []}
-            slim["series"] = {
-                role: {"step1": empty, "step60": v.get("step60") or empty}
-                for role, v in z["series"].items()}
+        # 段2：对象预算裁剪（角色全嵌 -> 节点按日志量 -> Top 客户端），
+        # 单点行预算 EMBED_ROW_BUDGET；其余对象留在 data.js
+        emb = set(z.get("embed_tiers") or [])
+        objs = z.get("objects") or {}
+        budget = EMBED_ROW_BUDGET
+        emb_objs = {}
+
+        def _take(key):
+            nonlocal budget
+            o = objs.get(key)
+            if not o:
+                return False
+            tiers = {k: v for k, v in (o.get("tiers") or {}).items()
+                     if k in emb}
+            rows = _tier_rowcount(tiers)
+            if not rows or rows > budget:
+                return False
+            budget -= rows
+            slim_o = {"label": o.get("label"), "kind": o.get("kind"),
+                      "tiers": tiers}
+            for k in ("node", "bytes", "p99_ms"):
+                if k in o:
+                    slim_o[k] = o[k]
+            emb_objs[key] = slim_o
+            return True
+
+        for key in ("all", "writer", "reader"):
+            _take(key)
+        nodes = sorted((k for k in objs if k.startswith("node:")),
+                       key=lambda k: -(objs[k].get("bytes") or 0))
+        for k in nodes:
+            _take(k)
+        for c in keep:
+            _take("client:" + c["name"])
+        slim["objects"] = emb_objs
+        slim["object_total"] = len(objs)
         embedded["sizes"][size] = slim
     meta_bits = []
     if meta.get("config"):
@@ -1525,39 +2129,71 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     subtitle = " · ".join(meta_bits) + \
         " · 生成于 " + time.strftime("%Y-%m-%d %H:%M:%S")
     body = """
-<div style="margin-bottom:8px"><a href="../../report/overview.html">← 返回运行总览</a></div>
-<div class="card"><div class="toolbar">
+<div class="card">
+<div class="toolbar">
+<label class="tl-label" for="sizeSel">数据大小</label>
 <select id="sizeSel"></select>
-<span id="roles" class="toolbar"></span>
-<span id="steps" class="toolbar"></span>
 </div>
-<div id="cards" class="grid"></div></div>
-<div class="card"><h2>时间线</h2>
+<h3 class="sec">性能统计</h3>
+<div id="perfcards" class="grid"></div>
+<h3 class="sec">信息展示</h3>
+<div id="infocards" class="grid"></div>
+<h3 class="sec">参数配置</h3>
+<div id="params" class="params"></div>
+</div>
+<div class="card"><h2>时延曲线</h2>
+<div class="toolbar">
+<label class="tl-label" for="objAdd">对象</label>
+<select id="objAdd"></select>
+<span id="objChips" class="chips"></span>
+<span class="tb-sep"></span>
+<span id="tierBtns" class="toolbar"></span>
+<span id="metricBtns" class="toolbar"></span>
+</div>
 <div id="mainchart" class="chart"></div>
-<div class="note">悬停查看每个桶的全部统计量；滚轮/拖动缩放；点击下方客户端行可叠加该客户端的分钟曲线。
-粒度：{gran}。大范围以上采用聚合桶（非逐点），Top 慢点表保留单点级证据。</div></div>
+<div class="note">对象可选：总体（含 writer/reader 角色）、节点聚合、单个客户端，可多选叠加对比
+（多选时用指标按钮切换显示指标）。粒度：时间分桶（1 秒~1 天，按运行时长自动裁剪可用档）
+与「自适应（按样本数）」双策略，横轴恒为时间轴；客户端曲线固定为自适应分桶。
+悬停查看每个桶的全部统计量，滚轮/拖动缩放。点击客户端表行可快速加入对比。</div></div>
 <div class="card" id="tracecard" style="display:none">
 <h2>SDK 全链路（C++ trace）</h2>
 <div class="sub" id="tmeta"></div>
 <div class="toolbar"><span id="tgroups" class="toolbar"></span>
-<select id="topSel" style="display:none"></select></div>
+<select id="topSel" style="display:none"></select>
+<span class="tb-sep"></span>
+<label class="tl-label" for="tsizeSel">数据大小</label>
+<select id="tsizeSel"></select></div>
 <div id="tcards" class="grid"></div>
-<div id="tstack" class="chart sm"></div>
+<h3 class="sec">分级时延（鼠标悬停看该块全部统计）</h3>
+<div class="toolbar"><span class="tl-label">指标</span>
+<span id="lvlMetric" class="toolbar"></span></div>
+<div id="levels" class="levels"></div>
+<h3 class="sec">阶段曲线（可多选阶段同图对比）</h3>
+<div class="toolbar"><span id="stageBtns" class="toolbar"></span>
+<span class="tb-sep"></span><span id="fmetricBtns" class="toolbar"></span>
+<span class="tb-sep"></span><span id="ftierBtns"></span></div>
 <div id="tchart" class="chart"></div>
-<div class="note">上：阶段构成（各阶段 p50 堆叠）；下：按 start_time 的 1s/1min 桶（样本数柱 + 端到端时延 p50/p99）。
-样例为采样命中或失败的请求（样本数 ≠ 请求总数）；阶段表含残差（total − 阶段和）。</div>
-<h2 style="margin-top:14px">阶段分解（树）</h2>
-<div class="wrapx"><table id="ttable"><tbody></tbody></table></div>
-<h2 style="margin-top:14px">最慢请求（Top-50）</h2>
+<div class="note">阶段曲线的时间桶为 1 分钟（超过 1440 桶自动降为 10 分钟），
+平均/最大值来自 SDK 字段统计；端到端曲线由 1s 桶聚合到同一档位。</div>
+<h3 class="sec">阶段树（点击节点查看指标套件）</h3>
+<div class="ttree" id="ttree"></div>
+<h3 class="sec">最慢请求（Top-50）</h3>
 <div class="wrapx"><table id="ttop"><thead><tr>
 <th>start_time</th><th>trace_id</th><th>key</th><th>op</th><th>状态</th>
 <th class="n">size</th><th class="n">total (µs)</th><th>主要阶段</th>
 </tr></thead><tbody></tbody></table></div>
-<h2 style="margin-top:14px">状态分布</h2>
+<h3 class="sec">状态分布</h3>
 <div id="terrs"></div>
 <div class="note">说明：① 采样门控——主行仅在采样命中或失败时出现；② put/upsert 的
 memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total_us 为全部副本合计）；
-③ `-1` 表示该阶段拿不到时间戳（不参与时延统计）；④ slice 明细行 P1 仅计数，后续补充。</div>
+③ `-1` 表示该阶段拿不到时间戳（不参与时延统计）；④ slice 明细行 P1 仅计数。</div>
+</div>
+<div class="modal-mask" id="nodeModal" style="display:none">
+ <div class="modal">
+  <div class="modal-head"><b id="modalTitle"></b>
+   <button id="modalClose" title="关闭" aria-label="关闭">✕</button></div>
+  <div class="modal-body" id="modalBody"></div>
+ </div>
 </div>
 <pre class="term" style="display:none"></pre>
 <div class="card"><h2>客户端（点击行叠加曲线）</h2><div class="wrapx">
