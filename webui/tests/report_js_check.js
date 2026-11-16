@@ -31,6 +31,7 @@ const switchSize = arg("--switch-size", null);
 const expectTrace = arg("--expect-trace", null) === "1";
 const tierLabel = arg("--tier-label", null);
 const addObjKey = arg("--add-obj", null);
+const useReal = process.argv.includes("--real");
 
 const elements = {};
 function makeEl(id) {
@@ -43,6 +44,9 @@ function makeEl(id) {
     children: [],
     title: "",
     value: "",
+    attrs: {},
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return this.attrs[k]; },
     onclick: null,
     onchange: null,
     appendChild(c) { this.children.push(c); return c; },
@@ -62,7 +66,7 @@ function getEl(id) {
   return elements[id];
 }
 
-const charts = {};        // elId -> [{opt, merge}]
+const charts = {};        // elId -> [opt]
 function echartsInit(el) {
   const id = el.id || "anon";
   if (!charts[id]) charts[id] = [];
@@ -100,6 +104,49 @@ const sandbox = {
 };
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
+
+/* ---- 真实 ECharts（SSR SVG）模式：桩 setOption 不解析 option，测不出
+   真实渲染异常（曾漏掉 markLine xAxis=undefined 杀整页的事故）。
+   --real 时用 vendored ECharts 真正 setOption + renderToSVGString，并把
+   option 同步记录进 charts 以保持既有断言可用。 ---- */
+const realCharts = [];    // {id, chart}
+let realInit = null;
+if (useReal) {
+  const path = require("path");
+  globalThis.window = windowStub;
+  globalThis.document = documentStub;
+  const realEcharts = require(path.resolve(__dirname, "..", "web", "vendor",
+                                           "echarts.min.js"));
+  if (typeof realEcharts.setPlatformAPI === "function") {
+    realEcharts.setPlatformAPI({
+      createCanvas: () => ({ getContext: () => ({
+        measureText: (t) => ({ width: String(t).length * 7 }) }) }),
+      measureText: (t) => ({ width: String(t).length * 7 }),
+      loadImage: null,
+    });
+  }
+  realInit = (el) => {
+    const id = (el && el.id) || "anon";
+    if (!charts[id]) charts[id] = [];
+    const c = realEcharts.init(null, null,
+      { renderer: "svg", ssr: true, width: 960, height: 420 });
+    realCharts.push({ id, chart: c });
+    return new Proxy(c, {
+      get(t, p) {
+        if (p === "setOption") {
+          return (opt, notMerge) => {
+            charts[id].push(opt);
+            return t.setOption(opt, notMerge);
+          };
+        }
+        const v = t[p];
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    });
+  };
+}
+
+if (realInit) sandbox.echarts = { init: realInit };
 
 const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
 windowStub.__MC_REPORT__ = data;
@@ -142,6 +189,16 @@ function seriesX0(opt, name) {
 if (!errs.length) {
   out.cards_text = [textOf(getEl("perfcards")), textOf(getEl("infocards")),
                     textOf(getEl("params"))].join(" ");
+  const hseq = charts.histchart || [];
+  const ho = hseq.length ? hseq[hseq.length - 1] : null;
+  out.hist_marks = (ho && ho.series && ho.series[0] && ho.series[0].markLine)
+    ? (ho.series[0].markLine.data || []).length : 0;
+  out.hist_cats = (ho && ho.xAxis) ? (ho.xAxis.data || []).length : 0;
+  out.hist_first = (ho && ho.xAxis && ho.xAxis.data)
+    ? String(ho.xAxis.data[0] || "") : "";
+  out.hist_mark_x = (ho && ho.series && ho.series[0] && ho.series[0].markLine
+    && ho.series[0].markLine.data)
+    ? ho.series[0].markLine.data.map((d) => d.xAxis) : [];
   out.init_len = seriesLen(mainOpt(), "p50");
   out.init_x0 = seriesX0(mainOpt(), "p50");
 
@@ -162,15 +219,65 @@ if (!errs.length) {
 
   if (addObjKey) {
     try {
-      const sel = getEl("objAdd");
-      sel.value = addObjKey;
-      sel.onchange();
+      // 对象树：找到 data-key 匹配的行并点击（等价于用户勾选）
+      let clicked = false;
+      (function walk(node) {
+        if (clicked || !node) return;
+        const kids = node.children || [];
+        for (const c of kids) {
+          const k = c.getAttribute && c.getAttribute("data-key");
+          if (k === addObjKey && c.onclick) { c.onclick(); clicked = true; return; }
+          walk(c);
+        }
+      })(getEl("objTree"));
+      if (!clicked) errs.push("add obj: tree row not found " + addObjKey);
       const opt = mainOpt();
       out.overlay_names = (opt && opt.series || []).map((s) => s.name);
       out.overlay_len = opt && opt.series && opt.series.length
         ? opt.series[0].data.length : null;
     } catch (e) { errs.push("add obj: " + String(e && e.stack || e)); }
   }
+
+  const focusKey = arg("--focus", null);
+  if (focusKey) {
+    try {
+      let done = false;
+      (function walk(node) {
+        if (done || !node) return;
+        const kids = node.children || [];
+        for (const c of kids) {
+          if (c.className === "lvl-toggle" && String(c.title || "").indexOf(focusKey) >= 0) {
+            c.onclick(); done = true; return;
+          }
+          walk(c);
+        }
+      })(getEl("levels"));
+      if (!done) errs.push("focus: toggle not found " + focusKey);
+      out.focus_text = textOf(getEl("levels"));
+    } catch (e) { errs.push("focus: " + String(e && e.stack || e)); }
+  }
+
+  const outlierArg = arg("--outlier", null);
+  if (outlierArg === "1") {
+    try {
+      const btn = getEl("outlierBtn");
+      btn.onclick();
+      const opt = mainOpt();
+      out.outlier_nulls = ((opt && opt.series) || []).map(function (s) {
+        return (s.data || []).filter(function (d) { return d[1] === null; }).length;
+      });
+      out.outlier_btn = textOf(btn);
+    } catch (e) { errs.push("outlier: " + String(e && e.stack || e)); }
+  }
+
+  const _tc=(charts.tchart||[]); const _tco=_tc.length?_tc[_tc.length-1]:null;
+  out.tchart_series=((_tco&&_tco.series)||[]).map(function(s){return s.name;});
+  out.tchart_empty=textOf(getEl("tchartEmpty"));
+  out.tree_rows = (getEl("objTree").children || []).map(function (r) {
+    return textOf(r);
+  });
+  out.qps_series = (charts.qpschart || []).length;
+  out.qps_note = textOf(getEl("qpsNote"));
 
   const hsizes = data.sizes || {};
   const hsize = Object.keys(hsizes)[0];
@@ -184,8 +291,7 @@ if (!errs.length) {
       const name = (row.children || []).find((c) => c.className === "tname");
       if (name && name.onclick) { name.onclick(); clicked = true; }
     });
-    out.modal_visible = getEl("nodeModal").style.display !== "none";
-    out.modal_text = textOf(getEl("modalBody"));
+    out.detail_text = textOf(getEl("tdetail"));
   }
 
   if (switchSize) {
@@ -201,6 +307,24 @@ if (!errs.length) {
       out.trace_visible = getEl("tracecard").style.display !== "none";
     }
   }
+}
+if (useReal && !errs.length) {
+  const real = { total: realCharts.length, ok: 0, fail: 0, fails: [] };
+  realCharts.forEach((rc) => {
+    try {
+      const svg = rc.chart.renderToSVGString();
+      if (!svg || svg.length < 200) throw new Error("empty svg " + (svg || "").length);
+      real.ok++;
+    } catch (e) {
+      real.fail++;
+      if (real.fails.length < 5) {
+        real.fails.push(rc.id + ": " + String(e && e.message || e));
+      }
+    }
+  });
+  out.real = real;
+  if (real.fail) errs.push("real-echarts render failures: " +
+                           real.fails.join(" | "));
 }
 process.stdout.write(JSON.stringify(out) + "\n");
 process.exit(errs.length ? 1 : 0);

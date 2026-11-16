@@ -106,7 +106,7 @@ TIER_LABELS = {1: "1 秒", 10: "10 秒", 60: "1 分钟", 600: "10 分钟",
                1800: "30 分钟", 3600: "1 小时", 10800: "3 小时",
                21600: "6 小时", 86400: "1 天"}
 COUNT_KEY = "cnt"
-COUNT_LABEL = "自适应（按样本数）"
+COUNT_LABEL = "自适应"
 MIN_TIER_BUCKETS = 8          # 少于 8 个桶的粒度没有意义，不提供
 EMBED_POINTS_MAX = 2048       # 每序列嵌入点数上限（Grafana/uPlot 同量级）
 EMBED_ROW_BUDGET = 150000     # report.html 内嵌点行总预算
@@ -114,7 +114,7 @@ DATAJS_AGG_MAX = 100000       # data.js 单个聚合序列点数上限
 DATAJS_ROW_BUDGET = 2000000   # data.js 点行总预算
 CLIENT_MIN_POINTS = 128
 CLIENT_MAX_POINTS = 2048
-COUNT_BUCKETS_MAX = 1024
+COUNT_BUCKETS_MAX = 2048      # 自适应档桶数上界（每条曲线各自）
 EMBED_CLIENTS_TOPK = 20
 
 
@@ -135,6 +135,20 @@ def _acc_bucket(b, row):
         b[7][int(k)] = b[7].get(int(k), 0) + int(n)
 
 
+def _merge_bucket(b, o):
+    """Merge bucket into bucket (both are [c,ok,fail,sum,max,qsum,qmax,hist])."""
+    b[0] += o[0]
+    b[1] += o[1]
+    b[2] += o[2]
+    b[3] += o[3]
+    b[4] = max(b[4], o[4])
+    b[5] += o[5]
+    b[6] = max(b[6], o[6])
+    for k, n in (o[7] or {}).items():
+        b[7][int(k)] = b[7].get(int(k), 0) + int(n)
+    return b
+
+
 def _tier_rows(rows, step):
     """Aggregate 1s bucket rows into time buckets of `step` seconds."""
     out = {}
@@ -148,23 +162,32 @@ def _tier_rows(rows, step):
 
 
 def _count_target(total):
-    """Adaptive sample-count bucketing: ~8 samples/bucket, 64..1024 buckets."""
+    """Adaptive sample-count bucketing: <= COUNT_BUCKETS_MAX buckets.
+
+    Rule (user spec): the bucket count is capped at 2048 and each bucket holds
+    total/2048 samples; when the run has fewer samples than the cap every
+    sample becomes its own bucket (nothing is dropped or averaged away)."""
     try:
-        t = int(total / 8)
+        total = int(total)
     except (TypeError, ValueError):
-        t = 0
-    return max(64, min(COUNT_BUCKETS_MAX, t or 64))
+        total = 0
+    if total <= 0:
+        return 0
+    return min(COUNT_BUCKETS_MAX, total)
 
 
 def _count_rows(rows, target, target_points=None):
     """Equal-sample buckets: accumulate 1s rows until ~total/target samples,
-    key each bucket by its LAST sample time (横轴仍是时间轴)."""
+    key each bucket by its LAST sample time (横轴仍是时间轴).
+
+    `per` uses ceil so the produced bucket count never exceeds the target
+    (round() could overshoot and produce one bucket too many)."""
     pts = target_points or target
     ordered = sorted(rows or [], key=lambda r: int(r[0]))
     total = sum(int(r[1]) for r in ordered)
     if not ordered or total <= 0 or pts <= 0:
         return {}
-    per = max(1, int(round(total / float(pts))))
+    per = max(1, int(-(-total // int(pts))))   # ceil(total/pts)
     out = {}
     acc = None
     for row in ordered:
@@ -172,10 +195,22 @@ def _count_rows(rows, target, target_points=None):
             acc = _new_bucket()
         _acc_bucket(acc, row)
         if acc[0] >= per:
-            out[int(row[0])] = acc
+            key = int(row[0])
+            prev = out.get(key)
+            if prev is None:
+                out[key] = acc
+            else:
+                # 同一时刻的多个客户端行必须合并 —— 直接覆盖会丢掉
+                # 前一个客户端的样本与统计（各客户端时钟对齐时必现）
+                _merge_bucket(prev, acc)
             acc = None
     if acc is not None and acc[0] > 0:
-        out[int(ordered[-1][0])] = acc
+        key = int(ordered[-1][0])
+        prev = out.get(key)
+        if prev is None:
+            out[key] = acc
+        else:
+            _merge_bucket(prev, acc)
     return out
 
 
@@ -300,6 +335,8 @@ def _summary_of(stats):
     return {
         "total": total, "ok": ok, "fail": fail,
         "fail_rate": (fail / total) if total else 0.0,
+        "hist_bins": [[int(k), int(v)] for k, v in sorted(hist.items())],
+        "bin_edges": [round(float(x), 3) for x in edges],
         "avg_ms": round(lat_sum / ok_rows, 4) if ok_rows else 0.0,
         "min_ms": round(gmin, 4) if gmin is not None else 0.0,
         "p50_ms": pct(0.50, "p50_ms"),
@@ -443,7 +480,18 @@ def reduce_size(stats, meta):
                            if span / s <= DATAJS_AGG_MAX), offered[-1])
     objects = {}
     used = 0
+    # 总体（全部）：跨角色的整体聚合。客户端都有 reader/writer 角色时
+    # 也要有这一条 —— 对象树的顶层与「总体 vs 节点 vs 客户端」对比
+    # 都依赖它（否则总体曲线根本不存在）。
+    all_rows = _obj_seconds(stats)
+    all_tiers = _obj_tiers(all_rows, edges, offered, fine_roles,
+                           _count_target(_samples(all_rows)))
+    used += _tier_rowcount(all_tiers)
+    objects["all"] = {"label": _role_label("all"), "kind": "role",
+                      "tiers": all_tiers}
     for role, group in sorted(role_stats.items()):
+        if role == "all":
+            continue          # 与「总体（全部）」是同一条，不重复建
         rows = _obj_seconds(group)
         tiers = _obj_tiers(rows, edges, offered, fine_roles,
                            _count_target(_samples(rows)))
@@ -590,6 +638,9 @@ def _field_pcts(fd, edges=None, hist_ok=True):
         "min": fd.get("min"), "max": fd.get("max"),
         "p50": pct(0.50), "p95": pct(0.95),
         "p99": pct(0.99), "p999": pct(0.999),
+        # p9999 needs >= 10k samples to mean anything; the JS side hides it
+        # below that threshold (the histogram ladder is coarse up there).
+        "p9999": pct(0.9999),
     }
 
 
@@ -962,6 +1013,14 @@ def reduce_monitors(local_log_dir):
             peak = max(peak, s)
         summary["peak_mem_mb"][h["node"]] = round(peak, 1)
     if mem_proc:
+        growth = sorted(mem_proc, key=lambda p: -(p.get("rss_growth_mb") or 0))
+        summary["proc_growth"] = [{
+            "label": "{}/{} {}".format(p["node"], p["pid"],
+                                       p.get("comm") or "").strip(),
+            "growth_mb": p.get("rss_growth_mb"),
+            "growth_pct": p.get("rss_growth_pct"),
+            "leak_suspect": p.get("leak_suspect")}
+            for p in growth[:12]]
         worst = max(mem_proc, key=lambda p: p.get("rss_growth_mb") or 0)
         summary["worst_proc"] = {
             "label": "{}/{} {}".format(worst["node"], worst["pid"],
@@ -1035,107 +1094,225 @@ def _read_echarts(path):
         return ""
 
 
+VENDOR_LIEFLAT = os.path.join(os.path.dirname(_HERE), "webui", "web",
+                               "vendor", "lieflat")
+
+
+def _lieflat_tokens_js():
+    """lieflat-charts 视觉 token（vendored，PolyForm NC；见同目录 NOTICE.md）。
+    report.html 自包含：两个 token 文件整体内联在 app JS 之前。"""
+    parts = []
+    for name in ("mono-tokens.js", "color-presets.js"):
+        text = _read_echarts(os.path.join(VENDOR_LIEFLAT, name))
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
 _PAGE_CSS = """
-:root{color-scheme:light dark;--bg:#f7f8fa;--panel:#fff;--fg:#1f2329;--mut:#6b7785;
---line:#e3e6eb;--pri:#0e7490;--ok:#2f9e44;--warn:#e8a33d;--err:#d64545;
---term-bg:#12171b;--term-fg:#d6dde3}
-@media (prefers-color-scheme:dark){:root{--bg:#101418;--panel:#161b21;--fg:#e6e9ed;
---mut:#8b97a3;--line:#252c34;--pri:#27b3c9;--ok:#4cc38a;--warn:#f0b35a;--err:#ff7b7b}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.6 system-ui,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}
-.wrap{max-width:1400px;margin:0 auto;padding:18px 20px 60px}
-h1{font-size:19px;margin:0 0 2px}h2{font-size:15px;margin:0 0 8px}
-.sub{color:var(--mut);font-size:12.5px;margin-bottom:14px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;
-padding:14px 16px;margin:12px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
-.kv{background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:8px 10px}
-.kv .k{color:var(--mut);font-size:11.5px}.kv .v{font-size:17px;font-weight:600;
-font-variant-numeric:tabular-nums}.kv .u{font-size:11.5px;color:var(--mut);font-weight:400}
-.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
-.tl-label{color:var(--mut);font-size:12px}
-.sec{font-size:13px;font-weight:600;color:var(--mut);margin:14px 0 8px;
-padding-bottom:5px;border-bottom:1px solid var(--line)}
-.sec:first-of-type{margin-top:2px}
-.params{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
-gap:2px 22px}
-.prow{display:flex;gap:10px;padding:4px 0;border-bottom:1px dashed var(--line);
-font-size:12.5px;min-width:0}
-.prow .pk{flex:0 0 130px;color:var(--mut)}
+:root{color-scheme:light dark;
+--paper:#F0F0EE;--ink:#1F1E1C;--mut:rgba(31,30,28,.60);--lab:rgba(31,30,28,.72);
+--faint:rgba(31,30,28,.32);--grid:rgba(31,30,28,.16);--quiet:rgba(31,30,28,.15);
+--track:rgba(31,30,28,.12);--hero:#F5572F;--term-bg:#1C1C1A;--term-fg:#F0EFEB}
+@media (prefers-color-scheme:dark){:root{--paper:#1C1C1A;--ink:#F0EFEB;
+--mut:rgba(240,240,238,.55);--lab:rgba(240,240,238,.72);--faint:#55554F;
+--grid:#2E2D29;--quiet:rgba(240,240,238,.15);--track:rgba(240,240,238,.12)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+font:14px/1.62 'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC',
+'Microsoft YaHei',sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1400px;margin:0 auto;padding:38px 28px 76px}
+h1{font-size:19px;font-weight:700;letter-spacing:-.02em;margin:0 0 3px}
+h2{font-size:16.5px;font-weight:700;letter-spacing:-.02em;margin:0 0 2px}
+.sub{color:var(--mut);font-size:13px;margin-bottom:14px}
+.card{background:var(--paper);border-radius:24px;padding:26px 26px 20px;
+margin:0}
+.card + .card,.wrap > .card:not(:first-child){margin-top:14px}
+.note{color:var(--mut);font-size:13px;line-height:1.75;margin-top:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));
+gap:18px 22px}
+.kv{padding:2px 0}
+.kv .k{color:var(--mut);font-size:12px;font-weight:500;letter-spacing:.06em;
+text-transform:uppercase;margin-bottom:2px}
+.kv .v{font-size:24px;font-weight:800;letter-spacing:-.02em;
+font-variant-numeric:tabular-nums;line-height:1.25}
+.kv .u{font-size:12px;font-weight:500;letter-spacing:.02em;color:var(--mut)}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+margin-bottom:10px}
+.tl-label{color:var(--faint);font-size:12px;font-weight:600;
+letter-spacing:.08em;text-transform:uppercase}
+.sec{font-size:13px;font-weight:600;letter-spacing:.1em;color:var(--faint);
+margin:20px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--grid);
+text-transform:uppercase}
+.sec:first-of-type{margin-top:4px}
+button{font:inherit;font-size:12.5px;padding:3px 11px;border-radius:99px;
+border:1px solid var(--grid);background:transparent;color:var(--ink);
+cursor:pointer;transition:background .15s,border-color .15s}
+button:hover{border-color:var(--faint)}
+button.on{background:var(--ink);border-color:var(--ink);color:var(--paper)}
+button:disabled{opacity:.35;cursor:not-allowed}
+select{font:inherit;font-size:12.5px;padding:3px 8px;border-radius:99px;
+border:1px solid var(--grid);background:transparent;color:var(--ink);
+max-width:280px}
+.chips{display:inline-flex;flex-wrap:wrap;gap:5px;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:2px;padding:3px 5px 3px 11px;
+border:1px solid var(--grid);border-radius:99px;font-size:12.5px;
+background:transparent;max-width:220px;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.chip .chip-x{border:none;background:transparent;color:var(--mut);
+cursor:pointer;font-size:12px;padding:0 5px}
+.chip .chip-x:hover{color:var(--hero)}
+.tb-sep{width:1px;height:16px;background:var(--grid);display:inline-block}
+.params{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+gap:0 26px}
+.prow{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid var(--grid);
+font-size:13px;min-width:0}
+.prow .pk{flex:0 0 132px;color:var(--mut);font-size:12.5px;letter-spacing:.02em}
 .prow .pv{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
-white-space:nowrap;font-family:'Cascadia Code',Consolas,monospace}
-.chips{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center}
-.chip{display:inline-flex;align-items:center;gap:2px;padding:2px 4px 2px 8px;
-border:1px solid var(--line);border-radius:12px;font-size:12px;background:var(--bg);
-max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.chip .chip-x{border:none;background:transparent;color:var(--mut);cursor:pointer;
-font-size:12px;padding:0 4px;border-radius:50%}
-.chip .chip-x:hover{color:var(--err)}
-.tb-sep{width:1px;height:18px;background:var(--line);display:inline-block}
-button:disabled{opacity:.4;cursor:not-allowed}
-/* 分级时延图（图1）：每层一行，块宽 sqrt 压缩 + 最小 2% */
-.levels{display:flex;flex-direction:column;gap:6px}
-.lvl-row{display:flex;gap:4px;align-items:stretch;min-height:30px}
-.lvl-blk{display:flex;align-items:center;padding:0 8px;border-radius:3px;
-color:#fff;font-size:11.5px;white-space:nowrap;overflow:hidden;
-text-overflow:ellipsis;cursor:default;min-width:18px}
-.lvl-blk:hover{outline:2px solid var(--fg);outline-offset:-2px}
-/* 阶段树（图3，参照 LinQuickRec Call Tree） */
-.ttree{border:1px solid var(--line);border-radius:5px;padding:6px 10px}
-.tnode{display:flex;align-items:center;gap:8px;padding:2px 0;
-line-height:1.8;user-select:none}
-.tarrow{width:14px;flex:none;color:var(--mut);cursor:pointer}
+white-space:nowrap;font-family:'Cascadia Code',Consolas,monospace;
+font-variant-numeric:tabular-nums}
+.chart{width:100%;height:420px}.chart.sm{height:250px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border-bottom:1px solid var(--grid);padding:6px 10px;text-align:left;
+white-space:nowrap}
+th{color:var(--faint);font-weight:600;font-size:12px;letter-spacing:.08em;
+text-transform:uppercase;position:sticky;top:0;background:var(--paper);
+z-index:1}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+td.mono{font-size:12px}
+tbody tr:hover td{background:var(--quiet)}
+.wrapx{overflow:auto;max-height:420px;border-top:1px solid var(--grid)}
+pre.term{background:var(--term-bg);color:var(--term-fg);border-radius:16px;
+padding:14px 16px;font:12.5px/1.6 'Cascadia Code',Consolas,monospace;
+overflow:auto;max-height:360px;white-space:pre-wrap;word-break:break-all}
+.tag{display:inline-block;font-size:12px;font-weight:600;padding:2px 9px;
+border-radius:99px;border:1px solid var(--grid);color:var(--mut);
+letter-spacing:.06em;vertical-align:middle}
+.tag.hero{color:var(--hero);border-color:var(--hero)}
+.mono{font-family:'Cascadia Code',Consolas,monospace}
+.path{color:var(--mut);font-size:12.5px}
+.anml li{margin:5px 0;font-size:13px}
+a{color:inherit}
+/* 时延分布（F14）/慢点（G15） */
+/* 分级时延图（Lupi 编辑语法） */
+.levels{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+/* 分级时延：块宽 = 占父项百分比；列宽用 minmax(可读下限, Nfr)，
+   极小项按最小可读宽度展开并允许整行横向滚动（不截断文字） */
+.lvl-row{display:grid;gap:3px;align-items:stretch;overflow-x:auto;padding-bottom:2px}
+.lvl-row.root{grid-template-columns:minmax(0,1fr)}
+.lvl-row.sub{margin-top:6px}
+.lvl-blk{display:flex;flex-direction:column;justify-content:center;gap:2px;
+padding:6px 9px;border-radius:6px;border:1px solid var(--grid);
+font-size:12px;font-weight:600;min-width:0;overflow:visible}
+.lvl-blk:hover{border-color:var(--ink)}
+.lvl-blk.focus{outline:2px solid var(--hero);outline-offset:-1px}
+.lvl-blk.residual{border-style:dashed}
+.lvl-top{display:flex;align-items:baseline;gap:8px;min-width:0}
+.lvl-name{font-weight:700;white-space:nowrap}
+.lvl-val{font-variant-numeric:tabular-nums;opacity:.85;white-space:nowrap}
+.lvl-sub{font-size:12px;opacity:.75;white-space:nowrap}
+.lvl-toggle{align-self:flex-start;margin-top:3px;font-size:12px;padding:1px 8px}
+.lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 4px}
+.focus-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.focus-empty{color:var(--mut);font-size:12.5px}
+/* 阶段树（F5 Tick Rows 语法） */
+.ttree{border-top:1px solid var(--grid);padding:2px 0}
+.tnode{display:flex;align-items:center;gap:9px;padding:3px 0;
+line-height:1.75;user-select:none;border-bottom:1px solid var(--grid)}
+.tnode:hover{background:var(--quiet)}
+.tarrow{width:14px;flex:none;color:var(--faint);cursor:pointer}
 .tname{font-size:13px;padding:1px 6px;border-radius:4px;cursor:pointer;
 white-space:nowrap}
-.tname:hover{background:var(--bg)}
-.tname.sel{background:var(--bg);color:var(--pri);font-weight:600}
-.tbar{width:80px;height:8px;flex:none;border-radius:2px;background:var(--line);
-overflow:hidden}
-.tfill{display:block;height:8px;border-radius:2px;min-width:2px;
+.tname:hover{background:var(--quiet)}
+.tname.sel{font-weight:700}
+.tbar{width:88px;height:7px;flex:none;border-radius:99px;
+background:var(--track);overflow:hidden}
+.tfill{display:block;height:7px;border-radius:99px;min-width:2px;
 transition:width .3s ease-out}
-.tpct{font-size:11.5px;color:var(--mut);min-width:38px;text-align:right;
+.tpct{font-size:12px;color:var(--mut);min-width:36px;text-align:right;
 font-variant-numeric:tabular-nums}
-.tval{font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
-/* 指标套件弹窗（纯 DOM，无 EP 依赖） */
-.modal-mask{position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.45);
-display:flex;align-items:center;justify-content:center;padding:24px}
-.modal{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-width:min(720px,94vw);max-height:86vh;overflow:auto;
-box-shadow:0 12px 40px rgba(0,0,0,.35)}
-.modal-head{display:flex;align-items:center;justify-content:space-between;
-padding:12px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;
-background:var(--panel);z-index:1}
-.modal-head button{border:none;background:transparent;cursor:pointer;
-font-size:14px;color:var(--mut);padding:2px 6px;border-radius:4px}
-.modal-head button:hover{color:var(--fg);background:var(--bg)}
-.modal-body{padding:12px 16px 20px}
+.tval{font-size:12.5px;font-weight:600;color:var(--mut);
+font-variant-numeric:tabular-nums}
+/* 状态分布（F5 横条） */
+.statusbars{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+.sbrow{display:flex;align-items:center;gap:10px}
+.sbname{flex:0 0 168px;font-size:12.5px;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.sbtrack{flex:1;height:8px;border-radius:99px;background:var(--track);
+overflow:hidden}
+.sbfill{display:block;height:8px;border-radius:99px;min-width:2px}
+.sbval{flex:0 0 auto;font-size:12.5px;font-weight:700;
+font-variant-numeric:tabular-nums}
+/* QPS 达成率（F11 刻度） */
+.gkv .gtrack{position:relative;height:6px;border-radius:99px;margin-top:8px;
+background:var(--track);overflow:visible}
+.gkv .gfill{display:block;height:6px;border-radius:99px;background:var(--ink)}
+.gkv .gtick{position:absolute;top:-3px;width:2px;height:12px;
+background:var(--hero);border-radius:1px}
+.gkv .gsub{font-size:12px;color:var(--faint);margin-top:5px;letter-spacing:.02em}
+/* RSS 增幅正负条（G10 diverging） */
+.grow{display:flex;flex-direction:column;gap:4px;margin:14px 0 2px}
+.grow-row{display:flex;align-items:center;gap:10px}
+.grow-name{flex:0 0 190px;font-size:12px;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap;color:var(--mut)}
+.grow-track{position:relative;flex:1;height:9px}
+.grow-track:before{content:"";position:absolute;left:50%;top:-2px;
+width:1px;height:13px;background:var(--faint)}
+.grow-bar{position:absolute;top:0;height:9px;border-radius:99px;
+background:var(--faint)}
+.grow-val{flex:0 0 96px;font-size:12px;text-align:right;
+font-variant-numeric:tabular-nums}
+/* ---- 时延曲线：左树右图 ---- */
+.chart-split{display:grid;grid-template-columns:288px minmax(0,1fr);gap:20px;
+align-items:start}
+.chart-main{min-width:0}
+.chart-hint{color:var(--mut);font-size:12.5px;margin-top:6px;letter-spacing:.01em}
+.qps-cap{margin-top:14px}
+.chart.qps{height:190px}
+.objtree{border:1px solid var(--grid);border-radius:14px;padding:10px 6px;
+max-height:560px;overflow:auto}
+.objtree-head{display:flex;align-items:center;justify-content:space-between;
+padding:2px 8px 8px;border-bottom:1px solid var(--grid);margin-bottom:6px}
+.objtree-count{color:var(--mut);font-size:12px}
+.tree-group{padding:4px 0}
+.tree-group-head{display:flex;align-items:center;gap:6px;padding:4px 8px}
+.tree-group-title{font-size:12px;font-weight:700;letter-spacing:.06em;
+color:var(--lab);text-transform:uppercase;flex:1}
+.tree-row{display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:6px}
+.tree-row:hover{background:var(--quiet)}
+.tree-row.on{background:var(--quiet)}
+.tree-check{display:flex;align-items:center;gap:8px;flex:1;min-width:0;
+background:none;border:none;padding:3px 2px;cursor:pointer;color:inherit;
+text-align:left;font:inherit}
+.tree-check:hover .tree-name{text-decoration:underline}
+.tree-box{flex:none;width:15px;height:15px;border-radius:4px;
+border:1px solid var(--faint);display:inline-flex;align-items:center;
+justify-content:center;font-size:12px;line-height:1;color:var(--paper)}
+.tree-row.on .tree-box{background:var(--ink);border-color:var(--ink)}
+.tree-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap;font-size:13px}
+.tree-note{color:var(--mut);font-size:12px;white-space:nowrap}
+.tree-caret{flex:none;width:16px;border:none;background:transparent;
+color:var(--faint);cursor:pointer;font-size:12px;padding:0}
+.tree-empty{color:var(--mut);font-size:12.5px;padding:6px 8px}
+button.mini{font-size:12px;padding:1px 8px;border-radius:99px;line-height:1.6}
+/* ---- 阶段树：左树右详情 ---- */
+.stage-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+gap:20px;align-items:start}
+.tdetail{border-left:1px solid var(--grid);padding-left:18px;min-width:0}
+.tdetail-title{font-size:13.5px;font-weight:700;margin:0 0 8px}
+.tdetail-sub{font-size:12.5px;font-weight:600;color:var(--lab);margin:14px 0 6px}
+.tnode.sel{background:var(--quiet)}
+.empty-tip{border:1px dashed var(--grid);border-radius:12px;padding:14px 16px;
+color:var(--mut);font-size:13px;margin-bottom:8px}
+@media (max-width:1100px){
+.chart-split{grid-template-columns:1fr}
+.stage-split{grid-template-columns:1fr}
+.tdetail{border-left:none;padding-left:0;border-top:1px solid var(--grid);
+padding-top:14px}
+}
 @media (prefers-reduced-motion: reduce){ .tfill{transition:none} }
-button{font:inherit;font-size:12.5px;padding:4px 10px;border:1px solid var(--line);
-background:var(--panel);color:var(--fg);border-radius:4px;cursor:pointer}
-button.on{background:var(--pri);border-color:var(--pri);color:#fff}
-select{font:inherit;font-size:12.5px;padding:4px 6px;border:1px solid var(--line);
-background:var(--panel);color:var(--fg);border-radius:4px;max-width:280px}
-.chart{width:100%;height:420px}.chart.sm{height:260px}
-table{border-collapse:collapse;width:100%;font-size:12.5px}
-th,td{border-bottom:1px solid var(--line);padding:5px 8px;text-align:left;
-white-space:nowrap}
-th{color:var(--mut);font-weight:500;position:sticky;top:0;background:var(--panel)}
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-tbody tr:hover{background:var(--bg)}
-.wrapx{overflow:auto;max-height:420px;border:1px solid var(--line);border-radius:5px}
-pre.term{background:var(--term-bg);color:var(--term-fg);border-radius:5px;
-padding:10px 12px;font:12.5px/1.5 'Cascadia Code',Consolas,monospace;
-overflow:auto;max-height:360px;white-space:pre-wrap;word-break:break-all}
-.tag{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:3px;
-border:1px solid var(--line);color:var(--mut)}
-.tag.ok{color:var(--ok);border-color:var(--ok)}.tag.err{color:var(--err);
-border-color:var(--err)}.tag.warn{color:var(--warn);border-color:var(--warn)}
-.mono{font-family:'Cascadia Code',Consolas,monospace}
-.path{color:var(--mut);font-size:12px}
-.anml li{margin:3px 0;font-size:12.5px}
-a{color:var(--pri)}
-.note{color:var(--mut);font-size:12px;margin-top:6px}
-"""
+""" 
 
 _APP_JS = r"""
 const D = window.__MC_REPORT__ || {};
@@ -1172,6 +1349,8 @@ function objLabel(key){const o=objAll()[key];return (o&&o.label)||key;}
 function defaultTier(){
   const z=Z(); if(!z) return 'cnt';
   const emb=z.embed_tiers||[];
+  // 自适应（按样本数）是默认档：样本不足 2048 时逐样本成桶 = 全量绘制
+  if(emb.indexOf('cnt')>=0) return 'cnt';
   const time=emb.filter(function(t){return t!=='cnt';});
   return time.length?time[0]:(emb.indexOf('cnt')>=0?'cnt':'');
 }
@@ -1181,27 +1360,175 @@ function colQps(col,tier){
   const step=tierStep(tier);
   return col.c.map(function(c,i){
     return Math.round(c/((col.span&&col.span[i])||step)*100)/100;});}
-const C = (window.matchMedia &&
-  window.matchMedia('(prefers-color-scheme: dark)').matches)
-  ? {fg:'#e6e9ed',mut:'#8b97a3',line:'#252c34',pri:'#27b3c9',
-     err:'#ff7b7b',ok:'#4cc38a',warn:'#f0b35a'}
-  : {fg:'#1f2329',mut:'#6b7785',line:'#e3e6eb',pri:'#0e7490',
-     err:'#d64545',ok:'#2f9e44',warn:'#e8a33d'};
+/* ---- lieflat Wire 主题（token 来自 vendored mono-tokens/color-presets） ---- */
+const LF_DARK = !!(window.matchMedia &&
+  window.matchMedia('(prefers-color-scheme: dark)').matches);
+const LF_W = (window.PRESETS && window.PRESETS.WIRE) || null;
+const LF_M = window.MONO || null;
+const LF_LADDER_L = (LF_W && LF_W.SER) || ['#22211F','#8F8E86','#C0BFB7',
+  'rgba(34,33,31,.52)','#DBDAD3','rgba(34,33,31,.3)'];
+const LF_LADDER_D = (LF_M && LF_M.DARK && LF_M.DARK.ladder) ||
+  ['#F0EFEB','#DCDAD2','#C9C7BD','#B3B0A4','#8F8E88','#6A6963','#4A4944'];
+const HERO = (LF_W && LF_W.HERO) || '#F5572F';
+const C = LF_DARK ? {
+  fg:(LF_M&&LF_M.DARK&&LF_M.DARK.ink)||'#F0EFEB',
+  mut:'rgba(240,240,238,.55)',
+  faint:(LF_M&&LF_M.DARK&&LF_M.DARK.faint)||'#55554F',
+  grid:(LF_M&&LF_M.DARK&&LF_M.DARK.grid)||'#2E2D29',
+  quiet:'rgba(240,240,238,.15)', track:'rgba(240,240,238,.12)',
+  ladder:LF_LADDER_D, hero:HERO,
+  blocks:['#F0EFEB','#B3B0A4','#8F8E88','#55554F']
+} : {
+  fg:(LF_W&&LF_W.TXT)||'#1F1E1C', mut:(LF_W&&LF_W.MUT)||'rgba(31,30,28,.60)',
+  faint:(LF_W&&LF_W.FAINT)||'rgba(31,30,28,.32)',
+  grid:(LF_W&&LF_W.GRID)||'rgba(31,30,28,.16)',
+  quiet:(LF_W&&LF_W.QUIET)||'rgba(31,30,28,.15)',
+  track:(LF_W&&LF_W.TRACK)||'rgba(31,30,28,.12)',
+  ladder:LF_LADDER_L, hero:HERO,
+  blocks:['#1F1E1C','#6E6D66','#8F8E86','#C0BFB7']
+};
+function lfColor(i){const L=C.ladder||[];return L[i%Math.max(1,L.length)]||C.fg;}
+const LFTIP = LF_DARK
+  ? ({backgroundColor:'#F0EFEB',padding:[10,14],
+      textStyle:{color:'#1C1C1A'},borderWidth:0,
+      _src:(LF_M&&LF_M.tipDark)})
+  : ({backgroundColor:'#1C1C1A',padding:[10,14],
+      textStyle:{color:'#F0EFEB'},borderWidth:0,
+      _src:(LF_M&&LF_M.tipLight)});
+const LFFONT="'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif";
 const METRICS=[['avg','平均'],['p50','p50'],['p99','p99'],['p999','p999'],
   ['max','最大'],['qps','QPS'],['fail','失败'],['qw','队列等待']];
 function metricLabel(k){const m=METRICS.find(function(x){return x[0]===k;});
   return m?m[1]:k;}
-function axisCommon(){
-  return {animation:false,textStyle:{color:C.fg,fontSize:12},
-    tooltip:{trigger:'axis',confine:true},
-    legend:{top:0,type:'scroll',textStyle:{color:C.fg}},
-    grid:{left:56,right:20,top:36,bottom:64},
-    xAxis:{type:'time',axisLabel:{color:C.mut,
-      formatter:function(v){return hhmmss(v/1000);}},
-      axisLine:{lineStyle:{color:C.line}}},
-    dataZoom:[{type:'inside'},{type:'slider',height:18,bottom:8}]};
+function lfTooltip(extra){
+  const o={trigger:'axis',confine:true,
+    backgroundColor:LFTIP.backgroundColor,borderWidth:0,
+    padding:LFTIP.padding,
+    textStyle:Object.assign({fontFamily:LFFONT,fontSize:13},
+      LFTIP.textStyle||{})};
+  if(extra)Object.keys(extra).forEach(function(k){o[k]=extra[k];});
+  return o;
 }
-let chart=null;
+function lfAxisTime(){
+  return {type:'time',axisLine:{show:false},axisTick:{show:false},
+    splitLine:{show:false},
+    axisLabel:{color:C.mut,fontSize:12,fontWeight:600,fontFamily:LFFONT,
+      formatter:function(v){return hhmmss(v/1000);}}};
+}
+function lfAxisValue(extra){
+  const o={type:'value',axisLine:{show:false},axisTick:{show:false},
+    axisLabel:{color:C.mut,fontSize:12,fontWeight:600,fontFamily:LFFONT},
+    nameTextStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT},
+    splitLine:{lineStyle:{color:C.grid,width:1}}};
+  if(extra)Object.keys(extra).forEach(function(k){o[k]=extra[k];});
+  return o;
+}
+function axisCommon(){
+  return {animation:false,
+    textStyle:{fontFamily:LFFONT,color:C.fg,fontSize:12},
+    tooltip:lfTooltip(),
+    legend:{top:0,type:'scroll',icon:'roundRect',itemWidth:14,itemHeight:3,
+      itemGap:16,textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}},
+    grid:{left:46,right:20,top:30,bottom:50},
+    xAxis:lfAxisTime(),
+    dataZoom:zoomModel('main')};
+}
+/* ---- 缩放 / 平移模型 --------------------------------------------------
+   滚轮 = 只缩时间轴（时延轴不动）；左右拖 = 平移时间轴；上下拖 = 平移时延轴
+   （x/y 平移互斥，一次拖动只作用一个轴）；时延轴的缩放只走左侧竖向滑块。
+   filterMode:'none' —— 缩放只改轴范围，不删数据点。                ---- */
+function zoomModel(mode){
+  if(mode==='xonly')
+    return [{type:'inside',xAxisIndex:[0],zoomOnMouseWheel:true,
+      moveOnMouseWheel:false,moveOnMouseMove:false,filterMode:'none'}];
+  return [
+    {type:'inside',xAxisIndex:[0],zoomOnMouseWheel:true,
+      moveOnMouseWheel:false,moveOnMouseMove:false,filterMode:'none'},
+    {type:'inside',yAxisIndex:[0],zoomOnMouseWheel:false,
+      moveOnMouseWheel:false,moveOnMouseMove:false,filterMode:'none'},
+    {type:'slider',xAxisIndex:[0],height:12,bottom:6,showDetail:false,
+      brushSelect:false,filterMode:'none',borderColor:'transparent',
+      backgroundColor:C.quiet,fillerColor:C.track,handleSize:'90%',
+      handleStyle:{color:C.faint},textStyle:{color:C.mut,fontSize:12}},
+    {type:'slider',yAxisIndex:[0],orient:'vertical',left:6,width:13,
+      showDetail:false,brushSelect:false,filterMode:'none',
+      borderColor:'transparent',backgroundColor:C.quiet,fillerColor:C.track,
+      handleSize:'90%',handleStyle:{color:C.faint},
+      textStyle:{color:C.mut,fontSize:12}}];
+}
+/* 时延曲线配色：p99 = 强调橙（唯一焦点），其余为高对比中性色实线
+   （不再用 30% 淡灰 / 虚线，避免"看不清"）。 */
+const LAT_COLORS = LF_DARK
+  ? {p99:HERO,p50:'#DCDAD2',avg:'#B3B0A4',p999:'#8F8E88',max:'#6A6963'}
+  : {p99:HERO,p50:'#3F3E3B',avg:'#6E6D66',p999:'#8F8E86',max:'#A5A49C'};
+const LAT_LINES=[['p99','p99',2.2],['p50','p50',1.8],['avg','平均',1.6],
+  ['p999','p999',1.6],['max','最大',1.3]];
+const MAIN_GRID={left:56,right:104,top:34,bottom:58};
+function latColor(k){return LAT_COLORS[k]||C.fg;}
+function objPalette(){
+  return LF_DARK
+    ? [C.hero,'#DCDAD2','#8F8E88','#B3B0A4','#6A6963','#4A4944']
+    : [C.hero,'#3F3E3B','#8F8E86','#6E6D66','#A5A49C','#55554F'];
+}
+/* ---- 离群值剔除（阀值 = 10 x 整体 p99，与 plot_latency.py 的 PNG 版一致） */
+let outlierOn=false;
+function outlierThreshold(){
+  const z=Z(); if(!z) return null;
+  const p99=(z.summary&&z.summary.p99_ms)||0;
+  return p99>0?p99*10:null;
+}
+function outlierMask(col){
+  if(!outlierOn||!col||!col.max) return null;
+  const th=outlierThreshold(); if(!th) return null;
+  let any=false; const m=[];
+  for(let i=0;i<col.max.length;i++){
+    const hit=col.max[i]>th; m.push(hit); if(hit) any=true;
+  }
+  return any?m:null;
+}
+function latLineSeries(col,x,mask){
+  return LAT_LINES.map(function(L){
+    const k=L[0], color=latColor(k), arr=col[k]||[];
+    return {name:L[1],type:'line',showSymbol:false,
+      lineStyle:{width:L[2],color:color}, itemStyle:{color:color},
+      z:(k==='p99')?6:3,
+      endLabel:{show:true,distance:6,
+        formatter:function(p){return p.seriesName;},
+        color:color,fontSize:12,fontWeight:600,fontFamily:LFFONT},
+      emphasis:{focus:'series',lineStyle:{width:L[2]+0.8}},
+      data:arr.map(function(v,i){
+        if(mask&&mask[i]) return [x[i],null];
+        return [x[i],v==null?0:v];})};
+  });
+}
+function markLines(tArr,mask){
+  const z=Z(); const data=[];
+  if(z&&z.anomalies&&z.anomalies.length)
+    z.anomalies.slice(0,50).forEach(function(a){
+      data.push({xAxis:a.t*1000,
+        lineStyle:{color:C.hero,width:1},label:{show:false}});});
+  if(mask){
+    let shown=0;
+    mask.forEach(function(hit,i){
+      if(!hit) return;
+      data.push({xAxis:tArr[i]*1000,
+        lineStyle:{color:C.hero,width:1.4,type:'dashed'},
+        label:{show:shown<8,formatter:'离群',position:'insideEndTop',
+          color:C.hero,fontSize:12,fontWeight:600}});
+      shown++;
+    });
+  }
+  return data.length?{symbol:'none',silent:true,data:data}:null;
+}
+let chart=null,qpsChart=null;
+/* 单步渲染隔离：任何一张图/一个区块抛错只丢自己，绝不整页中断 */
+function safe(name,fn){
+  try{ fn(); }
+  catch(e){
+    try{ console.error('[report] render '+name+' failed: '+(e&&e.message||e)); }
+    catch(_e){}
+  }
+}
 function ensureSel(){
   const all=objAll();
   if(!Object.keys(all).length) return;
@@ -1224,20 +1551,21 @@ function buildChart(){
   ensureSel();
   const tier=currentTier();
   const opt=selObjs.length>1?multiOpt(tier):richOpt(tier,selObjs[0]);
-  if(z.anomalies&&z.anomalies.length&&opt.series&&opt.series.length){
-    opt.series[0].markLine={symbol:'none',silent:true,
-      data:z.anomalies.slice(0,50).map(function(a){return {xAxis:a.t*1000,
-        lineStyle:{color:C.warn},label:{show:false}};})};
+  if(opt.series&&opt.series.length&&!opt.series[0].markLine){
+    const ml=markLines(null,null);      // 异常窗口竖线
+    if(ml) opt.series[0].markLine=ml;
   }
   chart.setOption(opt,true);
+  safe('qps-chart',buildQpsChart);
 }
 function richOpt(tier,key){
   const col=colsOf(key,tier);
   if(!col||!col.t.length) return emptyOpt();
-  const step=tierStep(tier);
   const qps=colQps(col,tier);
   const x=col.t.map(function(t){return t*1000;});
+  const mask=outlierMask(col);
   const o=axisCommon();
+  o.grid=MAIN_GRID;
   o.tooltip.formatter=function(ps){
     const i=ps[0].dataIndex; const t=col.t[i];
     const rows=[['时间',fullts(t)],['请求数',col.c[i]],['成功',col.ok[i]],
@@ -1245,53 +1573,178 @@ function richOpt(tier,key){
       ['p50(ms)',col.p50[i]],['p99(ms)',col.p99[i]],['p999(ms)',col.p999[i]],
       ['最大(ms)',col.max[i]],['队列等待均(ms)',col.qw[i]],
       ['队列等待峰(ms)',col.qwmax[i]]];
-    return '<b>'+fullts(t)+'</b><br>'+
+    let out='<b>'+fullts(t)+'</b><br>'+
       rows.map(function(r){return r[0]+'：'+r[1];}).join('<br>');
+    if(mask&&mask[i]) out+='<br><b>该桶判定为离群（已从折线剔除）</b>';
+    return out;
   };
-  o.yAxis=[{type:'value',name:'ms',scale:true,axisLabel:{color:C.mut},
-            splitLine:{lineStyle:{color:C.line}}},
-           {type:'value',name:'QPS',position:'right',splitLine:{show:false},
-            axisLabel:{color:C.mut}}];
-  o.series=[
-    {name:'QPS',type:'bar',yAxisIndex:1,data:x.map(function(v,i){return [v,qps[i]];}),
-     itemStyle:{color:C.pri,opacity:0.55},barMaxWidth:8,large:true},
-    {name:'失败',type:'bar',yAxisIndex:1,
-     data:x.map(function(v,i){return [v,col.fail[i]];}),
-     itemStyle:{color:C.err,opacity:0.75},barMaxWidth:8,large:true},
-    {name:'平均',type:'line',data:x.map(function(v,i){return [v,col.avg[i]];}),
-     showSymbol:false,lineStyle:{width:1,type:'dashed'}},
-    {name:'p50',type:'line',data:x.map(function(v,i){return [v,col.p50[i]];}),
-     showSymbol:false,lineStyle:{width:1.5}},
-    {name:'p99',type:'line',data:x.map(function(v,i){return [v,col.p99[i]];}),
-     showSymbol:false,lineStyle:{width:1.8}},
-    {name:'p999',type:'line',data:x.map(function(v,i){return [v,col.p999[i]];}),
-     showSymbol:false,lineStyle:{width:1.5}},
-    {name:'最大',type:'line',data:x.map(function(v,i){return [v,col.max[i]];}),
-     showSymbol:false,lineStyle:{width:1,type:'dotted'}}];
+  o.yAxis=[lfAxisValue({name:'ms',scale:true})];
+  o.series=latLineSeries(col,x,mask);
+  o.series[0].markLine=markLines(col.t,mask);
   return o;
 }
 function multiOpt(tier){
   const o=axisCommon();
-  o.yAxis=[{type:'value',name:metricLabel(curMetric),scale:true,
-            axisLabel:{color:C.mut},splitLine:{lineStyle:{color:C.line}}}];
+  o.grid=MAIN_GRID;
+  o.yAxis=[lfAxisValue({name:metricLabel(curMetric),scale:true})];
   o.series=[];
-  selObjs.forEach(function(key){
+  const pal=objPalette();
+  selObjs.forEach(function(key,idx){
     const t=colsOf(key,tier)?tier:'cnt';
     const col=colsOf(key,t);
     if(!col||!col.t.length) return;
-    const qps=(curMetric==='qps')?colQps(col,t):null;
+    const mask=outlierMask(col);
+    const x=col.t.map(function(v){return v*1000;});
     const nm=objLabel(key)+(t!==tier?'（自适应）':'');
+    let v;
+    if(curMetric==='qps') v=colQps(col,t);
+    else if(curMetric==='fail') v=col.fail;
+    else v=(col[curMetric]==null?0:col[curMetric]);
+    const color=pal[idx%pal.length];
     o.series.push({name:nm,type:'line',showSymbol:false,
-      data:col.t.map(function(tv,i){
-        let v;
-        if(curMetric==='qps') v=qps[i];
-        else if(curMetric==='fail') v=col.fail[i];
-        else v=(col[curMetric]==null?0:col[curMetric][i]);
-        return [tv*1000,v];}),
-      lineStyle:{width:1.8}});
+      lineStyle:{width:idx===0?2:1.5,color:color}, itemStyle:{color:color},
+      z:idx===0?6:3,
+      endLabel:{show:true,distance:6,
+        formatter:function(p){return p.seriesName;},
+        color:color,fontSize:12,fontWeight:600,fontFamily:LFFONT},
+      emphasis:{focus:'series',lineStyle:{width:2.4}},
+      data:(v||[]).map(function(val,i){
+        if(mask&&mask[i]) return [x[i],null];
+        return [x[i],val];})});
   });
   return o;
 }
+/* ---- 吞吐与失败（独立窄面板，共享时间轴；失败为 0 时也看得见） ---- */
+function qpsOpt(tier){
+  const o=axisCommon();
+  o.grid={left:56,right:56,top:26,bottom:34};
+  o.legend={top:0,type:'scroll',icon:'roundRect',itemWidth:14,itemHeight:3,
+    itemGap:16,textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
+  o.tooltip=lfTooltip({trigger:'axis'});
+  o.xAxis=lfAxisTime();
+  o.yAxis=[lfAxisValue({name:'QPS',scale:true}),
+           lfAxisValue({name:'失败',position:'right',splitLine:{show:false}})];
+  o.dataZoom=zoomModel('xonly');
+  o.series=[];
+  const keys=selObjs.length?selObjs:['all'];
+  const pal=objPalette();
+  keys.forEach(function(key,idx){
+    const t=colsOf(key,tier)?tier:'cnt';
+    const col=colsOf(key,t);
+    if(!col||!col.t.length) return;
+    const color=pal[idx%pal.length];
+    const qps=colQps(col,t);
+    const x=col.t.map(function(v){return v*1000;});
+    const nm=objLabel(key);
+    o.series.push({name:nm+' QPS',type:'line',showSymbol:false,
+      lineStyle:{width:idx===0?1.8:1.3,color:color}, itemStyle:{color:color},
+      areaStyle:idx===0?{color:C.track,opacity:.6}:null, z:3,
+      data:x.map(function(v,i){return [v,qps[i]];})});
+    o.series.push({name:nm+' 失败',type:'bar',yAxisIndex:1,stack:'fail',
+      barMaxWidth:6,large:true,itemStyle:{color:C.hero},z:4,
+      data:x.map(function(v,i){return [v,(col.fail&&col.fail[i])||0];})});
+  });
+  return o;
+}
+function totalFails(tier){
+  let sum=0;
+  const keys=selObjs.length?selObjs:['all'];
+  keys.forEach(function(key){
+    const t=colsOf(key,tier)?tier:'cnt';
+    const col=colsOf(key,t);
+    if(!col||!col.fail) return;
+    for(let i=0;i<col.fail.length;i++) sum+=(col.fail[i]||0);
+  });
+  return sum;
+}
+function buildQpsChart(){
+  const box=document.getElementById('qpschart'); if(!box) return;
+  if(!qpsChart) qpsChart=echarts.init(box);
+  const z=Z(); if(!z){qpsChart.clear();return;}
+  const tier=currentTier();
+  qpsChart.setOption(qpsOpt(tier),true);
+  const note=document.getElementById('qpsNote');
+  if(note){
+    const tf=totalFails(tier);
+    note.textContent=tf>0
+      ? ('失败合计 '+tf+' 次 —— 右侧红条即失败数（独立计数轴，与 QPS 不同量纲）。')
+      : '本段无失败：失败数全为 0 —— 右侧仍保留失败计数轴，一旦有失败即出现红条。';
+  }
+}
+/* ---- 拖拽平移（x/y 互斥）+ 竖滑块缩放 y + 重置视图 ---- */
+function panZoom(ch,idx,delta,extent){
+  try{
+    const opt=ch.getOption();
+    const dz=(opt.dataZoom||[])[idx]||{};
+    let s=dz.start,e=dz.end;
+    if(s==null||e==null) return;
+    const span=Math.max(0.001,e-s);
+    let ns=s-(delta/extent)*span;
+    ns=Math.max(0,Math.min(100-span,ns));
+    ch.dispatchAction({type:'dataZoom',dataZoomIndex:idx,
+      start:ns,end:ns+span});
+  }catch(err){}
+}
+function bindInteract(ch,grid){
+  if(!ch) return;
+  let zr=null;
+  try{ zr=ch.getZr&&ch.getZr(); }catch(e){ zr=null; }
+  if(!zr||!zr.on) return;
+  let drag=null;
+  zr.on('mousedown',function(e){
+    const g=grid||MAIN_GRID;
+    const w=ch.getWidth()||0,h=ch.getHeight()||0;
+    const ph=Math.max(1,h-g.top-g.bottom), pw=Math.max(1,w-g.left-g.right);
+    // 左侧竖滑块（缩放 y）与底部横滑块（缩放 x）由 ECharts 自己处理
+    if(e.offsetX>=0&&e.offsetX<=26&&e.offsetY>=g.top-4&&e.offsetY<=g.top+ph+4) return;
+    if(e.offsetY>=g.top+ph&&e.offsetY<=g.top+ph+20) return;
+    drag={x:e.offsetX,y:e.offsetY};
+  });
+  zr.on('mousemove',function(e){
+    if(!drag) return;
+    const dx=e.offsetX-drag.x, dy=e.offsetY-drag.y;
+    if(Math.abs(dx)<4&&Math.abs(dy)<4) return;
+    const g=grid||MAIN_GRID;
+    const w=ch.getWidth()||0,h=ch.getHeight()||0;
+    const pw=Math.max(1,w-g.left-g.right), ph=Math.max(1,h-g.top-g.bottom);
+    if(Math.abs(dx)>=Math.abs(dy)) panZoom(ch,0,dx,pw);
+    else panZoom(ch,1,dy,ph);
+    drag={x:e.offsetX,y:e.offsetY};
+  });
+  zr.on('mouseup',function(){drag=null;});
+  zr.on('globalout',function(){drag=null;});
+}
+let zoomLock=false;
+function linkZoom(a,b){
+  if(!a||!b) return;
+  function push(src,dst){
+    try{
+      src.on('datazoom',function(){
+        if(zoomLock) return;
+        zoomLock=true;
+        try{
+          const opt=src.getOption();
+          const dz=(opt.dataZoom||[])[0]||{};
+          if(dz.start==null) return;
+          dst.dispatchAction({type:'dataZoom',dataZoomIndex:0,
+            start:dz.start,end:dz.end});
+        }catch(e){}
+        zoomLock=false;
+      });
+    }catch(e){}
+  }
+  push(a,b); push(b,a);
+}
+function resetViews(){
+  [chart,qpsChart].forEach(function(c){
+    if(!c) return;
+    try{
+      c.dispatchAction({type:'dataZoom',dataZoomIndex:0,start:0,end:100});
+      c.dispatchAction({type:'dataZoom',dataZoomIndex:1,start:0,end:100});
+    }catch(e){}
+  });
+}
+
 function renderSummary(){
   const z=Z(); if(!z) return;
   const s=z.summary;
@@ -1309,9 +1762,8 @@ function renderSummary(){
   }
   ig.style.display='';
   const target=D.meta&&D.meta.qps_target?Number(D.meta.qps_target):0;
-  // 性能统计：时延/吞吐
   pg.appendChild(kv('QPS', s.qps));
-  if(target)pg.appendChild(kv('QPS 达成率', (s.qps/target*100).toFixed(1), '%'));
+  if(target) pg.appendChild(gaugeEl(s.qps,target));
   pg.appendChild(kv('平均时延', s.avg_ms, 'ms'));
   pg.appendChild(kv('p50', s.p50_ms, 'ms'));
   pg.appendChild(kv('p95', s.p95_ms, 'ms'));
@@ -1324,7 +1776,6 @@ function renderSummary(){
   if(s.max_depth)pg.appendChild(kv('最大队列深度', s.max_depth));
   pg.appendChild(kv('吞吐', s.throughput_mb_s==null?'-':
     Number(s.throughput_mb_s).toFixed(1), 'MB/s'));
-  // 信息展示：数量/规模
   ig.appendChild(kv('总数', s.total));
   ig.appendChild(kv('成功', s.ok));
   ig.appendChild(kv('失败', s.fail));
@@ -1332,6 +1783,22 @@ function renderSummary(){
   ig.appendChild(kv('时长', s.wall_s>0?fmtDur(s.wall_s):'-'));
   ig.appendChild(kv('客户端', s.clients));
 }
+function gaugeEl(qps,target){
+  const w=el('div','kv gkv');
+  w.appendChild(el('div','k','QPS 达成率'));
+  const pct=target>0?(qps/target*100):0;
+  w.appendChild(el('div','v',pct.toFixed(1)+'%'));
+  const track=el('div','gtrack');
+  const fill=el('span','gfill');
+  fill.style.width=Math.max(0,Math.min(100,pct))+'%';
+  track.appendChild(fill);
+  const tick=el('span','gtick'); tick.title='目标 '+target;
+  track.appendChild(tick);
+  w.appendChild(track);
+  w.appendChild(el('div','gsub','目标 '+target+' · 实际 '+qps));
+  return w;
+}
+
 function renderParams(box){
   const ps=(D.meta&&D.meta.params)||[];
   if(!ps.length){
@@ -1348,6 +1815,111 @@ function renderParams(box){
     box.appendChild(row);
   });
 }
+let histChart=null, slowChart=null;
+function binIndexFor(edges,v){
+  for(let i=0;i<edges.length-1;i++){ if(v<=edges[i+1]) return i; }
+  return null;
+}
+function fmtUsRange(lo,hi){
+  const f=function(v){return v>=1000?((v/1000).toFixed(v>=10000?0:1)+'ms')
+    :(Math.round(v)+'µs');};
+  return f(lo)+'–'+f(hi);
+}
+function renderHist(){
+  const z=Z(); const card=document.getElementById('histcard'); if(!card) return;
+  const sm=(z&&z.summary)||{};
+  const bins=sm.hist_bins||[];
+  // logstats 直方图阶梯单位是 ms；统一换算成 µs 再格式化/定位标注线
+  const edges=(sm.bin_edges||[]).map(function(v){return v*1000;});
+  if(!bins.length||edges.length<2){card.style.display='none';return;}
+  card.style.display='';
+  const box=document.getElementById('histchart');
+  if(!histChart) histChart=echarts.init(box);
+  const labels=[], counts=[];
+  bins.forEach(function(x){
+    const lo=edges[x[0]]!=null?edges[x[0]]:0;
+    const hi=(edges[x[0]+1]!=null?edges[x[0]+1]:lo);
+    labels.push(fmtUsRange(lo,hi)); counts.push(x[1]);
+  });
+  const o=axisCommon();
+  o.tooltip=lfTooltip();
+  o.grid={left:46,right:16,top:18,bottom:44};
+  o.xAxis={type:'category',data:labels,axisLine:{show:false},
+    axisTick:{show:false},splitLine:{show:false},
+    axisLabel:{color:C.mut,fontSize:12,fontWeight:600,fontFamily:LFFONT,
+      interval:Math.max(1,Math.floor(labels.length/9)),rotate:0}};
+  o.yAxis=[lfAxisValue({name:'样本'})];
+  o.dataZoom=[];
+  o.series=[{name:'样本数',type:'bar',data:counts,barWidth:'58%',
+    itemStyle:{color:lfColor(0),borderRadius:[99,99,0,0]}}];
+  const p50=(sm.p50_ms||0)*1000, p99=(sm.p99_ms||0)*1000;
+  const p999=(sm.p999_ms||0)*1000, p9999=(sm.p9999_ms||0)*1000;
+  const avg=(sm.avg_ms||0)*1000;
+  // 标注线按「阶梯下标 -> 非零桶位置」映射；labels 只包含非零桶，
+  // 直接 labels[阶梯下标] 会得到 undefined（真实 ECharts 会抛
+  // "reading 'coord'"，曾杀死整页后续渲染）
+  function binPos(ladderIdx){
+    if(ladderIdx==null) return null;
+    for(let i=0;i<bins.length;i++){ if(bins[i][0]===ladderIdx) return i; }
+    return null;
+  }
+  /* 配色：全部灰阶。重点三条（avg / p99 / p9999）用最深墨 + 粗实线；
+     次要两条（p50 / p999）用中灰 + 细虚线（沿用 p50 原样式）。 */
+  const INK_STRONG=C.fg, INK_MID=LF_DARK?'#9B9A93':'#8F8E86';
+  const mk=[];
+  function mkLine(value,label,strong){
+    const pos=binPos(binIndexFor(edges,value));
+    if(pos==null) return;
+    mk.push({xAxis:labels[pos],
+      lineStyle:strong?{color:INK_STRONG,width:1.8}
+                      :{color:INK_MID,width:1.2,type:'dashed'},
+      label:{formatter:label,color:strong?INK_STRONG:INK_MID,
+        fontSize:12,fontWeight:strong?700:600,position:'end'}});
+  }
+  mkLine(avg,'avg',true);
+  mkLine(p50,'p50',false);
+  mkLine(p99,'p99',true);
+  mkLine(p999,'p999',false);
+  if((sm.total||0)>=10000) mkLine(p9999,'p9999',true);
+  if(mk.length) o.series[0].markLine={symbol:'none',silent:true,data:mk};
+  histChart.setOption(o,true);
+}
+function tsEpoch(ts){
+  if(!ts) return null;
+  const m=String(ts).match(
+    /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?/);
+  if(!m) return null;
+  return new Date(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6],
+    m[7]?Math.round(Number('0.'+m[7])*1000):0).getTime()/1000;
+}
+function renderSlowStrip(){
+  const z=Z(); const card=document.getElementById('slowcard'); if(!card) return;
+  const rows=((z&&z.slowest)||[]).slice();
+  if(!rows.length){card.style.display='none';return;}
+  card.style.display='';
+  const box=document.getElementById('slowchart');
+  if(!slowChart) slowChart=echarts.init(box);
+  const pts=[]; let max=-1, maxI=-1;
+  rows.forEach(function(r,i){
+    const t=tsEpoch(r.ts); if(t==null) return;
+    const lat=Number(r.lat_ms)||0;
+    pts.push([t*1000,lat,[r.key,r.status]]);
+    if(lat>max){max=lat;maxI=pts.length-1;}
+  });
+  if(!pts.length){card.style.display='none';return;}
+  const o=axisCommon();
+  o.grid={left:46,right:16,top:18,bottom:40};
+  o.tooltip=lfTooltip({formatter:function(ps){
+    const p=ps[0].value;
+    return fullts(p[0]/1000)+'<br>'+String(p[2][0])+
+      '<br>时延：'+p[1]+' ms · '+String(p[2][1]);}});
+  o.yAxis=[lfAxisValue({name:'ms',scale:true})];
+  o.dataZoom=zoomModel('xonly');
+  o.series=[{name:'慢操作',type:'bar',barWidth:2,
+    data:pts.map(function(p,i){return {value:p,
+      itemStyle:{color:i===maxI?C.hero:C.faint}};})}];
+  slowChart.setOption(o,true);
+}
 function renderTable(){
   const z=Z(); if(!z) return;
   const note=document.getElementById('datanote');
@@ -1363,9 +1935,9 @@ function renderTable(){
       const td=el('td', (i>=3?'n':''), String(v));
       tr.appendChild(td);
     });
-    tr.title='点击加入时延曲线对比（对象选择器）';
+    tr.title='点击加入/移出时延曲线对比（对象树勾选）';
     tr.style.cursor='pointer';
-    tr.onclick=()=>addObj("client:"+c.name);
+    tr.onclick=()=>toggleObj("client:"+c.name);
     tb.appendChild(tr);
   });
 }
@@ -1449,52 +2021,121 @@ function renderSources(){
     box.appendChild(wrapx);
   }
 }
-function addObj(key){
-  if(!key) return;
-  if(selObjs.indexOf(key)<0) selObjs.push(key);
-  renderObjChips(); renderObjPicker(); renderControls(); buildChart();
-}
-function delObj(key){
-  selObjs=selObjs.filter(function(x){return x!==key;});
-  if(!selObjs.length) selObjs=['all'];
-  renderObjChips(); renderObjPicker(); renderControls(); buildChart();
-}
-function renderObjPicker(){
-  const sel=document.getElementById('objAdd'); if(!sel) return;
+/* ---- 对象树：总体 -> 节点 -> 客户端，每行一个复选框 -------------- */
+let treeOpen={};
+function objTreeModel(){
   const all=objAll();
-  const groups={role:[],node:[],client:[]};
+  const roles=[],nodes=[],clients=[];
   Object.keys(all).forEach(function(k){
-    const kind=all[k].kind||'client';
-    (groups[kind]||groups.client).push(k);
+    const o=all[k]; const kind=o.kind||'client';
+    if(kind==='role') roles.push(k);
+    else if(kind==='node') nodes.push(k);
+    else clients.push(k);
   });
-  sel.innerHTML='';
-  function addGroup(label,keys){
-    const vis=keys.filter(function(k){return selObjs.indexOf(k)<0;});
-    if(!vis.length) return;
-    const g=document.createElement('optgroup'); g.label=label;
-    vis.sort(function(x,y){
-      return String(objLabel(x)).localeCompare(String(objLabel(y)));})
-      .forEach(function(k){
-        const op=el('option',null,objLabel(k)); op.value=k; g.appendChild(op);});
-    sel.appendChild(g);
-  }
-  addGroup('总体',groups.role);
-  addGroup('节点',groups.node);
-  addGroup('客户端',groups.client);
-  sel.onchange=function(){
-    const v=sel.value; sel.value=''; if(v) addObj(v);};
+  const ord={'all':0,'writer':1,'reader':2};
+  roles.sort(function(a,b){
+    return (ord[a]===undefined?9:ord[a])-(ord[b]===undefined?9:ord[b]);});
+  nodes.sort(function(a,b){
+    return String(objLabel(a)).localeCompare(String(objLabel(b)));});
+  clients.sort(function(a,b){
+    return String(objLabel(a)).localeCompare(String(objLabel(b)));});
+  const byNode={};
+  clients.forEach(function(k){
+    const n=(all[k].node||'未归属节点');
+    (byNode[n]=byNode[n]||[]).push(k);
+  });
+  return {all:all,roles:roles,nodes:nodes,clients:clients,byNode:byNode};
 }
-function renderObjChips(){
-  const box=document.getElementById('objChips'); if(!box) return;
+function toggleObj(key){
+  if(!key) return;
+  const i=selObjs.indexOf(key);
+  if(i>=0) selObjs.splice(i,1); else selObjs.push(key);
+  ensureSel();
+  renderObjTree(); renderControls(); buildChart();
+}
+function setMany(keys,on){
+  keys.forEach(function(k){
+    const i=selObjs.indexOf(k);
+    if(on&&i<0) selObjs.push(k);
+    if(!on&&i>=0) selObjs.splice(i,1);
+  });
+  ensureSel();
+  renderObjTree(); renderControls(); buildChart();
+}
+function miniBtn(label,keys,title,on){
+  const b=el('button','mini',label);
+  b.title=title;
+  b.onclick=function(){setMany(keys,on);};
+  return b;
+}
+function treeRow(key,label,depth,opts){
+  opts=opts||{};
+  const on=selObjs.indexOf(key)>=0;
+  const row=el('div','tree-row'+(on?' on':''));
+  row.style.paddingLeft=(6+depth*16)+'px';
+  if(opts.lead) row.appendChild(opts.lead);
+  const b=el('button','tree-check');
+  b.setAttribute('data-key',key);
+  b.appendChild(el('span','tree-box',on?'✓':''));
+  b.appendChild(el('span','tree-name',label));
+  b.title=label;
+  b.onclick=function(){toggleObj(key);};
+  row.appendChild(b);
+  (opts.minis||[]).forEach(function(m){row.appendChild(m);});
+  if(opts.note) row.appendChild(el('span','tree-note',opts.note));
+  return row;
+}
+function treeGroupHead(title,keys){
+  const head=el('div','tree-group-head');
+  head.appendChild(el('span','tree-group-title',title));
+  head.appendChild(miniBtn('全选',keys,'选中本级全部对象',true));
+  head.appendChild(miniBtn('清空',keys,'取消本级全部对象',false));
+  return head;
+}
+function renderObjTree(){
+  const box=document.getElementById('objTree'); if(!box) return;
   ensureSel();
   box.innerHTML='';
-  selObjs.forEach(function(k){
-    const chip=el('span','chip',objLabel(k));
-    const x=el('button','chip-x','×'); x.title='移除该对象';
-    x.onclick=function(){delObj(k);};
-    chip.appendChild(x); box.appendChild(chip);
+  const m=objTreeModel();
+  const g1=el('div','tree-group');
+  g1.appendChild(treeGroupHead('总体与角色',m.roles));
+  m.roles.forEach(function(k){
+    g1.appendChild(treeRow(k,objLabel(k),1));
   });
+  box.appendChild(g1);
+  const g2=el('div','tree-group');
+  g2.appendChild(treeGroupHead('节点与客户端',m.nodes));
+  m.nodes.forEach(function(k){
+    const nodeName=String((m.all[k]&&m.all[k].node)||k.replace(/^node:/,''));
+    const kids=m.byNode[nodeName]||[];
+    const open=!!treeOpen[k];
+    let caret=null;
+    if(kids.length){
+      caret=el('button','tree-caret',open?'▾':'▸');
+      caret.title=open?'收起该节点的客户端':'展开该节点的客户端';
+      caret.onclick=function(){treeOpen[k]=!treeOpen[k];renderObjTree();};
+    }
+    const row=treeRow(k,objLabel(k),1,{
+      lead:caret,
+      minis:kids.length?[
+        miniBtn('全选',kids,'选中该节点下的全部客户端',true),
+        miniBtn('清空',kids,'取消该节点下的全部客户端',false)]:[],
+      note:kids.length?(kids.length+' 客户端'):''});
+    g2.appendChild(row);
+    if(open&&kids.length){
+      kids.forEach(function(ck){
+        g2.appendChild(treeRow(ck,objLabel(ck),2));
+      });
+    }
+  });
+  if(!m.nodes.length){
+    g2.appendChild(el('div','tree-empty','该数据大小没有节点聚合对象'));
+  }
+  box.appendChild(g2);
+  const c=document.getElementById('objCount');
+  if(c) c.textContent='已选 '+selObjs.length+' 项';
 }
+
 function renderControls(){
   const box=document.getElementById('tierBtns'); if(!box) return;
   ensureSel();
@@ -1514,37 +2155,51 @@ function renderControls(){
     if(selObjs.length>1){
       METRICS.forEach(function(m){
         const b=el('button', m[0]===curMetric?'on':'', m[1]);
+        b.title='多对象对比时显示的指标';
         b.onclick=function(){curMetric=m[0];renderControls();buildChart();};
         mb.appendChild(b);
       });
     }
+  }
+  const ob=document.getElementById('outlierBtn');
+  if(ob){
+    const th=outlierThreshold();
+    ob.className=outlierOn?'on':'';
+    ob.textContent=outlierOn?'显示离群值':'剔除离群值';
+    ob.title=th?('阀值 '+th.toFixed(2)+' ms（整体 p99 x 10）；点击切换')
+      :'当前数据大小没有 p99，无法计算离群阀值';
+    ob.disabled=!th;
   }
 }
 function renderAll(){
   const z=Z(); if(!z) return;
   const ss=document.getElementById('sizeSel');
   if(ss) ss.style.display=Object.keys(S).length>1?'inline-block':'none';
-  renderSummary(); renderObjPicker(); renderObjChips(); renderControls();
-  buildChart(); renderTable(); renderErrors();
-  renderTrace();
-  if(!window.__srcDone){renderSources();window.__srcDone=true;}
+  safe('summary',renderSummary);
+  safe('object-tree',function(){
+    renderObjTree(); renderControls();});
+  safe('latency-chart',buildChart);
+  safe('histogram',renderHist);
+  safe('slow-strip',renderSlowStrip);
+  safe('client-table',renderTable);
+  safe('errors',renderErrors);
+  safe('trace',renderTrace);
+  safe('sources',function(){
+    if(!window.__srcDone){renderSources();window.__srcDone=true;}});
 }
 let monCharts={};
 function _monChart(id, series, yname){
   const box=document.getElementById(id); if(!box||!series.length) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
-  c.setOption({animation:false,textStyle:{color:C.fg,fontSize:12},
-    tooltip:{trigger:'axis',confine:true},
-    legend:{top:0,type:'scroll',textStyle:{color:C.fg}},
-    grid:{left:56,right:20,top:36,bottom:56},
-    xAxis:{type:'time',axisLabel:{color:C.mut,formatter:v=>hhmmss(v/1000)},
-      axisLine:{lineStyle:{color:C.line}}},
-    yAxis:{type:'value',name:yname,scale:true,axisLabel:{color:C.mut},
-      splitLine:{lineStyle:{color:C.line}}},
-    dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
-    series:series}, true);
+  const o=axisCommon();
+  o.grid={left:52,right:18,top:26,bottom:42};
+  o.yAxis=[lfAxisValue({name:yname,scale:true})];
+  o.dataZoom=zoomModel('xonly');
+  o.series=series;
+  c.setOption(o, true);
   return true;
 }
+
 function renderMonitors(){
   const M=D.monitors||{}; const card=document.getElementById('monitorcard');
   if(!card) return;
@@ -1554,13 +2209,13 @@ function renderMonitors(){
   card.style.display='';
   const g=document.getElementById('moncards'); g.innerHTML='';
   const sm=M.summary||{};
-  if(sm.peak_mem_mb) Object.keys(sm.peak_mem_mb).forEach(n=>
-    g.appendChild(kv('峰值内存 '+n, sm.peak_mem_mb[n], 'MB')));
+  if(sm.peak_mem_mb) Object.keys(sm.peak_mem_mb).forEach(function(n){
+    g.appendChild(kv('峰值内存 · '+n, sm.peak_mem_mb[n], 'MB'));});
   if(sm.worst_proc){
     const w=sm.worst_proc;
     const k=kv('RSS 最大增幅', w.label||'-', '');
     if(w.leak_suspect){
-      const t=el('span','tag warn',' 疑似泄露');
+      const t=el('span','tag hero',' 疑似泄露');
       k.querySelector('.v').appendChild(t);
     }
     k.appendChild(el('div','note',
@@ -1571,25 +2226,55 @@ function renderMonitors(){
   if(sm.peak_urma&&sm.peak_urma.value!=null)
     g.appendChild(kv('端口峰值带宽', sm.peak_urma.label||'-',
       sm.peak_urma.value.toFixed(3)+' GiB/s'));
-  const hs=[];
-  (M.mem_host||[]).forEach(h=>h.columns.forEach(c=>hs.push({
-    name:h.node+'/'+c,type:'line',showSymbol:false,
-    data:h.t.map((t,i)=>[t*1000,h.series[c][i]])})));
-  _monChart('memchart', hs, 'MB');
-  const ps=(M.mem_proc||[]).map(p=>({
-    name:p.node+'/'+p.pid+(p.comm?' '+p.comm:''),type:'line',showSymbol:false,
-    data:p.t.map((t,i)=>[t*1000,p.rss_mb[i]])}));
-  _monChart('procchart', ps, 'RSS MB');
-  const us=[];
-  (M.urma||[]).forEach(u=>{
+  renderGrowth(sm.proc_growth||[]);
+  const hs=[]; let hi=0;
+  (M.mem_host||[]).forEach(function(h){
+    h.columns.forEach(function(c){
+      hs.push({name:h.node+'/'+c,type:'line',showSymbol:false,
+        lineStyle:{width:1.4,color:lfColor(hi++)},
+        data:h.t.map(function(t,j){return [t*1000,h.series[c][j]];})});
+    });});
+  safe('mem-chart',function(){_monChart('memchart', hs, 'MB');});
+  const ps=(M.mem_proc||[]).slice(0,8).map(function(p,i){
+    return {name:p.node+'/'+p.pid+(p.comm?' '+p.comm:''),type:'line',
+      showSymbol:false,lineStyle:{width:1.4,color:lfColor(i)},
+      data:p.t.map(function(t,j){return [t*1000,p.rss_mb[j]];})};});
+  safe('proc-chart',function(){_monChart('procchart', ps, 'RSS MB');});
+  const us=[]; let ui=0;
+  (M.urma||[]).forEach(function(u){
     const tag=u.node+' ubpu='+u.ubpu+' port='+u.port;
     us.push({name:tag+' RX',type:'line',showSymbol:false,
-      data:u.t.map((t,i)=>[t*1000,u.rx[i]])});
+      lineStyle:{width:1.5,color:lfColor(ui)},
+      data:u.t.map(function(t,i){return [t*1000,u.rx[i]];})});
     us.push({name:tag+' TX',type:'line',showSymbol:false,
-      data:u.t.map((t,i)=>[t*1000,u.tx[i]])});
-  });
-  _monChart('urmachart', us, 'GiB/s');
+      lineStyle:{width:1.1,color:lfColor(ui+1),type:'dashed'},
+      data:u.t.map(function(t,i){return [t*1000,u.tx[i]];})});
+    ui+=2;});
+  safe('urma-chart',function(){_monChart('urmachart', us, 'GiB/s');});
 }
+function renderGrowth(rows){
+  const box=document.getElementById('growth'); if(!box) return;
+  box.innerHTML='';
+  if(!rows.length){box.style.display='none';return;}
+  box.style.display='';
+  const max=Math.max.apply(null, rows.map(function(r){
+    return Math.abs(r.growth_mb||0);}).concat([1]));
+  rows.slice(0,10).forEach(function(r){
+    const row=el('div','grow-row');
+    row.appendChild(el('span','grow-name mono',r.label||''));
+    const mid=el('span','grow-track');
+    const bar=el('span','grow-bar');
+    const w=Math.max(1,Math.abs(r.growth_mb||0)/max*50);
+    bar.style.width=w+'%';
+    if((r.growth_mb||0)>=0) bar.style.left='50%'; else bar.style.right='50%';
+    if(r.leak_suspect) bar.style.background=C.hero;
+    mid.appendChild(bar); row.appendChild(mid);
+    row.appendChild(el('span','grow-val',
+      ((r.growth_mb||0)>0?'+':'')+(r.growth_mb||0)+' MB'));
+    box.appendChild(row);
+  });
+}
+
 function mount(){
   const sizeSel=document.getElementById('sizeSel');
   if(sizeSel){
@@ -1599,9 +2284,21 @@ function mount(){
     sizeSel.onchange=function(){curSize=sizeSel.value;selObjs=['all'];
       curTier=''; renderAll();};
   }
-  renderAll(); renderMonitors();
+  const ob=document.getElementById('outlierBtn');
+  if(ob) ob.onclick=function(){
+    outlierOn=!outlierOn; renderControls(); buildChart();};
+  const rb=document.getElementById('resetBtn');
+  if(rb) rb.onclick=function(){resetViews();};
+  renderAll(); safe('monitors',renderMonitors);
+  safe('chart-interactions',function(){
+    bindInteract(chart,MAIN_GRID);
+    linkZoom(chart,qpsChart);
+  });
   window.addEventListener('resize',function(){
     if(chart)chart.resize();
+    if(qpsChart)qpsChart.resize();
+    if(tChart)tChart.resize();
+    if(tdetailChart)tdetailChart.resize();
     Object.keys(monCharts).forEach(function(k){monCharts[k].resize();});
   });
 }
@@ -1630,6 +2327,19 @@ function traceSizes(){return Object.keys(S).filter(function(k){
 let tSize='',tGroup='',tOp='',tChart=null;
 let tLevelMetric='avg',tStageSel=['total_us'],tStageMetric='avg';
 const tExpand={};
+let tFocus={};        /* 分级时延焦点集合（可多选） */
+let tSel='total_us';  /* 阶段树当前选中节点 */
+const T_METRICS=[['min','最小'],['avg','平均'],['p50','p50'],['p99','p99'],
+  ['p999','p999'],['p9999','p9999'],['max','最大']];
+function tMetricName(k){
+  const m=T_METRICS.find(function(x){return x[0]===k;});
+  return m?m[1]:k;}
+function tMetricOf(st,metric){
+  if(!st) return null;
+  if(metric==='p9999'&&(st.n||0)<10000) return null;
+  const v=st[metric];
+  return (v==null)?null:v;
+}
 function traceOf(){
   const keys=traceSizes(); if(!keys.length) return null;
   if(tSize&&S[tSize]&&S[tSize].trace) return S[tSize].trace;
@@ -1653,54 +2363,200 @@ function tParentKey(key,cur){
   const it=tTree(cur.g).find(function(x){return x[0]===key;});
   return (it&&it[2])||'total_us';
 }
-function tLevelMetricOf(st){return st?(st[tLevelMetric]||0):0;}
+function tChildrenOf(key,cur){
+  return tTree(cur.g).filter(function(x){return x[1]>0&&x[2]===key;})
+    .map(function(x){return {key:x[0],
+      label:(x[0]==='residual'?'残差':x[0]), st:tStat(x[0],cur)};});
+}
 function fmtUs(v){v=Number(v)||0;
   return v>=1000?(v/1000).toFixed(2)+' ms':v.toFixed(1)+' µs';}
-function lvlColor(share){
-  const x=Math.max(0,Math.min(1,share));
-  return 'hsl('+Math.round(200-200*x)+',62%,44%)';
+/* 色深 = 占父项百分比（连续插值）：占比越大，颜色越深 */
+function hex2rgb(h){
+  h=String(h||'').replace('#','');
+  if(h.length===3) h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  const v=parseInt(h,16);
+  if(isNaN(v)) return [128,128,128];
+  return [(v>>16)&255,(v>>8)&255,v&255];
+}
+function rgb2hex(c){
+  return '#'+c.map(function(v){
+    v=Math.max(0,Math.min(255,Math.round(v)));
+    return (v<16?'0':'')+v.toString(16);}).join('');
+}
+function mixHex(a,b,t){
+  const A=hex2rgb(a),B=hex2rgb(b);
+  return rgb2hex([0,1,2].map(function(i){return A[i]+(B[i]-A[i])*t;}));
+}
+function lumOf(hex){
+  const c=hex2rgb(hex);
+  return (0.299*c[0]+0.587*c[1]+0.114*c[2])/255;
+}
+function lvlStyle(share,isResidual){
+  const L=C.blocks||[];
+  if(!L.length) return {background:C.faint,color:C.fg};
+  if(isResidual&&share>0.05) return {background:C.hero,color:'#FFFFFF'};
+  const s=Math.max(0,Math.min(1,share||0));
+  const pos=(1-s)*(L.length-1);
+  const i=Math.floor(pos), f=pos-i;
+  const bg=mixHex(L[i],L[Math.min(L.length-1,i+1)],f);
+  return {background:bg,color:(lumOf(bg)>0.55)?'#1F1E1C':'#FFFFFF'};
 }
 function renderLevelMetric(){
   const box=document.getElementById('lvlMetric'); if(!box) return;
   box.innerHTML='';
-  [['avg','平均'],['p50','p50'],['p99','p99']].forEach(function(m){
+  T_METRICS.forEach(function(m){
     const b=el('button',m[0]===tLevelMetric?'on':'',m[1]);
+    b.title=(m[0]==='p9999')
+      ? 'p9999 需要至少 10000 个样本，否则显示为空'
+      : ('按 '+m[1]+' 计算块宽、占父百分比与色深');
     b.onclick=function(){tLevelMetric=m[0];renderTrace();};
     box.appendChild(b);
   });
 }
+function focusLit(cur){
+  const lit={};
+  Object.keys(tFocus).forEach(function(k){
+    if(!tFocus[k]) return;
+    lit[k]=true;
+    let p=tParentKey(k,cur);
+    while(p&&p!==k&&!lit[p]){lit[p]=true;p=tParentKey(p,cur);}
+    (function mark(key){
+      tChildrenOf(key,cur).forEach(function(c){
+        if(lit[c.key]) return;
+        lit[c.key]=true; mark(c.key);
+      });
+    })(k);
+  });
+  return lit;
+}
+function toggleFocus(key){
+  tFocus[key]=!tFocus[key];
+  const cur=tPick(); if(!cur) return;
+  renderLevels(cur);
+}
+function focusBar(cur){
+  const bar=el('div','focus-bar');
+  bar.appendChild(el('span','tl-label','焦点'));
+  const keys=Object.keys(tFocus).filter(function(k){return tFocus[k];});
+  if(!keys.length){
+    bar.appendChild(el('span','focus-empty',
+      '未聚焦 —— 点击任一阶段块展开其下一级；可同时聚焦多个（再次点击取消）'));
+    return bar;
+  }
+  keys.forEach(function(k){
+    const chip=el('span','chip',k);
+    const x=el('button','chip-x','×'); x.title='取消聚焦';
+    x.onclick=function(){tFocus[k]=false;renderLevels(cur);};
+    chip.appendChild(x); bar.appendChild(chip);
+  });
+  const clr=el('button','mini','收起全部');
+  clr.title='取消全部焦点';
+  clr.onclick=function(){tFocus={};renderLevels(cur);};
+  bar.appendChild(clr);
+  return bar;
+}
+function levelTip(b){
+  const st=b.x.st||{};
+  const nm=b.residual?'残差':b.x.label;
+  const tip=[nm,'样本 '+(st.n==null?'-':st.n)];
+  ['min','avg','p50','p95','p99','p999','p9999','max','sigma','neg'].forEach(
+    function(k){ if(st[k]!=null) tip.push(k+'：'+st[k]+' µs'); });
+  tip.push('占父项：'+(b.share*100).toFixed(1)+'%');
+  if(b.residual) tip.push('残差 = 父项 − 各子项之和（未展开的部分）');
+  return tip.join('\n');
+}
+function lvlBlock(b,cur,lit,depth){
+  const blk=el('div','lvl-blk'+(b.residual?' residual':''));
+  const st=lvlStyle(b.share,b.residual);
+  blk.style.background=st.background; blk.style.color=st.color;
+  const top=el('div','lvl-top');
+  top.appendChild(el('span','lvl-name',b.x.label));
+  top.appendChild(el('span','lvl-val',fmtUs(b.x.v)));
+  blk.appendChild(top);
+  blk.appendChild(el('div','lvl-sub','占父 '+(b.share*100).toFixed(1)+'%'+
+    (b.x.st&&b.x.st.n!=null?(' · n='+b.x.st.n):'')));
+  const kids=b.residual?[]:tChildrenOf(b.x.key,cur);
+  if(kids.length){
+    const focused=!!tFocus[b.x.key];
+    const tog=el('button','lvl-toggle',focused?'收起':'展开');
+    tog.title=focused?('收起 '+b.x.label+' 的下一级'):('聚焦 '+b.x.label+' 并展开下一级');
+    tog.onclick=function(){toggleFocus(b.x.key);};
+    blk.appendChild(tog);
+    if(focused){
+      const srow=el('div','lvl-row sub');
+      appendLevelRow(srow,kids,b.x.st,b.x.v,cur,lit,depth+1);
+      blk.appendChild(srow);
+    }
+  }
+  if(lit&&Object.keys(lit).length){
+    if(lit[b.x.key]) blk.className=blk.className+' focus';
+    else blk.style.opacity='0.25';
+  }
+  blk.title=levelTip(b);
+  return blk;
+}
+function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
+  const metric=tLevelMetric;
+  const vals=items.map(function(it){
+    const v=tMetricOf(it.st,metric);
+    return {key:it.key,label:it.label,st:it.st,v:(v==null?0:v),has:v!=null};
+  });
+  const sum=vals.reduce(function(a,b){return a+b.v;},0);
+  const parentV=parentVal||0;
+  let scale=1,over=false;
+  if(parentV>0&&sum>parentV){scale=parentV/sum;over=true;}
+  const cols=[],blocks=[];
+  vals.forEach(function(x){
+    const share=parentV>0?(x.v/parentV):0;
+    const w=share*100*scale;
+    const minW=Math.max(78,Math.round(String(x.label).length*7.6+30));
+    cols.push('minmax('+minW+'px,'+w.toFixed(3)+'fr)');
+    blocks.push({x:x,share:share,w:w});
+  });
+  const used=vals.reduce(function(a,b){return a+b.v*scale;},0);
+  const rest=parentV>0?Math.max(0,parentV-used):0;
+  if(rest>0.0001||over){
+    const share=parentV>0?(rest/parentV):0;
+    cols.push('minmax(78px,'+(share*100).toFixed(3)+'fr)');
+    blocks.push({x:{key:'__residual__',label:'残差',
+      st:tStat('residual',cur),v:rest},
+      share:share,w:share*100,residual:true});
+  }
+  rowEl.style.gridTemplateColumns=cols.join(' ');
+  blocks.forEach(function(b){rowEl.appendChild(lvlBlock(b,cur,lit,depth));});
+  const parent=rowEl.parentNode;
+  if(over&&parent){
+    parent.appendChild(el('div','lvl-note',
+      '子项合计 '+(sum/parentV*100).toFixed(1)+'%，超出父项 —— 已按比例压缩填满父项宽度。'));
+  }
+  const tiny=blocks.some(function(b){return b.share>0&&b.share<0.08;});
+  if(tiny&&parent){
+    parent.appendChild(el('div','lvl-note',
+      '本行含占比极小的项：已按最小可读宽度展开（整行可横向滚动），块内百分比与颜色仍按真实占比计算。'));
+  }
+}
 function renderLevels(cur){
   const box=document.getElementById('levels'); if(!box) return;
   box.innerHTML='';
-  const tree=tTree(cur.g);
   const total=tStat('total_us',cur);
-  [0,1,2].forEach(function(level){
-    const items=tree.filter(function(x){return x[1]===level;});
-    if(!items.length) return;
-    const vals=items.map(function(it){
-      return {key:it[0],parent:it[2],st:tStat(it[0],cur)};});
-    const maxv=Math.max.apply(null,vals.map(function(v){
-      return tLevelMetricOf(v.st);}).concat([0.001]));
+  const tv=tMetricOf(total,tLevelMetric);
+  box.appendChild(focusBar(cur));
+  if(tv==null){
+    box.appendChild(el('div','note','当前指标（'+tMetricName(tLevelMetric)+
+      '）没有可用数据：样本量不足 10000 或该阶段没有样本。'));
+    return;
+  }
+  const lit=focusLit(cur);
+  const root=el('div','lvl-row root');
+  root.appendChild(lvlBlock({x:{key:'total_us',label:'total（端到端）',
+    st:total,v:tv},share:1},cur,lit,0));
+  box.appendChild(root);
+  const l1=tChildrenOf('total_us',cur);
+  if(l1.length){
     const row=el('div','lvl-row');
-    vals.forEach(function(v){
-      const m=tLevelMetricOf(v.st);
-      const pm=tLevelMetricOf(tStat(v.parent||'total_us',cur));
-      const share=pm>0?m/pm:0;
-      const b=el('div','lvl-blk');
-      b.style.width=Math.max(2,Math.round(Math.sqrt(m/maxv)*100))+'%';
-      b.style.background=lvlColor(share);
-      const nm=(v.key==='residual')?'残差':v.key;
-      b.textContent=nm+' '+fmtUs(m);
-      const tip=[nm,'样本 '+(v.st.n==null?'-':v.st.n)];
-      ['avg','p50','p95','p99','p999','max','sigma','neg'].forEach(function(k){
-        if(v.st&&v.st[k]!=null) tip.push(k+'：'+v.st[k]+' µs');});
-      if(total&&total.avg>0&&v.st&&v.st.avg!=null)
-        tip.push('占端到端：'+(v.st.avg/total.avg*100).toFixed(1)+'%');
-      b.title=tip.join('\n');
-      row.appendChild(b);
-    });
+    appendLevelRow(row,l1,total,tv,cur,lit,1);
     box.appendChild(row);
-  });
+  }
 }
 function totalSeriesData(cur,tier,metric){
   const rows=cur.data.minutes||[];
@@ -1717,39 +2573,55 @@ function totalSeriesData(cur,tier,metric){
       const a=agg[k];
       return [a.t*1000, metric==='max'?a.max:(a.ok?a.sum/a.ok:0)];});
 }
+const STAGE_GRID={left:56,right:104,top:30,bottom:50};
+let tChartBound=false;
 function buildStageChart(cur){
   const box=document.getElementById('tchart'); if(!box) return;
+  const cap=document.getElementById('tchartEmpty');
+  const fm=cur.data.fminutes||{};
+  const hasF=Object.keys(fm).length>0;
+  if(cap){
+    cap.style.display=hasF?'none':'';
+    if(!hasF) cap.textContent='阶段曲线暂无数据：该 trace 产物是旧版格式（缺少阶段分钟桶 '+
+      'fminutes）。重新执行 map 阶段（scripts/tracestats.py）生成新版 trace 产物后即可显示。';
+  }
   if(!tChart) tChart=echarts.init(box);
+  if(!hasF){ try{tChart.clear();}catch(e){} return; }
   const tier=cur.data.ftier||60;
-  const fmin=cur.data.fminutes||{};
-  const series=[];
+  const pal=objPalette();
+  const series=[]; let ci=0;
   tStageSel.forEach(function(key){
     if(key==='total_us'){
+      const color=pal[0];
       series.push({name:'total（端到端）',type:'line',showSymbol:false,
-        data:totalSeriesData(cur,tier,tStageMetric),
-        lineStyle:{width:2}});
+        lineStyle:{width:2.2,color:color},itemStyle:{color:color},z:6,
+        endLabel:{show:true,distance:6,
+          formatter:function(p){return p.seriesName;},
+          color:color,fontSize:12,fontWeight:600,fontFamily:LFFONT},
+        data:totalSeriesData(cur,tier,tStageMetric)});
       return;
     }
-    const rows=fmin[key]||[];
+    const rows=fm[key]||[];
     if(!rows.length) return;
+    const color=pal[1+(ci++)%Math.max(1,pal.length-1)];
     series.push({name:(key==='residual'?'残差':key),
       type:'line',showSymbol:false,
+      lineStyle:{width:1.6,color:color},itemStyle:{color:color},z:3,
+      endLabel:{show:true,distance:6,
+        formatter:function(p){return p.seriesName;},
+        color:color,fontSize:12,fontWeight:600,fontFamily:LFFONT},
       data:rows.map(function(r){
-        return [r[0]*1000, tStageMetric==='max'?r[3]:r[2]];}),
-      lineStyle:{width:1.6}});
+        return [r[0]*1000, tStageMetric==='max'?r[3]:r[2]];})});
   });
-  tChart.setOption({animation:false,textStyle:{color:C.fg,fontSize:12},
-    tooltip:{trigger:'axis',confine:true,
-      valueFormatter:function(v){return fmtUs(v);}},
-    legend:{top:0,type:'scroll',textStyle:{color:C.fg}},
-    grid:{left:60,right:20,top:36,bottom:56},
-    xAxis:{type:'time',axisLabel:{color:C.mut,
-      formatter:function(v){return hhmmss(v/1000);}},
-      axisLine:{lineStyle:{color:C.line}}},
-    yAxis:{type:'value',name:'µs',scale:true,axisLabel:{color:C.mut},
-      splitLine:{lineStyle:{color:C.line}}},
-    dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
-    series:series},true);
+  const o=axisCommon();
+  o.grid=STAGE_GRID;
+  o.tooltip.valueFormatter=function(v){return fmtUs(v);};
+  o.yAxis=[lfAxisValue({name:'µs',scale:true})];
+  o.dataZoom=zoomModel('main');
+  o.series=series;
+  tChart.setOption(o,true);
+  if(!tChartBound){tChartBound=true;safe('stage-interactions',function(){
+    bindInteract(tChart,STAGE_GRID);});}
 }
 function renderStageBtns(cur){
   const box=document.getElementById('stageBtns'); if(!box) return;
@@ -1760,6 +2632,7 @@ function renderStageBtns(cur){
   list.forEach(function(k){
     const on=tStageSel.indexOf(k)>=0;
     const b=el('button',on?'on':'',k==='residual'?'残差':k);
+    b.title='点击加入/移出阶段曲线对比';
     b.onclick=function(){
       const i=tStageSel.indexOf(k);
       if(i>=0)tStageSel.splice(i,1); else tStageSel.push(k);
@@ -1771,6 +2644,7 @@ function renderStageBtns(cur){
   const mb=document.getElementById('fmetricBtns'); mb.innerHTML='';
   [['avg','平均'],['max','最大']].forEach(function(m){
     const b=el('button',m[0]===tStageMetric?'on':'',m[1]);
+    b.title='阶段分钟桶只统计了平均与最大值';
     b.onclick=function(){tStageMetric=m[0];renderStageBtns(cur);
       buildStageChart(cur);};
     mb.appendChild(b);
@@ -1784,7 +2658,7 @@ function renderTree(cur){
   box.innerHTML='';
   const tree=tTree(cur.g);
   function addRow(key,level,st,label){
-    const row=el('div','tnode');
+    const row=el('div','tnode'+(tSel===key?' sel':''));
     row.style.paddingLeft=(level*22)+'px';
     const hasKids=level===1&&tree.some(function(x){
       return x[1]===2&&x[2]===key;});
@@ -1793,8 +2667,8 @@ function renderTree(cur){
       tExpand[key]=!tExpand[key]; renderTree(cur);};
     row.appendChild(arrow);
     const nm=el('span','tname',label);
-    nm.title='点击查看指标套件';
-    nm.onclick=function(){openNodeModal(cur,key,label);};
+    nm.title='点击在右侧查看该阶段的指标套件';
+    nm.onclick=function(){tSel=key;renderTree(cur);renderTreeDetail(cur);};
     row.appendChild(nm);
     const pk=(level===0)?'total_us':tParentKey(key,cur);
     const pm=tStat(pk,cur);
@@ -1802,7 +2676,7 @@ function renderTree(cur){
     const bar=el('span','tbar');
     const fill=el('span','tfill');
     fill.style.width=Math.max(2,Math.min(100,Math.round(share*100)))+'%';
-    fill.style.background=lvlColor(share);
+    fill.style.background=lvlStyle(share,key==='residual').background;
     bar.appendChild(fill); row.appendChild(bar);
     row.appendChild(el('span','tpct',share>0?Math.round(share*100)+'%':''));
     row.appendChild(el('span','tval',(st&&st.n!=null)?
@@ -1819,62 +2693,63 @@ function renderTree(cur){
     }
   });
 }
-let modalChart=null;
-function openNodeModal(cur,key,label){
-  const st=tStat(key,cur);
+let tdetailChart=null;
+function renderTreeDetail(cur){
+  const box=document.getElementById('tdetail'); if(!box) return;
+  box.innerHTML='';
+  if(tdetailChart){try{tdetailChart.dispose&&tdetailChart.dispose();}catch(e){}
+    tdetailChart=null;}
+  const st=tStat(tSel,cur);
   const total=tStat('total_us',cur);
-  document.getElementById('modalTitle').textContent=
-    (key==='residual'?'残差':key)+' · 指标套件';
-  const body=document.getElementById('modalBody'); body.innerHTML='';
+  const label=(tSel==='residual')?'残差':tSel;
+  box.appendChild(el('h4','tdetail-title',label+' · 指标套件'));
   if(!st||st.n==null){
-    body.appendChild(el('div','note','该阶段无样本'));
-  }else{
-    const g=el('div','grid');
-    [['样本数',st.n],['负值(-1) 样本',st.neg],['平均',st.avg,'µs'],
-     ['p50',st.p50,'µs'],['p95',st.p95,'µs'],['p99',st.p99,'µs'],
-     ['p999',st.p999,'µs'],['最大',st.max,'µs'],['最小',st.min,'µs'],
-     ['标准差 σ',st.sigma,'µs']].forEach(function(x){
-      if(x[1]==null) return;
-      g.appendChild(kv(x[0],x[1],x[2]||''));
-    });
-    if(total&&total.avg>0&&st.avg!=null)
-      g.appendChild(kv('占端到端',(st.avg/total.avg*100).toFixed(1),'%'));
-    const pm=tStat(tParentKey(key,cur),cur);
-    if(pm&&pm.avg>0&&st.avg!=null)
-      g.appendChild(kv('占父阶段',(st.avg/pm.avg*100).toFixed(1),'%'));
-    body.appendChild(g);
-    if(st.hist){
-      body.appendChild(el('h3','sec','时延分布（对数分箱）'));
-      const div=el('div','chart sm');
-      body.appendChild(div);
-      const keys=Object.keys(st.hist).map(Number)
-        .sort(function(a,b){return a-b;});
-      modalChart=echarts.init(div);
-      modalChart.setOption({animation:false,textStyle:{color:C.fg,fontSize:12},
-        tooltip:{trigger:'axis'},grid:{left:56,right:16,top:16,bottom:40},
-        xAxis:{type:'category',data:keys,axisLabel:{color:C.mut}},
-        yAxis:{type:'value',axisLabel:{color:C.mut},
-          splitLine:{lineStyle:{color:C.line}}},
-        series:[{type:'bar',data:keys.map(function(k){return st.hist[k];}),
-          itemStyle:{color:C.pri,opacity:0.7}}]});
-    }
+    box.appendChild(el('div','note','该阶段无样本'));
+    return;
   }
-  const hasCurve=(key==='total_us'||key==='residual'||
-    !!(cur.data.fminutes||{})[key]);
+  const g=el('div','grid');
+  [['样本数',st.n],['负值(-1) 样本',st.neg],['最小',st.min,'µs'],
+   ['平均',st.avg,'µs'],['p50',st.p50,'µs'],['p95',st.p95,'µs'],
+   ['p99',st.p99,'µs'],['p999',st.p999,'µs'],
+   ['p9999',(st.n>=10000?st.p9999:null),'µs'],
+   ['最大',st.max,'µs'],['标准差 σ',st.sigma,'µs']].forEach(function(x){
+    if(x[1]==null) return;
+    g.appendChild(kv(x[0],x[1],x[2]||''));
+  });
+  if(total&&total.avg>0&&st.avg!=null)
+    g.appendChild(kv('占端到端',(st.avg/total.avg*100).toFixed(1),'%'));
+  const pm=tStat(tParentKey(tSel,cur),cur);
+  if(pm&&pm.avg>0&&st.avg!=null)
+    g.appendChild(kv('占父阶段',(st.avg/pm.avg*100).toFixed(1),'%'));
+  box.appendChild(g);
+  if(st.hist){
+    box.appendChild(el('h4','tdetail-sub','时延分布（对数分箱）'));
+    const div=el('div','chart sm');
+    box.appendChild(div);
+    const keys=Object.keys(st.hist).map(Number)
+      .sort(function(a,b){return a-b;});
+    tdetailChart=echarts.init(div);
+    tdetailChart.setOption({animation:false,
+      textStyle:{fontFamily:LFFONT,color:C.fg,fontSize:12},
+      tooltip:{trigger:'axis'},grid:{left:56,right:16,top:16,bottom:40},
+      xAxis:{type:'category',data:keys,
+        axisLabel:{color:C.mut,fontSize:12,fontFamily:LFFONT}},
+      yAxis:{type:'value',axisLabel:{color:C.mut,fontSize:12,fontFamily:LFFONT},
+        splitLine:{lineStyle:{color:C.grid,width:1}}},
+      series:[{type:'bar',data:keys.map(function(k){return st.hist[k];}),
+        itemStyle:{color:C.hero,opacity:0.75}}]});
+  }
+  const hasCurve=(tSel==='total_us'||tSel==='residual'||
+    !!(cur.data.fminutes||{})[tSel]);
   if(hasCurve){
-    const b=el('button','','查看该阶段时间曲线');
+    const b=el('button','','加入阶段曲线对比');
     b.style.marginTop='10px';
     b.onclick=function(){
-      if(tStageSel.indexOf(key)<0) tStageSel.push(key);
-      closeNodeModal(); renderStageBtns(cur); buildStageChart(cur);
+      if(tStageSel.indexOf(tSel)<0) tStageSel.push(tSel);
+      renderStageBtns(cur); buildStageChart(cur);
     };
-    body.appendChild(b);
+    box.appendChild(b);
   }
-  document.getElementById('nodeModal').style.display='flex';
-}
-function closeNodeModal(){
-  document.getElementById('nodeModal').style.display='none';
-  if(modalChart){modalChart.dispose&&modalChart.dispose(); modalChart=null;}
 }
 function renderTraceTop(cur){
   const tb=document.querySelector('#ttop tbody'); if(!tb) return;
@@ -1895,18 +2770,25 @@ function renderTraceTop(cur){
   }
 }
 function renderTraceStatus(cur){
-  const box=document.getElementById('terrs'); box.innerHTML='';
+  const box=document.getElementById('terrs'); if(!box) return;
+  box.innerHTML='';
   const st=(cur&&cur.data&&cur.data.status)||{};
   const es=Object.entries(st).sort(function(a,b){return b[1]-a[1];});
   if(!es.length){box.appendChild(el('div','note','无数据'));return;}
-  const t=el('table'); const thead=el('thead'); const hr=el('tr');
-  hr.appendChild(el('th',null,'状态')); hr.appendChild(el('th','n','次数'));
-  thead.appendChild(hr); t.appendChild(thead);
-  const tbody=el('tbody');
+  const max=Math.max.apply(null,es.map(function(x){return x[1];}).concat([1]));
+  const wrap=el('div','statusbars');
   es.forEach(function(x){
-    const tr=el('tr'); tr.appendChild(el('td','mono',x[0]));
-    tr.appendChild(el('td','n',String(x[1]))); tbody.appendChild(tr);});
-  t.appendChild(tbody); box.appendChild(t);
+    const row=el('div','sbrow');
+    row.appendChild(el('span','sbname mono',x[0]));
+    const track=el('span','sbtrack');
+    const fill=el('span','sbfill');
+    fill.style.width=Math.max(1.5,x[1]/max*100)+'%';
+    fill.style.background=(x[0]==='ok'||x[0]==='')?lfColor(1):C.hero;
+    track.appendChild(fill); row.appendChild(track);
+    row.appendChild(el('span','sbval',String(x[1])));
+    wrap.appendChild(row);
+  });
+  box.appendChild(wrap);
 }
 function renderTrace(){
   const card=document.getElementById('tracecard'); if(!card) return;
@@ -1943,7 +2825,8 @@ function renderTrace(){
   const gbox=document.getElementById('tgroups'); gbox.innerHTML='';
   tGroupsList().forEach(function(g){
     const b=el('button',g===tGroup?'on':'',
-      g==='read'?'读':(g==='write'?'写':'其它'));
+      g==='read'?'读路径':(g==='write'?'写路径':'其它'));
+    b.title='SDK trace 的请求方向（读=get 类 / 写=put 类）';
     b.onclick=function(){tGroup=g;tOp='';renderTrace();};
     gbox.appendChild(b);});
   const sel=document.getElementById('topSel');
@@ -1966,19 +2849,16 @@ function renderTrace(){
   if(tot.p95!=null)cards.appendChild(kv('p95',tot.p95,'µs'));
   if(tot.p99!=null)cards.appendChild(kv('p99',tot.p99,'µs'));
   if(tot.p999!=null)cards.appendChild(kv('p999',tot.p999,'µs'));
+  if(tot.p9999!=null&&(tot.n||0)>=10000)cards.appendChild(kv('p9999',tot.p9999,'µs'));
   if(tot.max!=null)cards.appendChild(kv('最大',tot.max,'µs'));
-  renderLevelMetric(); renderLevels(cur);
-  renderStageBtns(cur); buildStageChart(cur);
-  renderTree(cur);
-  renderTraceTop(cur);
-  renderTraceStatus(cur);
+  safe('trace-levels',function(){renderLevelMetric();renderLevels(cur);});
+  safe('trace-stage-chart',function(){renderStageBtns(cur);
+    buildStageChart(cur);});
+  safe('trace-tree',function(){renderTree(cur);renderTreeDetail(cur);});
+  safe('trace-top',function(){renderTraceTop(cur);});
+  safe('trace-status',function(){renderTraceStatus(cur);});
 }
-document.addEventListener('DOMContentLoaded',function(){
-  const mc=document.getElementById('modalClose');
-  if(mc) mc.onclick=closeNodeModal;
-  const nm=document.getElementById('nodeModal');
-  if(nm) nm.onclick=function(e){if(e.target===nm)closeNodeModal();};
-});
+
 window.__MC_FULL_READY__=function(){renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """
@@ -2019,7 +2899,7 @@ _PAGE_ADAPTER_JS = """
 
 
 def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
-               full_loader, rel_base=None, data_rel=None):
+               full_loader, rel_base=None, data_rel=None, theme_js=""):
     # JSON is embedded as a JS literal; escape the closing-script sequence.
     data_literal = json.dumps(data_json, ensure_ascii=False,
                               separators=(",", ":")).replace("</", "<\\/")
@@ -2045,6 +2925,7 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
 {body}
 </div>
 <script>{echarts}</script>
+<script>{theme}</script>
 <script>window.__MC_REPORT__ = {data};</script>
 {rel_vars}{loader}{adapter}
 <script>{app}</script>
@@ -2053,7 +2934,8 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
 """.format(title=html.escape(str(title), quote=True),
            subtitle=html.escape(str(subtitle), quote=True), body=body_html,
            css=_PAGE_CSS, echarts=echarts_js, data=data_literal,
-           rel_vars=rel_vars, loader=loader, adapter=adapter, app=_APP_JS)
+           theme=theme_js, rel_vars=rel_vars, loader=loader, adapter=adapter,
+           app=_APP_JS)
 
 
 def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
@@ -2142,19 +3024,36 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
 <div id="params" class="params"></div>
 </div>
 <div class="card"><h2>时延曲线</h2>
+<div class="chart-split">
+<aside class="objtree">
+<div class="objtree-head"><span class="tl-label">对象</span>
+<span id="objCount" class="objtree-count"></span></div>
+<div class="objtree-body" id="objTree"></div>
+</aside>
+<div class="chart-main">
 <div class="toolbar">
-<label class="tl-label" for="objAdd">对象</label>
-<select id="objAdd"></select>
-<span id="objChips" class="chips"></span>
-<span class="tb-sep"></span>
 <span id="tierBtns" class="toolbar"></span>
+<span class="tb-sep"></span>
 <span id="metricBtns" class="toolbar"></span>
+<span class="tb-sep"></span>
+<button id="outlierBtn">剔除离群值</button>
+<button id="resetBtn" title="恢复初始缩放范围">重置视图</button>
 </div>
 <div id="mainchart" class="chart"></div>
-<div class="note">对象可选：总体（含 writer/reader 角色）、节点聚合、单个客户端，可多选叠加对比
-（多选时用指标按钮切换显示指标）。粒度：时间分桶（1 秒~1 天，按运行时长自动裁剪可用档）
-与「自适应（按样本数）」双策略，横轴恒为时间轴；客户端曲线固定为自适应分桶。
-悬停查看每个桶的全部统计量，滚轮/拖动缩放。点击客户端表行可快速加入对比。</div></div>
+<div class="sub qps-cap">吞吐与失败（与上图共享时间轴）</div>
+<div id="qpschart" class="chart qps"></div>
+<div class="note" id="qpsNote"></div>
+<div class="chart-hint">滚轮 = 缩放时间轴（时延轴不动） · 左右拖动 = 平移时间轴 ·
+上下拖动 = 平移时延轴（两者互斥） · 左侧竖滑块 = 缩放时延轴</div>
+</div>
+</div></div>
+<div class="card" id="histcard" style="display:none"><h2>时延分布</h2>
+<div class="sub">对数分箱频数（跨客户端合并直方图）；标注 avg / p50 / p99 / p999 / p9999
+（重点三项为深墨色，p9999 需样本 ≥ 10000）</div>
+<div id="histchart" class="chart sm"></div></div>
+<div class="card" id="slowcard" style="display:none"><h2>慢点捕捉</h2>
+<div class="sub">每条 = 一次慢操作（Top-100），橙色为该组最大值</div>
+<div id="slowchart" class="chart sm"></div></div>
 <div class="card" id="tracecard" style="display:none">
 <h2>SDK 全链路（C++ trace）</h2>
 <div class="sub" id="tmeta"></div>
@@ -2163,8 +3062,10 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
 <span class="tb-sep"></span>
 <label class="tl-label" for="tsizeSel">数据大小</label>
 <select id="tsizeSel"></select></div>
+<div class="note">读路径 / 写路径 = SDK trace 的请求方向（读=get 类，写=put 类）；
+「数据大小」= 本次 trace 对应的对象规模。</div>
 <div id="tcards" class="grid"></div>
-<h3 class="sec">分级时延（鼠标悬停看该块全部统计）</h3>
+<h3 class="sec">分级时延（块宽 = 占父项百分比；点击块可聚焦展开下一级）</h3>
 <div class="toolbar"><span class="tl-label">指标</span>
 <span id="lvlMetric" class="toolbar"></span></div>
 <div id="levels" class="levels"></div>
@@ -2172,11 +3073,15 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
 <div class="toolbar"><span id="stageBtns" class="toolbar"></span>
 <span class="tb-sep"></span><span id="fmetricBtns" class="toolbar"></span>
 <span class="tb-sep"></span><span id="ftierBtns"></span></div>
+<div id="tchartEmpty" class="empty-tip" style="display:none"></div>
 <div id="tchart" class="chart"></div>
 <div class="note">阶段曲线的时间桶为 1 分钟（超过 1440 桶自动降为 10 分钟），
 平均/最大值来自 SDK 字段统计；端到端曲线由 1s 桶聚合到同一档位。</div>
-<h3 class="sec">阶段树（点击节点查看指标套件）</h3>
+<h3 class="sec">阶段树（点击节点，右侧显示该阶段指标套件）</h3>
+<div class="stage-split">
 <div class="ttree" id="ttree"></div>
+<div class="tdetail" id="tdetail"></div>
+</div>
 <h3 class="sec">最慢请求（Top-50）</h3>
 <div class="wrapx"><table id="ttop"><thead><tr>
 <th>start_time</th><th>trace_id</th><th>key</th><th>op</th><th>状态</th>
@@ -2188,15 +3093,8 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
 memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total_us 为全部副本合计）；
 ③ `-1` 表示该阶段拿不到时间戳（不参与时延统计）；④ slice 明细行 P1 仅计数。</div>
 </div>
-<div class="modal-mask" id="nodeModal" style="display:none">
- <div class="modal">
-  <div class="modal-head"><b id="modalTitle"></b>
-   <button id="modalClose" title="关闭" aria-label="关闭">✕</button></div>
-  <div class="modal-body" id="modalBody"></div>
- </div>
-</div>
 <pre class="term" style="display:none"></pre>
-<div class="card"><h2>客户端（点击行叠加曲线）</h2><div class="wrapx">
+<div class="card"><h2>客户端（点击行加入/移出对比）</h2><div class="wrapx">
 <table id="ctable"><thead><tr>
 <th>客户端</th><th>角色</th><th>节点</th><th class="n">总数</th><th class="n">成功</th>
 <th class="n">失败</th><th class="n">平均</th><th class="n">p50</th><th class="n">p99</th>
@@ -2209,12 +3107,15 @@ WebUI/HTTP 直接打开）：客户端表仅显示 Top-20，点击行只能叠�
 <div class="card"><h2>现场索引</h2><div id="sources"></div></div>
 <div class="note">数据文件：report.html（自包含）+ data.js（全量，深查用）。
 由 logstats（map）+ report.py（reduce）生成。</div>
-""".format(gran="1 秒 / 1 分钟")
+"""
+
     mon = data.get("monitors") or {}
     if mon.get("mem_host") or mon.get("mem_proc") or mon.get("urma"):
         body += """
 <div class="card" id="monitorcard"><h2>节点监控（内存 / URMA 端口）</h2>
 <div id="moncards" class="grid"></div>
+<h3 class="sec">进程 RSS 增幅（正/负）</h3>
+<div id="growth" class="grow" style="display:none"></div>
 <div id="memchart" class="chart"></div>
 <div id="procchart" class="chart"></div>
 <div id="urmachart" class="chart"></div>
@@ -2225,7 +3126,7 @@ WebUI/HTTP 直接打开）：客户端表仅显示 Top-20，点击行只能叠�
     echarts_js = _read_echarts(echarts_path)
     html = _page_html("场景报表", subtitle, body, embedded, echarts_js,
                       "data.js", True, rel_base=rel_base,
-                      data_rel="data.js")
+                      data_rel="data.js", theme_js=_lieflat_tokens_js())
     html_path = os.path.join(out_dir, "report.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -2343,7 +3244,8 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
         ("开始 " + run_meta["started"]) if run_meta.get("started") else "",
         "生成于 " + time.strftime("%Y-%m-%d %H:%M:%S")]))
     page = _page_html("运行总览", subtitle, body, {"meta": run_meta},
-                      "", None, False, rel_base=rel_base)
+                      "", None, False, rel_base=rel_base,
+                      theme_js=_lieflat_tokens_js())
     path = os.path.join(out_dir, "overview.html")
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)

@@ -49,7 +49,11 @@ def test_reduce_roles_clients_sources(tmp_path):
                               {"config": "cfg", "mode": "pipeline"})
     z = data["sizes"]["8MB"]
     roles = {k for k, o in z["objects"].items() if o.get("kind") == "role"}
-    assert roles == {"writer", "reader"}
+    # 角色 + 「总体（全部）」聚合（客户端全为 reader/writer 时也必须有）
+    assert roles == {"all", "writer", "reader"}
+    all_col = z["objects"]["all"]["tiers"]["cnt"]
+    # 4 秒 x 2 客户端 x 10 样本 = 80；同一时刻的客户端行必须合并而非覆盖
+    assert all_col["c"] and sum(all_col["c"]) == 80, all_col["c"]
     # 对象体系：角色 + 节点聚合 + 客户端；每对象都带自适应档
     assert "node:n1" in z["objects"] and "node:n2" in z["objects"]
     assert any(k.startswith("client:") for k in z["objects"])
@@ -175,6 +179,13 @@ def test_rebuild_reports_local(tmp_path, monkeypatch):
     assert rc == 0
     html = (logs / "report" / "report.html").read_text(encoding="utf-8")
     assert "场景" in html and "节点数" in html and "目标 QPS" in html
+    import re as _re
+    emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
+                                html, _re.S).group(1))
+    ps = dict((p[0], p[1]) for p in (emb.get("meta") or {}).get("params") or [])
+    # 客户端总数/节点数按实际加载的 stats 重算（旧 params 的幽灵值被纠正）
+    assert ps["客户端总数"] == 1
+    assert ps["节点数"] == 1
     assert (tmp_path / "20261112-1000" / "report" / "overview.html").is_file()
     # missing run -> non-zero
     assert bm.rebuild_reports("nope") == 2
@@ -318,7 +329,9 @@ def test_render_trace_section(tmp_path):
     assert 'id="tracecard"' in src
     # 段3 三图：分级时延 / 阶段曲线 / 阶段树（含指标套件弹窗）
     assert 'id="levels"' in src and 'id="tchart"' in src and 'id="ttree"' in src
-    assert 'id="nodeModal"' in src and 'id="tsizeSel"' in src
+    # 阶段树细节在右半部分（不再用弹窗）
+    assert 'id="tdetail"' in src and 'id="tsizeSel"' in src
+    assert 'id="nodeModal"' not in src
     assert "分级时延" in src and "阶段树" in src
     assert "残差（total − 阶段和）" in src
     assert "最慢请求" in src
@@ -412,8 +425,10 @@ def test_tier_buttons_and_ladder(tmp_path):
     if res is None:
         return
     assert res["errors"] == []
-    assert res["init_len"] == 360           # 默认 10 秒档（360 桶）
-    assert res["init_x0"] == 3600 * 1000    # x 轴用 epoch 毫秒
+    # 默认档 = 自适应（按样本数等分，<=2048 桶）；3600 样本 -> 每桶 2 个 -> 1800 桶
+    assert res["init_len"] == 1800
+    # 自适应桶按「桶内最后一个样本时刻」标注（横轴仍是时间轴）
+    assert res["init_x0"] == 3601 * 1000
     assert res["min_len"] == 60             # 切到 1 分钟档
 
 
@@ -835,6 +850,274 @@ def test_trace_three_charts_js(tmp_path):
     assert "total" in lv and "memread_total_us" in lv and "残差" in lv
     tree = res.get("tree_text") or ""
     assert "total（端到端）" in tree and "memread_total_us" in tree
-    assert res.get("modal_visible") is True
-    mt = res.get("modal_text") or ""
+    # 细节在右半部分（不再是弹窗）
+    assert res.get("modal_visible") is None
+    mt = res.get("detail_text") or ""
     assert ("样本数" in mt) or ("平均" in mt)
+
+
+# ---------------------------------------------------------------------------
+# lieflat 风格改造：F14 直方图数据 / G10 增幅 / 新卡结构
+# ---------------------------------------------------------------------------
+
+def test_summary_hist_bins_and_edges(tmp_path):
+    """F14：summary 透传合并直方图（非零 bins）与分箱边界；计数守恒。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    b = _stats(tmp_path, "b.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    s = data["sizes"]["8MB"]["summary"]
+    assert s["hist_bins"], "hist_bins missing"
+    assert len(s["bin_edges"]) >= 2
+    # 直方图按 RESULT 行计数（_stats 每个客户端 40 行，两个客户端 80 行）
+    assert sum(n for _i, n in s["hist_bins"]) == 80
+    idxs = [i for i, _n in s["hist_bins"]]
+    assert idxs == sorted(idxs)
+
+
+def test_monitor_proc_growth_sorted(tmp_path):
+    """G10：RSS 增幅列表按增长降序，泄露标记保留。"""
+    root = tmp_path / "logs" / "cfg" / "profiling" / "n1"
+    root.mkdir(parents=True)
+    (root / "mem.proc.csv").write_text(
+        "ts,pid,comm,rss_kb,pss_kb,private_dirty_kb,private_clean_kb,swap_kb\n"
+        "1000,11,a,102400,100000,1,1,0\n"
+        "1001,11,a,409600,400000,1,1,0\n"
+        "1000,22,b,102400,100000,1,1,0\n"
+        "1001,22,b,112640,110000,1,1,0\n", encoding="utf-8")
+    mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"))
+    g = mon["summary"]["proc_growth"]
+    assert g and g[0]["growth_mb"] >= g[-1]["growth_mb"]
+    assert g[0]["leak_suspect"] is True
+    assert g[0]["label"].startswith("n1/11")
+
+
+def test_render_new_charts_structure(tmp_path):
+    """新图卡存在且默认隐藏（无数据时不显示）；来源行已加。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    for i in ('id="histcard"', 'id="slowcard"', 'id="histchart"',
+              'id="slowchart"'):
+        assert i in src
+    assert 'class="src"' in src
+    # lieflat token 已内联（mono-tokens / color-presets）
+    assert "window.MONO" in src or "MONO=" in src
+    assert "PRESETS" in src and "F5572F" in src
+
+
+# ---------------------------------------------------------------------------
+# 回归：profiling 产物不得变成幽灵数据档；F14 直方图单位/标注正确
+# ---------------------------------------------------------------------------
+
+def test_profiling_artifacts_not_clients(tmp_path, monkeypatch):
+    """logs/profiling/*/mem.err.log 是监控产物，不是客户端日志：
+    不得生成 stats（幽灵 'all' 档）、不得计入客户端数。"""
+    logs = tmp_path / "logs" / "cfg"
+    (logs / "profiling" / "store1").mkdir(parents=True)
+    rows = "".join(
+        "RESULT\t2026-11-16 10:00:{:02d}.{:06d}\tpipeline_read\tk{}\t1.0\tOK\t0.5\t4\n"
+        .format(10 + i // 10, i % 10, i) for i in range(30))
+    (logs / "cfg.benchmark_c1_t1_8MB.reader.log").write_text(rows,
+                                                             encoding="utf-8")
+    (logs / "profiling" / "store1" / "mem.err.log").write_text(
+        "numastat: command not found\n", encoding="utf-8")
+    stats = bm._collect_local_stats(str(logs))
+    assert len(stats) == 1, stats
+    assert not (logs / "profiling" / "store1" /
+                "mem.err.log.stats.json").exists()
+    assert bm._is_client_log("mem.err.log") is False
+    data = rp.reduce_scenario(rp.load(stats), {"config": "cfg"})
+    assert "all" not in data["sizes"], list(data["sizes"])
+
+
+def test_hist_chart_units_and_marklines(tmp_path):
+    """F14：bin_edges(ms) -> µs 格式化；p50/p99 标注线必须命中分箱。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    s = data["sizes"]["8MB"]["summary"]
+    assert s["p50_ms"] < s["p99_ms"]
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["hist_cats"] > 0
+    # avg / p50 / p99 / p999 四条（p9999 需样本 >= 10000）
+    assert res["hist_marks"] == 4, res
+    assert ("µs" in res["hist_first"]) or ("ms" in res["hist_first"]), res
+
+
+# ---------------------------------------------------------------------------
+# 真实 ECharts 渲染冒烟（桩 setOption 掩盖过 markLine 事故，必须真渲染）
+# ---------------------------------------------------------------------------
+
+def test_real_echarts_render_smoke(tmp_path):
+    """--real：真实 ECharts 逐图 setOption + renderToSVGString，任何一图失败
+    即失败；F14 标注线必须落在真实 label 上（曾是 undefined -> 整页中断）。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    tr = _trace_stats(tmp_path, "c.glog")
+    mons = {
+        "mem_host": [{"node": "n1", "t": [1000, 1001],
+                      "columns": ["n0_used_mb"],
+                      "series": {"n0_used_mb": [10.0, 20.0]}}],
+        "mem_proc": [{"node": "n1", "pid": 1, "comm": "python",
+                      "t": [1000, 1001], "rss_mb": [10.0, 20.0],
+                      "pss_mb": [9.0, 18.0], "rss_growth_mb": 10.0,
+                      "rss_growth_pct": 100.0, "leak_suspect": False}],
+        "urma": [{"node": "n1", "ubpu": 0, "port": 1, "t": [1000, 1001],
+                  "rx": [1.0, 2.0], "tx": [0.5, 1.0],
+                  "rx_avg": 1.5, "rx_max": 2.0,
+                  "tx_avg": 0.75, "tx_max": 1.0}],
+        "summary": {
+            "peak_mem_mb": {"n1": 20}, "peak_urma": None,
+            "worst_proc": {"label": "n1/1 python", "growth_mb": 10.0,
+                           "growth_pct": 100.0, "leak_suspect": False},
+            "proc_growth": [{"label": "n1/1 python", "growth_mb": 10.0,
+                             "growth_pct": 100.0, "leak_suspect": False}],
+        },
+    }
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=mons, traces=[tr])
+    res = _js_check(tmp_path, data, "--real")
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    real = res.get("real") or {}
+    assert real.get("fail") == 0, real
+    assert real.get("ok", 0) >= 7, real
+    # F14 标注线：xAxis 必须是非空 label 字符串
+    assert res.get("hist_marks") == 4, res.get("hist_marks")
+    xs = res.get("hist_mark_x") or []
+    assert len(xs) == 4
+    assert all(isinstance(x, str) and x for x in xs), xs
+
+
+# ---------------------------------------------------------------------------
+# 报表 v3：排版基线 / 自适应分桶 / 对象树 / 离群值 / 分级时延聚焦
+# ---------------------------------------------------------------------------
+
+def test_adaptive_bucket_rule(tmp_path):
+    """自适应档：<=2048 桶；样本不足 2048 时逐样本成桶（全量绘制）。"""
+    st = _minimal_stats([10 * i for i in range(40)], [600])
+    st["meta"]["ts_from"] = 0
+    st["meta"]["ts_to"] = 400
+    z = rp.reduce_size([st], {"config": "c"})
+    cnt = z["objects"]["writer"]["tiers"]["cnt"]
+    assert len(cnt["t"]) == 40, len(cnt["t"])
+    assert all(c == 1 for c in cnt["c"]), cnt["c"]
+    # 样本多于 2048：桶数封顶 2048，每桶样本数相等
+    st2 = _minimal_stats([10 * i for i in range(5000)], [600])
+    st2["meta"]["ts_from"] = 0
+    st2["meta"]["ts_to"] = 50000
+    z2 = rp.reduce_size([st2], {"config": "c"})
+    cnt2 = z2["objects"]["writer"]["tiers"]["cnt"]
+    assert 0 < len(cnt2["t"]) <= 2048, len(cnt2["t"])
+    per = sorted(set(cnt2["c"]))
+    assert len(per) <= 2, per                    # 等分（最多差 1）
+    assert cnt2["t"] == sorted(cnt2["t"])
+
+
+def test_report_has_no_micro_captions_and_tiny_fonts(tmp_path):
+    """排版基线：编辑性 .src 小注整条删除；CSS/图表字号不得低于 12px。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    # 装饰性来源小注整条删除（用报表正文独有的文案判定，
+    # 避免误伤 vendored lieflat 主题里的注释模板）
+    for gone in ("指标卡与参数台账", "单变量分箱频数", "单点时延证据",
+                 "系列：QPS/失败/平均/p50/p99/p999/最大", "账本式表格"):
+        assert gone not in src, gone
+    assert ".src{" not in rp._PAGE_CSS
+    css_sizes = [float(x) for x in re.findall(r"font-size:([\d.]+)px", rp._PAGE_CSS)]
+    assert css_sizes and min(css_sizes) >= 12, min(css_sizes)
+    js_sizes = [float(x) for x in re.findall(r"fontSize:([\d.]+)", rp._APP_JS)]
+    assert js_sizes and min(js_sizes) >= 12, min(js_sizes)
+
+
+def test_section_order_and_renames(tmp_path):
+    """区块顺序：时延曲线 -> 时延分布 -> 慢点捕捉；长说明删除。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    i_curve = src.index("<h2>时延曲线</h2>")
+    i_hist = src.index("<h2>时延分布</h2>")
+    i_slow = src.index("<h2>慢点捕捉</h2>")
+    assert i_curve < i_hist < i_slow
+    assert "慢点分布" not in src
+    assert "对象可选：总体（含 writer/reader 角色）" not in src
+    # 失败数不再挤在 QPS 轴上：独立的吞吐/失败窄面板
+    assert 'id="qpschart"' in src and 'id="qpsNote"' in src
+
+
+def test_object_tree_and_qps_panel_js(tmp_path):
+    """对象树：总体/节点分组 + 每级全选清空；吞吐/失败面板已渲染。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    rows = res.get("tree_rows") or []
+    joined = " ".join(rows)
+    assert "总体与角色" in joined and "节点与客户端" in joined
+    assert "全选" in joined and "清空" in joined
+    assert res.get("qps_series"), res.get("qps_series")
+    note = res.get("qps_note") or ""
+    assert "失败" in note, note
+
+
+def test_outlier_toggle_masks_buckets(tmp_path):
+    """离群值剔除：阀值 = 10 x p99，命中桶从折线挖空（可一键开关）。"""
+    st = _minimal_stats([10 * i for i in range(20)], [600])
+    st["meta"]["ts_from"] = 0
+    st["meta"]["ts_to"] = 200
+    st["seconds"][7][5] = 1000.0            # 一个巨大离群值
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data, "--outlier", "1")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert any(n > 0 for n in (res.get("outlier_nulls") or [])), res.get("outlier_nulls")
+    assert "离群" in (res.get("outlier_btn") or "")
+
+
+def test_levels_focus_expand_and_residual(tmp_path):
+    """分级时延：聚焦展开下一级；残差显式；多点聚焦可叠加。"""
+    tr = _trace_stats(tmp_path, "c.glog")
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--focus", "query_total_us")
+    if res is None:
+        return
+    assert res["errors"] == []
+    lv = res.get("focus_text") or ""
+    assert "残差" in lv, lv[:200]
+    assert "query_route_us" in lv, lv[:400]     # 聚焦后展开下一级
+    assert "query_rpc_us" in lv, lv[:400]
+
+
+def test_trace_field_has_p9999(tmp_path):
+    """trace 字段统计补齐 p9999（供分级时延指标切换器使用）。"""
+    tr = _trace_stats(tmp_path, "a.glog")
+    z = rp.reduce_trace_size([tr])
+    read = z["groups"]["read"]["ops"]["get_buffer"]
+    tot = read["fields"]["total_us"]
+    assert "p9999" in tot and tot["p9999"] is not None
+    for key in ("query_total_us", "select_us"):
+        assert "p9999" in read["fields"][key]
+
+
+def test_adaptive_bucket_merges_same_second_clients(tmp_path):
+    """回归：同一秒内多个客户端的行必须合并（曾被后者覆盖，样本与统计全丢）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    z = data["sizes"]["8MB"]
+    for key in ("all", "writer", "reader"):
+        col = z["objects"][key]["tiers"]["cnt"]
+        # 4 秒 x 10 样本（两个客户端同一时刻 -> 合并后每桶 20）
+        assert sum(col["c"]) == (80 if key == "all" else 40), (key, col["c"])
+        assert col["ok"] and all(v > 0 for v in col["avg"]), col["avg"]
