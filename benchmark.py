@@ -14,6 +14,7 @@ import argparse
 import base64
 import csv
 import glob
+import hashlib
 import ipaddress
 import json
 import math
@@ -857,6 +858,22 @@ KVTEST_READER_OPS = {
     "exist": "exist",
     "isExist": "exist",
 }
+
+
+def _kvtest_artifact_prefix(cfg_name):
+    """Short, stable per-config prefix for remote/local kvtest artifacts.
+
+    The full config name already appears in the parent local directory. K8s
+    pod names can be 80+ characters, so repeating config+pod in every file
+    exceeded Windows MAX_PATH before plotting even started.
+    """
+    digest = hashlib.sha1(cfg_name.encode("utf-8")).hexdigest()[:10]
+    return "kv" + digest
+
+
+def _kvtest_artifact_base(cfg_name, iid, port, data_size):
+    return "{}.i{}_p{}.kvtest_{}".format(
+        _kvtest_artifact_prefix(cfg_name), iid, port, data_size)
 
 
 def _kvtest_writer_operation(cfg):
@@ -2131,8 +2148,9 @@ def _wait_log_pull_retry(attempt, label):
     time.sleep(delay)
 
 
-def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry_run):
-    """Pull every <cfg>.* file from each involved node.
+def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir,
+              dry_run, remote_prefix=None):
+    """Pull every <prefix>.* file from each involved node.
 
     Transfers are size verified by :func:`scp_pull`.  A failed transfer gets
     two retries with reconnect + backoff; this covers both a cut SFTP channel
@@ -2144,7 +2162,8 @@ def pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, 
         if n["ip"] in pulled_ips:
             continue
         pulled_ips.add(n["ip"])
-        remote_glob = "{}/{}.*".format(remote_log_dir, cfg_name)
+        remote_glob = "{}/{}.*".format(
+            remote_log_dir, remote_prefix or cfg_name)
         last_exc = None
         for attempt in range(_LOG_PULL_ATTEMPTS):
             try:
@@ -4670,12 +4689,16 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                                     "fail cleanup")
         except Exception as exc:
             log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
-    # 6. pull every log of this scenario (stage logs + instance logs + nohup)
-    try:
-        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
-                  local_log_dir, False)
-    except Exception as exc:
-        log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
+    # 6. Pull stage logs (full cfg prefix) and compact instance artifacts.
+    # Keep these separate: one missing wildcard must not hide the other set.
+    for prefix, label in ((cfg_name, "stage"),
+                          (_kvtest_artifact_prefix(cfg_name), "instance")):
+        try:
+            pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
+                      local_log_dir, False, remote_prefix=prefix)
+        except Exception as exc:
+            log("[WARN] fail-cleanup: {} log pull failed: {}".format(
+                label, exc))
 
 
 def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
@@ -4874,6 +4897,14 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     "(N={}, spread maxSkew=1, run={})".format(
                         len(plan["writers"]), len(plan["readers"]),
                         n_nodes, _run_label))
+        # Artifact filenames no longer carry the full node/Pod name. Preserve
+        # the iid -> real node mapping in the in-memory scenario config so CSV
+        # aggregation can still resolve node IP/topology after files are
+        # pulled into the per-config local directory.
+        cfg["_kvtest_iid_nodes"] = {
+            str(entry["iid"]): entry["node"]
+            for entry in plan["writers"] + plan["readers"]
+        }
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
         # kvtest.binary_local: push the C++ binary to every node/pod; the
@@ -4965,8 +4996,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             ConfigMap stays shared/read-only). Nothing runs yet — the nohup
             command is stored on the entry for _fire_instances."""
             n = get_node(cluster, entry["node"])
-            base = "{}.{}_i{}_p{}.kvtest_{}".format(
-                cfg_name, entry["node"], entry["iid"], entry["port"], ds)
+            base = _kvtest_artifact_base(
+                cfg_name, entry["iid"], entry["port"], ds)
             entry["_base"] = base
             entry["_out_dir"] = "{}/kvtest_out/{}".format(remote_log_dir, base)
             cfg_file = "{}/{}.json".format(remote_log_dir, base)
@@ -5556,6 +5587,61 @@ def parse_benchmark_log(paths, op_filter=None):
     })
 
 
+def _kvtest_latency_stats(values):
+    """Python/basic-compatible latency statistics over successful samples."""
+    ordered = sorted(values)
+    n = len(ordered)
+    return {
+        "avg_ms": (sum(ordered) / n) if n else 0.0,
+        "p50_ms": percentile(ordered, 0.50),
+        "p90_ms": percentile(ordered, 0.90),
+        "p99_ms": percentile(ordered, 0.99),
+        "p999_ms": percentile(ordered, 0.999),
+        "p9999_ms": percentile(ordered, 0.9999),
+        "max_ms": ordered[-1] if ordered else 0.0,
+    }
+
+
+def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None):
+    """Load request-level OK latencies keyed by (size, iid, node, op)."""
+    legacy_re = re.compile(
+        r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
+        r"(?P<ds>.+)\.samples\.csv$".format(re.escape(cfg_name)))
+    compact_re = re.compile(
+        r"^{}\.i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
+        r"(?P<ds>.+)\.samples\.csv$".format(
+            re.escape(_kvtest_artifact_prefix(cfg_name))))
+    iid_nodes = iid_nodes or {}
+    samples = {}
+    pattern = os.path.join(local_log_dir, "*.kvtest_*.samples.csv")
+    for path in sorted(glob.glob(pattern)):
+        match = compact_re.match(os.path.basename(path))
+        legacy = False
+        if not match:
+            match = legacy_re.match(os.path.basename(path))
+            legacy = bool(match)
+        if not match:
+            continue
+        iid = int(match.group("iid"))
+        node = (match.group("node") if legacy else
+                iid_nodes.get(str(iid), "i{}".format(iid)))
+        try:
+            with open(path, newline="", encoding="utf-8") as stream:
+                for row in csv.DictReader(stream):
+                    if row.get("status") != "OK":
+                        continue
+                    operation = row.get("operation", "")
+                    if not operation:
+                        continue
+                    key = (match.group("ds"), iid, node, operation)
+                    samples.setdefault(key, []).append(
+                        float(row["latency_ms"]))
+        except (OSError, ValueError, KeyError, csv.Error) as exc:
+            log("[WARN] kvtest samples {}: {} (skipped)".format(
+                os.path.basename(path), exc))
+    return samples
+
+
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                        mooncake_store_nodes=None, result_dir=None):
     """拓扑判定（IP 匹配）：节点的 cluster.json `ip` 出现在
@@ -5820,8 +5906,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                                  "pipeline_read", ds_bytes))
                 rows.append(row)
     elif is_kvtest:
-        # kvtest rows come from the per-instance summary.json artifacts
-        # (pulled as {cfg}.{node}_i{iid}_p{port}.kvtest_{ds}.summary.json).
+        # kvtest rows come from compact per-instance summary.json artifacts;
+        # the runtime iid->node map restores node/IP/topology metadata.
         # Throughput/qps use each C++ instance's measured elapsed_seconds,
         # starting at its successful /start metric reset.
         plan = kvtest_plan(cfg)
@@ -5880,7 +5966,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         def op_stats(summary, op):
             return (summary.get("operations", {}) or {}).get(op) or {}
 
-        def fill_metrics(row, st, wall):
+        def fill_metrics(row, st, wall, values=None):
             total = int(st.get("total", 0) or 0)
             ok = int(st.get("success", 0) or 0)
             fail = int(st.get("failure", 0) or 0)
@@ -5894,24 +5980,34 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
                                       if wall > 0 else 0.0)
             row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
+            stats = (_kvtest_latency_stats(values) if values is not None
+                     else st)
             for k in lat_keys:
-                row[k] = round(float(st.get(k, 0) or 0), 4)
+                row[k] = round(float(stats.get(k, 0) or 0), 4)
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
 
-        def fill_notify(row, summary):
+        def fill_notify(row, summary, values=None):
             nt = op_stats(summary, "notify_http")
             row["notify_submitted"] = int(nt.get("total", 0) or 0)
             row["notify_ok"] = int(nt.get("success", 0) or 0)
             row["notify_fail"] = int(nt.get("failure", 0) or 0)
-            row["notify_avg_ms"] = round(float(nt.get("avg_ms", 0) or 0), 4)
-            row["notify_max_ms"] = round(float(nt.get("max_ms", 0) or 0), 4)
+            stats = (_kvtest_latency_stats(values) if values is not None
+                     else nt)
+            row["notify_avg_ms"] = round(
+                float(stats.get("avg_ms", 0) or 0), 4)
+            row["notify_max_ms"] = round(
+                float(stats.get("max_ms", 0) or 0), 4)
 
-        def fill_queue(row, summary):
+        def fill_queue(row, summary, values=None):
             q = op_stats(summary, "notify_queue_wait")
-            row["queue_wait_avg_ms"] = round(float(q.get("avg_ms", 0) or 0), 4)
-            row["queue_wait_max_ms"] = round(float(q.get("max_ms", 0) or 0), 4)
+            stats = (_kvtest_latency_stats(values) if values is not None
+                     else q)
+            row["queue_wait_avg_ms"] = round(
+                float(stats.get("avg_ms", 0) or 0), 4)
+            row["queue_wait_max_ms"] = round(
+                float(stats.get("max_ms", 0) or 0), 4)
 
         def weighted_of(inst_rows, value_key, weight_key="total"):
             weighted = [(float(r.get(value_key, 0) or 0),
@@ -5921,10 +6017,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             return round(sum(v * w for v, w in weighted) / weight, 4) \
                 if weight else 0.0
 
-        def total_row(role, inst_rows, ds, wall):
-            # TOTAL over per-instance rows: counts/bytes sum exactly;
-            # latency percentiles average across instances (summary.json
-            # keeps no raw samples, so an exact merge is impossible)
+        def total_row(role, inst_rows, ds, wall, pooled_values=None):
+            # Counts/bytes sum exactly. With complete request samples the
+            # latency distribution is recomputed over the merged OK samples.
             row = base_row(role, "TOTAL", "", ds)
             total = sum(r["total"] for r in inst_rows)
             fail = sum(r["fail"] for r in inst_rows)
@@ -5941,11 +6036,21 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 float(r.get("throughput_mb_s", 0) or 0) for r in inst_rows)
             row["throughput_gb_s"] = sum(
                 float(r.get("throughput_gb_s", 0) or 0) for r in inst_rows)
-            for k in lat_keys:
-                # avg_ms becomes exact; percentiles are count-weighted
-                # approximations because summary.json has no mergeable
-                # histogram/raw samples.
-                row[k] = weighted_of(inst_rows, k)
+            if pooled_values is not None:
+                stats = _kvtest_latency_stats(pooled_values)
+                for k in lat_keys:
+                    row[k] = round(stats[k], 4)
+            else:
+                # Compatibility fallback for an old binary without samples:
+                # avg/percentiles remain weighted approximations, but max is
+                # still exactly the largest per-instance maximum.
+                for k in lat_keys:
+                    if k == "max_ms":
+                        row[k] = max((float(r.get(k, 0) or 0)
+                                      for r in inst_rows), default=0.0)
+                    else:
+                        row[k] = weighted_of(
+                            inst_rows, k, weight_key="success")
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
@@ -5953,16 +6058,27 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
 
         # one block of rows per data_size: writer rows, writer TOTAL,
         # reader rows, reader TOTAL (dual instances emit both sides)
-        summary_re = re.compile(
+        legacy_summary_re = re.compile(
             r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
             r"(?P<ds>.+)\.summary\.json$".format(re.escape(name)))
+        compact_summary_re = re.compile(
+            r"^{}\.i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
+            r"(?P<ds>.+)\.summary\.json$".format(
+                re.escape(_kvtest_artifact_prefix(name))))
+        iid_nodes = cfg.get("_kvtest_iid_nodes", {}) or {}
         summaries = {}   # ds -> [(iid, node, summary_dict)]
         for p in sorted(glob.glob(os.path.join(
-                local_log_dir, "{}.*.kvtest_*.summary.json".format(
-                    glob.escape(name))))):
-            m = summary_re.match(os.path.basename(p))
+                local_log_dir, "*.kvtest_*.summary.json"))):
+            m = compact_summary_re.match(os.path.basename(p))
+            legacy = False
+            if not m:
+                m = legacy_summary_re.match(os.path.basename(p))
+                legacy = bool(m)
             if not m:
                 continue
+            iid = int(m.group("iid"))
+            nodename = (m.group("node") if legacy else
+                        iid_nodes.get(str(iid), "i{}".format(iid)))
             try:
                 with open(p, encoding="utf-8") as f:
                     summary = json.load(f)
@@ -5971,49 +6087,89 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                     os.path.basename(p), exc))
                 continue
             summaries.setdefault(m.group("ds"), []).append(
-                (int(m.group("iid")), m.group("node"), summary))
+                (iid, nodename, summary))
+        ok_samples = _load_kvtest_ok_samples(
+            local_log_dir, name, iid_nodes=iid_nodes)
+
+        def sample_values(ds, iid, nodename, operation, expected):
+            values = ok_samples.get((ds, iid, nodename, operation), [])
+            if len(values) != expected:
+                log("[WARN] kvtest {} i{} {} samples incomplete: {} OK rows, "
+                    "summary success={}; using summary fallback".format(
+                        ds, iid, operation, len(values), expected))
+                return None
+            return values
+
         for ds in data_size_list(cfg):
             wall = duration
             writer_rows, reader_rows = [], []
+            writer_pooled, reader_pooled = [], []
+            writer_exact = reader_exact = True
             for iid, nodename, summary in sorted(summaries.get(ds, [])):
                 ops = summary.get("operations") or {}
                 instance_wall = float(summary.get("elapsed_seconds", 0) or
                                       duration)
                 if writer_op in ops:
+                    writer_st = op_stats(summary, writer_op)
+                    writer_values = sample_values(
+                        ds, iid, nodename, writer_op,
+                        int(writer_st.get("success", 0) or 0))
                     row = base_row("writer", "i{}".format(iid), nodename, ds)
-                    fill_metrics(row, op_stats(summary, writer_op),
-                                 instance_wall)
-                    fill_notify(row, summary)
+                    fill_metrics(row, writer_st, instance_wall, writer_values)
+                    notify_st = op_stats(summary, "notify_http")
+                    notify_values = sample_values(
+                        ds, iid, nodename, "notify_http",
+                        int(notify_st.get("success", 0) or 0))
+                    fill_notify(row, summary, notify_values)
                     writer_rows.append(row)
+                    if writer_values is None:
+                        writer_exact = False
+                    else:
+                        writer_pooled.extend(writer_values)
                 if reader_op in ops:
+                    reader_st = op_stats(summary, reader_op)
+                    reader_values = sample_values(
+                        ds, iid, nodename, reader_op,
+                        int(reader_st.get("success", 0) or 0))
                     row = base_row("reader", "i{}".format(iid), nodename, ds)
-                    fill_metrics(row, op_stats(summary, reader_op),
-                                 instance_wall)
-                    fill_queue(row, summary)
+                    fill_metrics(row, reader_st, instance_wall, reader_values)
+                    queue_st = op_stats(summary, "notify_queue_wait")
+                    queue_values = sample_values(
+                        ds, iid, nodename, "notify_queue_wait",
+                        int(queue_st.get("success", 0) or 0))
+                    fill_queue(row, summary, queue_values)
                     # data verification runs on the read path
                     row["verify_failures"] = int(
                         summary.get("verify_failures", 0) or 0)
                     reader_rows.append(row)
+                    if reader_values is None:
+                        reader_exact = False
+                    else:
+                        reader_pooled.extend(reader_values)
             # grouped like the pipeline CSV: all writers + TOTAL, then all
             # readers + TOTAL
             rows.extend(writer_rows)
             if writer_rows:
-                row = total_row("writer", writer_rows, ds, wall)
+                row = total_row(
+                    "writer", writer_rows, ds, wall,
+                    writer_pooled if writer_exact else None)
                 for k in ("notify_submitted", "notify_ok", "notify_fail"):
                     row[k] = sum(r.get(k, 0) for r in writer_rows)
                 row["notify_avg_ms"] = weighted_of(
-                    writer_rows, "notify_avg_ms", "notify_submitted")
+                    writer_rows, "notify_avg_ms", "notify_ok")
                 row["notify_max_ms"] = max(
                     (r.get("notify_max_ms", 0) or 0 for r in writer_rows),
                     default=0)
                 rows.append(row)
             rows.extend(reader_rows)
             if reader_rows:
-                row = total_row("reader", reader_rows, ds, wall)
+                row = total_row(
+                    "reader", reader_rows, ds, wall,
+                    reader_pooled if reader_exact else None)
                 row["verify_failures"] = sum(
                     r.get("verify_failures", 0) for r in reader_rows)
                 row["queue_wait_avg_ms"] = weighted_of(
-                    reader_rows, "queue_wait_avg_ms")
+                    reader_rows, "queue_wait_avg_ms", "success")
                 row["queue_wait_max_ms"] = max(
                     (r.get("queue_wait_max_ms", 0) or 0 for r in reader_rows),
                     default=0)

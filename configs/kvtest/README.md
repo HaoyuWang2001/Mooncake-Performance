@@ -150,6 +150,10 @@ PNG，以及 run 级 `<cfg>.csv` 和 `benchmark_detail.csv`。`summary.json` 和
 保留它们用于排障和重画。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。每实例 QPS/吞吐使用 summary 中的实际 `elapsed_seconds`。
+延迟统计只使用 `status=OK` 的请求；TOTAL 行会先合并全部实例的成功请求样本，
+再重新计算 avg/max/P50/P90/P99/P999/P9999，因此 max 是真正的全局最大值，
+分位数也不是各实例分位数的加权平均。旧二进制没有请求样本时才回退为近似值并
+打印 WARN。
 
 kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
 内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其
@@ -159,3 +163,9 @@ kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` �
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
 request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回窗口聚合数据；
 `--no-plot` 可关闭自动绘图。
+
+kvtest 实例文件使用紧凑名称
+`kv<配置哈希>.i<instance>_p<port>.kvtest_<size>.*`。K8s Pod 全名不再进入
+日志、summary/sample 或 PNG 文件名；instance 到真实节点/Pod 的映射保存在运行时
+配置中并写入最终 CSV，从而避免 Windows 260/264 字符路径限制。旧版
+`<cfg>.<node>_i...` 文件仍可被汇总和绘图脚本读取。

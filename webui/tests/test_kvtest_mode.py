@@ -267,6 +267,16 @@ def test_kvtest_success_cleanup_keeps_logs_and_png(tmp_path):
     assert all(path.exists() for path in keep)
 
 
+def test_kvtest_artifact_base_is_compact_and_omits_node_name():
+    cfg_name = "very_long_kvtest_configuration_name_" * 3
+    pod_name = "mc-run-reader-7c9d8f6d4b-abcde"
+    base = bm._kvtest_artifact_base(cfg_name, 123, 9201, "1024MB")
+    assert len(base) < 50
+    assert cfg_name not in base
+    assert pod_name not in base
+    assert base.endswith(".i123_p9201.kvtest_1024MB")
+
+
 # ------------------------------------------------------ binary_local push
 
 def test_kvtest_deploy_binary_local(tmp_path, monkeypatch):
@@ -392,6 +402,7 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
         summary = _summary(iid, up, get, verify)
         if iid == 1:
             summary["operations"]["upsert_from"]["avg_ms"] = 3.0
+            summary["operations"]["upsert_from"]["max_ms"] = 19.0
         (local_logs / fn).write_text(json.dumps(summary), encoding="utf-8")
     cfg = _kv_cfg()
     # run-time records the auto pool + real client counts
@@ -416,12 +427,14 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     assert w0["key_pool_size"] == 256
     assert w0["num_threads"] == 1 and w0["notify_threads"] == 10
     assert w0["target_qps"] == 105
-    # TOTAL rows: counts sum exactly, percentiles average across instances
+    # Old-summary fallback: counts sum exactly; avg/percentiles are weighted
+    # by successful request count and max is the largest instance max.
     assert wT["total"] == 2800 and wT["success"] == 2800
     assert wT["notify_submitted"] == 28000 and wT["notify_fail"] == 20
     assert wT["notify_avg_ms"] == 1.5 and wT["notify_max_ms"] == 9.0
     assert wT["avg_ms"] == round((1500 * 1.0 + 1300 * 3.0) / 2800, 4)
     assert wT["p50_ms"] == 0.8                   # identical inputs -> same
+    assert wT["max_ms"] == 19.0                  # true max, never weighted
     assert wT["throughput_mb_s"] == round(2800 * 8 / 30, 2)   # MB per second
     # reader rows: queue wait + verify failures (read-path verification)
     assert r0["operation"] == "get_buffer" and r0["verify_failures"] == 2
@@ -435,6 +448,54 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     # rows carry exactly the header keys the detail csv expects
     for r in rows:
         assert set(r.keys()) <= set(bm.KVTEST_CSV_HEADER)
+
+
+def test_kvtest_total_latency_recomputed_from_merged_ok_samples(tmp_path):
+    local_logs = tmp_path / "logs"
+    local_logs.mkdir()
+    cases = [("nodeA", 0, 9301, [1.0, 2.0]),
+             ("nodeB", 1, 9302, [100.0])]
+    for node, iid, port, values in cases:
+        base = bm._kvtest_artifact_base("kvtest_csv", iid, port, "8MB")
+        summary = _summary(iid, len(values), 0, 0)
+        summary["operations"].pop("get_buffer")
+        summary["operations"].pop("notify_queue_wait")
+        summary["operations"]["notify_http"].update(
+            {"total": 0, "success": 0, "failure": 0, "count": 0})
+        # Deliberately wrong summary latency fields: raw OK samples must win.
+        summary["operations"]["upsert_from"].update(
+            {"avg_ms": -1, "p50_ms": -1, "p90_ms": -1,
+             "p99_ms": -1, "p999_ms": -1, "p9999_ms": -1,
+             "max_ms": -1})
+        (local_logs / (base + ".summary.json")).write_text(
+            json.dumps(summary), encoding="utf-8")
+        rows = [
+            "elapsed_us,instance_id,operation,request_index,latency_ms,status,bytes"
+        ]
+        for index, value in enumerate(values):
+            rows.append("{}, {},upsert_from,{},{},OK,8388608".format(
+                index + 1, iid, index, value).replace(", ", ","))
+        # Failed requests are retained in the raw file but excluded from all
+        # latency distribution statistics.
+        rows.append("99,{},upsert_from,99,9999,ERR,0".format(iid))
+        (local_logs / (base + ".samples.csv")).write_text(
+            "\n".join(rows) + "\n", encoding="utf-8")
+
+    cfg = _kv_cfg()
+    cfg["_kvtest_iid_nodes"] = {"0": "nodeA", "1": "nodeB"}
+    result = bm.write_scenario_csv(
+        str(local_logs), cfg, "ts",
+        os.path.join(str(tmp_path), "kvtest_csv.json"), cluster=None,
+        mooncake_store_nodes=[], result_dir=str(tmp_path))
+    w0, w1, total = [r for r in result if r["role"] == "writer"]
+    assert w0["avg_ms"] == 1.5 and w0["max_ms"] == 2.0
+    assert w1["avg_ms"] == 100.0 and w1["max_ms"] == 100.0
+    assert total["avg_ms"] == 34.3333
+    assert total["max_ms"] == 100.0
+    assert total["p50_ms"] == 2.0
+    assert total["p99_ms"] == 100.0
+    assert total["p999_ms"] == 100.0
+    assert total["p9999_ms"] == 100.0
 
 
 def test_kvtest_csv_skips_bad_summary_json(tmp_path, capsys):
