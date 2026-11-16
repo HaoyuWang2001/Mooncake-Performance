@@ -1369,7 +1369,7 @@ function renderTraceTable(cur){
 }
 function renderTraceTop(cur){
   const tb=document.querySelector("#ttop tbody");tb.innerHTML="";
-  const top=(cur.data.top||[]).slice(0,50);
+  const top=(cur.t.top||[]).slice(0,50);
   top.forEach(function(e){
     const tr=el("tr");
     const st=Object.entries(e.stages||{}).sort(function(a,b){return b[1]-a[1];})
@@ -1523,6 +1523,7 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     subtitle = " · ".join(meta_bits) + \
         " · 生成于 " + time.strftime("%Y-%m-%d %H:%M:%S")
     body = """
+<div style="margin-bottom:8px"><a href="../../report/overview.html">← 返回运行总览</a></div>
 <div class="card"><div class="toolbar">
 <select id="sizeSel"></select>
 <span id="roles" class="toolbar"></span>
@@ -1651,7 +1652,7 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
         mode = html.escape(str(m.get("mode") or ""))
         cards.append("""
 <div class="card"><h2>{name}</h2>
-<div class="sub">{mode} · {clients} 客户端 · 时长 {dur} {early}</div>
+<div class="sub">{mode} · {proto} · {sizes} · {clients} 客户端 · 时长 {dur} · 目标 QPS {qt} {early}</div>
 <div class="grid">
 <div class="kv"><div class="k">成功</div><div class="v">{ok}</div></div>
 <div class="kv"><div class="k">失败</div><div class="v">{fail}</div></div>
@@ -1666,6 +1667,11 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
 <div style="margin-top:10px"><a href="{link}">打开场景完整报表 →</a></div>
 </div>""".format(
             name=name, mode=mode,
+            proto=html.escape(str(m.get("protocol") or "-")),
+            sizes=html.escape(", ".join(
+                str(k) for k in (sc.get("sizes") or {}) if k != "all") or "-",
+                quote=True),
+            qt=m.get("qps_target") or "-",
             clients=m.get("clients") or "-",
             dur=_fmt_dur(s.get("wall_s") or 0),
             early='<span class="tag warn">提前停止/异常</span>'
