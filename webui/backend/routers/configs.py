@@ -69,10 +69,35 @@ def validate_config_content(path, content):
             errors.append("params must be a non-empty array of "
                           "{num_clients, num_threads} objects")
     elif scenario_dir == "kvtest":
-        try:
-            bm.kvtest_plan(merged, 1)  # node_count=1: shape validation only
-        except (RuntimeError, KeyError, ValueError) as exc:
-            errors.append("kvtest plan invalid: {}".format(exc))
+        if merged.get("scenario") == "kvtest_basic":
+            op = merged.get("operation")
+            if not op:
+                errors.append("kvtest_basic requires operation")
+            else:
+                put_iface, get_iface, mixed = bm.kvtest_basic_split_operation(
+                    merged)
+                if mixed:
+                    if put_iface not in bm.KVTEST_WRITER_OPS:
+                        errors.append(
+                            "kvtest_basic unsupported put interface: "
+                            "{}".format(put_iface))
+                    if get_iface not in bm.KVTEST_READER_OPS:
+                        errors.append(
+                            "kvtest_basic unsupported get interface: "
+                            "{}".format(get_iface))
+                elif (put_iface not in bm.KVTEST_WRITER_OPS and
+                      get_iface not in bm.KVTEST_READER_OPS):
+                    errors.append(
+                        "kvtest_basic unsupported operation: {}".format(op))
+            params = merged.get("params")
+            if not isinstance(params, list) or not params:
+                errors.append("params must be a non-empty array of "
+                              "{num_clients, num_threads} objects")
+        else:
+            try:
+                bm.kvtest_plan(merged, 1)  # node_count=1: shape validation only
+            except (RuntimeError, KeyError, ValueError) as exc:
+                errors.append("kvtest plan invalid: {}".format(exc))
     else:
         try:
             bm.pipeline_plan(merged, 1)  # node_count=1: shape validation only
