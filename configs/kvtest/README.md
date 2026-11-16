@@ -100,8 +100,9 @@ pod/节点后经 `scripts/run_kvtest.sh` 启动；运行窗口 = `duration`，�
 
 ## 二进制部署
 
-- `kvtest.binary`（随附配置为 `/home/Mooncake/bin/kvtest`；字段未配置时默认
-  `mooncake_kvtest`）：节点/pod 上的二进制路径，从 PATH 或镜像内解析；
+- `kvtest.binary`（公共继承配置为 `/home/Mooncake/bin/kvtest`，单个场景可覆盖；
+  字段未配置时默认 `mooncake_kvtest`）：节点/pod 上的二进制路径，从 PATH
+  或镜像内解析；
 - `kvtest.binary_local`（可选）：编排器本地二进制路径；设置后自动 scp/kubectl cp
   推送到每个目标再执行。若二进制同级 `lib/` 或上一级的 `lib/` 中存在 `.so`，
   会一并推送并由 runner 加入 `LD_LIBRARY_PATH`。ssh 节点落在 scripts 目录，k8s

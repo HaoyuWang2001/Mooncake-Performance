@@ -26,6 +26,6 @@
   "kvtest": {
     "key_pool_size": 256,
     "local_port_base": 12345,
-    "binary": "/home/Mooncake/bin/kvtest"
+    "binary": "/home/w00921547/Mooncake/outputs/bin/mooncake_kvtest"
   }
 }
