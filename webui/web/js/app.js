@@ -152,16 +152,6 @@ const App = {
         <span class="brand-mark" aria-hidden="true"></span>
         <span class="brand-text">Mooncake<span>Performance</span></span>
       </div>
-      <div class="badges">
-        <div class="badge-line" :title="runTitle">
-          <span class="badge-dot" :class="runDot"></span>
-          <span>{{ runText }}</span>
-        </div>
-        <div class="badge-line" title="定时任务状态">
-          <span class="badge-dot" :class="schDot"></span>
-          <span>{{ schText }}</span>
-        </div>
-      </div>
       <el-menu :default-active="store.view" class="menu" @select="go">
         <el-menu-item index="perf">
           <el-icon><component is="Monitor"/></el-icon><span>性能测试</span>
@@ -207,44 +197,6 @@ const App = {
       });
     }
 
-    const _activeRuns = computed(() => store.status.active_runs
-      || (store.status.active_run ? [store.status.active_run] : []));
-    const runDot = computed(() => {
-      const runs = _activeRuns.value;
-      if (!runs.length) return "";
-      return runs.some(r => r.stopping) ? "exec" : "on";
-    });
-    const runText = computed(() => {
-      const runs = _activeRuns.value;
-      if (!runs.length) return "空闲";
-      if (runs.length === 1) {
-        return (runs[0].stopping ? "停止中" : "运行中")
-          + "（" + Math.round(runs[0].elapsed) + "s）";
-      }
-      return "运行中 " + runs.length + " 个";
-    });
-    const runTitle = computed(() => {
-      const runs = _activeRuns.value;
-      if (!runs.length) return "当前没有运行中的实例";
-      return runs.map(r => r.id + "：" + r.status
-        + (r.stopping ? "（停止中）" : "")).join("\n");
-    });
-    const schDot = computed(() => {
-      const s = store.status.scheduler;
-      if (!s) return "";
-      if (s.state === "executing") return "exec";
-      if (["waiting", "waiting_slot"].includes(s.state)) return "on";
-      return "";
-    });
-    const schText = computed(() => {
-      const s = store.status.scheduler;
-      if (!s) return "关闭";
-      let t = schedulerText(s.state);
-      if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state))
-        t += "（" + s.next_trigger.slice(-8) + "）";
-      return t;
-    });
-
     let timer = null;
     async function pollStatus() {
       try { Object.assign(store.status, await api("GET", "/api/status")); }
@@ -253,8 +205,7 @@ const App = {
     onMounted(() => { pollStatus(); timer = setInterval(pollStatus, 3000); });
     onUnmounted(() => clearInterval(timer));
 
-    return { store, theme, toggleDark, go, viewComp,
-             runDot, runText, runTitle, schDot, schText };
+    return { store, theme, toggleDark, go, viewComp };
   },
 };
 

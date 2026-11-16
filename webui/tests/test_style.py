@@ -165,10 +165,11 @@ def test_shell_brand_and_badges():
     assert "brand-text" in src and ".brand-text" in css
     # 默认页签 = 性能测试
     assert 'return "perf"' in src
-    # 徽标不带前缀文案（完整语义在 title）
-    assert "运行实例：" not in src
-    assert "定时任务：" not in src
-    # 失败态页签点（曾经只有 on/exec/ok，err 无样式）
+    # 侧边栏徽标（空闲/关闭状态及其列表）已移除
+    assert 'class="badges"' not in src
+    assert "badge-line" not in src
+    assert ">空闲<" not in src and ">关闭<" not in src
+    # 失败态页签点（实例详情页签仍在用；曾经只有 on/exec/ok，err 无样式）
     assert ".badge-dot.err" in css
 
 
