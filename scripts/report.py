@@ -698,15 +698,17 @@ def _parse_urma(path, node, flit_bytes):
         samples.sort(key=lambda s: s[0])
         t, rxr, txr = [], [], []
         prev = None
+        resync = False        # 回绕/复位的下一拍跳过（否则出现假尖峰）
         for ts, rx, tx in samples:
             if prev is not None:
                 dt_ns = ts - prev[0]
                 drx, dtx = rx - prev[1], tx - prev[2]
-                if dt_ns > 0 and drx >= 0 and dtx >= 0:
+                if dt_ns > 0 and drx >= 0 and dtx >= 0 and not resync:
                     sec = dt_ns / 1e9
                     t.append(round(ts / 1e9, 3))
                     rxr.append(round(drx * flit_bytes / sec / gib, 4))
                     txr.append(round(dtx * flit_bytes / sec / gib, 4))
+                resync = (drx < 0 or dtx < 0)
             prev = (ts, rx, tx)
         if not t:
             continue

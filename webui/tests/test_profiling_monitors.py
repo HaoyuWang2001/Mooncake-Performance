@@ -196,3 +196,29 @@ def test_overview_shows_monitor_summary(tmp_path):
     assert "RSS 疑似泄露" in src
     assert "端口峰值" in src and "峰值内存" in src
 
+
+
+def test_urma_counter_wrap_and_reset_no_spike(tmp_path):
+    """计数器回绕/复位后不得出现假尖峰（回绕样本与紧随样本都跳过）。"""
+    per = 536870912                    # ~10 GiB/s @20B/flit
+    root = tmp_path / "logs" / "cfg" / "profiling" / "n1"
+    root.mkdir(parents=True)
+    wrap = int(29.5 * 5 * per)
+    rows = ["ts_ns,ubpu,port,rx_flits,tx_flits"]
+    for i in range(35):
+        ts = (1000000 + i * 5) * 1000000000
+        rows.append("{},0,1,{},{}".format(ts, (i * 5 * per) % wrap, 0))
+    # 复位场景：i=20 处计数器突然归零再重新增长（设备重启）
+    rows = [rows[0]]
+    for i in range(35):
+        ts = (1000000 + i * 5) * 1000000000
+        v = (i * 5 * per) % wrap
+        if i >= 20:
+            v = (i - 20) * 5 * per     # 复位后从头累加
+        rows.append("{},0,1,{},0".format(ts, v))
+    (root / "urma.flits.csv").write_text("\n".join(rows) + "\n",
+                                         encoding="utf-8")
+    mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"))
+    u = mon["urma"][0]
+    assert u["rx_max"] <= 12.0, u["rx_max"]     # 无 310 GiB/s 假尖峰
+    assert 8.0 <= max(u["rx"]) <= 12.0
