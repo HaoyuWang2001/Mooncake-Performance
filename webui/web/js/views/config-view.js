@@ -1,7 +1,7 @@
 "use strict";
-/* 配置维护视图（v4）：
-   - 左列：通用配置（configs 根 *.json，点击编辑）+ 运行配置树（点击文件名编辑）
-   - 右侧：编辑器（校验/保存）
+/* 配置维护视图（v5）：
+   - 左：通用配置（configs 根 *.json）｜右：运行配置树（默认全折叠）
+   - 点击文件名 -> 弹窗编辑器（校验/保存，未保存关闭需确认）；不再常驻编辑器
    运行框已移至“性能测试”页；本页只负责配置浏览与编辑。 */
 
 const CfgNode = {
@@ -23,7 +23,8 @@ const CfgNode = {
     </div>
   </div>`,
   setup(props) {
-    const open = Vue.ref(props.depth < 1);
+    // 默认全部折叠：目录需要逐层展开（文件多时不至于满屏刷出）
+    const open = Vue.ref(false);
     const openFile = Vue.inject("openConfigFile", () => {});
     const onName = () => {
       if (props.node.isDir) open.value = !open.value;
@@ -39,14 +40,14 @@ const ConfigView = {
     <div class="mc-page-head">
       <div>
         <h1 class="title">配置维护</h1>
-        <p class="desc">编辑 cluster/global/profile 与测试场景配置；保存前自动校验并备份，运行框的配置选择来自此处。</p>
+        <p class="desc">编辑 cluster/global/profile 与测试场景配置；点击文件名在弹窗中编辑，保存前自动校验并备份，运行框的配置选择来自此处。</p>
       </div>
     </div>
     <el-row :gutter="14">
-      <el-col :span="8">
-        <el-card shadow="never" style="margin-bottom: 14px">
+      <el-col :span="10">
+        <el-card shadow="never">
           <template #header><b>通用配置</b>
-            <span class="hint" style="margin-left: 8px">configs/_ssh、_k8s 及根目录</span></template>
+            <span class="card-hint">configs/_ssh、_k8s 及根目录</span></template>
           <div class="newcfg-row">
             <el-input v-model="newCfgName" placeholder="新文件名，如 cluster.3nodes.json"
                       size="small" style="width: 220px"></el-input>
@@ -64,12 +65,13 @@ const ConfigView = {
           </div>
           <el-empty v-if="!general.length" description="无通用配置" :image-size="50"></el-empty>
         </el-card>
-
+      </el-col>
+      <el-col :span="14">
         <el-card shadow="never">
           <template #header>
-            <div class="header-row" style="margin: 0">
+            <div class="mc-toolbar">
               <b>运行配置</b>
-              <span class="hint" style="margin-left: 8px">点击文件名可编辑</span>
+              <span class="card-hint">目录默认折叠，点击文件名编辑</span>
             </div>
           </template>
           <div class="cfg-tree">
@@ -77,25 +79,25 @@ const ConfigView = {
           </div>
         </el-card>
       </el-col>
-      <el-col :span="16">
-        <el-card shadow="never">
-          <template #header>
-            <b>编辑器</b>
-            <span v-if="editPath" style="margin-left: 10px; font-family: monospace; font-weight: 400">
-              {{ editPath }}
-            </span>
-          </template>
-          <el-input type="textarea" :rows="24" v-model="editContent" class="editor"
-                    :placeholder="editPath ? '' : '点击通用配置或运行配置文件开始编辑'"></el-input>
-          <div class="header-row" style="margin: 10px 0 0">
-            <el-button size="small" @click="validate" :disabled="!editPath">校验</el-button>
-            <el-button size="small" type="primary" @click="save" :disabled="!dirty" :loading="saving">保存</el-button>
-            <span v-if="editMsg.text" :style="{ color: editMsg.ok ? 'var(--el-color-success)' : 'var(--el-color-error)',
-                      fontSize: '12.5px' }">{{ editMsg.text }}</span>
-          </div>
-        </el-card>
-      </el-col>
     </el-row>
+
+    <el-dialog v-model="dlgOpen" width="72%" top="6vh" class="cfg-dlg"
+               :close-on-click-modal="false" :before-close="askClose">
+      <template #header>
+        <b>编辑配置</b>
+        <span v-if="editPath" class="cfg-dlg-path">{{ editPath }}</span>
+        <el-tag v-if="isNew" size="small" type="warning">新文件（未保存）</el-tag>
+      </template>
+      <el-input type="textarea" :rows="22" v-model="editContent" class="editor"></el-input>
+      <el-alert v-if="editMsg.text" :type="editMsg.ok ? 'success' : 'error'"
+                :title="editMsg.text" :closable="false" show-icon class="mt-2" />
+      <template #footer>
+        <el-button size="small" @click="askClose">取消</el-button>
+        <el-button size="small" :disabled="!editPath" @click="validate">校验</el-button>
+        <el-button size="small" type="primary" :disabled="!dirty" :loading="saving"
+                   @click="save">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 `,
   setup() {
@@ -107,6 +109,8 @@ const ConfigView = {
     const newCfgSource = Vue.ref("configs/_ssh/cluster.example.json");
     const newCfgSources = Vue.ref(["configs/_ssh/cluster.example.json"]);
 
+    const dlgOpen = Vue.ref(false);
+    const newSession = Vue.ref(false);   // 新建（未保存）会话标记
     const editPath = Vue.ref("");
     const editContent = Vue.ref("");
     const editSnapshot = Vue.ref("");
@@ -114,6 +118,7 @@ const ConfigView = {
     const saving = Vue.ref(false);
     const dirty = Vue.computed(() =>
       !!editPath.value && editContent.value !== editSnapshot.value);
+    const isNew = Vue.computed(() => newSession.value);
 
     function toNode(treeNode) {
       const children = [
@@ -157,9 +162,27 @@ const ConfigView = {
         editContent.value = r.content;
         editSnapshot.value = r.content;
         editMsg.text = "";
+        newSession.value = false;
+        dlgOpen.value = true;
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
       }
+    }
+
+    // 未保存关闭 -> 丢弃确认（破坏性丢弃未保存内容，确认键 danger）
+    function askClose(done) {
+      const close = () => {
+        editMsg.text = "";
+        dlgOpen.value = false;
+        if (typeof done === "function") done();
+      };
+      if (!dirty.value) { close(); return; }
+      ElementPlus.ElMessageBox.confirm(
+        "有未保存的修改，丢弃并关闭？", "未保存的修改",
+        { confirmButtonText: "丢弃修改", cancelButtonText: "继续编辑",
+          type: "warning" })
+        .then(() => close())
+        .catch(() => { /* 继续编辑 */ });
     }
 
     // 新建配置：拉取复制源内容，以新文件名打开未保存的编辑会话；
@@ -182,8 +205,9 @@ const ConfigView = {
         editContent.value = r.content;
         editSnapshot.value = r.content;
         editMsg.ok = true;
-        editMsg.text = "新文件（基于 " + newCfgSource.value + "，未保存）";
-        ElementPlus.ElMessage.success("已打开新文件编辑会话，编辑后点击「保存」创建");
+        editMsg.text = "新文件（基于 " + newCfgSource.value + "，保存后创建）";
+        newSession.value = true;
+        dlgOpen.value = true;
       } catch (e) {
         ElementPlus.ElMessage.error("读取复制源失败: " + e.message);
       }
@@ -203,9 +227,12 @@ const ConfigView = {
       try {
         const r = await api("PUT", "/api/config",
                             { path: editPath.value, content: editContent.value });
-        editMsg.ok = true;
-        editMsg.text = "已保存" + (r.backup ? "（备份 " + r.backup + "）" : "");
+        ElementPlus.ElMessage.success(
+          "已保存" + (r.backup ? "（备份 " + r.backup + "）" : ""));
+        editMsg.text = "";
         editSnapshot.value = editContent.value;
+        newSession.value = false;
+        dlgOpen.value = false;
         await loadAll();
       } catch (e) {
         editMsg.ok = false; editMsg.text = e.message;
@@ -220,7 +247,7 @@ const ConfigView = {
     Vue.onActivated(loadAll);
 
     return { treeRoots, general, openFile, newCfgName, newCfgSource, newCfgSources,
-             newConfig, editPath, editContent, editMsg, saving, dirty,
-             validate, save, loadAll };
+             newConfig, dlgOpen, editPath, editContent, editMsg, saving, dirty,
+             isNew, askClose, validate, save, loadAll };
   },
 };

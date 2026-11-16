@@ -135,7 +135,7 @@ const PerfView = {
           <el-radio-button value="ssh">真机</el-radio-button>
           <el-radio-button value="k8s">k8s</el-radio-button>
         </el-radio-group>
-        <span class="rb-label" style="margin-left: 20px">启动方式</span>
+        <span class="rb-label rb-group">启动方式</span>
         <el-radio-group v-model="launchMode" size="small">
           <el-radio-button value="single">单任务</el-radio-button>
           <el-radio-button value="rank_recall" :disabled="mode !== 'k8s'">Rank + Recall 并行</el-radio-button>
@@ -148,13 +148,13 @@ const PerfView = {
           <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
                      :label="c.path || c" :value="c.path || c"></el-option>
         </el-select>
-        <span class="rb-label" style="margin-left: 16px">global</span>
+        <span class="rb-label rb-group">global</span>
         <el-select v-model="flags.global" size="small" style="width: 280px" filterable
                    placeholder="选择 global 配置">
           <el-option v-for="g in modeCandidates.global" :key="g.path || g"
                      :label="g.path || g" :value="g.path || g"></el-option>
         </el-select>
-        <span class="rb-label" style="margin-left: 16px">profile</span>
+        <span class="rb-label rb-group">profile</span>
         <el-select v-model="flags.profile" size="small" style="width: 240px"
                    placeholder="选择 profile 配置">
           <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
@@ -170,7 +170,7 @@ const PerfView = {
             <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
                        :label="c.path || c" :value="c.path || c"></el-option>
           </el-select>
-          <span class="rb-label" style="margin-left: 12px">global</span>
+          <span class="rb-label rb-label-inline">global</span>
           <el-select v-model="flags.rankGlobal" size="small" style="width: 300px" filterable
                      placeholder="选择 rank global">
             <el-option v-for="g in modeCandidates.global" :key="g.path || g"
@@ -185,7 +185,7 @@ const PerfView = {
             <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
                        :label="c.path || c" :value="c.path || c"></el-option>
           </el-select>
-          <span class="rb-label" style="margin-left: 12px">global</span>
+          <span class="rb-label rb-label-inline">global</span>
           <el-select v-model="flags.recallGlobal" size="small" style="width: 300px" filterable
                      placeholder="选择 recall global">
             <el-option v-for="g in modeCandidates.global" :key="g.path || g"
@@ -199,10 +199,10 @@ const PerfView = {
             <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
                        :label="m.path || m" :value="m.path || m"></el-option>
           </el-select>
-          <span class="rb-sel-note" style="margin-left: 12px">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
+          <span class="rb-sel-note">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
         </div>
       </template>
-      <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row" style="margin-top: 2px">
+      <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row">
         <span class="rb-label">image</span>
         <span :title="clusterImage" class="rb-image">{{ clusterImage || "-" }}</span>
       </div>
@@ -245,7 +245,7 @@ const PerfView = {
       <div class="rb-row rb-btn-row">
         <el-tooltip :disabled="!runHint" :content="runHint" placement="top">
           <span>
-            <el-button type="primary" size="default" style="width: 130px" :loading="creating"
+            <el-button type="primary" size="default" :loading="creating"
                        :disabled="!!runHint || creating || cleaning"
                        @click="createInstance">创建实例</el-button>
           </span>
@@ -253,7 +253,7 @@ const PerfView = {
         <span class="spacer"></span>
         <el-tooltip :disabled="!cleanupHint" :content="cleanupHint" placement="top">
           <span>
-            <el-button type="danger" plain size="default" style="width: 110px"
+            <el-button type="danger" plain size="default"
                        :loading="cleaning"
                        :disabled="cleaning || creating || schedulerBusy || launchMode === 'rank_recall'"
                        @click="cleanup">清理远端</el-button>
@@ -266,13 +266,13 @@ const PerfView = {
         与 controller workspace；SSH：cluster.json 所有节点的 remote_dir；
         本地 outputs/日志保留，操作不可恢复。
       </div>
-      <el-alert v-if="warnings.length" type="warning" :closable="false" style="margin-top: 8px"
+      <el-alert v-if="warnings.length" type="warning" :closable="false"
                 :title="warnings.join('；')"></el-alert>
     </el-card>
 
-    <el-card shadow="never" style="margin-top: 14px">
+    <el-card shadow="never">
       <template #header>
-        <div class="header-row" style="margin: 0">
+        <div class="mc-toolbar">
           <b>实例（{{ instances.length }}）</b>
           <span class="spacer"></span>
           <el-tooltip content="刷新实例列表" placement="top">
@@ -331,17 +331,17 @@ const PerfView = {
           <div class="inst-actions">
             <el-tooltip :disabled="!instanceRunHint(it)" :content="instanceRunHint(it)" placement="top">
               <span>
-                <el-button size="small" type="primary" plain
+                <el-button size="small" link type="primary"
                            :loading="!!it._running"
                            :disabled="it.status === 'running' || schedulerBusy"
                            @click="runInstance(it)">运行</el-button>
               </span>
             </el-tooltip>
-            <el-button size="small" type="warning" plain v-if="it.status === 'running'"
+            <el-button size="small" link type="warning" v-if="it.status === 'running'"
                        :loading="!!it._stopping"
                        :disabled="!!it._stopping"
                        @click="stopInstance(it)">停止</el-button>
-            <el-button size="small" type="danger" plain
+            <el-button size="small" link type="danger"
                        :disabled="it.status === 'running'"
                        @click="deleteInstance(it)">删除</el-button>
             <span class="spacer"></span>
@@ -353,9 +353,9 @@ const PerfView = {
 
     <!-- 配置选择弹窗 -->
     <el-dialog v-model="cfgDialog" title="选择测试配置" width="560px">
-      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px"
+      <el-alert type="info" :closable="false" show-icon class="mb-2"
                 title="勾选文件或目录（勾选目录 = 递归该目录全部配置）" />
-      <div style="max-height: 400px; overflow-y: auto; border: 1px solid var(--el-border-color-lighter); border-radius: 6px; padding: 8px">
+      <div class="dlg-tree-box">
         <sel-node v-for="root in treeRoots" :key="root.path" :node="root" :depth="0"></sel-node>
       </div>
       <template #footer>
@@ -367,7 +367,7 @@ const PerfView = {
     </el-dialog>
 
     <!-- 历史抽屉 -->
-    <el-drawer v-model="drawerOpen" title="历史 Runs" size="560px" direction="rtl">
+    <el-drawer v-model="drawerOpen" title="历史运行" size="560px" direction="rtl">
       <el-table :data="runs" size="small" highlight-current-row @row-click="onHistoryClick">
         <el-table-column prop="id" label="id" width="180" show-overflow-tooltip></el-table-column>
         <el-table-column label="状态" width="88">
@@ -375,8 +375,8 @@ const PerfView = {
             <el-tag :type="statusType(scope.row.status)" size="small">{{ statusText(scope.row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="rc" label="rc" width="56"></el-table-column>
-        <el-table-column label="耗时" width="72">
+        <el-table-column prop="rc" label="rc" width="56" class-name="mc-num"></el-table-column>
+        <el-table-column label="耗时" width="72" class-name="mc-num">
           <template #default="scope">{{ Math.round(scope.row.elapsed) + "s" }}</template>
         </el-table-column>
         <el-table-column prop="cmd" label="命令" show-overflow-tooltip></el-table-column>

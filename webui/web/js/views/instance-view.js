@@ -41,7 +41,7 @@ const InstanceLogPane = {
         </template>
         <template v-else>{{ ln.text }}</template>
       </div>
-      <div v-if="!lines.length" class="hint" style="padding: 24px; text-align: center">
+      <div v-if="!lines.length" class="hint hint-pad">
         {{ rid ? (loading ? "加载中…" : "（本流暂无日志）") : "该实例尚未运行" }}
       </div>
     </div>
@@ -285,7 +285,7 @@ const InstanceView = {
                      :disabled="detail.instance.status === 'running'" @click="remove">删除</el-button>
           <el-button size="small" @click="rename">改名</el-button>
           <span class="spacer"></span>
-          <el-checkbox v-if="isCombined" v-model="merged" style="margin-right: 12px">
+          <el-checkbox v-if="isCombined" v-model="merged" class="mc-ml-3">
             合并日志
           </el-checkbox>
           <el-button size="small" plain
@@ -296,7 +296,7 @@ const InstanceView = {
         </div>
       </el-card>
 
-      <el-card shadow="never" style="margin-top: 12px" v-if="latestRun">
+      <el-card shadow="never" v-if="latestRun">
         <div v-if="isCombined && !merged" class="ilog-split">
           <instance-log-pane :rid="latestRun.id" stream="rank" title="rank"
                              :live="detail.instance.status === 'running'"
@@ -309,7 +309,7 @@ const InstanceView = {
                            :live="detail.instance.status === 'running'"
                            :ticket="ticket"></instance-log-pane>
       </el-card>
-      <el-card v-else shadow="never" style="margin-top: 12px">
+      <el-card v-else shadow="never">
         <el-empty description="该实例尚未运行" :image-size="72">
           <el-button type="primary" size="small" :disabled="schedulerBusy" @click="run">运行</el-button>
         </el-empty>

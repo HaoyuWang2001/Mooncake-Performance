@@ -236,7 +236,7 @@ const ResPane = {
     </div>
     <div class="pane-body" :class="{ fsbody: fs, auto: pane.auto }" v-loading="pane.loading"
          :style="(fs || pane.auto) ? null : { height: pane.h + 'px' }">
-      <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
+      <div v-if="!pane.file" class="hint hint-pad">选择文件查看</div>
       <template v-else-if="kindOf(pane) === 'img'">
         <div v-if="fs" class="imgfs">
           <div class="imgbar">
@@ -274,7 +274,7 @@ const ResPane = {
           （图表可缩放/悬停查看每个桶的统计量）。
         </div>
         <el-button type="primary" @click="openReport(pane)">在新标签页打开报表</el-button>
-        <div class="mc-muted" style="margin-top: 8px">
+        <div class="mc-muted mt-2">
           也可直接分享该文件：report.html 单文件可用；同目录 data.js 提供全量深查数据。
         </div>
       </div>
@@ -374,10 +374,10 @@ const ResultsView = {
       <el-col :span="6">
         <el-card shadow="never" class="run-list-card">
           <template #header>
-            <div class="header-row" style="margin: 0">
+            <div class="mc-toolbar">
               <b>运行结果（{{ runs.length }}）</b>
               <span class="spacer"></span>
-              <el-button size="small" :type="multiSelect ? 'primary' : ''" @click="toggleMulti">
+              <el-button size="small" plain :type="multiSelect ? 'primary' : ''" @click="toggleMulti">
                 {{ multiSelect ? "退出多选" : "多选" }}
               </el-button>
             </div>
@@ -418,7 +418,7 @@ const ResultsView = {
 
       <el-col :span="18">
         <div v-if="!panes.length" class="pane pane-empty">
-          <div class="hint" style="padding: 40px; text-align: center">
+          <div class="hint hint-pad">
             尚无结果框——点击左侧 run 或「＋ 添加结果框」开始查看
           </div>
         </div>
@@ -427,8 +427,7 @@ const ResultsView = {
                   :pane="p" :idx="i" :runs="runs" :focused="activePane === i"
                   @focus="activePane = i"
                   @close="removePane(i)"
-                  @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"
-                  style="margin-bottom: 14px"></res-pane>
+                  @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"></res-pane>
       </el-col>
     </el-row>
 
@@ -581,9 +580,10 @@ const ResultsView = {
 
     async function _deleteNames(names, label) {
       try {
-        await ElementPlus.ElMessageBox.confirm(
-          "将把" + label + "移入回收站（webui/backups/outputs-trash），确定？",
-          "删除运行结果", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+        await confirmDanger("将把" + label + "移入回收站（webui/backups/outputs-trash）。" +
+                            (names.length > 1 ? "目标：" + names.slice(0, 5).join("、") +
+                             (names.length > 5 ? " 等 " + names.length + " 个" : "") : ""),
+                            "删除运行结果");
       } catch (e) { return; }
       try {
         const r = await api("POST", "/api/outputs/delete", { names: names });

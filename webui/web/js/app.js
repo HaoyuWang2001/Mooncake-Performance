@@ -25,7 +25,7 @@ function loadInitialView() {
     const v = localStorage.getItem("mcweb-view");
     if (VIEW_KEYS.includes(v)) return v;
   } catch (e) { /* ignore */ }
-  return "config";
+  return "perf";
 }
 
 function _loadInstanceTabs() {
@@ -150,7 +150,7 @@ const App = {
     <el-aside width="210px" class="aside">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
-        <span>Mooncake<span>-Performance</span></span>
+        <span class="brand-text">Mooncake<span>Performance</span></span>
       </div>
       <div class="badges">
         <div class="badge-line" :title="runTitle">
@@ -216,12 +216,12 @@ const App = {
     });
     const runText = computed(() => {
       const runs = _activeRuns.value;
-      if (!runs.length) return "运行实例：空闲";
+      if (!runs.length) return "空闲";
       if (runs.length === 1) {
-        return "运行实例：" + (runs[0].stopping ? "停止中" : "运行中")
+        return (runs[0].stopping ? "停止中" : "运行中")
           + "（" + Math.round(runs[0].elapsed) + "s）";
       }
-      return "运行实例：" + runs.length + " 个";
+      return "运行中 " + runs.length + " 个";
     });
     const runTitle = computed(() => {
       const runs = _activeRuns.value;
@@ -238,8 +238,8 @@ const App = {
     });
     const schText = computed(() => {
       const s = store.status.scheduler;
-      if (!s) return "定时任务：关闭";
-      let t = "定时任务：" + schedulerText(s.state);
+      if (!s) return "关闭";
+      let t = schedulerText(s.state);
       if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state))
         t += "（" + s.next_trigger.slice(-8) + "）";
       return t;
