@@ -4453,7 +4453,7 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "notify_read_format": "both",
         "start_paused": True,
         "data_sizes": [ds_label],
-        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 3000) or 3000),
+        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 0) or 0),
         "output_dir": entry["_out_dir"],
         "cpu_affinity": entry.get("_cpu_affinity", ""),
         "verify_level": kv.get("verify_level", "size"),
@@ -5364,7 +5364,7 @@ def build_kvtest_basic_instance_config(cfg, globals_cfg, metadata_server,
         "warmup_duration": warmup,
         "start_paused": True,
         "samples_max": int(kv.get("samples_max", 0) or 0),
-        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 3000) or 3000),
+        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 0) or 0),
         "output_dir": entry["_out_dir"],
         "cpu_affinity": kv.get("cpu_affinity", ""),
         "verify_level": kv.get("verify_level", "size"),
@@ -5793,6 +5793,7 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         def aggregate(op_name):
             total = ok = fail = bytes_ = 0
             wall = 0.0
+            busy_ms = 0.0
             weighted = {k: 0.0 for k in lat_keys}
             mins = []
             maxs = []
@@ -5802,6 +5803,7 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 ok += int(st.get("success", 0) or 0)
                 fail += int(st.get("failure", 0) or 0)
                 bytes_ += int(st.get("bytes", 0) or 0)
+                busy_ms += float(st.get("busy_ms", 0) or 0)
                 wall = max(wall, float(summary.get("elapsed_seconds", 0) or 0))
                 weight = int(st.get("success", 0) or 0)
                 for key in lat_keys:
@@ -5810,6 +5812,11 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                     mins.append(float(st.get("min_ms", 0) or 0))
                 if st.get("max_ms") is not None:
                     maxs.append(float(st.get("max_ms", 0) or 0))
+            busy_s = busy_ms / 1000.0
+            throughput_mb = (bytes_ / busy_s / 1024.0 ** 2
+                             if busy_s > 0
+                             else (bytes_ / wall / 1024.0 ** 2
+                                   if wall > 0 else 0.0))
             row = {
                 "scenario": cfg.get("scenario", "kvtest_basic"),
                 "work_mode": cfg.get("work_mode", "basic"),
@@ -5829,10 +5836,8 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "total": total,
                 "total_bytes": bytes_,
                 "wall_s": round(wall, 4),
-                "throughput_mb_s": (bytes_ / wall / 1024.0 ** 2
-                                    if wall > 0 else 0.0),
-                "throughput_gb_s": (bytes_ / wall / 1024.0 ** 3
-                                    if wall > 0 else 0.0),
+                "throughput_mb_s": throughput_mb,
+                "throughput_gb_s": throughput_mb / 1024.0,
                 "ok": ok,
                 "fail": fail,
                 "qps": (total / wall) if wall > 0 else 0.0,
@@ -6478,8 +6483,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["total_bytes"] = int(st.get("bytes", 0) or 0)
             row["wall_s"] = wall
             row["qps"] = (total / wall) if wall > 0 else 0.0
-            row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
-                                      if wall > 0 else 0.0)
+            busy_throughput = float(st.get("throughput_mb_s", 0) or 0)
+            row["throughput_mb_s"] = (busy_throughput
+                                      if busy_throughput > 0
+                                      else (row["total_bytes"] / wall / 1024.0 ** 2
+                                            if wall > 0 else 0.0))
             row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
             for k in lat_keys:
                 row[k] = round(float(st.get(k, 0) or 0), 4)
