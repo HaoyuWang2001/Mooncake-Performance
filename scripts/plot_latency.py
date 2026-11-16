@@ -181,7 +181,7 @@ def _fmt_hms(seconds, base):
 
 
 def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
-                ylabel="Latency (ms)"):
+                ylabel="Latency (ms)", time_axis="wall"):
     """Dot-line plot with stat hlines, absolute reference lines and outliers.
 
     times: wall-clock seconds per sample (None -> request#i axis). When
@@ -193,9 +193,12 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
         times = None
     n = len(vals)
     fig, ax = plt.subplots(figsize=(12, 6))
-    if times:
+    if times and time_axis == "wall":
         t0 = times[0]
         xs = [t - t0 for t in times]  # 相对秒（底部刻度再渲染回绝对 HH:MM:SS）
+    elif times:
+        t0 = 0.0
+        xs = list(times)  # kvtest: already seconds elapsed since /start
     else:
         t0 = None
         xs = list(range(n))
@@ -220,14 +223,16 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                 "p9999": percentile(stat_vals, 0.9999)}
     for name, color in STAT_HLINES_ALWAYS:
         v = computed[name]
-        ax.axhline(v, linestyle="--", linewidth=1.2, color=color)
+        ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
+                   label=f"{name}={v:.4f}ms")
         ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
                     ha="right", va="bottom", fontsize=9, color=color)
     for name, color, min_n in STAT_HLINES_GATED:
         if n < min_n:
             continue  # 样本量不达标：分位数无意义，不加线
         v = computed[name]
-        ax.axhline(v, linestyle="--", linewidth=1.2, color=color)
+        ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
+                   label=f"{name}={v:.4f}ms")
         ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
                     ha="right", va="bottom", fontsize=9, color=color)
     for v, label in REF_LINES:
@@ -238,7 +243,7 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend(loc="upper left", fontsize=9)
-    if times:
+    if times and time_axis == "wall":
         ax.set_xlabel("time (HH:MM:SS)")
         ax.xaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, _: _fmt_hms(x, t0)))
@@ -250,15 +255,28 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                 lambda i, _xt=np.array(xs), _xi=np.arange(len(vals)):
                 np.interp(i, _xi, _xt)))
         sec.set_xlabel("request #i")
+    elif times:
+        ax.set_xlabel("elapsed time (s)")
+        sec = ax.secondary_xaxis(
+            "top", functions=(
+                lambda t, _xt=np.array(xs), _xi=np.arange(len(vals)):
+                np.interp(t, _xt, _xi),
+                lambda i, _xt=np.array(xs), _xi=np.arange(len(vals)):
+                np.interp(i, _xi, _xt)))
+        sec.set_xlabel("request #i")
     else:
         ax.set_xlabel("request #i")
-    ax.set_xlim(min(xs) if times else 0, max(xs))
+    if len(xs) == 1:
+        ax.set_xlim(xs[0] - 0.5, xs[0] + 0.5)
+    else:
+        ax.set_xlim(min(xs) if times else 0, max(xs))
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
 
 
-def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note):
+def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note,
+                time_axis="wall"):
     """Write the latency/queue-wait figure(s): full view always; trimmed view
     additionally when outliers exist (stats recomputed on trimmed data)."""
     suffix = "latency" if kind == "latency" else "queuewait"
@@ -268,14 +286,18 @@ def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note):
     has_out = len(trimmed) != len(vals)
     png = os.path.join(out_dir, f"{file_stem}.{suffix}.png")
     plot_series(vals, times, base_title, png, outlier_ms, include_outliers=True,
-                ylabel=ylabel)
+                ylabel=ylabel, time_axis=time_axis)
+    outputs = [png]
     print(f"  -> {png}")
     if has_out:
         png = os.path.join(out_dir, f"{file_stem}.{suffix}.trimmed.png")
         plot_series(trimmed, _trim_times(times, vals, outlier_ms),
                     f"{stem}  ({note}, outliers removed)", png, outlier_ms,
-                    include_outliers=False, ylabel=ylabel)
+                    include_outliers=False, ylabel=ylabel,
+                    time_axis=time_axis)
         print(f"  -> {png}  (trimmed, {len(vals) - len(trimmed)} outliers excluded)")
+        outputs.append(png)
+    return outputs
 
 
 def _trim_times(times, vals, threshold):
@@ -346,108 +368,6 @@ def parse_kvtest_samples(path):
     return groups
 
 
-def plot_kvtest_samples(path, operation, points, args):
-    """Plot kvtest raw samples with exactly one marker per operation call."""
-    is_queue_wait = _kvtest_is_queue_wait(operation)
-    if args.type == "latency" and is_queue_wait:
-        return None
-    if args.type == "queue-wait" and not is_queue_wait:
-        return None
-
-    out_dir = args.out or os.path.dirname(os.path.abspath(path))
-    os.makedirs(out_dir, exist_ok=True)
-    name = os.path.basename(path)
-    stem = name[:-len(KVTEST_SAMPLES_SUFFIX)] \
-        if name.endswith(KVTEST_SAMPLES_SUFFIX) else os.path.splitext(name)[0]
-    suffix = "queuewait" if is_queue_wait else "latency"
-    out_png = os.path.join(out_dir, "{}.{}.{}.png".format(
-        stem, _safe_plot_component(operation), suffix))
-
-    xs = [p["elapsed_us"] / 1_000_000.0 for p in points]
-    successful = [p for p in points if p["status"] == "OK"]
-    values = [p["latency_ms"] for p in successful]
-    threshold = args.outlier
-    if threshold is None and values:
-        threshold = max(round(percentile(sorted(values), 0.99) * 10), 1)
-    threshold = float("inf") if threshold is None else threshold
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    latencies = [p["latency_ms"] for p in points]
-    # Draw the complete request sequence as a point-line series. Failures and
-    # outliers are overlaid below so they stay visible without breaking the
-    # chronological connecting line.
-    ax.plot(xs, latencies, linewidth=0.45, marker=".", markersize=2,
-            color="tab:gray", alpha=0.8,
-            label="requests ({})".format(len(points)))
-    outlier_x, outlier_y, failed_x, failed_y = [], [], [], []
-    for x, point in zip(xs, points):
-        latency = point["latency_ms"]
-        if point["status"] != "OK":
-            failed_x.append(x)
-            failed_y.append(latency)
-        elif latency > threshold:
-            outlier_x.append(x)
-            outlier_y.append(latency)
-    if outlier_x:
-        ax.scatter(outlier_x, outlier_y, s=25, marker="x", color="tab:orange",
-                   zorder=5,
-                   label="OK outliers ({}, >{:g}ms)".format(
-                       len(outlier_x), threshold))
-    if failed_x:
-        ax.scatter(failed_x, failed_y, s=28, marker="x", color="red",
-                   zorder=6,
-                   label="failed requests ({})".format(len(failed_x)))
-
-    if values:
-        sorted_values = sorted(values)
-        computed = {
-            "avg": sum(values) / len(values),
-            "max": sorted_values[-1],
-            "p99": percentile(sorted_values, 0.99),
-            "p999": percentile(sorted_values, 0.999),
-            "p9999": percentile(sorted_values, 0.9999),
-        }
-        for stat, color in STAT_HLINES_ALWAYS:
-            value = computed[stat]
-            ax.axhline(value, linestyle="--", linewidth=1.1, color=color)
-            ax.annotate("{}={:.4f}".format(stat, value),
-                        xy=(0.998, value), xycoords=("axes fraction", "data"),
-                        ha="right", va="bottom", fontsize=8, color=color)
-        for stat, color, minimum in STAT_HLINES_GATED:
-            if len(values) < minimum:
-                continue
-            value = computed[stat]
-            ax.axhline(value, linestyle="--", linewidth=1.0, color=color)
-            ax.annotate("{}={:.4f}".format(stat, value),
-                        xy=(0.998, value), xycoords=("axes fraction", "data"),
-                        ha="right", va="bottom", fontsize=8, color=color)
-
-    ylabel = "Queue wait (ms)" if is_queue_wait else "Latency (ms)"
-    ax.set_xlabel("elapsed time (s)")
-    ax.set_ylabel(ylabel)
-    ax.set_title("{} — {}  (one point per request, OK={}, failed={})".format(
-        stem, operation, len(successful), len(points) - len(successful)))
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="upper left", fontsize=8)
-    if len(xs) > 1 and xs[-1] > xs[0]:
-        indexes = np.arange(len(xs))
-        top = ax.secondary_xaxis(
-            "top", functions=(
-                lambda t, _xt=np.array(xs), _xi=indexes:
-                np.interp(t, _xt, _xi),
-                lambda i, _xt=np.array(xs), _xi=indexes:
-                np.interp(i, _xi, _xt)))
-        top.set_xlabel("request #i")
-    if len(xs) == 1:
-        ax.set_xlim(xs[0] - 0.5, xs[0] + 0.5)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
-    print("[{}] {} requests: {} -> {}".format(
-        name, operation, len(points), out_png))
-    return out_png
-
-
 def process_kvtest_samples(path, args):
     groups = parse_kvtest_samples(path)
     if not groups:
@@ -455,10 +375,37 @@ def process_kvtest_samples(path, args):
             os.path.basename(path)))
         return []
     outputs = []
+    name = os.path.basename(path)
+    base = name[:-len(KVTEST_SAMPLES_SUFFIX)] \
+        if name.endswith(KVTEST_SAMPLES_SUFFIX) else os.path.splitext(name)[0]
+    out_dir = args.out or os.path.dirname(os.path.abspath(path))
+    os.makedirs(out_dir, exist_ok=True)
     for operation in sorted(groups):
-        output = plot_kvtest_samples(path, operation, groups[operation], args)
-        if output:
-            outputs.append(output)
+        is_queue_wait = _kvtest_is_queue_wait(operation)
+        if args.type == "latency" and is_queue_wait:
+            continue
+        if args.type == "queue-wait" and not is_queue_wait:
+            continue
+        points = groups[operation]
+        successful = [p for p in points if p["status"] == "OK"]
+        vals = [p["latency_ms"] for p in successful]
+        times = [p["elapsed_us"] / 1_000_000.0 for p in successful]
+        failed = len(points) - len(successful)
+        if not vals:
+            print("[{}] {} skip (no OK request samples)".format(
+                name, operation))
+            continue
+        threshold = args.outlier or max(
+            round(percentile(sorted(vals), 0.99) * 10), 1)
+        print("[{}] {}: OK={}, failed={}, outlier threshold={}ms".format(
+            name, operation, len(vals), failed, threshold))
+        kind = "queue-wait" if is_queue_wait else "latency"
+        file_stem = "{}.{}".format(base, _safe_plot_component(operation))
+        title = "{} — {}".format(base, operation)
+        outputs.extend(_emit_plots(
+            title, file_stem, kind, vals, times, out_dir, threshold,
+            "{} OK samples  ERR:{}".format(len(vals), failed),
+            time_axis="elapsed"))
     return outputs
 
 

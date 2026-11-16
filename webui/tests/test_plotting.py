@@ -98,7 +98,9 @@ def test_plot_file_stem_avoids_regression_windows_max_path():
 
 def test_kvtest_samples_generate_one_request_per_point_png(tmp_path):
     pl = _load_plot_module()
-    assert "ax.plot(xs, latencies" in _read("scripts/plot_latency.py")
+    src = _read("scripts/plot_latency.py")
+    assert "outputs.extend(_emit_plots(" in src
+    assert 'time_axis="elapsed"' in src
     path = tmp_path / "kvtest_smoke.node_i0_p9101.kvtest_8MB.samples.csv"
     path.write_text(
         "elapsed_us,instance_id,operation,request_index,latency_ms,status,bytes\n"
@@ -125,3 +127,22 @@ def test_kvtest_samples_generate_one_request_per_point_png(tmp_path):
     inputs = pl.collect_inputs(str(tmp_path))
     assert str(path) in inputs
     assert str(window) not in inputs
+
+
+def test_plot_series_exposes_percentiles_in_legend(tmp_path, monkeypatch):
+    pl = _load_plot_module()
+    original_close = pl.plt.close
+    monkeypatch.setattr(pl.plt, "close", lambda fig: None)
+    try:
+        # 10,000 samples make p99/p999/p9999 statistically eligible under
+        # the same gating rules used by the Python RESULT plots.
+        values = [0.1 + (i % 100) / 1000.0 for i in range(10000)]
+        output = tmp_path / "percentiles.png"
+        pl.plot_series(values, None, "stats", str(output), 10,
+                       include_outliers=True)
+        labels = [line.get_label() for line in pl.plt.gcf().axes[0].lines]
+        assert any(label.startswith("p99=") for label in labels)
+        assert any(label.startswith("p999=") for label in labels)
+        assert any(label.startswith("p9999=") for label in labels)
+    finally:
+        original_close("all")
