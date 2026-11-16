@@ -34,8 +34,17 @@ host_header_written=0
 while true; do
   ts=$(date +%s)
 
-  # ---- whole-node memory: per-NUMA MemUsed (numastat -m) + MemAvailable ----
+  # ---- whole-node memory: per-NUMA MemUsed + MemAvailable ----
+  # 优先 numastat -m；缺失（如精简镜像）时回退内核接口 /sys 节点 meminfo，
+  # 保证任何节点都能采整机内存（MemTotal-MemFree）。列名保持一致 nX_used_mb。
   nums=$(numastat -m 2>>"$ERR_LOG" | awk '/^MemUsed/ {for (i = 2; i <= NF; i++) printf "%s ", $i}')
+  if [ -z "$nums" ]; then
+    nums=$(for _f in /sys/devices/system/node/node*/meminfo; do
+      [ -r "$_f" ] || continue
+      awk '/MemTotal:/ {tot = $4} /MemFree:/ {fr = $4}
+           END {if (tot != "") printf "%.1f ", (tot - fr) / 1024}' "$_f"
+    done)
+  fi
   if [ -n "$nums" ]; then
     if [ "$host_header_written" -eq 0 ]; then
       hdr="ts"

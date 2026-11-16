@@ -48,9 +48,10 @@ TOOL_DEFAULTS = {
                 "interval_s": 10},
     "offcputime": {"enabled": False, "bin": "bpftrace", "sudo": True,
                    "min_block_us": 1000},
-    # node/process memory sampler (leak observation); on by default — numastat
-    # is ubiquitous, needs no sudo, and the overhead is tiny
-    "mem": {"enabled": True, "bin": "numastat", "sudo": False,
+    # node/process memory sampler (leak observation); on by default. The
+    # script prefers `numastat -m` but falls back to /sys node meminfo, so the
+    # presence probe is bash (a minimal image without numactl still works).
+    "mem": {"enabled": True, "bin": "bash", "sudo": False,
             "interval_s": 1, "proc_pattern": "mooncake_benchmark_client",
             "leak_growth_pct": 30, "leak_min_mb": 200},
     # UBPU port traffic via mdcli; opt-in (only specific nodes ship mdcli —

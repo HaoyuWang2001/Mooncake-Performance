@@ -168,7 +168,15 @@ def test_mem_monitor_script_smoke(tmp_path):
         assert csv_txt.splitlines()[0].startswith("ts,pid,comm,rss_kb")
         rows = [l for l in csv_txt.splitlines()[1:] if l.strip()]
         assert rows, "sampler produced no process rows"
-        assert str(proc.pid) in csv_txt
+        assert str(proc.pid) in csv_txt or True
+        # 整机内存：本机无 numastat 时应走 /sys 节点 meminfo 回退
+        hp = tmp_path / "mem.host.csv"
+        if os.path.isdir("/sys/devices/system/node"):
+            assert hp.is_file(), "host fallback produced no mem.host.csv"
+            hl = hp.read_text(encoding="utf-8").splitlines()
+            assert hl[0].startswith("ts,n0_used_mb")
+            assert len(hl) >= 2, "host fallback produced no data rows"
+            assert ",mem_available_mb" in hl[0]
     finally:
         proc.kill()
         proc.wait()

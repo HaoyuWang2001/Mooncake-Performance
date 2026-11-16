@@ -25,7 +25,7 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 | `perf` | on-CPU 任意函数火焰图（系统级 `-a`） | `sudo -n perf record -F 99 -a -g --call-graph fp -o perf.data`，SIGINT 后轮询落盘再收集；stderr 存 `perf.data.err` 一并收集 | sudo（可关） |
 | `runqlat` | 调度延迟直方图（bt/runqlat.bt，周期输出带时间戳） | `sudo -n env INTERVAL=10 bpftrace runqlat.bt`（.bt 启动时推送到远端 profiling 目录） | sudo（可关） |
 | `offcputime` | off-CPU/持锁等待（bt/offcputime.bt，大事件明细带时间戳） | `sudo -n env MIN_BLOCK_US=1000 bpftrace offcputime.bt`（同上） | sudo（可关） |
-| `mem` | 整机内存（numastat 各 NUMA MemUsed + MemAvailable）与进程内存（`/proc/<pid>/smaps_rollup` 的 Rss/Pss/Private/Swap），用于泄露观测。**默认开启** | `env INTERVAL_S=1 PROC_PATTERN=mooncake_benchmark_client bash mem_monitor.sh`，追加写 CSV | 无（仅 client 进程） |
+| `mem` | 整机内存（`numastat -m` 各 NUMA MemUsed；缺失时回退内核 `/sys/devices/system/node/node*/meminfo`）+ MemAvailable，以及进程内存（`/proc/<pid>/smaps_rollup` 的 Rss/Pss/Private/Swap），用于泄露观测。**默认开启** | `env INTERVAL_S=1 PROC_PATTERN=mooncake_benchmark_client bash mem_monitor.sh`，追加写 CSV | 无（仅 client 进程；无需 numactl） |
 | `urma` | UBPU 端口流量：mdcli 读取 flit 计数器，报表端差分计算带宽 | `env INTERVAL_S=1 SLOT=2 UBPUS="0 1" bash urma_monitor.sh`，追加写 CSV | 无（仅装有 mdcli 的节点启动） |
 
 工具在节点上不可用（探测失败）→ `[WARN]` 跳过该工具，其余照常。**逐工具故障隔离**：任一
