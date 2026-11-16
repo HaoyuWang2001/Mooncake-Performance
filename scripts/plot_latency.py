@@ -11,15 +11,13 @@ RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟�
 存在离群值时每个统计量出两幅图：原名图（包含离群值，红 x 标注）+ .trimmed.png
 （剔除离群值，分位线按剔除后数据重算）。
 
-kvtest C++ 客户端没有逐请求 RESULT 行，而是输出
-``*.kvtest_*.timeseries.csv``。脚本会按 operation 分组，绘制窗口级
-avg/p50/p90/p99/max 时延和 success/failure ops/s；notify_queue_wait 使用
-``.queuewait.png`` 后缀，其余操作使用 ``.latency.png``。
+kvtest C++ 客户端把逐请求样本批量落到 ``*.kvtest_*.samples.csv``，脚本按
+operation 绘制一请求一点的 ``.latency.png`` / ``.queuewait.png``。
 
 用法：
   python plot_latency.py --log <日志文件|目录> [--out DIR] [--outlier MS] [--type both]
-    --log      单个日志/kvtest timeseries 文件，或目录（递归扫描 *.log 与
-               *.timeseries.csv，逐文件出图）
+    --log      单个日志/kvtest CSV，或目录（递归扫描 *.log 与
+               *.samples.csv，逐文件出图）
     --out      输出目录，缺省 = 日志所在目录（即 outputs/<ts>/logs/<配置名>/）
     --outlier  离群阈值 ms；缺省自动 = p99 × 10 取整（p99 不会被尾部离群值自身抬高）
     --type     both（缺省）| latency | queue-wait
@@ -71,16 +69,7 @@ _PIPELINE_POD_STEM_PATTERNS = (
     # split writer: ...writer_<pod>_w0
     re.compile(r"^(?P<prefix>.*\.writer)_.+(?P<suffix>_w\d+)$"),
 )
-KVTEST_TIMESERIES_SUFFIX = ".timeseries.csv"
-KVTEST_PERCENTILES = (
-    ("avg_ms", "avg", 1, "tab:blue", "-"),
-    ("p50_ms", "p50", 1, "tab:cyan", "-"),
-    ("p90_ms", "p90", 10, "tab:orange", "-"),
-    ("p99_ms", "p99", 100, "tab:red", "-"),
-    ("p999_ms", "p999", 1000, "tab:green", "--"),
-    ("p9999_ms", "p9999", 10000, "tab:purple", "--"),
-    ("max_ms", "max", 1, "black", ":"),
-)
+KVTEST_SAMPLES_SUFFIX = ".samples.csv"
 
 
 def percentile(sorted_vals, q):
@@ -328,18 +317,13 @@ def process_file(path, args):
                     f"{len(qws)} samples")
 
 
-def parse_kvtest_timeseries(path):
-    """Return ``{operation: [window, ...]}`` from a kvtest timeseries CSV.
-
-    Corrupt/incomplete rows are skipped so a partially copied tail cannot
-    prevent plots for earlier complete windows.
-    """
+def parse_kvtest_samples(path):
+    """Return one row per kvtest operation call, grouped by operation."""
     groups = {}
     with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
         reader = csv.DictReader(f)
-        required = {"elapsed_ms", "operation", "count", "success", "failure",
-                    "bytes", "avg_ms", "p50_ms", "p90_ms", "p99_ms",
-                    "p999_ms", "p9999_ms", "max_ms"}
+        required = {"elapsed_us", "instance_id", "operation", "request_index",
+                    "latency_ms", "status", "bytes"}
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             return groups
         for row in reader:
@@ -348,20 +332,132 @@ def parse_kvtest_timeseries(path):
                 continue
             try:
                 point = {
-                    "elapsed_ms": float(row["elapsed_ms"]),
-                    "count": int(row["count"]),
-                    "success": int(row["success"]),
-                    "failure": int(row["failure"]),
+                    "elapsed_us": int(row["elapsed_us"]),
+                    "request_index": int(row["request_index"]),
+                    "latency_ms": float(row["latency_ms"]),
+                    "status": (row["status"] or "").strip(),
                     "bytes": int(row["bytes"]),
                 }
-                for field, _label, _minimum, _color, _style in KVTEST_PERCENTILES:
-                    point[field] = float(row[field])
             except (KeyError, TypeError, ValueError):
                 continue
             groups.setdefault(operation, []).append(point)
     for points in groups.values():
-        points.sort(key=lambda p: p["elapsed_ms"])
+        points.sort(key=lambda p: (p["elapsed_us"], p["request_index"]))
     return groups
+
+
+def plot_kvtest_samples(path, operation, points, args):
+    """Plot kvtest raw samples with exactly one marker per operation call."""
+    is_queue_wait = _kvtest_is_queue_wait(operation)
+    if args.type == "latency" and is_queue_wait:
+        return None
+    if args.type == "queue-wait" and not is_queue_wait:
+        return None
+
+    out_dir = args.out or os.path.dirname(os.path.abspath(path))
+    os.makedirs(out_dir, exist_ok=True)
+    name = os.path.basename(path)
+    stem = name[:-len(KVTEST_SAMPLES_SUFFIX)] \
+        if name.endswith(KVTEST_SAMPLES_SUFFIX) else os.path.splitext(name)[0]
+    suffix = "queuewait" if is_queue_wait else "latency"
+    out_png = os.path.join(out_dir, "{}.{}.{}.png".format(
+        stem, _safe_plot_component(operation), suffix))
+
+    xs = [p["elapsed_us"] / 1_000_000.0 for p in points]
+    successful = [p for p in points if p["status"] == "OK"]
+    values = [p["latency_ms"] for p in successful]
+    threshold = args.outlier
+    if threshold is None and values:
+        threshold = max(round(percentile(sorted(values), 0.99) * 10), 1)
+    threshold = float("inf") if threshold is None else threshold
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    normal_x, normal_y, outlier_x, outlier_y, failed_x, failed_y = \
+        [], [], [], [], [], []
+    for x, point in zip(xs, points):
+        latency = point["latency_ms"]
+        if point["status"] != "OK":
+            failed_x.append(x)
+            failed_y.append(latency)
+        elif latency > threshold:
+            outlier_x.append(x)
+            outlier_y.append(latency)
+        else:
+            normal_x.append(x)
+            normal_y.append(latency)
+    if normal_x:
+        ax.scatter(normal_x, normal_y, s=7, marker=".", color="tab:gray",
+                   label="OK requests ({})".format(len(normal_x)))
+    if outlier_x:
+        ax.scatter(outlier_x, outlier_y, s=25, marker="x", color="tab:orange",
+                   label="OK outliers ({}, >{:g}ms)".format(
+                       len(outlier_x), threshold))
+    if failed_x:
+        ax.scatter(failed_x, failed_y, s=28, marker="x", color="red",
+                   label="failed requests ({})".format(len(failed_x)))
+
+    if values:
+        sorted_values = sorted(values)
+        computed = {
+            "avg": sum(values) / len(values),
+            "max": sorted_values[-1],
+            "p99": percentile(sorted_values, 0.99),
+            "p999": percentile(sorted_values, 0.999),
+            "p9999": percentile(sorted_values, 0.9999),
+        }
+        for stat, color in STAT_HLINES_ALWAYS:
+            value = computed[stat]
+            ax.axhline(value, linestyle="--", linewidth=1.1, color=color)
+            ax.annotate("{}={:.4f}".format(stat, value),
+                        xy=(0.998, value), xycoords=("axes fraction", "data"),
+                        ha="right", va="bottom", fontsize=8, color=color)
+        for stat, color, minimum in STAT_HLINES_GATED:
+            if len(values) < minimum:
+                continue
+            value = computed[stat]
+            ax.axhline(value, linestyle="--", linewidth=1.0, color=color)
+            ax.annotate("{}={:.4f}".format(stat, value),
+                        xy=(0.998, value), xycoords=("axes fraction", "data"),
+                        ha="right", va="bottom", fontsize=8, color=color)
+
+    ylabel = "Queue wait (ms)" if is_queue_wait else "Latency (ms)"
+    ax.set_xlabel("elapsed time (s)")
+    ax.set_ylabel(ylabel)
+    ax.set_title("{} — {}  (one point per request, OK={}, failed={})".format(
+        stem, operation, len(successful), len(points) - len(successful)))
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper left", fontsize=8)
+    if len(xs) > 1 and xs[-1] > xs[0]:
+        indexes = np.arange(len(xs))
+        top = ax.secondary_xaxis(
+            "top", functions=(
+                lambda t, _xt=np.array(xs), _xi=indexes:
+                np.interp(t, _xt, _xi),
+                lambda i, _xt=np.array(xs), _xi=indexes:
+                np.interp(i, _xi, _xt)))
+        top.set_xlabel("request #i")
+    if len(xs) == 1:
+        ax.set_xlim(xs[0] - 0.5, xs[0] + 0.5)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print("[{}] {} requests: {} -> {}".format(
+        name, operation, len(points), out_png))
+    return out_png
+
+
+def process_kvtest_samples(path, args):
+    groups = parse_kvtest_samples(path)
+    if not groups:
+        print("[{}] skip (no valid kvtest request samples)".format(
+            os.path.basename(path)))
+        return []
+    outputs = []
+    for operation in sorted(groups):
+        output = plot_kvtest_samples(path, operation, groups[operation], args)
+        if output:
+            outputs.append(output)
+    return outputs
 
 
 def _safe_plot_component(value):
@@ -372,111 +468,23 @@ def _kvtest_is_queue_wait(operation):
     return operation == "notify_queue_wait" or operation.endswith("queue_wait")
 
 
-def plot_kvtest_operation(path, operation, points, args):
-    """Plot one kvtest operation's window percentiles and operation rate."""
-    is_queue_wait = _kvtest_is_queue_wait(operation)
-    if args.type == "latency" and is_queue_wait:
-        return None
-    if args.type == "queue-wait" and not is_queue_wait:
-        return None
-
-    out_dir = args.out or os.path.dirname(os.path.abspath(path))
-    os.makedirs(out_dir, exist_ok=True)
-    name = os.path.basename(path)
-    stem = name[:-len(KVTEST_TIMESERIES_SUFFIX)] \
-        if name.endswith(KVTEST_TIMESERIES_SUFFIX) else os.path.splitext(name)[0]
-    suffix = "queuewait" if is_queue_wait else "latency"
-    out_png = os.path.join(
-        out_dir, "{}.{}.{}.png".format(
-            stem, _safe_plot_component(operation), suffix))
-
-    xs = [p["elapsed_ms"] / 1000.0 for p in points]
-    fig, (lat_ax, rate_ax) = plt.subplots(
-        2, 1, figsize=(12, 8), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]})
-    plotted = []
-    for field, label, minimum, color, style in KVTEST_PERCENTILES:
-        values = [p[field] if p["count"] >= minimum else None for p in points]
-        if not any(v is not None for v in values):
-            continue
-        lat_ax.plot(xs, values, label=label, color=color, linestyle=style,
-                    linewidth=1.3, marker="." if label in ("avg", "p99") else None,
-                    markersize=3)
-        plotted.extend(v for v in values if v is not None)
-    ylabel = "Queue wait (ms)" if is_queue_wait else "Latency (ms)"
-    lat_ax.set_ylabel(ylabel)
-    lat_ax.grid(True, alpha=0.25)
-    lat_ax.legend(loc="upper left", ncol=4, fontsize=8)
-    if plotted:
-        for value, label in REF_LINES:
-            if max(plotted) >= value:
-                lat_ax.axhline(value, linestyle="-.", linewidth=0.8,
-                               color="gray", alpha=0.65)
-                lat_ax.annotate(label, xy=(0.003, value),
-                                xycoords=("axes fraction", "data"),
-                                ha="left", va="bottom", fontsize=8,
-                                color="gray")
-
-    success_rates, failure_rates = [], []
-    previous_ms = 0.0
-    for point in points:
-        interval_s = max((point["elapsed_ms"] - previous_ms) / 1000.0, 1e-9)
-        success_rates.append(point["success"] / interval_s)
-        failure_rates.append(point["failure"] / interval_s)
-        previous_ms = point["elapsed_ms"]
-    rate_ax.plot(xs, success_rates, label="success ops/s", color="tab:green",
-                 linewidth=1.2, marker=".", markersize=3)
-    if any(failure_rates):
-        rate_ax.plot(xs, failure_rates, label="failure ops/s", color="tab:red",
-                     linewidth=1.2, marker="x", markersize=4)
-    rate_ax.set_xlabel("elapsed time (s)")
-    rate_ax.set_ylabel("ops/s")
-    rate_ax.grid(True, alpha=0.25)
-    rate_ax.legend(loc="upper left", fontsize=8)
-
-    total_success = sum(p["success"] for p in points)
-    total_failure = sum(p["failure"] for p in points)
-    fig.suptitle("{} — {}  (success={}, failure={})".format(
-        stem, operation, total_success, total_failure))
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
-    print("[{}] {} windows: {} -> {}".format(
-        name, operation, len(points), out_png))
-    return out_png
-
-
-def process_kvtest_timeseries(path, args):
-    groups = parse_kvtest_timeseries(path)
-    if not groups:
-        print("[{}] skip (no valid kvtest timeseries rows)".format(
-            os.path.basename(path)))
-        return []
-    outputs = []
-    for operation in sorted(groups):
-        output = plot_kvtest_operation(path, operation, groups[operation], args)
-        if output:
-            outputs.append(output)
-    return outputs
-
-
 def collect_inputs(path):
     if os.path.isfile(path):
         return [path]
     found = []
     for root, _dirs, files in os.walk(path):
         for f in sorted(files):
-            if f.endswith(".log") or f.endswith(KVTEST_TIMESERIES_SUFFIX):
+            if f.endswith(".log") or f.endswith(KVTEST_SAMPLES_SUFFIX):
                 found.append(os.path.join(root, f))
     return found
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Plot latency stats from RESULT logs or kvtest timeseries CSV")
+        description="Plot latency stats from RESULT logs or kvtest samples CSV")
     parser.add_argument("--log", required=True,
                         help="file or directory (recursive *.log and "
-                             "*.timeseries.csv scan)")
+                             "*.samples.csv scan)")
     parser.add_argument("--out", default=None,
                         help="output dir; default = each log's own directory")
     parser.add_argument("--outlier", type=float, default=None,
@@ -488,10 +496,10 @@ def main(argv=None):
         sys.exit(f"[ERROR] log path not found: {args.log}")
     inputs = collect_inputs(args.log)
     if not inputs:
-        sys.exit(f"[ERROR] no *.log or *.timeseries.csv under {args.log}")
+        sys.exit(f"[ERROR] no *.log or *.samples.csv under {args.log}")
     for path in inputs:
-        if path.endswith(KVTEST_TIMESERIES_SUFFIX):
-            process_kvtest_timeseries(path, args)
+        if path.endswith(KVTEST_SAMPLES_SUFFIX):
+            process_kvtest_samples(path, args)
         else:
             process_file(path, args)
     print("done")

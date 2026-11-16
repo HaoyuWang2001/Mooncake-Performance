@@ -229,6 +229,24 @@ def test_kvtest_runner_replaces_both_runtime_placeholders():
     assert "s/__UB_DEVICE__/${device_escaped}/g" in runner
 
 
+def test_kvtest_artifact_flatten_includes_request_samples(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        bm, "get_node", lambda cluster, name: {"ip": "10.0.0.1"})
+
+    def fake_ssh(ip, node, command, quiet=False):
+        commands.append(command)
+        return "summary=OK timeseries=OK samples=OK"
+
+    monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
+    entry = {"node": "n1", "_base": "case.i0", "_out_dir": "/out/i0"}
+    ok, status = bm._kvtest_flatten_artifacts(
+        {"nodes": {}}, entry, "/remote/logs")
+    assert ok and status.endswith("samples=OK")
+    assert "latency_samples.csv" in commands[0]
+    assert "/remote/logs/case.i0.samples.csv" in commands[0]
+
+
 # ------------------------------------------------------ binary_local push
 
 def test_kvtest_deploy_binary_local(tmp_path, monkeypatch):

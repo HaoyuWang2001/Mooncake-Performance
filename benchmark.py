@@ -4559,12 +4559,15 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
     n = get_node(cluster, entry["node"])
     base = entry["_base"]
     command = (
-        "summary=OK; timeseries=OK; "
+        "summary=OK; timeseries=OK; samples=MISSING; "
         "cp '{o}/summary.json' '{d}/{b}.summary.json' 2>/dev/null || "
         "summary=MISSING; "
         "cp '{o}/latency_timeseries.csv' '{d}/{b}.timeseries.csv' "
         "2>/dev/null || timeseries=MISSING; "
-        "printf 'summary=%s timeseries=%s' \"$summary\" \"$timeseries\""
+        "cp '{o}/latency_samples.csv' '{d}/{b}.samples.csv' 2>/dev/null "
+        "&& samples=OK; "
+        "printf 'summary=%s timeseries=%s samples=%s' \"$summary\" "
+        "\"$timeseries\" \"$samples\""
     ).format(o=entry["_out_dir"], d=remote_log_dir, b=base)
     last = "not attempted"
     for attempt in range(max(1, int(attempts))):
@@ -4572,7 +4575,9 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
             last = ssh_check_output(n["ip"], n, command, quiet=True).strip()
         except Exception as exc:
             last = "copy command failed: {}".format(exc)
-        if last == "summary=OK timeseries=OK":
+        # samples=MISSING is accepted for compatibility with older binaries;
+        # new binaries expose one-request-per-row latency_samples.csv.
+        if last.startswith("summary=OK timeseries=OK samples="):
             return True, last
         if attempt + 1 < attempts and retry_s:
             time.sleep(retry_s)
@@ -5182,6 +5187,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             for entry, _pid in instance_pids:
                 n = get_node(cluster, entry["node"])
                 base = entry["_base"]
+                status = ""
                 if not dry:
                     ok, status = _kvtest_flatten_artifacts(
                         cluster, entry, remote_log_dir,
@@ -5192,13 +5198,21 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                             "both available after retries: {} in {}"
                             "".format(entry["iid"], status,
                                       entry["_out_dir"]))
-                _groups.append((n,
-                                ["{}/{}.json".format(remote_log_dir, base),
-                                 "{}/{}.log".format(remote_log_dir, base),
-                                 "{}/{}.log.glog".format(remote_log_dir, base),
-                                 "{}/{}.log.exitrc".format(remote_log_dir, base),
-                                 "{}/{}.summary.json".format(remote_log_dir, base),
-                                 "{}/{}.timeseries.csv".format(remote_log_dir, base)],
+                _files = [
+                    "{}/{}.json".format(remote_log_dir, base),
+                    "{}/{}.log".format(remote_log_dir, base),
+                    "{}/{}.log.glog".format(remote_log_dir, base),
+                    "{}/{}.log.exitrc".format(remote_log_dir, base),
+                    "{}/{}.summary.json".format(remote_log_dir, base),
+                    "{}/{}.timeseries.csv".format(remote_log_dir, base)]
+                if dry or "samples=OK" in status:
+                    _files.append("{}/{}.samples.csv".format(
+                        remote_log_dir, base))
+                elif not dry:
+                    log("[WARN] kvtest i{} uses an older binary without "
+                        "latency_samples.csv; request-level plot unavailable"
+                        "".format(entry["iid"]))
+                _groups.append((n, _files,
                                 "kvtest i{}".format(entry["iid"])))
             _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
             log("logs: {} files / {} instances pulled".format(
@@ -6580,11 +6594,11 @@ def main(args, cfg_paths):
         log_dir = os.path.join(ts_dir, "logs")
         has_plot_inputs = bool(
             glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True)
-            or glob.glob(os.path.join(log_dir, "**", "*.timeseries.csv"),
+            or glob.glob(os.path.join(log_dir, "**", "*.samples.csv"),
                          recursive=True))
         if not has_plot_inputs:
-            log("[WARN] auto-plot skipped (no *.log or *.timeseries.csv "
-                "under {})".format(log_dir))
+            log("[WARN] auto-plot skipped (no *.log or *.samples.csv under "
+                "{})".format(log_dir))
         else:
             plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")
             # Plotting is 100% local (on this orchestrator machine). Cap the

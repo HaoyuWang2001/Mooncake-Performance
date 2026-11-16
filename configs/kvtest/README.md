@@ -143,15 +143,17 @@ Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，�
 
 ## 结果
 
-每实例输出 `<cfg>.<ds>.kvtest_<node>_<tag>.{log,glog,exitrc,summary.json,timeseries.csv}`
+每实例输出
+`<cfg>.<ds>.kvtest_<node>_<tag>.{log,glog,exitrc,summary.json,timeseries.csv,samples.csv}`
 拉回 `outputs/<ts>/logs/<cfg>/`；`summary.json` 聚合进 `<cfg>.csv` 与
 `benchmark_detail.csv`（`KVTEST_CSV_HEADER`，仅保留 TOTAL 行）。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。每实例 QPS/吞吐使用 summary 中的实际 `elapsed_seconds`。
 
-运行结束后，`scripts/plot_latency.py` 会自动读取每个
-`*.kvtest_*.timeseries.csv`，按 operation 生成窗口时序图：普通接口输出
-`<实例>.<operation>.latency.png`，`notify_queue_wait` 输出
-`<实例>.notify_queue_wait.queuewait.png`。图的上半部分为
-avg/p50/p90/p99（样本数足够时增加 p999/p9999）及 max，下半部分为每窗口
-success/failure ops/s；`--no-plot` 可关闭自动绘图。
+kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
+内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其
+拉回为 `*.samples.csv`，`scripts/plot_latency.py` 按 operation 生成一请求一点的
+`<实例>.<operation>.latency.png`；`notify_queue_wait` 使用
+`<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
+request #i。`latency_timeseries.csv` 仍会保留和拉回作为聚合原始数据，但不再
+生成窗口聚合 PNG；`--no-plot` 可关闭自动绘图。
