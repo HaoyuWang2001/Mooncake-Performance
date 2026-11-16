@@ -144,10 +144,10 @@ Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，�
 
 ## 结果
 
-每实例输出
-`<cfg>.<ds>.kvtest_<node>_<tag>.{log,glog,exitrc,summary.json,timeseries.csv,samples.csv}`
-拉回 `outputs/<ts>/logs/<cfg>/`；`summary.json` 聚合进 `<cfg>.csv` 与
-`benchmark_detail.csv`（`KVTEST_CSV_HEADER`，仅保留 TOTAL 行）。注意：
+成功运行的最终目录按 Python 模式收敛，只保留每实例 `log`/`glog`、请求级
+PNG，以及 run 级 `<cfg>.csv` 和 `benchmark_detail.csv`。`summary.json` 和
+`samples.csv` 仅作为汇总、作图的临时输入，成功后自动删除；失败或绘图失败时
+保留它们用于排障和重画。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。每实例 QPS/吞吐使用 summary 中的实际 `elapsed_seconds`。
 
@@ -157,5 +157,5 @@ kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` �
 并按完成时间顺序连接的点线图
 `<实例>.<operation>.latency.png`；`notify_queue_wait` 使用
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
-request #i。`latency_timeseries.csv` 仍会保留和拉回作为聚合原始数据，但不再
-生成窗口聚合 PNG；`--no-plot` 可关闭自动绘图。
+request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回窗口聚合数据；
+`--no-plot` 可关闭自动绘图。

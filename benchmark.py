@@ -4553,21 +4553,19 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
                               retry_s=0):
     """Copy one instance's nested artifacts into the pullable log root.
 
-    Return ``(ok, status)``.  Summary and timeseries are copied independently
-    so a late summary can no longer hide an already-present timeseries file.
+    Return ``(ok, status)``. ``summary.json`` feeds CSV aggregation and the
+    request samples feed the Python-compatible point-line plot. The obsolete
+    windowed timeseries is deliberately not copied.
     """
     n = get_node(cluster, entry["node"])
     base = entry["_base"]
     command = (
-        "summary=OK; timeseries=OK; samples=MISSING; "
+        "summary=OK; samples=MISSING; "
         "cp '{o}/summary.json' '{d}/{b}.summary.json' 2>/dev/null || "
         "summary=MISSING; "
-        "cp '{o}/latency_timeseries.csv' '{d}/{b}.timeseries.csv' "
-        "2>/dev/null || timeseries=MISSING; "
         "cp '{o}/latency_samples.csv' '{d}/{b}.samples.csv' 2>/dev/null "
         "&& samples=OK; "
-        "printf 'summary=%s timeseries=%s samples=%s' \"$summary\" "
-        "\"$timeseries\" \"$samples\""
+        "printf 'summary=%s samples=%s' \"$summary\" \"$samples\""
     ).format(o=entry["_out_dir"], d=remote_log_dir, b=base)
     last = "not attempted"
     for attempt in range(max(1, int(attempts))):
@@ -4577,11 +4575,33 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
             last = "copy command failed: {}".format(exc)
         # samples=MISSING is accepted for compatibility with older binaries;
         # new binaries expose one-request-per-row latency_samples.csv.
-        if last.startswith("summary=OK timeseries=OK samples="):
+        if last.startswith("summary=OK samples="):
             return True, last
         if attempt + 1 < attempts and retry_s:
             time.sleep(retry_s)
     return False, last
+
+
+def _cleanup_kvtest_success_intermediates(log_dir):
+    """Remove raw kvtest inputs after aggregation and plotting succeed.
+
+    Basic/Python mode leaves logs and figures, not a second set of raw metric
+    files. kvtest needs summary/samples temporarily, but they are not final
+    user-facing artifacts. Failed runs intentionally retain these inputs.
+    """
+    patterns = ("*.kvtest_*.summary.json", "*.kvtest_*.samples.csv",
+                "*.kvtest_*.timeseries.csv")
+    removed = 0
+    for pattern in patterns:
+        for path in glob.glob(os.path.join(log_dir, "**", pattern),
+                              recursive=True):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as exc:
+                log("[WARN] cannot remove kvtest intermediate {}: {}".format(
+                    path, exc))
+    return removed
 
 
 def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
@@ -5199,12 +5219,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                             "".format(entry["iid"], status,
                                       entry["_out_dir"]))
                 _files = [
-                    "{}/{}.json".format(remote_log_dir, base),
                     "{}/{}.log".format(remote_log_dir, base),
                     "{}/{}.log.glog".format(remote_log_dir, base),
-                    "{}/{}.log.exitrc".format(remote_log_dir, base),
-                    "{}/{}.summary.json".format(remote_log_dir, base),
-                    "{}/{}.timeseries.csv".format(remote_log_dir, base)]
+                    "{}/{}.summary.json".format(remote_log_dir, base)]
                 if dry or "samples=OK" in status:
                     _files.append("{}/{}.samples.csv".format(
                         remote_log_dir, base))
@@ -5234,11 +5251,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # Config end: remove-all — clears everything this config's writers
         # wrote (kvtest keys share the store with nothing else here)
         remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
-        command = "bash {} remove-keys {} --scope full".format(remote_runner_pipeline, remove_log)
+        command = "bash {} remove-keys {} --scope full".format(
+            remote_runner_pipeline, remove_log)
         run_ssh(host, node, command, dry_run=dry)
+        pull_stage_logs(host, node, [remove_log], local_log_dir, dry)
         if not dry:
             _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
-        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, dry)
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
@@ -6590,6 +6608,7 @@ def main(args, cfg_paths):
     log("done. results in {}".format(ts_dir))
     # auto-plot runs on the ORCHESTRATOR (local sys.executable, local logs dir);
     # it must never run on remote nodes. Skip when a failed run produced no logs.
+    plot_succeeded = bool(args.no_plot)
     if not args.no_plot:
         log_dir = os.path.join(ts_dir, "logs")
         has_plot_inputs = bool(
@@ -6623,8 +6642,19 @@ def main(args, cfg_paths):
                         "see the traceback above (plotter crash). Plotting "
                         "runs locally; if matplotlib is missing: pip install "
                         "matplotlib".format(proc.returncode))
+                else:
+                    plot_succeeded = True
             except Exception as exc:
                 log("[WARN] auto-plot failed: {}".format(exc))
+    # kvtest's summary/samples are implementation details needed only until
+    # the normal CSV and PNG outputs exist. Match the Python/basic result
+    # layout by removing them after a completely successful run. On any
+    # scenario or plotting failure, preserve them for diagnosis/replotting.
+    if not failed_scenarios and plot_succeeded:
+        removed = _cleanup_kvtest_success_intermediates(
+            os.path.join(ts_dir, "logs"))
+        if removed:
+            log("kvtest intermediate artifacts removed: {}".format(removed))
     if args.clean_up:
         # reap first: recorded processes must be killed before their
         # scripts/binaries vanish with the remote directory

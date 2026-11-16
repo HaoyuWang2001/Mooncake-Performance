@@ -4,7 +4,7 @@
   "duration": 30,
   "batch_size": 1,
   "kvtest": {
-    "binary": "/home/Mooncake/bin/kvtest",
+    "binary": "/home/Mooncake/outputs/bin/mooncake_kvtest",
     "key_pool_size": "auto",
     "notify_queue_max": 65536,
     "verify_level": "size",
