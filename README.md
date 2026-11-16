@@ -328,6 +328,7 @@ demo/ 另有 2 个传统分离角色冒烟配置。
 | --- | --- | --- |
 | throughput_mb_s / throughput_gb_s | 吞吐量（1024 进制，1 MB/s = 1024² B/s），详见下方公式 | MB/s、GB/s |
 | qps | 每秒操作数（total / wall_s） | ops/s |
+| actual_qps | 真实成功 QPS（success/ok / wall_s）；实例行按本实例真实时长计算，TOTAL 行为并发实例成功 QPS 汇总 | ops/s |
 | total | 总操作数；pipeline 场景按 key 数计（writer 为写入 key 数，reader 为读取 key 数） | ops |
 | success / ok、fail、fail_rate | 成功数 / 失败数 / 失败率（fail / total） | ops、% |
 | avg_ms / min_ms / max_ms / p99_ms / p999_ms / p9999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9 / P99.99），仅统计成功样本 | ms |

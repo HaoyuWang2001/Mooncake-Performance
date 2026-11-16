@@ -152,7 +152,7 @@ BASIC_CSV_HEADER = [
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
     "p9999_ms",
-    "ok", "fail", "qps", "fail_rate",
+    "ok", "fail", "qps", "actual_qps", "fail_rate",
 ]
 PIPELINE_CSV_HEADER = [
     "config_name",
@@ -162,7 +162,7 @@ PIPELINE_CSV_HEADER = [
     "client_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
     "total", "success", "fail", "fail_rate",
-    "total_bytes", "wall_s", "qps",
+    "total_bytes", "wall_s", "qps", "actual_qps",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
     "p9999_ms",
@@ -184,7 +184,7 @@ KVTEST_CSV_HEADER = [
     "client_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps",
     "total", "success", "fail", "fail_rate",
-    "total_bytes", "wall_s", "qps",
+    "total_bytes", "wall_s", "qps", "actual_qps",
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms", "p9999_ms",
     "max_ms",
@@ -5762,6 +5762,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["total_bytes"] = int(ok * bytes_per_op)
             row["wall_s"] = wall
             row["qps"] = (total / wall) if wall > 0 else 0.0
+            row["actual_qps"] = (ok / wall) if wall > 0 else 0.0
             if throughput_mb is None:
                 # interface throughput = successful bytes / sum of successful
                 # interface call durations (busy time, not wall clock)
@@ -5781,7 +5782,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 if isinstance(v, float):
                     row[k] = round(v, 4)
             for k in ("throughput_mb_s", "throughput_gb_s",
-                      "qps", "fail_rate"):
+                      "qps", "actual_qps", "fail_rate"):
                 v = row.get(k)
                 if isinstance(v, float):
                     row[k] = round(v, 2)
@@ -5977,6 +5978,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["total_bytes"] = int(st.get("bytes", 0) or 0)
             row["wall_s"] = wall
             row["qps"] = (total / wall) if wall > 0 else 0.0
+            row["actual_qps"] = (ok / wall) if wall > 0 else 0.0
             row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
                                       if wall > 0 else 0.0)
             row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
@@ -5984,7 +5986,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                      else st)
             for k in lat_keys:
                 row[k] = round(float(stats.get(k, 0) or 0), 4)
-            for k in ("qps", "fail_rate", "throughput_mb_s",
+            for k in ("qps", "actual_qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
 
@@ -6032,6 +6034,11 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                                  for r in inst_rows), default=wall)
             row["qps"] = sum(float(r.get("qps", 0) or 0)
                              for r in inst_rows)
+            row["actual_qps"] = sum(
+                (float(r.get("success", 0) or 0) /
+                 float(r.get("wall_s", 0) or 1))
+                if float(r.get("wall_s", 0) or 0) > 0 else 0.0
+                for r in inst_rows)
             row["throughput_mb_s"] = sum(
                 float(r.get("throughput_mb_s", 0) or 0) for r in inst_rows)
             row["throughput_gb_s"] = sum(
@@ -6051,7 +6058,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                     else:
                         row[k] = weighted_of(
                             inst_rows, k, weight_key="success")
-            for k in ("qps", "fail_rate", "throughput_mb_s",
+            for k in ("qps", "actual_qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
             return row
@@ -6181,6 +6188,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
                 "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms",
                 "ok", "fail", "qps", "fail_rate")})
+            row["actual_qps"] = (
+                row["ok"] / row["wall_s"] if row["wall_s"] > 0 else 0.0)
             # throughput recomputed from this row's own bytes/wall so split
             # (mixed) rows never inherit combined SUMMARY bytes
             row["throughput_mb_s"] = (row["total_bytes"] / row["wall_s"] / 1024.0 ** 2) if row["wall_s"] > 0 else 0.0
@@ -6190,7 +6199,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 if v is not None and isinstance(v, float):
                     row[k] = round(v, 4)
             for k in ("throughput_mb_s", "throughput_gb_s",
-                      "qps", "fail_rate", "total_bytes"):
+                      "qps", "actual_qps", "fail_rate", "total_bytes"):
                 v = row.get(k)
                 if v is not None and isinstance(v, float):
                     row[k] = round(v, 2)

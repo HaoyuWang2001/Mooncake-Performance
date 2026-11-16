@@ -154,6 +154,9 @@ kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 
 再重新计算 avg/max/P50/P90/P99/P999/P9999，因此 max 是真正的全局最大值，
 分位数也不是各实例分位数的加权平均。旧二进制没有请求样本时才回退为近似值并
 打印 WARN。
+CSV 中 `qps=total/wall_s` 表示成功和失败请求合计速率，
+`actual_qps=success/wall_s` 表示真实成功 QPS；TOTAL 行汇总所有并发实例的
+`actual_qps`。
 
 kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
 内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其

@@ -423,6 +423,7 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     assert w0["operation"] == "upsert_from" and w0["total"] == 1500
     assert w0["total_bytes"] == 1500 * 8 * 1024 * 1024
     assert w0["qps"] == 50.0                     # 1500 / 30s
+    assert w0["actual_qps"] == 50.0              # all requests succeeded
     assert w0["notify_submitted"] == 15000 and w0["notify_fail"] == 10
     assert w0["key_pool_size"] == 256
     assert w0["num_threads"] == 1 and w0["notify_threads"] == 10
@@ -448,6 +449,25 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     # rows carry exactly the header keys the detail csv expects
     for r in rows:
         assert set(r.keys()) <= set(bm.KVTEST_CSV_HEADER)
+
+
+def test_kvtest_actual_qps_excludes_failed_requests(tmp_path):
+    local_logs = tmp_path / "logs"
+    local_logs.mkdir()
+    summary = _summary(0, 100, 0, 0)
+    summary["operations"]["upsert_from"].update(
+        {"total": 100, "success": 90, "failure": 10})
+    (local_logs / "kvtest_csv.nodeA_i0_p9301.kvtest_8MB.summary.json") \
+        .write_text(json.dumps(summary), encoding="utf-8")
+    rows = bm.write_scenario_csv(
+        str(local_logs), _kv_cfg(), "ts",
+        os.path.join(str(tmp_path), "kvtest_csv.json"), cluster=None,
+        mooncake_store_nodes=[], result_dir=str(tmp_path))
+    writer, total = [r for r in rows if r["role"] == "writer"]
+    assert writer["qps"] == 3.33       # 100 attempted / 30s
+    assert writer["actual_qps"] == 3.0  # 90 successful / 30s
+    assert total["qps"] == 3.33
+    assert total["actual_qps"] == 3.0
 
 
 def test_kvtest_total_latency_recomputed_from_merged_ok_samples(tmp_path):

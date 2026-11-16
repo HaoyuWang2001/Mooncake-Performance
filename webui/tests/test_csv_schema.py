@@ -24,6 +24,13 @@ def test_basic_header_has_no_client_count():
     assert "client_count" not in bm.BASIC_CSV_HEADER
 
 
+def test_all_result_schemas_expose_actual_qps():
+    for header in (bm.BASIC_CSV_HEADER, bm.PIPELINE_CSV_HEADER,
+                   bm.KVTEST_CSV_HEADER):
+        assert "actual_qps" in header
+        assert header.index("actual_qps") == header.index("qps") + 1
+
+
 def test_client_count_uses_runtime_totals():
     """client_count 取运行期记录的真实集群总数（不是 node_count=1 的 plan）。"""
     src = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
