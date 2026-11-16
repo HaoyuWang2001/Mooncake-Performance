@@ -179,7 +179,8 @@ KVTEST_CSV_HEADER = [
     "config_name",
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_threads", "notify_threads",
-    "data_size", "key_pool_size", "batch_size", "duration",
+    "data_size", "key_pool_size", "batch_size", "duration", "warmup_duration",
+    "traffic_mode",
     "client_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps",
     "total", "success", "fail", "fail_rate",
@@ -187,9 +188,11 @@ KVTEST_CSV_HEADER = [
     "throughput_mb_s", "throughput_gb_s",
     "avg_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms", "p9999_ms",
     "max_ms",
-    "verify_failures",
+    "verify_failures", "miss", "mismatch", "error",
     "notify_submitted", "notify_ok", "notify_fail",
     "notify_avg_ms", "notify_max_ms",
+    "notify_dropped", "notify_inflight_peak", "notify_queue_peak",
+    "notify_backpressure_ms",
     "queue_wait_avg_ms", "queue_wait_max_ms",
 ]
 
@@ -832,30 +835,34 @@ def pipeline_plan(cfg, node_count=1):
 # normalizes both forms, but writing the native form keeps summary.json op
 # keys stable for the CSV aggregation.
 KVTEST_WRITER_OPS = {
-    "put": "upsert",
+    "put": "put",
     "upsert": "upsert",
     "setStringView": "upsert",
-    "put_batch": "batch_upsert_from",
+    "put_batch": "put_batch",
+    "put_from": "put_from",
+    "batch_put_from": "batch_put_from",
+    "upsert_from": "upsert_from",
+    "upsertFrom": "upsert_from",
     "batch_upsert_from": "batch_upsert_from",
     "batchUpsertFrom": "batch_upsert_from",
     "mSet": "batch_upsert_from",
-    "put_from": "upsert_from",
-    "upsert_from": "upsert_from",
-    "upsertFrom": "upsert_from",
     "remove": "remove",
     "del": "remove",
 }
 KVTEST_READER_OPS = {
-    "get": "get_buffer",
-    "get_batch": "batch_get_buffer",
-    "batch_get_buffer": "batch_get_buffer",
-    "batchGetBuffer": "batch_get_buffer",
-    "mGet": "batch_get_buffer",
-    "get_into": "get_buffer",
+    "get": "get",
+    "get_batch": "get_batch",
+    "get_into": "get_into",
     "get_buffer": "get_buffer",
     "getBuffer": "get_buffer",
+    "batch_get_buffer": "get_batch",
+    "batchGetBuffer": "get_batch",
+    "mGet": "get_batch",
     "exist": "exist",
     "isExist": "exist",
+    "batch_exist": "batch_exist",
+    "batchIsExist": "batch_exist",
+    "mExist": "batch_exist",
 }
 
 
@@ -4435,6 +4442,15 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "key_pool_size": key_pool,
         "notify_queue_max": int(kv.get("notify_queue_max", 8192) or 8192),
         "enable_jitter": bool(kv.get("enable_jitter", True)),
+        "traffic_mode": str(cfg.get("traffic_mode", "balanced") or "balanced"),
+        "pacing_catch_up": True,
+        "duration": float(cfg.get("duration", 0) or 0),
+        "warmup_duration": float(
+            (cfg.get("warmup", {}) or {}).get("duration", 0) or 0),
+        "notify_async": bool(plan["notify_async"]),
+        "notify_overflow": "block",
+        "notify_format": "json",
+        "notify_read_format": "both",
         "start_paused": True,
         "data_sizes": [ds_label],
         "metrics_interval_ms": int(kv.get("metrics_interval_ms", 3000) or 3000),
@@ -5128,19 +5144,24 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     "; ".join(start_failures)))
 
             # ---- measurement window: every C++ collector was reset by
-            # /start. Per-instance elapsed_seconds from summary.json is used
-            # for QPS/throughput, avoiding launch/health-gate contamination.
+            # /start; with warmup the measured phase only begins after the
+            # warmup phase, so wait for warmup + duration before /stop.
+            # Per-instance elapsed_seconds from summary.json is used for
+            # QPS/throughput, avoiding launch/health-gate contamination.
+            warmup_duration = float(
+                (cfg.get("warmup", {}) or {}).get("duration", 0) or 0)
+            window_s = warmup_duration + duration
             if not dry:
-                log("kvtest measurement window: {}s (all instances healthy; "
-                    "ETA {})".format(
-                        int(duration),
+                log("kvtest measurement window: {}s (warmup {}s + measured "
+                    "{}s; all instances healthy; ETA {})".format(
+                        int(window_s), int(warmup_duration), int(duration),
                         time.strftime("%H:%M:%S",
-                                      time.localtime(time.time() + duration))))
+                                      time.localtime(time.time() + window_s))))
                 t0 = time.time()
-                while time.time() - t0 < duration:
+                while time.time() - t0 < window_s:
                     _check_stop()
                     time.sleep(min(1.0, max(0.05,
-                                            duration - (time.time() - t0))))
+                                            window_s - (time.time() - t0))))
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
             for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
@@ -5283,6 +5304,566 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             else:
                 cleanup_pods(cluster, involved_nodes, dry)
         raise
+
+
+# --------------------------------------------------------------------------
+# kvtest_basic scenario: the C++ single-interface runner behind the harness
+# --------------------------------------------------------------------------
+
+KVTEST_BASIC_PUT_IFACES = ("put", "put_batch", "put_from", "upsert",
+                           "upsert_from", "batch_upsert_from")
+KVTEST_BASIC_GET_IFACES = ("get", "get_batch", "get_into", "get_buffer",
+                           "exist", "batch_exist")
+
+
+def kvtest_basic_split_operation(cfg):
+    """(put_iface, get_iface, mixed) for a kvtest_basic operation."""
+    op = str(cfg.get("operation", "") or "").strip()
+    if "/" in op:
+        put_iface, get_iface = op.split("/", 1)
+        return put_iface.strip(), get_iface.strip(), True
+    if op in KVTEST_READER_OPS:
+        return None, op, False
+    if op in KVTEST_WRITER_OPS:
+        return op, None, False
+    return op, None, False
+
+
+def kvtest_basic_base(cfg_name, node_name, client_id, port, ds):
+    return "{}.basic_{}_i{}_p{}_{}".format(
+        cfg_name, node_name, client_id, port, ds)
+
+
+def build_kvtest_basic_instance_config(cfg, globals_cfg, metadata_server,
+                                       master_addr, entry, ds_label, operation,
+                                       client_count, threads, key_start,
+                                       key_end):
+    """Per-client mooncake_kvtest JSON for one kvtest_basic run."""
+    kv = cfg.get("kvtest", {}) or {}
+    total_qps = float(cfg.get("target_qps", 0) or 0)
+    per_client_qps = (total_qps / client_count) if total_qps > 0 else 0.0
+    warmup = float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0)
+    batch = max(1, int(cfg.get("batch_size", 1) or 1))
+    return {
+        "mode": "basic",
+        "instance_id": entry["iid"],
+        "listen_port": entry["port"],
+        "role": "client",
+        "operation": operation,
+        "key_prefix": cfg.get("key_prefix", "mc_bench"),
+        "key_scenario": cfg.get("key_scenario", ""),
+        "key_count": int(cfg.get("key_count", 1000) or 1000),
+        "key_start": int(key_start),
+        "key_end": int(key_end),
+        "data_sizes": [ds_label],
+        "num_threads": int(threads),
+        "batch_keys_count": batch,
+        "put_ratio": float(cfg.get("put_ratio", 0.5) or 0.5),
+        "target_qps": per_client_qps,
+        "duration": float(cfg.get("duration", 0) or 0),
+        "warmup_duration": warmup,
+        "start_paused": True,
+        "samples_max": int(kv.get("samples_max", 0) or 0),
+        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 3000) or 3000),
+        "output_dir": entry["_out_dir"],
+        "cpu_affinity": kv.get("cpu_affinity", ""),
+        "verify_level": kv.get("verify_level", "size"),
+        "verify_sample_bytes": kv.get("verify_sample_bytes", "4KB"),
+        "verify_sample_step_bytes": kv.get(
+            "verify_sample_step_bytes", "1MB"),
+        "verify_fail_op": bool(kv.get("verify_fail_op", False)),
+        "store": {
+            "local_hostname": "__FABRIC_IP__:{}".format(
+                entry.get("_lhost_port", 12345)),
+            "metadata_server": metadata_server,
+            "global_segment_size": 0,
+            "local_buffer_size": int(parse_size_bytes(
+                globals_cfg.get("local_buffer_size", 8589934592))),
+            "protocol": cfg["protocol"],
+            "rdma_devices": "__UB_DEVICE__",
+            "master_server_address": master_addr,
+            "tenant_id": globals_cfg.get("tenant_id", "default"),
+            "replica_num": max(1, int(kv.get("replica_num", 1) or 1)),
+        },
+    }
+
+
+def build_kvtest_basic_stage_config(cfg, globals_cfg, metadata_server,
+                                    master_addr, ds_label, mode,
+                                    key_count, output_dir, port, scope="range"):
+    """mode=prefill|cleanup helper config (one-shot, no HTTP server)."""
+    kv = cfg.get("kvtest", {}) or {}
+    config = {
+        "mode": mode,
+        "instance_id": 0,
+        "listen_port": int(port),
+        "role": "client",
+        "key_prefix": cfg.get("key_prefix", "mc_bench"),
+        "key_scenario": cfg.get("key_scenario", ""),
+        "key_count": int(key_count),
+        "key_start": 0,
+        "key_end": int(key_count),
+        "data_sizes": [ds_label],
+        "prefill_batch": int(kv.get("prefill_batch", 64) or 64),
+        "output_dir": output_dir,
+        "store": {
+            "local_hostname": "__FABRIC_IP__:{}".format(
+                int(kv.get("local_port_base", 12345) or 12345)),
+            "metadata_server": metadata_server,
+            "global_segment_size": 0,
+            "local_buffer_size": int(parse_size_bytes(
+                globals_cfg.get("local_buffer_size", 8589934592))),
+            "protocol": cfg["protocol"],
+            "rdma_devices": "__UB_DEVICE__",
+            "master_server_address": master_addr,
+            "tenant_id": globals_cfg.get("tenant_id", "default"),
+            "replica_num": max(1, int(kv.get("replica_num", 1) or 1)),
+        },
+    }
+    if mode == "cleanup":
+        config["scope"] = scope
+    return config
+
+
+def _kvtest_push_config(node, remote_path, config, dry):
+    payload = base64.b64encode(
+        json.dumps(config).encode("utf-8")).decode("ascii")
+    ssh_check_output(
+        node["ip"], node,
+        "printf '%s' '{b}' | base64 -d > '{f}'".format(
+            b=payload, f=remote_path),
+        quiet=True, dry_run=dry)
+
+
+def _kvtest_basic_foreground(cluster, host, node, remote_runner, kv_binary,
+                             remote_log_dir, local_log_dir, cfg_name, label,
+                             config, dry):
+    cfg_path = "{}/{}.{}.json".format(remote_log_dir, cfg_name, label)
+    log_path = "{}/{}.{}.log".format(remote_log_dir, cfg_name, label)
+    _kvtest_push_config(node, cfg_path, config, dry)
+    command = "bash {} {} {} {}".format(
+        remote_runner, log_path, cfg_path, kv_binary)
+    run_ssh_with_progress(host, node, command,
+                          "kvtest_basic {}".format(label),
+                          dry_run=dry, quiet=True)
+    if not dry:
+        try:
+            scp_pull(node["ip"], node, log_path, local_log_dir, dry_run=False)
+        except Exception as exc:
+            log("[WARN] kvtest_basic pull {} failed: {}".format(label, exc))
+
+
+def _kvtest_basic_wait_single_pass(cluster, entries, timeout_s=900):
+    """Count-mode (duration=0) runs finish when measured_ops stops changing."""
+    if not entries:
+        return
+    last = None
+    stable = 0
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        _check_stop()
+        totals = {}
+        for entry in entries:
+            n = get_node(cluster, entry["node"])
+            cmd = ("curl -s --noproxy '*' --connect-timeout 1 --max-time 2 "
+                   "http://127.0.0.1:{}/stats".format(entry["port"]))
+            try:
+                out = ssh_check_output(n["ip"], n, cmd, quiet=True)
+                data = json.loads(out) if out else {}
+            except Exception:
+                data = {}
+            totals[entry["iid"]] = int(data.get("measured_ops", 0) or 0)
+        if (last is not None and totals == last and totals and
+                all(v > 0 for v in totals.values())):
+            stable += 1
+            if stable >= 2:
+                return
+        else:
+            stable = 0
+        last = totals
+        time.sleep(0.5)
+    log("[WARN] kvtest_basic single-pass wait timed out; forcing /stop")
+
+
+def run_kvtest_basic_scenario(cluster, globals_cfg, cfg, ts, args):
+    """Run one kvtest_basic scenario: C++ single-interface clients.
+
+    One node/pod hosts ``num_clients`` C++ processes per run combo; each
+    process owns a contiguous key shard and measures one operation (or a
+    mixed put/get pair). get-family runs are prefilled with the C++ prefill
+    mode; put-family combos start from a clean store (full cleanup).
+    """
+    apply_cli_overrides(cfg, args)
+    cfg_name = os.path.splitext(
+        os.path.basename(cfg.get("__cfg_path__", "kvtest_basic")))[0]
+    dry = args.dry_run
+    op = str(cfg.get("operation", "") or "")
+    put_iface, get_iface, mixed = kvtest_basic_split_operation(cfg)
+    if not op:
+        raise RuntimeError("kvtest_basic requires operation")
+    if mixed:
+        if put_iface not in KVTEST_WRITER_OPS:
+            raise RuntimeError(
+                "kvtest_basic unsupported put interface: {}".format(put_iface))
+        if get_iface not in KVTEST_READER_OPS:
+            raise RuntimeError(
+                "kvtest_basic unsupported get interface: {}".format(get_iface))
+    elif get_iface is not None:
+        if get_iface not in KVTEST_READER_OPS:
+            raise RuntimeError(
+                "kvtest_basic unsupported get interface: {}".format(get_iface))
+    elif put_iface not in KVTEST_WRITER_OPS:
+        raise RuntimeError(
+            "kvtest_basic unsupported put interface: {}".format(put_iface))
+
+    work_mode = cfg.get("work_mode", "basic")
+    is_k8s = cluster.get("_controller") is not None
+    primary_node_name = None if is_k8s else cfg["client_node"]
+    involved_nodes = [] if is_k8s else [primary_node_name]
+    local_result_dir = getattr(args, "_result_dir_path", None) or \
+        os.path.join(RESULTS_DIR, ts)
+    remote_dir, remote_scripts, remote_log_dir, _remote_runner_basic, \
+        _remote_runner_pipeline, local_log_dir = scenario_paths(
+            globals_cfg, ts, cfg_name, local_result_dir)
+    if not dry:
+        os.makedirs(local_log_dir, exist_ok=True)
+    scenario_params = base_scenario_params(
+        cfg, work_mode, "k8s_pod" if is_k8s else "ssh",
+        "client" if is_k8s else primary_node_name)
+    cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
+    ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name,
+                     dry)
+    if is_k8s:
+        primary_node_name = ensure_k8s_pod(cluster, ts, cfg_name, dry)
+        involved_nodes = [primary_node_name]
+    else:
+        ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+    cfg["_primary_node"] = primary_node_name
+    node = get_node(cluster, primary_node_name)
+    host = node["ip"]
+    if is_k8s:
+        topology = "remote_node"
+    else:
+        store_node_ips = resolve_store_node_ips(
+            cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+        topology = ("local_node" if node["ip"] in store_node_ips
+                    else "remote_node")
+    cfg["_kvtest_basic_topology"] = topology
+    log("=== scenario {} (kvtest_basic op={}, topo={}, protocol={}) "
+        "node={} ===".format(cfg_name, op, topology, cfg["protocol"], host))
+    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
+                   remote_scripts, remote_log_dir, dry)
+    kv = cfg.get("kvtest", {}) or {}
+    kv_binary = str(kv.get("binary", "mooncake_kvtest") or "mooncake_kvtest")
+    pushed = _kvtest_deploy_binary(
+        cluster, involved_nodes, kv.get("binary_local", ""), remote_scripts,
+        globals_cfg.get("_pod_workspace"), is_k8s, dry)
+    if pushed:
+        kv_binary = pushed
+    metadata_server, master_addr = _kvtest_store_targets(
+        globals_cfg, cluster_session)
+    remote_runner = remote_scripts + "/run_kvtest.sh"
+    port_base = int(kv.get("port_base", 9401) or 9401)
+    local_port_base = int(kv.get("local_port_base", 12345) or 12345)
+    ssh_check_output(host, node, "mkdir -p {}".format(remote_log_dir),
+                     dry_run=dry)
+
+    runs = build_runs(cfg)
+    key_count = int(cfg.get("key_count", 1000) or 1000)
+    for _c, _t, _ds in runs:
+        if _c > key_count:
+            raise RuntimeError(
+                "kvtest_basic num_clients={} exceeds key_count={}".format(
+                    _c, key_count))
+    duration = float(cfg.get("duration", 0) or 0)
+    warmup = float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0)
+    health_timeout = int(kv.get("health_timeout_s", 120) or 120)
+    entries_all = []
+    try:
+        current_ds = None
+        prefilled = set()
+
+        def run_stage_config(label, mode, ds, scope="range"):
+            stage_cfg = build_kvtest_basic_stage_config(
+                cfg, globals_cfg, metadata_server, master_addr, ds, mode,
+                key_count,
+                "{}/kvtest_basic_out/{}.{}".format(
+                    remote_log_dir, cfg_name, label),
+                port_base, scope=scope)
+            _kvtest_basic_foreground(
+                cluster, host, node, remote_runner, kv_binary, remote_log_dir,
+                local_log_dir, cfg_name, label, stage_cfg, dry)
+
+        for c, t, ds in runs:
+            _check_stop()
+            if ds != current_ds:
+                run_stage_config("cleanup_{}".format(ds), "cleanup", ds,
+                                 scope="all")
+                current_ds = ds
+                prefilled.discard(ds)
+            if get_iface is not None and put_iface is None and \
+                    ds not in prefilled:
+                run_stage_config("prefill_{}".format(ds), "prefill", ds)
+                prefilled.add(ds)
+            if put_iface is not None:
+                # Fresh writes for every combo: C++ put skips existing keys.
+                run_stage_config(
+                    "cleanup_{}_c{}_t{}".format(ds, c, t), "cleanup", ds,
+                    scope="all")
+            entries = []
+            for client_index in range(c):
+                iid = client_index
+                port = port_base + client_index
+                base = kvtest_basic_base(
+                    cfg_name, primary_node_name or "", client_index + 1, port,
+                    ds)
+                out_dir = "{}/kvtest_basic_out/{}".format(
+                    remote_log_dir, base)
+                start = client_index * key_count // c
+                end = (client_index + 1) * key_count // c
+                entry = {
+                    "node": primary_node_name,
+                    "iid": iid,
+                    "port": port,
+                    "base": base,
+                    "out_dir": out_dir,
+                    "_out_dir": out_dir,
+                    "_lhost_port": local_port_base + client_index,
+                }
+                instance_cfg = build_kvtest_basic_instance_config(
+                    cfg, globals_cfg, metadata_server, master_addr, entry, ds,
+                    op, c, t, start, end)
+                cfg_path = "{}/{}.json".format(remote_log_dir, base)
+                log_path = "{}/{}.log".format(remote_log_dir, base)
+                nohup_log = "{}/{}.nohup".format(remote_log_dir, base)
+                _kvtest_push_config(node, cfg_path, instance_cfg, dry)
+                command = ("nohup bash {} {} {} {} > {} 2>&1 & echo $!"
+                           .format(remote_runner, log_path, cfg_path,
+                                   kv_binary, nohup_log))
+                pid = ssh_check_output(node["ip"], node, command,
+                                       dry_run=dry).strip()
+                entry["pid"] = pid
+                entry["log"] = log_path
+                entries.append(entry)
+                if not dry and pid:
+                    state_append([{
+                        "ip": node["ip"],
+                        "node": primary_node_name,
+                        "port": port,
+                        "fabric_host": node.get("fabric_ip",
+                                                node.get("ip", "")),
+                        "pid": pid,
+                        "label": "kvtest_basic i{}".format(iid),
+                        "marker": "run_kvtest.sh",
+                        "cfg": cfg_name,
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
+            entries_all.extend(entries)
+            if not dry:
+                _kvtest_health_gate(cluster, entries, health_timeout,
+                                    "kvtest_basic c{}t{}".format(c, t))
+            items = [(get_node(cluster, e["node"]), e["port"], e["pid"],
+                      "kvtest_basic i{}".format(e["iid"])) for e in entries]
+            start_results = _pipeline_http_parallel(
+                cluster, items, "/start", timeout=health_timeout, dry=dry)
+            failures = ["{}: {}".format(what, err or "non-200")
+                        for what, ok, err in start_results if not ok]
+            if failures:
+                raise RuntimeError("kvtest_basic /start failed: {}".format(
+                    "; ".join(failures)))
+            if not dry:
+                if duration > 0:
+                    window = warmup + duration
+                    t0 = time.time()
+                    while time.time() - t0 < window:
+                        _check_stop()
+                        time.sleep(min(1.0, max(0.05,
+                                                window - (time.time() - t0))))
+                else:
+                    _kvtest_basic_wait_single_pass(cluster, entries)
+            stop_results = _pipeline_http_parallel(
+                cluster, items, "/stop", timeout=10, dry=dry)
+            for what, ok, err in stop_results:
+                if not ok:
+                    log("[WARN] kvtest_basic /stop {}: {}".format(
+                        what, err or "non-200"))
+            for entry in entries:
+                if entry.get("pid"):
+                    try:
+                        wait_process_exit(
+                            cluster, entry["node"], entry["pid"],
+                            "kvtest_basic i{}".format(entry["iid"]), 30,
+                            dry_run=dry, marker="run_kvtest.sh")
+                    except Exception as exc:
+                        log("[WARN] kvtest_basic wait {}: {}".format(
+                            entry["base"], exc))
+                if dry:
+                    continue
+                tmp_dir = os.path.join(local_log_dir, "_pull_tmp")
+                os.makedirs(tmp_dir, exist_ok=True)
+                for remote_name, local_suffix in (
+                        ("summary.json", ".summary.json"),
+                        ("metrics_{}.csv".format(entry["iid"]),
+                         ".metrics.csv")):
+                    try:
+                        scp_pull(
+                            node["ip"], node,
+                            "{}/{}".format(entry["out_dir"], remote_name),
+                            tmp_dir, dry_run=False)
+                        src = os.path.join(
+                            tmp_dir, os.path.basename(remote_name))
+                        dst = os.path.join(
+                            local_log_dir, entry["base"] + local_suffix)
+                        if os.path.exists(src):
+                            os.replace(src, dst)
+                    except Exception as exc:
+                        log("[WARN] kvtest_basic pull {} {}: {}".format(
+                            entry["base"], remote_name, exc))
+                try:
+                    os.rmdir(tmp_dir)
+                except OSError:
+                    pass
+            if not dry:
+                state_remove_cfg(cfg_name)
+        run_stage_config("cleanup_end", "cleanup", current_ds or
+                         data_size_list(cfg)[0], scope="range")
+        try:
+            pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
+                      local_log_dir, dry)
+        except Exception as exc:
+            log("[WARN] kvtest_basic pull logs: {}".format(exc))
+        if not dry:
+            state_remove_cfg(cfg_name)
+        return {"host": host, "node": primary_node_name,
+                "runner": _remote_runner_pipeline,
+                "remote_log_dir": remote_log_dir}
+    except Exception:
+        try:
+            for entry in entries_all:
+                if entry.get("pid"):
+                    _pipeline_http_parallel(
+                        cluster,
+                        [(get_node(cluster, entry["node"]), entry["port"],
+                          entry["pid"], "kvtest_basic i{}".format(
+                              entry["iid"]))],
+                        "/stop", timeout=5, dry=dry)
+        except Exception:
+            pass
+        raise
+
+
+def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
+                           result_dir=None):
+    """Aggregate per-client summary.json files into BASIC_CSV_HEADER rows."""
+    name = os.path.splitext(
+        os.path.basename(cfg.get("__cfg_path__", cfg_path)))[0]
+    out_csv = os.path.join(
+        result_dir or os.path.join(RESULTS_DIR, ts), "{}.csv".format(name))
+    put_iface, get_iface, mixed = kvtest_basic_split_operation(cfg)
+    primary = cfg.get("_primary_node") or cfg.get("client_node")
+    node_ip = primary
+    if cluster is not None and primary:
+        try:
+            node_ip = get_node(cluster, primary)["ip"]
+        except (KeyError, RuntimeError):
+            node_ip = primary
+    topology = cfg.get("_kvtest_basic_topology", "")
+    batch = max(1, int(cfg.get("batch_size", 1) or 1))
+    warmup = float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0)
+    port_base = int((cfg.get("kvtest", {}) or {}).get("port_base", 9401) or 9401)
+    lat_keys = ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+                "p9999_ms")
+    rows = []
+    for c, t, ds in build_runs(cfg):
+        summaries = []
+        for client_index in range(c):
+            port = port_base + client_index
+            base = kvtest_basic_base(
+                name, primary or "", client_index + 1, port, ds)
+            path = os.path.join(local_log_dir, base + ".summary.json")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    summaries.append(json.load(fh))
+            except Exception as exc:
+                log("[WARN] kvtest_basic summary {}: {}".format(path, exc))
+        if not summaries:
+            continue
+
+        def aggregate(op_name):
+            total = ok = fail = bytes_ = 0
+            wall = 0.0
+            weighted = {k: 0.0 for k in lat_keys}
+            mins = []
+            maxs = []
+            for summary in summaries:
+                st = (summary.get("operations", {}) or {}).get(op_name) or {}
+                total += int(st.get("total", 0) or 0)
+                ok += int(st.get("success", 0) or 0)
+                fail += int(st.get("failure", 0) or 0)
+                bytes_ += int(st.get("bytes", 0) or 0)
+                wall = max(wall, float(summary.get("elapsed_seconds", 0) or 0))
+                weight = int(st.get("success", 0) or 0)
+                for key in lat_keys:
+                    weighted[key] += float(st.get(key, 0) or 0) * weight
+                if st.get("min_ms") is not None:
+                    mins.append(float(st.get("min_ms", 0) or 0))
+                if st.get("max_ms") is not None:
+                    maxs.append(float(st.get("max_ms", 0) or 0))
+            row = {
+                "scenario": cfg.get("scenario", "kvtest_basic"),
+                "work_mode": cfg.get("work_mode", "basic"),
+                "operation": op_name,
+                "node": node_ip,
+                "topology": topology,
+                "protocol": cfg.get("protocol", ""),
+                "num_clients": c,
+                "num_threads": t,
+                "data_size": ds,
+                "key_count": cfg.get("key_count", ""),
+                "batch_size": (batch if "batch" in op_name else ""),
+                "put_ratio": (cfg.get("put_ratio", "") if mixed else ""),
+                "duration": cfg.get("duration", ""),
+                "warmup_duration": warmup,
+                "target_qps": cfg.get("target_qps") or "",
+                "total": total,
+                "total_bytes": bytes_,
+                "wall_s": round(wall, 4),
+                "throughput_mb_s": (bytes_ / wall / 1024.0 ** 2
+                                    if wall > 0 else 0.0),
+                "throughput_gb_s": (bytes_ / wall / 1024.0 ** 3
+                                    if wall > 0 else 0.0),
+                "ok": ok,
+                "fail": fail,
+                "qps": (total / wall) if wall > 0 else 0.0,
+                "fail_rate": (fail * 100.0 / total) if total else 0.0,
+            }
+            for key in lat_keys:
+                row[key] = round(weighted[key] / ok, 4) if ok else 0.0
+            row["min_ms"] = round(min(mins), 4) if mins else 0.0
+            row["max_ms"] = round(max(maxs), 4) if maxs else 0.0
+            row["throughput_mb_s"] = round(row["throughput_mb_s"], 2)
+            row["throughput_gb_s"] = round(row["throughput_gb_s"], 2)
+            row["qps"] = round(row["qps"], 2)
+            row["fail_rate"] = round(row["fail_rate"], 2)
+            return row
+
+        if mixed:
+            rows.append(aggregate(KVTEST_WRITER_OPS.get(put_iface, put_iface)))
+            rows.append(aggregate(KVTEST_READER_OPS.get(get_iface, get_iface)))
+        else:
+            if put_iface is not None:
+                rows.append(aggregate(
+                    KVTEST_WRITER_OPS.get(put_iface, put_iface)))
+            else:
+                rows.append(aggregate(
+                    KVTEST_READER_OPS.get(get_iface, get_iface)))
+    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=BASIC_CSV_HEADER)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return rows
 
 
 def _pod_template_path(cluster):
@@ -5868,6 +6449,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "key_pool_size": effective_pool,
                 "batch_size": cfg.get("batch_size", ""),
                 "duration": cfg.get("duration", ""),
+                "warmup_duration": (cfg.get("warmup", {}) or {}).get(
+                    "duration", ""),
+                "traffic_mode": cfg.get("traffic_mode", ""),
                 "client_count": client_count,
                 "notify_count": plan["notify_count"],
                 "store_count": ("N*{}".format(cfg.get("store_count_per_node"))
@@ -5888,6 +6472,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["success"] = ok
             row["fail"] = fail
             row["fail_rate"] = (fail * 100.0 / total) if total else 0.0
+            row["miss"] = int(st.get("miss", 0) or 0)
+            row["mismatch"] = int(st.get("mismatch", 0) or 0)
+            row["error"] = int(st.get("error", 0) or 0)
             row["total_bytes"] = int(st.get("bytes", 0) or 0)
             row["wall_s"] = wall
             row["qps"] = (total / wall) if wall > 0 else 0.0
@@ -5902,11 +6489,22 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
 
         def fill_notify(row, summary):
             nt = op_stats(summary, "notify_http")
-            row["notify_submitted"] = int(nt.get("total", 0) or 0)
-            row["notify_ok"] = int(nt.get("success", 0) or 0)
-            row["notify_fail"] = int(nt.get("failure", 0) or 0)
+            row["notify_submitted"] = int(
+                summary.get("notify_http_submitted",
+                            nt.get("total", 0)) or 0)
+            row["notify_ok"] = int(
+                summary.get("notify_http_ok", nt.get("success", 0)) or 0)
+            row["notify_fail"] = int(
+                summary.get("notify_http_fail", nt.get("failure", 0)) or 0)
             row["notify_avg_ms"] = round(float(nt.get("avg_ms", 0) or 0), 4)
             row["notify_max_ms"] = round(float(nt.get("max_ms", 0) or 0), 4)
+            row["notify_dropped"] = int(summary.get("notify_dropped", 0) or 0)
+            row["notify_inflight_peak"] = int(
+                summary.get("notify_inflight_peak", 0) or 0)
+            row["notify_queue_peak"] = int(
+                summary.get("notify_queue_peak", 0) or 0)
+            row["notify_backpressure_ms"] = round(float(
+                summary.get("notify_backpressure_ms", 0) or 0), 4)
 
         def fill_queue(row, summary):
             q = op_stats(summary, "notify_queue_wait")
@@ -5999,8 +6597,18 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             rows.extend(writer_rows)
             if writer_rows:
                 row = total_row("writer", writer_rows, ds, wall)
-                for k in ("notify_submitted", "notify_ok", "notify_fail"):
+                for k in ("notify_submitted", "notify_ok", "notify_fail",
+                          "notify_dropped"):
                     row[k] = sum(r.get(k, 0) for r in writer_rows)
+                row["notify_inflight_peak"] = max(
+                    (r.get("notify_inflight_peak", 0) or 0
+                     for r in writer_rows), default=0)
+                row["notify_queue_peak"] = max(
+                    (r.get("notify_queue_peak", 0) or 0
+                     for r in writer_rows), default=0)
+                row["notify_backpressure_ms"] = sum(
+                    float(r.get("notify_backpressure_ms", 0) or 0)
+                    for r in writer_rows)
                 row["notify_avg_ms"] = weighted_of(
                     writer_rows, "notify_avg_ms", "notify_submitted")
                 row["notify_max_ms"] = max(
@@ -6012,6 +6620,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 row = total_row("reader", reader_rows, ds, wall)
                 row["verify_failures"] = sum(
                     r.get("verify_failures", 0) for r in reader_rows)
+                for k in ("miss", "mismatch", "error"):
+                    row[k] = sum(r.get(k, 0) for r in reader_rows)
                 row["queue_wait_avg_ms"] = weighted_of(
                     reader_rows, "queue_wait_avg_ms")
                 row["queue_wait_max_ms"] = max(
@@ -6505,14 +7115,22 @@ def main(args, cfg_paths):
                 sweep_remove = run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args)
             elif cfg.get("scenario") == "kvtest":
                 sweep_remove = run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args)
+            elif cfg.get("scenario") == "kvtest_basic":
+                sweep_remove = run_kvtest_basic_scenario(
+                    cluster, globals_cfg, cfg, ts, args)
             else:
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
                 store_nodes = (globals_cfg.get("mooncake_store_nodes", []) or []) \
                     if args.mode != "k8s" else []
-                rows = write_scenario_csv(
-                    os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
-                    cluster, store_nodes, result_dir=ts_dir)
+                if cfg.get("scenario") == "kvtest_basic":
+                    rows = write_kvtest_basic_csv(
+                        os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
+                        cluster, result_dir=ts_dir)
+                else:
+                    rows = write_scenario_csv(
+                        os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
+                        cluster, store_nodes, result_dir=ts_dir)
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows
@@ -6521,6 +7139,9 @@ def main(args, cfg_paths):
                     categories.add("kvtest")
                     # detail keeps only the aggregated writer/reader TOTAL rows
                     all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
+                elif cfg.get("scenario") == "kvtest_basic":
+                    categories.add("basic")
+                    all_rows.extend(rows)
                 else:
                     categories.add("basic")
                     all_rows.extend(rows)
