@@ -4449,6 +4449,15 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
             (cfg.get("warmup", {}) or {}).get("duration", 0) or 0),
         "notify_async": bool(plan["notify_async"]),
         "notify_overflow": "block",
+        "notify_transport": str(kv.get("notify_transport", "http") or "http"),
+        "notify_rpc_port": int(entry["port"]) + 10000,
+        "notify_rpc_threads": int(kv.get("notify_rpc_threads", 4) or 4),
+        "notify_rpc_connections_per_peer": int(
+            kv.get("notify_rpc_connections_per_peer", 4) or 4),
+        "notify_rpc_reuse_limit": int(
+            kv.get("notify_rpc_reuse_limit", 4) or 0),
+        "notify_rpc_timeout_ms": int(
+            kv.get("notify_rpc_timeout_ms", 3000) or 3000),
         "notify_format": "json",
         "notify_read_format": "both",
         "start_paused": True,
@@ -4462,6 +4471,7 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "verify_fail_op": bool(kv.get("verify_fail_op", False)),
         "nodes": [
             {"host": i["host"], "port": i["port"],
+             "notify_rpc_port": i["port"] + 10000,
              "instance_id": i["iid"], "role": i["role"]}
             for i in all_instances
         ],
@@ -6497,6 +6507,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
 
         def fill_notify(row, summary):
             nt = op_stats(summary, "notify_http")
+            if not nt:
+                nt = op_stats(summary, "notify_rpc")
             row["notify_submitted"] = int(
                 summary.get("notify_http_submitted",
                             nt.get("total", 0)) or 0)
