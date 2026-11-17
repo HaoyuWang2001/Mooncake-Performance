@@ -246,7 +246,9 @@ if (!errs.length) {
         if (done || !node) return;
         const kids = node.children || [];
         for (const c of kids) {
-          if (c.className === "lvl-toggle" && String(c.title || "").indexOf(focusKey) >= 0) {
+          // 聚焦 = 直接点击块本身（块 title 里带字段名）
+          if (c.className && c.className.indexOf("lvl-blk") === 0 &&
+              String(c.title || "").indexOf(focusKey) >= 0 && c.onclick) {
             c.onclick(); done = true; return;
           }
           walk(c);
@@ -266,6 +268,9 @@ if (!errs.length) {
       out.outlier_nulls = ((opt && opt.series) || []).map(function (s) {
         return (s.data || []).filter(function (d) { return d[1] === null; }).length;
       });
+      out.outlier_max = Math.max.apply(null, [0].concat.apply([], ((opt && opt.series) || []).map(function (s) {
+        return (s.data || []).map(function (d) { return (d && d[1] != null) ? d[1] : 0; });
+      })));
       out.outlier_btn = textOf(btn);
     } catch (e) { errs.push("outlier: " + String(e && e.stack || e)); }
   }
@@ -273,6 +278,8 @@ if (!errs.length) {
   const _tc=(charts.tchart||[]); const _tco=_tc.length?_tc[_tc.length-1]:null;
   out.tchart_series=((_tco&&_tco.series)||[]).map(function(s){return s.name;});
   out.tchart_empty=textOf(getEl("tchartEmpty"));
+  out.yscale_hi = textOf(getEl("yscaleHi"));
+  out.yscale_lo = textOf(getEl("yscaleLo"));
   out.tree_rows = (getEl("objTree").children || []).map(function (r) {
     return textOf(r);
   });

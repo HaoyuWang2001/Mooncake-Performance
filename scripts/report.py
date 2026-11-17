@@ -1197,22 +1197,25 @@ a{color:inherit}
 /* 分级时延图（Lupi 编辑语法） */
 .levels{display:flex;flex-direction:column;gap:8px;margin-top:4px}
 /* 分级时延：块宽 = 占父项百分比；列宽用 minmax(可读下限, Nfr)，
-   极小项按最小可读宽度展开并允许整行横向滚动（不截断文字） */
-.lvl-row{display:grid;gap:3px;align-items:stretch;overflow-x:auto;padding-bottom:2px}
+   极小项按最小可读宽度展开并允许整行横向滚动（不截断文字）。
+   块无任何边框；聚焦只靠块的形态（更大、字更大）表达。 */
+.lvl-wrap{margin-bottom:2px}
+.lvl-row{display:grid;gap:4px;align-items:start;overflow-x:auto;padding-bottom:2px}
 .lvl-row.root{grid-template-columns:minmax(0,1fr)}
-.lvl-row.sub{margin-top:6px}
-.lvl-blk{display:flex;flex-direction:column;justify-content:center;gap:2px;
-padding:6px 9px;border-radius:6px;border:1px solid var(--grid);
-font-size:12px;font-weight:600;min-width:0;overflow:visible}
-.lvl-blk:hover{border-color:var(--ink)}
-.lvl-blk.focus{outline:2px solid var(--hero);outline-offset:-1px}
-.lvl-blk.residual{border-style:dashed}
-.lvl-top{display:flex;align-items:baseline;gap:8px;min-width:0}
-.lvl-name{font-weight:700;white-space:nowrap}
-.lvl-val{font-variant-numeric:tabular-nums;opacity:.85;white-space:nowrap}
-.lvl-sub{font-size:12px;opacity:.75;white-space:nowrap}
-.lvl-toggle{align-self:flex-start;margin-top:3px;font-size:12px;padding:1px 8px}
-.lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 4px}
+.lvl-blk{display:flex;flex-direction:column;justify-content:center;gap:1px;
+padding:7px 11px;border-radius:8px;border:0;
+font-size:12px;font-weight:600;min-width:0;overflow:hidden;line-height:1.3}
+.lvl-blk:hover{filter:brightness(1.07)}
+.lvl-blk.focus{padding:13px 16px;font-size:13px}
+.lvl-blk.focus .lvl-val{font-size:13px}
+.lvl-blk.compressed{padding:5px 6px}
+.lvl-blk.compressed .lvl-name,.lvl-blk.compressed .lvl-val{visibility:hidden}
+.lvl-name{font-weight:700;white-space:nowrap;overflow:hidden;
+text-overflow:ellipsis}
+.lvl-val{font-variant-numeric:tabular-nums;opacity:.85;white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis}
+.lvl-children{align-self:start;overflow-x:auto;padding-top:5px}
+.lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 6px}
 .focus-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 .focus-empty{color:var(--mut);font-size:12.5px}
 /* 阶段树（F5 Tick Rows 语法） */
@@ -1296,6 +1299,28 @@ white-space:nowrap;font-size:13px}
 color:var(--faint);cursor:pointer;font-size:12px;padding:0}
 .tree-empty{color:var(--mut);font-size:12.5px;padding:6px 8px}
 button.mini{font-size:12px;padding:1px 8px;border-radius:99px;line-height:1.6}
+/* ---- 时延轴刻度轨（地图比例尺式：上界/下界可拖，永不倒转） ---- */
+.chart-frame{display:grid;grid-template-columns:58px minmax(0,1fr);gap:10px;
+align-items:stretch}
+.chart-canvas{position:relative;min-width:0}
+.yscale{display:flex;flex-direction:column;align-items:center;gap:5px;
+color:var(--mut);font-size:12px}
+.yscale-cap{font-variant-numeric:tabular-nums;font-size:12px;white-space:nowrap}
+.yscale-rail{position:relative;flex:1;width:100%;min-height:150px;
+background:var(--track);border-radius:8px}
+.yscale-win{position:absolute;left:0;right:0;top:0;height:100%;
+background:var(--quiet);border:1px solid var(--faint);border-radius:6px;
+cursor:grab}
+.yscale-grip{position:absolute;left:-2px;right:-2px;height:13px;cursor:ns-resize;
+z-index:2}
+.yscale-grip:after{content:"";position:absolute;left:4px;right:4px;top:5px;
+height:2px;background:var(--ink);border-radius:2px}
+.yscale-hint{font-size:12px;writing-mode:vertical-rl;letter-spacing:.06em}
+/* ---- 端点标识：细线指向端点，标识纵向排开 ---- */
+.endlabels{position:absolute;inset:0;pointer-events:none;overflow:visible}
+.endlabel{position:absolute;font-size:12px;font-weight:700;white-space:nowrap;
+transform:translateY(-50%)}
+.endleader{position:absolute;height:1px;transform-origin:0 50%;opacity:.85}
 /* ---- 阶段树：左树右详情 ---- */
 .stage-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
 gap:20px;align-items:start}
@@ -1435,8 +1460,8 @@ function axisCommon(){
 }
 /* ---- 缩放 / 平移模型 --------------------------------------------------
    滚轮 = 只缩时间轴（时延轴不动）；左右拖 = 平移时间轴；上下拖 = 平移时延轴
-   （x/y 平移互斥，一次拖动只作用一个轴）；时延轴的缩放只走左侧竖向滑块。
-   filterMode:'none' —— 缩放只改轴范围，不删数据点。                ---- */
+   （x/y 平移互斥，一次拖动只作用一个轴）；时延轴的缩放**只**走左侧刻度轨
+   （自绘，永不倒转）。filterMode:'none' —— 缩放只改轴范围，不删数据点。 */
 function zoomModel(mode){
   if(mode==='xonly')
     return [{type:'inside',xAxisIndex:[0],zoomOnMouseWheel:true,
@@ -1449,12 +1474,7 @@ function zoomModel(mode){
     {type:'slider',xAxisIndex:[0],height:12,bottom:6,showDetail:false,
       brushSelect:false,filterMode:'none',borderColor:'transparent',
       backgroundColor:C.quiet,fillerColor:C.track,handleSize:'90%',
-      handleStyle:{color:C.faint},textStyle:{color:C.mut,fontSize:12}},
-    {type:'slider',yAxisIndex:[0],orient:'vertical',left:6,width:13,
-      showDetail:false,brushSelect:false,filterMode:'none',
-      borderColor:'transparent',backgroundColor:C.quiet,fillerColor:C.track,
-      handleSize:'90%',handleStyle:{color:C.faint},
-      textStyle:{color:C.mut,fontSize:12}}];
+      handleStyle:{color:C.faint},textStyle:{color:C.mut,fontSize:12}}];
 }
 /* 时延曲线配色：p99 = 强调橙（唯一焦点），其余为高对比中性色实线
    （不再用 30% 淡灰 / 虚线，避免"看不清"）。 */
@@ -1463,14 +1483,18 @@ const LAT_COLORS = LF_DARK
   : {p99:HERO,p50:'#3F3E3B',avg:'#6E6D66',p999:'#8F8E86',max:'#A5A49C'};
 const LAT_LINES=[['p99','p99',2.2],['p50','p50',1.8],['avg','平均',1.6],
   ['p999','p999',1.6],['max','最大',1.3]];
-const MAIN_GRID={left:56,right:104,top:34,bottom:58};
+const MAIN_GRID={left:56,right:104,top:44,bottom:58};
+const QPS_GRID={left:56,right:56,top:48,bottom:34};
 function latColor(k){return LAT_COLORS[k]||C.fg;}
 function objPalette(){
   return LF_DARK
     ? [C.hero,'#DCDAD2','#8F8E88','#B3B0A4','#6A6963','#4A4944']
     : [C.hero,'#3F3E3B','#8F8E86','#6E6D66','#A5A49C','#55554F'];
 }
-/* ---- 离群值剔除（阀值 = 10 x 整体 p99，与 plot_latency.py 的 PNG 版一致） */
+/* ---- 离群值剔除（阀值 = 10 x 整体 p99，与 plot_latency.py 的 PNG 版一致）
+   语义：命中桶**不丢弃**，而是把该桶的取值截顶到阀值 —— 这样 y 轴不再被
+   偶发离群值抬到天上，同时数据点不消失（早前版本整桶置空，一个 1s 桶
+   里有 100 个样本时命中概率极高，曲线会缺一大半 = 明显 bug）。        */
 let outlierOn=false;
 function outlierThreshold(){
   const z=Z(); if(!z) return null;
@@ -1486,41 +1510,54 @@ function outlierMask(col){
   }
   return any?m:null;
 }
-function latLineSeries(col,x,mask){
+function latLineSeries(col,x,mask,th,meta){
   return LAT_LINES.map(function(L){
     const k=L[0], color=latColor(k), arr=col[k]||[];
+    const data=arr.map(function(v,i){
+      let val=(v==null?0:v);
+      if(mask&&mask[i]&&th&&val>th) val=th;   // 截顶
+      return [x[i],val];});
+    if(meta) meta.push({name:L[1],color:color,data:data});
     return {name:L[1],type:'line',showSymbol:false,
       lineStyle:{width:L[2],color:color}, itemStyle:{color:color},
       z:(k==='p99')?6:3,
-      endLabel:{show:true,distance:6,
-        formatter:function(p){return p.seriesName;},
-        color:color,fontSize:12,fontWeight:600,fontFamily:LFFONT},
       emphasis:{focus:'series',lineStyle:{width:L[2]+0.8}},
-      data:arr.map(function(v,i){
-        if(mask&&mask[i]) return [x[i],null];
-        return [x[i],v==null?0:v];})};
+      data:data};
   });
 }
-function markLines(tArr,mask){
+function markLines(tArr,mask,th){
   const z=Z(); const data=[];
   if(z&&z.anomalies&&z.anomalies.length)
     z.anomalies.slice(0,50).forEach(function(a){
       data.push({xAxis:a.t*1000,
         lineStyle:{color:C.hero,width:1},label:{show:false}});});
-  if(mask){
+  if(mask&&tArr){
     let shown=0;
     mask.forEach(function(hit,i){
       if(!hit) return;
       data.push({xAxis:tArr[i]*1000,
         lineStyle:{color:C.hero,width:1.4,type:'dashed'},
-        label:{show:shown<8,formatter:'离群',position:'insideEndTop',
+        label:{show:shown<6,formatter:'离群',position:'insideEndTop',
           color:C.hero,fontSize:12,fontWeight:600}});
       shown++;
     });
   }
+  if(th){
+    data.push({yAxis:th,
+      lineStyle:{color:C.hero,width:1.2,type:'dashed'},
+      label:{formatter:'离群阀值 '+fmtMs(th),position:'insideStartTop',
+        color:C.hero,fontSize:12,fontWeight:600}});
+  }
   return data.length?{symbol:'none',silent:true,data:data}:null;
 }
+function fmtMs(v){
+  v=Number(v)||0;
+  if(v>=1000) return (v/1000).toFixed(2)+'s';
+  if(v>=10) return v.toFixed(1)+'ms';
+  return v.toFixed(2)+'ms';
+}
 let chart=null,qpsChart=null;
+let mainLabelMeta=[];   /* 端点标识用：{name,color,data} */
 /* 单步渲染隔离：任何一张图/一个区块抛错只丢自己，绝不整页中断 */
 function safe(name,fn){
   try{ fn(); }
@@ -1552,11 +1589,17 @@ function buildChart(){
   const tier=currentTier();
   const opt=selObjs.length>1?multiOpt(tier):richOpt(tier,selObjs[0]);
   if(opt.series&&opt.series.length&&!opt.series[0].markLine){
-    const ml=markLines(null,null);      // 异常窗口竖线
+    const ml=markLines(null,null,null);      // 异常窗口竖线
     if(ml) opt.series[0].markLine=ml;
   }
   chart.setOption(opt,true);
   safe('qps-chart',buildQpsChart);
+  safe('y-scale',function(){
+    yScaleState.domain=yDomainOf();
+    const w=yWindowFromChart();
+    applyYWindow(w[0],w[1]);
+  });
+  safe('end-labels',function(){layoutEndLabels(chart);});
 }
 function richOpt(tier,key){
   const col=colsOf(key,tier);
@@ -1564,6 +1607,7 @@ function richOpt(tier,key){
   const qps=colQps(col,tier);
   const x=col.t.map(function(t){return t*1000;});
   const mask=outlierMask(col);
+  const th=outlierThreshold();
   const o=axisCommon();
   o.grid=MAIN_GRID;
   o.tooltip.formatter=function(ps){
@@ -1575,20 +1619,25 @@ function richOpt(tier,key){
       ['队列等待峰(ms)',col.qwmax[i]]];
     let out='<b>'+fullts(t)+'</b><br>'+
       rows.map(function(r){return r[0]+'：'+r[1];}).join('<br>');
-    if(mask&&mask[i]) out+='<br><b>该桶判定为离群（已从折线剔除）</b>';
+    if(mask&&mask[i])
+      out+='<br><b>该桶含离群值（已按阀值 '+fmtMs(th)+' 截顶）</b>';
     return out;
   };
-  o.yAxis=[lfAxisValue({name:'ms',scale:true})];
-  o.series=latLineSeries(col,x,mask);
-  o.series[0].markLine=markLines(col.t,mask);
+  o.yAxis=[lfAxisValue({name:'ms',scale:true,nameLocation:'end',nameGap:14})];
+  mainLabelMeta=[];
+  o.series=latLineSeries(col,x,mask,th,mainLabelMeta);
+  o.series[0].markLine=markLines(col.t,mask,outlierOn?th:null);
   return o;
 }
 function multiOpt(tier){
   const o=axisCommon();
   o.grid=MAIN_GRID;
-  o.yAxis=[lfAxisValue({name:metricLabel(curMetric),scale:true})];
+  o.yAxis=[lfAxisValue({name:metricLabel(curMetric),scale:true,
+    nameLocation:'end',nameGap:14})];
   o.series=[];
+  mainLabelMeta=[];
   const pal=objPalette();
+  const th=outlierThreshold();
   selObjs.forEach(function(key,idx){
     const t=colsOf(key,tier)?tier:'cnt';
     const col=colsOf(key,t);
@@ -1601,47 +1650,188 @@ function multiOpt(tier){
     else if(curMetric==='fail') v=col.fail;
     else v=(col[curMetric]==null?0:col[curMetric]);
     const color=pal[idx%pal.length];
+    const data=(v||[]).map(function(val,i){
+      let x2=val;
+      if(mask&&mask[i]&&th&&x2>th) x2=th;
+      return [x[i],x2];});
+    mainLabelMeta.push({name:nm,color:color,data:data});
     o.series.push({name:nm,type:'line',showSymbol:false,
       lineStyle:{width:idx===0?2:1.5,color:color}, itemStyle:{color:color},
       z:idx===0?6:3,
-      endLabel:{show:true,distance:6,
-        formatter:function(p){return p.seriesName;},
-        color:color,fontSize:12,fontWeight:600,fontFamily:LFFONT},
       emphasis:{focus:'series',lineStyle:{width:2.4}},
-      data:(v||[]).map(function(val,i){
-        if(mask&&mask[i]) return [x[i],null];
-        return [x[i],val];})});
+      data:data});
   });
   return o;
 }
-/* ---- 吞吐与失败（独立窄面板，共享时间轴；失败为 0 时也看得见） ---- */
+/* ---- 端点标识：细线指向端点，标识纵向排开（避免完全重叠） ---- */
+function layoutEndLabels(ch){
+  const ov=document.getElementById('endlabels');
+  if(!ov) return;
+  ov.innerHTML='';
+  if(!ch||!ch.convertToPixel) return;          /* 桩环境跳过 */
+  const g=MAIN_GRID;
+  const items=[];
+  mainLabelMeta.forEach(function(m,idx){
+    let last=null;
+    for(let i=(m.data||[]).length-1;i>=0;i--){
+      const d=m.data[i];
+      if(d&&d[1]!=null){last=d;break;}
+    }
+    if(!last) return;
+    let p=null;
+    try{ p=ch.convertToPixel({seriesIndex:idx},[last[0],last[1]]); }
+    catch(e){ p=null; }
+    if(!p||isNaN(p[0])||isNaN(p[1])) return;
+    items.push({x:p[0],y:p[1],name:m.name,color:m.color});
+  });
+  if(!items.length) return;
+  const H=ch.getHeight?ch.getHeight():400;
+  const MIN=19;
+  items.sort(function(a,b){return a.y-b.y;});
+  for(let i=1;i<items.length;i++)
+    if(items[i].y-items[i-1].y<MIN) items[i].y=items[i-1].y+MIN;
+  const top=g.top+8, bot=H-g.bottom-8;
+  let over=items[items.length-1].y-bot;
+  if(over>0) items.forEach(function(it){it.y-=over;});
+  if(items[0].y<top){
+    const d=top-items[0].y;
+    items.forEach(function(it){it.y+=d;});
+  }
+  items.forEach(function(it){
+    const lx=it.x+12;
+    const dx=lx-it.x, dy=it.y-it.y;
+    const line=el('div','endleader');
+    line.style.left=it.x+'px'; line.style.top=it.y+'px';
+    line.style.width=Math.max(1,Math.abs(dx))+'px'; line.style.height='1px';
+    line.style.background=it.color;
+    ov.appendChild(line);
+    const lab=el('div','endlabel',it.name);
+    lab.style.left=lx+'px'; lab.style.top=it.y+'px';
+    lab.style.color=it.color;
+    ov.appendChild(lab);
+  });
+}
+/* ---- 时延轴刻度轨（自绘，永不倒转；上/下界可拖） ---- */
+const yScaleState={domain:[0,1]};
+function yDomainOf(){
+  let mx=-Infinity,mn=Infinity;
+  (mainLabelMeta||[]).forEach(function(m){
+    (m.data||[]).forEach(function(d){
+      if(d&&d[1]!=null){
+        if(d[1]>mx)mx=d[1];
+        if(d[1]<mn)mn=d[1];}});
+  });
+  if(!isFinite(mx)||!isFinite(mn)){mx=1;mn=0;}
+  if(mx===mn)mx=mn+1;
+  if(mn>0)mn=0;
+  return [mn,mx];
+}
+function yWindowFromChart(){
+  const d=yScaleState.domain, span=(d[1]-d[0])||1;
+  let s=0,e=100;
+  try{
+    const opt=chart.getOption();
+    const dz=(opt.dataZoom||[])[1]||{};
+    if(dz.start!=null)s=dz.start;
+    if(dz.end!=null)e=dz.end;
+  }catch(err){}
+  return [d[0]+s/100*span, d[0]+e/100*span];
+}
+function applyYWindow(lo,hi){
+  const d=yScaleState.domain, span=(d[1]-d[0])||1;
+  const minSpan=span*0.01;
+  if(hi-lo<minSpan){                 /* 绝不倒转 */
+    const mid=(lo+hi)/2;
+    lo=mid-minSpan/2; hi=mid+minSpan/2;
+  }
+  lo=Math.max(d[0],Math.min(lo,d[1]-minSpan));
+  hi=Math.min(d[1],Math.max(hi,d[0]+minSpan));
+  if(hi<=lo)hi=Math.min(d[1],lo+minSpan);
+  try{
+    chart.dispatchAction({type:'dataZoom',dataZoomIndex:1,
+      start:(lo-d[0])/span*100, end:(hi-d[0])/span*100});
+  }catch(e){}
+  syncYScale(lo,hi);
+}
+function syncYScale(lo,hi){
+  const rail=document.getElementById('yscaleRail');
+  const win=document.getElementById('yscaleWin');
+  const hg=document.getElementById('yscaleHiGrip');
+  const lg=document.getElementById('yscaleLoGrip');
+  const capHi=document.getElementById('yscaleHi');
+  const capLo=document.getElementById('yscaleLo');
+  if(!rail||!win) return;
+  const d=yScaleState.domain, span=(d[1]-d[0])||1;
+  const H=rail.clientHeight||1;
+  const topPct=Math.max(0,Math.min(100,(d[1]-hi)/span*100));
+  const botPct=Math.max(0,Math.min(100,(d[1]-lo)/span*100));
+  win.style.top=topPct+'%';
+  win.style.height=Math.max(1.5,botPct-topPct)+'%';
+  if(hg) hg.style.top='calc('+topPct+'% - 6px)';
+  if(lg) lg.style.top='calc('+botPct+'% - 6px)';
+  if(capHi) capHi.textContent=fmtMs(hi);
+  if(capLo) capLo.textContent=fmtMs(lo);
+}
+function bindYScale(){
+  const rail=document.getElementById('yscaleRail');
+  if(!rail) return;
+  function startDrag(mode,ev){
+    if(ev&&ev.preventDefault)ev.preventDefault();
+    const H=rail.clientHeight||1;
+    const d=yScaleState.domain, span=(d[1]-d[0])||1;
+    const w0=yWindowFromChart();
+    const lo0=w0[0], hi0=w0[1], y0=ev?ev.clientY:0;
+    function move(e){
+      const dv=-(e.clientY-y0)/H*span;   /* 往上拖 = 数值变大 */
+      if(mode==='hi') applyYWindow(lo0,hi0+dv);
+      else if(mode==='lo') applyYWindow(lo0+dv,hi0);
+      else { const w=hi0-lo0; applyYWindow(lo0+dv,lo0+dv+w); }
+    }
+    function up(){
+      document.removeEventListener('mousemove',move);
+      document.removeEventListener('mouseup',up);
+    }
+    document.addEventListener('mousemove',move);
+    document.addEventListener('mouseup',up);
+  }
+  const hg=document.getElementById('yscaleHiGrip');
+  const lg=document.getElementById('yscaleLoGrip');
+  const win=document.getElementById('yscaleWin');
+  if(hg) hg.onmousedown=function(e){startDrag('hi',e);};
+  if(lg) lg.onmousedown=function(e){startDrag('lo',e);};
+  if(win) win.onmousedown=function(e){startDrag('pan',e);};
+}
+/* ---- 吞吐与失败（共享时间轴；QPS 每桶一根柱，失败为独立计数轴红柱） ---- */
 function qpsOpt(tier){
   const o=axisCommon();
-  o.grid={left:56,right:56,top:26,bottom:34};
+  o.grid=QPS_GRID;
   o.legend={top:0,type:'scroll',icon:'roundRect',itemWidth:14,itemHeight:3,
     itemGap:16,textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
   o.tooltip=lfTooltip({trigger:'axis'});
   o.xAxis=lfAxisTime();
-  o.yAxis=[lfAxisValue({name:'QPS',scale:true}),
-           lfAxisValue({name:'失败',position:'right',splitLine:{show:false}})];
+  o.yAxis=[lfAxisValue({name:'QPS',scale:true,nameLocation:'end',nameGap:16}),
+           lfAxisValue({name:'失败',position:'right',splitLine:{show:false},
+             nameLocation:'end',nameGap:16})];
   o.dataZoom=zoomModel('xonly');
   o.series=[];
   const keys=selObjs.length?selObjs:['all'];
   const pal=objPalette();
+  const qcolors=LF_DARK?['#8F8E88','#B3B0A4','#6A6963','#DCDAD2']
+                      :['#8F8E86','#6E6D66','#A5A49C','#4A4944'];
   keys.forEach(function(key,idx){
     const t=colsOf(key,tier)?tier:'cnt';
     const col=colsOf(key,t);
     if(!col||!col.t.length) return;
-    const color=pal[idx%pal.length];
     const qps=colQps(col,t);
     const x=col.t.map(function(v){return v*1000;});
     const nm=objLabel(key);
-    o.series.push({name:nm+' QPS',type:'line',showSymbol:false,
-      lineStyle:{width:idx===0?1.8:1.3,color:color}, itemStyle:{color:color},
-      areaStyle:idx===0?{color:C.track,opacity:.6}:null, z:3,
-      data:x.map(function(v,i){return [v,qps[i]];})});
-    o.series.push({name:nm+' 失败',type:'bar',yAxisIndex:1,stack:'fail',
-      barMaxWidth:6,large:true,itemStyle:{color:C.hero},z:4,
+    o.series.push({name:nm+' QPS',type:'bar',yAxisIndex:0,
+      barMaxWidth:7,large:true,
+      itemStyle:{color:qcolors[idx%qcolors.length],borderRadius:[99,99,0,0]},
+      z:3, data:x.map(function(v,i){return [v,qps[i]];})});
+    o.series.push({name:nm+' 失败',type:'bar',yAxisIndex:1,
+      barMaxWidth:3,large:true,barGap:'-100%',
+      itemStyle:{color:C.hero,borderRadius:[99,99,0,0]},z:4,
       data:x.map(function(v,i){return [v,(col.fail&&col.fail[i])||0];})});
   });
   return o;
@@ -1667,11 +1857,11 @@ function buildQpsChart(){
   if(note){
     const tf=totalFails(tier);
     note.textContent=tf>0
-      ? ('失败合计 '+tf+' 次 —— 右侧红条即失败数（独立计数轴，与 QPS 不同量纲）。')
-      : '本段无失败：失败数全为 0 —— 右侧仍保留失败计数轴，一旦有失败即出现红条。';
+      ? ('失败合计 '+tf+' 次 —— 细红柱为失败数（右侧独立计数轴，与 QPS 不同量纲）。')
+      : '本段无失败：失败数全为 0 —— 右侧仍保留失败计数轴，一旦有失败即出现红柱。';
   }
 }
-/* ---- 拖拽平移（x/y 互斥）+ 竖滑块缩放 y + 重置视图 ---- */
+/* ---- 拖拽平移（x/y 互斥） ---- */
 function panZoom(ch,idx,delta,extent){
   try{
     const opt=ch.getOption();
@@ -1695,9 +1885,7 @@ function bindInteract(ch,grid){
     const g=grid||MAIN_GRID;
     const w=ch.getWidth()||0,h=ch.getHeight()||0;
     const ph=Math.max(1,h-g.top-g.bottom), pw=Math.max(1,w-g.left-g.right);
-    // 左侧竖滑块（缩放 y）与底部横滑块（缩放 x）由 ECharts 自己处理
-    if(e.offsetX>=0&&e.offsetX<=26&&e.offsetY>=g.top-4&&e.offsetY<=g.top+ph+4) return;
-    if(e.offsetY>=g.top+ph&&e.offsetY<=g.top+ph+20) return;
+    if(e.offsetY>=g.top+ph&&e.offsetY<=g.top+ph+20) return;  /* 底部横滑块 */
     drag={x:e.offsetX,y:e.offsetY};
   });
   zr.on('mousemove',function(e){
@@ -1742,6 +1930,10 @@ function resetViews(){
       c.dispatchAction({type:'dataZoom',dataZoomIndex:0,start:0,end:100});
       c.dispatchAction({type:'dataZoom',dataZoomIndex:1,start:0,end:100});
     }catch(e){}
+  });
+  safe('y-scale',function(){
+    yScaleState.domain=yDomainOf();
+    applyYWindow(yScaleState.domain[0],yScaleState.domain[1]);
   });
 }
 
@@ -2021,6 +2213,7 @@ function renderSources(){
     box.appendChild(wrapx);
   }
 }
+
 /* ---- 对象树：总体 -> 节点 -> 客户端，每行一个复选框 -------------- */
 let treeOpen={};
 function objTreeModel(){
@@ -2294,6 +2487,19 @@ function mount(){
     bindInteract(chart,MAIN_GRID);
     linkZoom(chart,qpsChart);
   });
+  safe('y-scale',function(){
+    bindYScale();
+    if(chart){
+      try{
+        chart.on('finished',function(){
+          safe('end-labels',function(){layoutEndLabels(chart);});});
+        chart.on('dataZoom',function(){
+          safe('end-labels',function(){layoutEndLabels(chart);});
+          safe('y-scale',function(){
+            const w=yWindowFromChart(); syncYScale(w[0],w[1]);});});
+      }catch(e){}
+    }
+  });
   window.addEventListener('resize',function(){
     if(chart)chart.resize();
     if(qpsChart)qpsChart.resize();
@@ -2328,6 +2534,7 @@ let tSize='',tGroup='',tOp='',tChart=null;
 let tLevelMetric='avg',tStageSel=['total_us'],tStageMetric='avg';
 const tExpand={};
 let tFocus={};        /* 分级时延焦点集合（可多选） */
+let tExpandAll=false; /* 展开全部（不聚焦时） */
 let tSel='total_us';  /* 阶段树当前选中节点 */
 const T_METRICS=[['min','最小'],['avg','平均'],['p50','p50'],['p99','p99'],
   ['p999','p999'],['p9999','p9999'],['max','最大']];
@@ -2430,17 +2637,27 @@ function focusLit(cur){
   return lit;
 }
 function toggleFocus(key){
+  if(tExpandAll) tExpandAll=false;
   tFocus[key]=!tFocus[key];
   const cur=tPick(); if(!cur) return;
   renderLevels(cur);
 }
 function focusBar(cur){
   const bar=el('div','focus-bar');
+  const exp=el('button','mini'+(tExpandAll?' on':''),'展开全部');
+  exp.title='不聚焦，展开全部子阶段（每一级另起一行）';
+  exp.onclick=function(){tFocus={};tExpandAll=true;renderLevels(cur);};
+  bar.appendChild(exp);
+  const clr=el('button','mini','收起全部');
+  clr.title='取消全部聚焦与展开';
+  clr.onclick=function(){tFocus={};tExpandAll=false;renderLevels(cur);};
+  bar.appendChild(clr);
   bar.appendChild(el('span','tl-label','焦点'));
   const keys=Object.keys(tFocus).filter(function(k){return tFocus[k];});
   if(!keys.length){
-    bar.appendChild(el('span','focus-empty',
-      '未聚焦 —— 点击任一阶段块展开其下一级；可同时聚焦多个（再次点击取消）'));
+    bar.appendChild(el('span','focus-empty',tExpandAll
+      ? '已展开全部子阶段（点击任一块可切换为聚焦）'
+      : '未聚焦 —— 点击任一阶段块即可聚焦，其下一级在下一行展开'));
     return bar;
   }
   keys.forEach(function(k){
@@ -2449,10 +2666,6 @@ function focusBar(cur){
     x.onclick=function(){tFocus[k]=false;renderLevels(cur);};
     chip.appendChild(x); bar.appendChild(chip);
   });
-  const clr=el('button','mini','收起全部');
-  clr.title='取消全部焦点';
-  clr.onclick=function(){tFocus={};renderLevels(cur);};
-  bar.appendChild(clr);
   return bar;
 }
 function levelTip(b){
@@ -2463,38 +2676,27 @@ function levelTip(b){
     function(k){ if(st[k]!=null) tip.push(k+'：'+st[k]+' µs'); });
   tip.push('占父项：'+(b.share*100).toFixed(1)+'%');
   if(b.residual) tip.push('残差 = 父项 − 各子项之和（未展开的部分）');
+  else tip.push('点击聚焦：下一级在下一行展开，其余块横向压缩');
   return tip.join('\n');
 }
+/* 块：两行文字（名称 / 值 + 占父%），无任何边框；聚焦靠块的形态（更大）。 */
 function lvlBlock(b,cur,lit,depth){
-  const blk=el('div','lvl-blk'+(b.residual?' residual':''));
+  const blk=el('div','lvl-blk'+(b.focused?' focus':'')+
+    (b.compressed?' compressed':''));
   const st=lvlStyle(b.share,b.residual);
   blk.style.background=st.background; blk.style.color=st.color;
-  const top=el('div','lvl-top');
-  top.appendChild(el('span','lvl-name',b.x.label));
-  top.appendChild(el('span','lvl-val',fmtUs(b.x.v)));
-  blk.appendChild(top);
-  blk.appendChild(el('div','lvl-sub','占父 '+(b.share*100).toFixed(1)+'%'+
-    (b.x.st&&b.x.st.n!=null?(' · n='+b.x.st.n):'')));
-  const kids=b.residual?[]:tChildrenOf(b.x.key,cur);
-  if(kids.length){
-    const focused=!!tFocus[b.x.key];
-    const tog=el('button','lvl-toggle',focused?'收起':'展开');
-    tog.title=focused?('收起 '+b.x.label+' 的下一级'):('聚焦 '+b.x.label+' 并展开下一级');
-    tog.onclick=function(){toggleFocus(b.x.key);};
-    blk.appendChild(tog);
-    if(focused){
-      const srow=el('div','lvl-row sub');
-      appendLevelRow(srow,kids,b.x.st,b.x.v,cur,lit,depth+1);
-      blk.appendChild(srow);
-    }
-  }
-  if(lit&&Object.keys(lit).length){
-    if(lit[b.x.key]) blk.className=blk.className+' focus';
-    else blk.style.opacity='0.25';
-  }
+  blk.appendChild(el('div','lvl-name',b.x.label));
+  blk.appendChild(el('div','lvl-val',
+    fmtUs(b.x.v)+'  '+(b.share*100).toFixed(1)+'%'));
   blk.title=levelTip(b);
+  if(!b.residual){
+    blk.style.cursor='pointer';
+    blk.onclick=function(){toggleFocus(b.x.key);};
+  }
   return blk;
 }
+/* 一行 = 同一父下的一组子项：列宽 = 占父百分比（minmax(可读下限, Nfr)）。
+   聚焦时该列横向扩展、其余列压缩（压缩块文字隐藏）；子级另起一行。 */
 function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
   const metric=tLevelMetric;
   const vals=items.map(function(it){
@@ -2505,35 +2707,55 @@ function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
   const parentV=parentVal||0;
   let scale=1,over=false;
   if(parentV>0&&sum>parentV){scale=parentV/sum;over=true;}
+  const used=vals.reduce(function(a,b){return a+b.v*scale;},0);
+  const rest=parentV>0?Math.max(0,parentV-used):0;
+  const hasRest=(rest>0.0001||over);
+  const anyFocus=vals.some(function(x){return !!tFocus[x.key];});
   const cols=[],blocks=[];
   vals.forEach(function(x){
     const share=parentV>0?(x.v/parentV):0;
     const w=share*100*scale;
-    const minW=Math.max(78,Math.round(String(x.label).length*7.6+30));
-    cols.push('minmax('+minW+'px,'+w.toFixed(3)+'fr)');
-    blocks.push({x:x,share:share,w:w});
+    const minW=Math.max(96,Math.round(String(x.label).length*7.8+36));
+    const focused=!!tFocus[x.key];
+    let col;
+    if(focused) col='minmax('+minW+'px, 9fr)';
+    else if(anyFocus) col='minmax(0px, 0.4fr)';
+    else col='minmax('+minW+'px,'+w.toFixed(3)+'fr)';
+    cols.push(col);
+    blocks.push({x:x,share:share,w:w,focused:focused,
+      compressed:anyFocus&&!focused});
   });
-  const used=vals.reduce(function(a,b){return a+b.v*scale;},0);
-  const rest=parentV>0?Math.max(0,parentV-used):0;
-  if(rest>0.0001||over){
+  if(hasRest){
     const share=parentV>0?(rest/parentV):0;
-    cols.push('minmax(78px,'+(share*100).toFixed(3)+'fr)');
+    cols.push(anyFocus?'minmax(0px, 0.4fr)'
+      :'minmax(96px,'+(share*100).toFixed(3)+'fr)');
     blocks.push({x:{key:'__residual__',label:'残差',
       st:tStat('residual',cur),v:rest},
-      share:share,w:share*100,residual:true});
+      share:share,w:share*100,residual:true,compressed:anyFocus});
   }
   rowEl.style.gridTemplateColumns=cols.join(' ');
-  blocks.forEach(function(b){rowEl.appendChild(lvlBlock(b,cur,lit,depth));});
-  const parent=rowEl.parentNode;
-  if(over&&parent){
-    parent.appendChild(el('div','lvl-note',
-      '子项合计 '+(sum/parentV*100).toFixed(1)+'%，超出父项 —— 已按比例压缩填满父项宽度。'));
-  }
+  blocks.forEach(function(b,i){
+    rowEl.appendChild(lvlBlock(b,cur,lit,depth));
+    const kids=b.residual?[]:tChildrenOf(b.x.key,cur);
+    if(!kids.length) return;
+    if(!(b.focused||tExpandAll)) return;
+    const holder=el('div','lvl-children');
+    holder.style.gridColumn=(i+1);
+    holder.style.gridRow='2';
+    const sub=el('div','lvl-row');
+    appendLevelRow(sub,kids,b.x.st,b.x.v,cur,lit,depth+1);
+    holder.appendChild(sub);
+    rowEl.appendChild(holder);
+  });
+  const notes=[];
+  if(over) notes.push('子项合计 '+(sum/parentV*100).toFixed(1)+
+    '%，超出父项 —— 已按比例压缩填满父项宽度。');
   const tiny=blocks.some(function(b){return b.share>0&&b.share<0.08;});
-  if(tiny&&parent){
-    parent.appendChild(el('div','lvl-note',
-      '本行含占比极小的项：已按最小可读宽度展开（整行可横向滚动），块内百分比与颜色仍按真实占比计算。'));
-  }
+  if(tiny) notes.push('本行含占比极小的项：已按最小可读宽度展开（整行可横向滚动），'+
+    '块内百分比与颜色仍按真实占比计算。');
+  notes.forEach(function(t){
+    if(rowEl.parentNode) rowEl.parentNode.appendChild(el('div','lvl-note',t));
+  });
 }
 function renderLevels(cur){
   const box=document.getElementById('levels'); if(!box) return;
@@ -2547,17 +2769,23 @@ function renderLevels(cur){
     return;
   }
   const lit=focusLit(cur);
-  const root=el('div','lvl-row root');
-  root.appendChild(lvlBlock({x:{key:'total_us',label:'total（端到端）',
-    st:total,v:tv},share:1},cur,lit,0));
-  box.appendChild(root);
+  const rw=el('div','lvl-wrap');
+  const rrow=el('div','lvl-row root');
+  rrow.style.gridTemplateColumns='minmax(0,1fr)';
+  rrow.appendChild(lvlBlock({x:{key:'total_us',label:'total',st:total,v:tv},
+    share:1},cur,lit,0));
+  rw.appendChild(rrow);
+  box.appendChild(rw);
   const l1=tChildrenOf('total_us',cur);
   if(l1.length){
+    const wrap=el('div','lvl-wrap');
     const row=el('div','lvl-row');
     appendLevelRow(row,l1,total,tv,cur,lit,1);
-    box.appendChild(row);
+    wrap.appendChild(row);
+    box.appendChild(wrap);
   }
 }
+
 function totalSeriesData(cur,tier,metric){
   const rows=cur.data.minutes||[];
   const agg={};
@@ -3039,12 +3267,27 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
 <button id="outlierBtn">剔除离群值</button>
 <button id="resetBtn" title="恢复初始缩放范围">重置视图</button>
 </div>
+<div class="chart-frame">
+<div class="yscale" id="yscale">
+<div class="yscale-cap" id="yscaleHi">—</div>
+<div class="yscale-rail" id="yscaleRail">
+<div class="yscale-win" id="yscaleWin"></div>
+<div class="yscale-grip yscale-grip-hi" id="yscaleHiGrip" title="拖动设置时延轴上界"></div>
+<div class="yscale-grip yscale-grip-lo" id="yscaleLoGrip" title="拖动设置时延轴下界"></div>
+</div>
+<div class="yscale-cap" id="yscaleLo">—</div>
+<div class="yscale-hint">时延轴刻度</div>
+</div>
+<div class="chart-canvas">
 <div id="mainchart" class="chart"></div>
-<div class="sub qps-cap">吞吐与失败（与上图共享时间轴）</div>
+<div id="endlabels" class="endlabels"></div>
+</div>
+</div>
+<div class="sub qps-cap">吞吐与失败</div>
 <div id="qpschart" class="chart qps"></div>
 <div class="note" id="qpsNote"></div>
 <div class="chart-hint">滚轮 = 缩放时间轴（时延轴不动） · 左右拖动 = 平移时间轴 ·
-上下拖动 = 平移时延轴（两者互斥） · 左侧竖滑块 = 缩放时延轴</div>
+上下拖动 = 平移时延轴（两者互斥） · 左侧刻度轨：拖上/下端改时延轴上下界，拖中间平移</div>
 </div>
 </div></div>
 <div class="card" id="histcard" style="display:none"><h2>时延分布</h2>
@@ -3065,7 +3308,7 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
 <div class="note">读路径 / 写路径 = SDK trace 的请求方向（读=get 类，写=put 类）；
 「数据大小」= 本次 trace 对应的对象规模。</div>
 <div id="tcards" class="grid"></div>
-<h3 class="sec">分级时延（块宽 = 占父项百分比；点击块可聚焦展开下一级）</h3>
+<h3 class="sec">分级时延（块宽 = 占父项百分比；点击块聚焦，下一级在新行展开）</h3>
 <div class="toolbar"><span class="tl-label">指标</span>
 <span id="lvlMetric" class="toolbar"></span></div>
 <div id="levels" class="levels"></div>

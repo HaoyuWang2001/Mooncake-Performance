@@ -1080,8 +1080,28 @@ def test_outlier_toggle_masks_buckets(tmp_path):
     if res is None:
         return
     assert res["errors"] == []
-    assert any(n > 0 for n in (res.get("outlier_nulls") or [])), res.get("outlier_nulls")
+    # 语义：命中桶**截顶**而不是整桶丢弃（整桶丢弃会因 1s 桶样本多而误伤大片）
+    assert not any(n > 0 for n in (res.get("outlier_nulls") or [])), \
+        res.get("outlier_nulls")
+    # 阀值 = 10 x p99 = 18ms -> 图上最大值被压到 18
+    assert abs((res.get("outlier_max") or 0) - 18.0) < 0.01, res.get("outlier_max")
     assert "离群" in (res.get("outlier_btn") or "")
+
+
+def test_y_scale_rail_bounds_never_invert(tmp_path):
+    """时延轴刻度轨：给出上下界，且上界 > 下界（绝不倒转）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    hi = res.get("yscale_hi") or ""
+    lo = res.get("yscale_lo") or ""
+    assert hi and lo, (hi, lo)
+    def val(t):
+        return float(t.replace("ms", "").replace("s", ""))
+    assert val(hi) > val(lo), (hi, lo)
 
 
 def test_levels_focus_expand_and_residual(tmp_path):
@@ -1095,7 +1115,8 @@ def test_levels_focus_expand_and_residual(tmp_path):
     assert res["errors"] == []
     lv = res.get("focus_text") or ""
     assert "残差" in lv, lv[:200]
-    assert "query_route_us" in lv, lv[:400]     # 聚焦后展开下一级
+    assert "query_total_us" in lv
+    assert "query_route_us" in lv, lv[:400]     # 聚焦后下一级在新行展开
     assert "query_rpc_us" in lv, lv[:400]
 
 
