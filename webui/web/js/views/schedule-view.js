@@ -71,7 +71,7 @@ const ScheduleView = {
         <b>编辑计划</b>
         <span v-if="currentPlan" class="cfg-dlg-path">{{ currentPlan }}</span>
       </template>
-      <el-input type="textarea" :rows="18" v-model="planContent" class="editor"></el-input>
+      <el-input type="textarea" :rows="18" v-model="planContent" class="editor" ref="planInput"></el-input>
       <el-alert v-if="msg.text" :type="msg.ok ? 'success' : 'error'"
                 :title="msg.text" :closable="false" show-icon class="mt-2" />
       <template #footer>
@@ -93,6 +93,7 @@ const ScheduleView = {
     const starting = Vue.ref(false);
     const sch = Vue.ref(null);
     const dlgOpen = Vue.ref(false);
+    const planInput = Vue.ref(null);
 
     const dirty = Vue.computed(() =>
       !!currentPlan.value && planContent.value !== planSnapshot.value);
@@ -135,6 +136,7 @@ const ScheduleView = {
         planContent.value = r.content;
         planSnapshot.value = r.content;
         dlgOpen.value = true;
+        Vue.nextTick(() => { if (planInput.value) planInput.value.focus(); });
       } catch (e) { ElementPlus.ElMessage.error(e.message); }
     }
 
@@ -152,6 +154,7 @@ const ScheduleView = {
       msg.ok = true;
       msg.text = "新计划（未保存）";
       dlgOpen.value = true;
+      Vue.nextTick(() => { if (planInput.value) planInput.value.focus(); });
     }
 
     // 未保存关闭 -> 丢弃确认（同配置维护交互）
@@ -194,13 +197,19 @@ const ScheduleView = {
 
     async function start() {
       starting.value = true;
-      try { await api("POST", "/api/schedule/start", { plan: currentPlan.value }); }
+      try {
+        await api("POST", "/api/schedule/start", { plan: currentPlan.value });
+        ElementPlus.ElMessage.success("调度已启动");
+      }
       catch (e) { ElementPlus.ElMessage.error(e.message); }
       finally { starting.value = false; }
     }
 
     async function stop() {
-      try { await api("POST", "/api/schedule/stop"); }
+      try {
+        await api("POST", "/api/schedule/stop");
+        ElementPlus.ElMessage.success("调度已停止");
+      }
       catch (e) { ElementPlus.ElMessage.error(e.message); }
     }
 
@@ -210,6 +219,19 @@ const ScheduleView = {
     }
 
     let timer = null;
+    function onEditorKey(e) {
+      if (!dlgOpen.value) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "s" || e.key === "S") {
+        e.preventDefault();
+        if (currentPlan.value && dirty.value) savePlan();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        syntaxCheck();
+      }
+    }
+    Vue.onMounted(() => window.addEventListener("keydown", onEditorKey));
+    Vue.onUnmounted(() => window.removeEventListener("keydown", onEditorKey));
     Vue.onActivated(() => {
       loadPlans();
       pollSch();
@@ -218,7 +240,7 @@ const ScheduleView = {
     Vue.onDeactivated(() => clearInterval(timer));
 
     return { plans, currentPlan, planContent, newName, msg, saving, starting,
-             dlgOpen, dirty, sch, schTagType, schText, schEvents, schedulerText,
+             dlgOpen, planInput, dirty, sch, schTagType, schText, schEvents, schedulerText,
              startHint, loadPlans, onPlanClick, newPlan, askClose,
              syntaxCheck, savePlan, start, stop };
   },

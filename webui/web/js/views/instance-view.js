@@ -228,7 +228,7 @@ const InstanceView = {
     </el-card>
 
     <template v-else-if="detail">
-      <el-card shadow="never" class="inst-detail-head">
+      <el-card shadow="never" class="inst-detail-head" v-loading="loading">
         <div class="inst-head">
           <span class="inst-name" :title="detail.instance.name">{{ detail.instance.name }}</span>
           <el-tag size="small" :type="detail.instance.launch_mode === 'rank_recall' ? 'warning' : 'info'">
@@ -454,6 +454,7 @@ const InstanceView = {
       } catch (e) { return; }
       try {
         await api("POST", "/api/instances/" + iid + "/rename", { name });
+        ElementPlus.ElMessage.success("已改名");
         await load();
       } catch (e) { ElementPlus.ElMessage.error("改名失败: " + e.message); }
     }
@@ -510,7 +511,7 @@ const InstanceView = {
     });
     Vue.onDeactivated(() => { clearInterval(timer); });
 
-    return { tabs, active, detail, busyRun, busyStop, merged, ticket,
+    return { tabs, active, detail, loading, busyRun, busyStop, merged, ticket,
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, activate, closeTab,
              statusType, statusText, run, stop, remove, rename,

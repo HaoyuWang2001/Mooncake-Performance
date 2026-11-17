@@ -702,6 +702,7 @@ const PerfView = {
         });
         warnings.value = r.warnings || [];
         refreshRuns();
+        ElementPlus.ElMessage.success("清理完成（远端残留已删除）");
       } catch (e) {
         ElementPlus.ElMessage.error("清理失败: " + e.message);
       } finally {

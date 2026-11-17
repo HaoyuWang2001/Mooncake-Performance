@@ -88,7 +88,7 @@ const ConfigView = {
         <span v-if="editPath" class="cfg-dlg-path">{{ editPath }}</span>
         <el-tag v-if="isNew" size="small" type="warning">新文件（未保存）</el-tag>
       </template>
-      <el-input type="textarea" :rows="22" v-model="editContent" class="editor"></el-input>
+      <el-input type="textarea" :rows="22" v-model="editContent" class="editor" ref="editInput"></el-input>
       <el-alert v-if="editMsg.text" :type="editMsg.ok ? 'success' : 'error'"
                 :title="editMsg.text" :closable="false" show-icon class="mt-2" />
       <template #footer>
@@ -110,6 +110,7 @@ const ConfigView = {
     const newCfgSources = Vue.ref(["configs/_ssh/cluster.example.json"]);
 
     const dlgOpen = Vue.ref(false);
+    const editInput = Vue.ref(null);
     const newSession = Vue.ref(false);   // 新建（未保存）会话标记
     const editPath = Vue.ref("");
     const editContent = Vue.ref("");
@@ -164,6 +165,7 @@ const ConfigView = {
         editMsg.text = "";
         newSession.value = false;
         dlgOpen.value = true;
+        Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
       }
@@ -208,6 +210,7 @@ const ConfigView = {
         editMsg.text = "新文件（基于 " + newCfgSource.value + "，保存后创建）";
         newSession.value = true;
         dlgOpen.value = true;
+        Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
       } catch (e) {
         ElementPlus.ElMessage.error("读取复制源失败: " + e.message);
       }
@@ -241,13 +244,25 @@ const ConfigView = {
       }
     }
 
+    function onEditorKey(e) {
+      if (!dlgOpen.value) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "s" || e.key === "S") {
+        e.preventDefault();
+        if (dirty.value) save();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        validate();
+      }
+    }
     Vue.provide("openConfigFile", openFile);
-    Vue.onMounted(loadAll);
+    Vue.onMounted(() => { loadAll(); window.addEventListener("keydown", onEditorKey); });
     // 每次切入页签都重新拉取：手动创建/修改的配置文件切回即自动可见
     Vue.onActivated(loadAll);
+    Vue.onUnmounted(() => window.removeEventListener("keydown", onEditorKey));
 
     return { treeRoots, general, openFile, newCfgName, newCfgSource, newCfgSources,
-             newConfig, dlgOpen, editPath, editContent, editMsg, saving, dirty,
+             newConfig, dlgOpen, editInput, editPath, editContent, editMsg, saving, dirty,
              isNew, askClose, validate, save, loadAll };
   },
 };

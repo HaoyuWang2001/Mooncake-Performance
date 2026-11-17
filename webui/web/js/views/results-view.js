@@ -387,6 +387,7 @@ const ResultsView = {
             <span class="hint">已选 {{ selected.length }}</span>
             <span class="spacer"></span>
             <el-button size="small" type="danger" :disabled="!selected.length"
+                       title="先多选勾选要删除的运行结果"
                        @click="deleteSelected">删除选中</el-button>
           </div>
           <div class="run-list">
@@ -411,7 +412,6 @@ const ResultsView = {
               <el-button size="small" text type="danger" @click.stop="deleteRun(r.ts)" title="删除">删除</el-button>
             </div>
           </div>
-          <el-empty v-if="!runs.length" description="暂无结果" :image-size="60"></el-empty>
           </div>
         </el-card>
       </el-col>
