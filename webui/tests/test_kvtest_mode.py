@@ -145,6 +145,8 @@ def test_build_kvtest_instance_config_http_master():
     assert inst["key_pool_size"] == 256
     assert inst["start_paused"] is True
     assert inst["metrics_interval_ms"] == 0
+    assert inst["notify_transport"] == "http"
+    assert inst["notify_rpc_port"] == entry["port"] + 10000
     # late-bound placeholders (filled by run_kvtest.sh per pod)
     assert inst["store"]["rdma_devices"] == "__UB_DEVICE__"
     assert inst["store"]["local_hostname"] == "__FABRIC_IP__:12345"
