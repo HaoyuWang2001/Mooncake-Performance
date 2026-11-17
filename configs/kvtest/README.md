@@ -1,12 +1,13 @@
 # configs/kvtest — mooncake_kvtest（C++ 原生压测）配置
 
 `scenario: "kvtest"` 调用 mooncake-store 仓库 `benchmarks/kvtest` 编译出的
-`mooncake_kvtest` C++ 二进制：HTTP 通知处理、通知队列、Mooncake 调用与指标
-采集全部留在 C++ 内（无 Python 请求路径），用于对照 Python client 的
-pipeline（rank/recall）结果。
+`mooncake_kvtest` C++ 二进制：Writer→Reader 通知使用 YLT `coro_rpc`，HTTP
+仅保留控制接口；通知队列、Mooncake 调用与指标采集全部留在 C++ 内（无
+Python 请求路径），用于对照 Python client 的 pipeline（rank/recall）结果。
 
-> 需要包含 `start_paused`、`POST /start` 和 summary `elapsed_seconds` 的新版
-> `mooncake_kvtest`；旧二进制会在编排器的 `/start` 健康门处明确失败。
+> 需要包含 `start_paused`、`POST /start|pause|drain|reset|arm|resume` 和 summary
+> `elapsed_seconds` 的新版 `mooncake_kvtest`；开启 warmup 时，旧二进制会在
+> `/pause` 控制门处明确失败。
 
 ## 运行方式（与现有场景一致）
 
@@ -93,8 +94,9 @@ cross-child barrier，再并行 `POST /start`，由 C++ 清空启动阶段指标
 writer。这样 rank/recall 的 Store 初始化耗时不同也不会污染窗口对齐。注意并行建议单 data_size 场景
 （barrier 是一次性的，后续 sweep 条目不再对齐，与 pipeline 并行语义一致）。
 
-编排器把本目录的场景配置翻译成 **每实例一份 kvtest JSON**（`role`/`listen_port`/
-`target_qps`/`nodes`/`store` 全部由 cluster.json + global.json 派生），推送到每个
+编排器把本目录的场景配置翻译成 **每实例一份 kvtest JSON**（`role`/
+`listen_port`/`notify_rpc_port`/`target_qps`/`nodes`/`store` 全部由
+cluster.json + global.json 派生），推送到每个
 pod/节点后经 `scripts/run_kvtest.sh` 启动；运行窗口 = `duration`，到点后编排器
 `POST /stop`，C++ 停机路径落盘最终 `summary.json`。
 
@@ -136,11 +138,17 @@ Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，�
 | `kvtest.local_port_base` | 每个节点/Pod 的 Mooncake 传输监听端口基址；真机并行场景之间必须错开 |
 | `writer.num_threads` | 每进程 C++ 写管线线程数（默认 1） |
 | `reader.num_threads` | 每进程 C++ 通知消费 worker 数（默认 4；纯 reader 进程同理） |
-| `writer.notify_threads` | 出站 HTTP 通知线程池大小 |
+| `writer.notify_threads` | 出站 RPC 任务线程池大小 |
+| `kvtest.notify_rpc_port_offset` | YLT RPC 端口相对 HTTP 控制端口的偏移，默认 10000 |
+| `kvtest.notify_rpc_threads` | 每实例 YLT RPC server 的 I/O 线程数，默认 4 |
+| `kvtest.notify_rpc_connections_per_peer` | 每个 Reader 的 YLT 长连接缓存容量，默认 4；突发时 YLT 可临时创建额外连接 |
+| `kvtest.notify_rpc_reuse_limit` | YLT 连接开始 pipeline 复用的并发阈值，默认 4 |
+| `kvtest.notify_rpc_timeout_ms` | 建连和单次 RPC 请求超时，默认 3000 ms |
 | `batch_size` | 映射 kvtest `batch_keys_count` |
 | `kvtest.key_pool_size` | `auto`（默认）= 按 Store 容量计算；0 = 无限新 key（YuanRong 行为）；>0 = 显式容量受限 key 池 |
 | `kvtest.verify_level` | `off` / `size`（默认）/ `sample` / `full` |
-| `duration` | 测量窗口秒数（kvtest 无 warmup 概念，残留 warmup 字段会被忽略并 WARN） |
+| `warmup.duration` | warmup 窗口秒数，默认 5；`--no-warmup` 强制设为 0 |
+| `duration` | 正式测量窗口秒数，不包含 warmup 和队列排空时间 |
 
 ## 结果
 
@@ -149,14 +157,19 @@ PNG，以及 run 级 `<cfg>.csv` 和 `benchmark_detail.csv`。`summary.json` 和
 `samples.csv` 仅作为汇总、作图的临时输入，成功后自动删除；失败或绘图失败时
 保留它们用于排障和重画。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
-开始。每实例 QPS/吞吐使用 summary 中的实际 `elapsed_seconds`。
+开始。配置 warmup 时，`/start` 先释放 warmup；到时后编排器依次执行
+`/pause`（停 writer 并排空出站通知）、`/drain`（排空 reader 入站队列）、
+`/reset`（清除 warmup metrics/samples）、`/arm`（启动正式计时）和 `/resume`
+（进入正式测量）。每实例 QPS/吞吐使用 summary 中从 arm 后开始计算的实际
+`elapsed_seconds`，不包含跨任务 barrier 等待。
 延迟统计只使用 `status=OK` 的请求；TOTAL 行会先合并全部实例的成功请求样本，
 再重新计算 avg/max/P50/P90/P99/P999/P9999，因此 max 是真正的全局最大值，
 分位数也不是各实例分位数的加权平均。旧二进制没有请求样本时才回退为近似值并
 打印 WARN。
-CSV 中 `qps=total/wall_s` 表示成功和失败请求合计速率，
-`actual_qps=success/wall_s` 表示真实成功 QPS；TOTAL 行汇总所有并发实例的
-`actual_qps`。
+CSV 中 `qps=success/wall_s`，直接表示实测成功 QPS；TOTAL 行汇总所有并发
+实例的成功 QPS。汇总延迟列为 min/avg/P50/P90/P95/P99/P99.9/P99.99/max，
+并记录 `>2000us`、`>5000us`、`>6000us`、`>7000us`、`>8000us`、
+`>9000us`、`>10000us`、`>20000us` 的成功请求数。
 
 kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
 内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其

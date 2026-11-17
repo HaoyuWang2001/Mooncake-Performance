@@ -327,11 +327,11 @@ demo/ 另有 2 个传统分离角色冒烟配置。
 | 指标 | 含义 | 单位 |
 | --- | --- | --- |
 | throughput_mb_s / throughput_gb_s | 吞吐量（1024 进制，1 MB/s = 1024² B/s），详见下方公式 | MB/s、GB/s |
-| qps | 每秒操作数（total / wall_s） | ops/s |
-| actual_qps | 真实成功 QPS（success/ok / wall_s）；实例行按本实例真实时长计算，TOTAL 行为并发实例成功 QPS 汇总 | ops/s |
+| qps | 实测成功 QPS（success/ok / wall_s）；TOTAL 行汇总并发实例成功 QPS | ops/s |
 | total | 总操作数；pipeline 场景按 key 数计（writer 为写入 key 数，reader 为读取 key 数） | ops |
 | success / ok、fail、fail_rate | 成功数 / 失败数 / 失败率（fail / total） | ops、% |
-| avg_ms / min_ms / max_ms / p99_ms / p999_ms / p9999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9 / P99.99），仅统计成功样本 | ms |
+| min_ms / avg_ms / p50_ms / p90_ms / p95_ms / p99_ms / p999_ms / p9999_ms / max_ms | 成功请求时延分布 | ms |
+| >2000us ... >20000us | 成功请求时延严格超过对应微秒阈值的样本数 | ops |
 | queue_wait_avg_ms / queue_wait_max_ms / max_depth | reader 队列积压诊断：notify 到达→出队等待（平均/最大）与最大队列深度 | ms、ops |
 
 - 时延基于全部 client 上报的成功操作样本精确统计（失败样本计入 fail/fail_rate，不计入时延百分位）；
@@ -355,7 +355,7 @@ demo/ 另有 2 个传统分离角色冒烟配置。
   的通信路径差异）、全 reader 聚合一行；
   reader 的 pipeline_read 时延为 reader 节点本地对 `store.get` 接口调用的耗时（`time.perf_counter()`
   计时，不依赖跨节点时钟同步；exist 预检与数据校验不计入时延）。writer 时延样本为每次 `put_batch`
-  接口调用的耗时，total/success/fail/qps 均按 key 数计（qps = key 数 / duration），TOTAL 行将
+  接口调用的耗时，total/success/fail 均按 key 数计（qps = 成功 key 数 / duration），TOTAL 行将
   全部 writer 写入的 key 数或全部 reader 读取的 key 数叠加后除以 duration。reader 行附
   queue_wait/max_depth 列用于观察积压是否发生及严重程度（writer 行为空）；
 - **basic mixed（put/get）拆分输出**：put 与 get 分别统计、各输出一行（operation 列取

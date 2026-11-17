@@ -1,6 +1,9 @@
 {
   "scenario": "kvtest",
   "protocol": "ub",
+  "warmup": {
+    "duration": 5
+  },
   "duration": 30,
   "batch_size": 1,
   "kvtest": {
