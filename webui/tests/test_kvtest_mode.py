@@ -263,6 +263,32 @@ def test_kvtest_runner_replaces_both_runtime_placeholders():
     assert "s/__UB_DEVICE__/${device_escaped}/g" in runner
 
 
+def test_kvtest_runner_binds_cpu_and_memory_to_requested_numa_node():
+    runner = open(os.path.join(ROOT, "scripts", "run_kvtest.sh"),
+                  encoding="utf-8").read()
+    assert "KVTEST_NUMA_NODE" in runner
+    assert '"--cpunodebind=$KVTEST_NUMA_NODE"' in runner
+    assert '"--membind=$KVTEST_NUMA_NODE"' in runner
+
+
+def test_rank_smoke_numa_process_mapping():
+    cfg = bm.load_scenario_config(_smoke_path("kvtest_rank_smoke.json"))
+    plan = bm.kvtest_plan(cfg, node_count=1)
+    assert [bm._kvtest_numa_node(cfg, entry, "writer")
+            for entry in plan["writers"]] == [0, 2]
+    assert [bm._kvtest_numa_node(cfg, entry, "reader")
+            for entry in plan["readers"]] == [1, 3]
+
+
+def test_recall_smoke_numa_process_mapping():
+    cfg = bm.load_scenario_config(_smoke_path("kvtest_recall_smoke.json"))
+    plan = bm.kvtest_plan(cfg, node_count=1)
+    assert [bm._kvtest_numa_node(cfg, entry, "writer")
+            for entry in plan["writers"]] == [0, 0, 0, 2, 2, 2]
+    assert [bm._kvtest_numa_node(cfg, entry, "reader")
+            for entry in plan["readers"]] == [1, 1, 1, 3, 3, 3]
+
+
 def test_kvtest_artifact_flatten_includes_request_samples(monkeypatch):
     commands = []
     monkeypatch.setattr(

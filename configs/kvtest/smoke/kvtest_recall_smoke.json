@@ -25,6 +25,32 @@
   "duration": 30,
   "kvtest": {
     "key_pool_size": 256,
-    "local_port_base": 13345
+    "local_port_base": 13345,
+    "numa_bindings": [
+      {
+        "writer": 0,
+        "reader": 1
+      },
+      {
+        "writer": 0,
+        "reader": 1
+      },
+      {
+        "writer": 0,
+        "reader": 1
+      },
+      {
+        "writer": 2,
+        "reader": 3
+      },
+      {
+        "writer": 2,
+        "reader": 3
+      },
+      {
+        "writer": 2,
+        "reader": 3
+      }
+    ]
   }
 }

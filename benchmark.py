@@ -1004,6 +1004,33 @@ def _kvtest_split_qps(per_node_qps, cpn, local):
     return base + (1 if local < rem else 0)
 
 
+def _kvtest_numa_node(cfg, entry, role):
+    """Return an explicit per-process NUMA node from kvtest.numa_bindings."""
+    bindings = (cfg.get("kvtest", {}) or {}).get("numa_bindings")
+    if bindings is None:
+        return None
+    if role not in ("writer", "reader"):
+        raise RuntimeError(
+            "kvtest.numa_bindings only supports split writer/reader roles")
+    if not isinstance(bindings, list):
+        raise RuntimeError("kvtest.numa_bindings must be a list")
+    local = int(entry.get("local", -1))
+    if local < 0 or local >= len(bindings):
+        raise RuntimeError(
+            "kvtest.numa_bindings has no mapping for client local {}"
+            .format(local))
+    binding = bindings[local]
+    if not isinstance(binding, dict) or role not in binding:
+        raise RuntimeError(
+            "kvtest.numa_bindings[{}] must define {}".format(local, role))
+    node = binding[role]
+    if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+        raise RuntimeError(
+            "kvtest.numa_bindings[{}].{} must be a non-negative integer"
+            .format(local, role))
+    return node
+
+
 def _kvtest_warmup_duration(cfg, args):
     if getattr(args, "no_warmup", False):
         return 0.0
@@ -5082,7 +5109,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                                   entry["local"])
             else:
                 entry["_qps"] = 0
-            # NUMA binding (ssh only): numactl prefix + JSON cpu_affinity
+            # SSH uses the legacy topology-driven binding. K8s split-mode
+            # scenarios may provide an explicit writer/reader NUMA map; the
+            # runner applies CPU-node and memory-node binding inside the pod.
             launch_prefix = ""
             if (cpu_shard > 0 or numa_bind) and not dry \
                     and not is_k8s_node(n):
@@ -5097,6 +5126,13 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
             else:
                 entry["_cpu_affinity"] = ""
+            explicit_numa_node = None
+            if is_k8s:
+                explicit_numa_node = _kvtest_numa_node(cfg, entry, role)
+                if explicit_numa_node is not None:
+                    launch_prefix = "env KVTEST_NUMA_NODE={} ".format(
+                        explicit_numa_node)
+            entry["_numa_node"] = explicit_numa_node
             inst_cfg = build_kvtest_instance_config(
                 cfg, globals_cfg, cluster_session, plan, entry, role, ds,
                 key_pool, all_instances)
@@ -5104,9 +5140,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 json.dumps(inst_cfg).encode("utf-8")).decode("ascii")
             if dry:
                 log("[dry-run] kvtest {} i{} on {}: config {} ({} B), "
-                    "qps={}, out {}".format(
+                    "qps={}, numa_node={}, out {}".format(
                         role, entry["iid"], entry["node"], cfg_file,
-                        len(payload), entry["_qps"], entry["_out_dir"]))
+                        len(payload), entry["_qps"], explicit_numa_node,
+                        entry["_out_dir"]))
             else:
                 ssh_check_output(
                     n["ip"], n,

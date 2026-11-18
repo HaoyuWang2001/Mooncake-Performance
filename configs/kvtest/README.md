@@ -126,6 +126,13 @@ pod/节点后经 `scripts/run_kvtest.sh` 启动；运行窗口 = `duration`，�
 Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，因此一个 Pod 的
 内存预算至少要覆盖两个 client buffer 加进程额外开销。
 
+K8s split 场景可用 `kvtest.numa_bindings` 按节点内 client 序号分别指定
+writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node>` 和
+`--membind=<node>` 同时绑定 CPU 与内存；目标节点必须位于 kubelet 为该 Pod
+生成的 cgroup `cpuset.cpus` / `cpuset.mems` 允许范围内。rank smoke 的两对进程
+映射为 `0/1`、`2/3`，recall smoke 的前三对映射为 `0/1`、后三对映射为
+`2/3`。
+
 | 字段 | 语义 |
 | --- | --- |
 | `client.count_per_node` | dual/split 模式每节点目标 Pod 数 |
@@ -136,6 +143,7 @@ Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，�
 | `reader.operation` | `get_buffer` / `batch_get_buffer` / `exist` |
 | `writer.port_base` / `reader.port_base` | split/完全分离模式的进程 HTTP 端口，必须不同 |
 | `kvtest.local_port_base` | 每个节点/Pod 的 Mooncake 传输监听端口基址；真机并行场景之间必须错开 |
+| `kvtest.numa_bindings` | K8s split 模式按 client 序号指定 `{writer, reader}` NUMA 节点，并同时绑定 CPU/内存 |
 | `writer.num_threads` | 每进程 C++ 写管线线程数（默认 1） |
 | `reader.num_threads` | 每进程 C++ 通知消费 worker 数（默认 4；纯 reader 进程同理） |
 | `writer.notify_threads` | 出站 RPC 任务线程池大小 |

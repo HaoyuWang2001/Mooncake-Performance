@@ -68,6 +68,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: MC_UB_ELECTRICAL_NETWORK_ENABLE
+          value: "off"
         securityContext:
           privileged: false
           capabilities:

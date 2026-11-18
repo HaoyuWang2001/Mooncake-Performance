@@ -69,9 +69,25 @@ if command -v ldd >/dev/null 2>&1; then
   fi
 fi
 
+LAUNCH_CMD=()
+if [ -n "${KVTEST_NUMA_NODE:-}" ]; then
+  if ! [[ "$KVTEST_NUMA_NODE" =~ ^[0-9]+$ ]]; then
+    echo "[FATAL] KVTEST_NUMA_NODE must be a non-negative integer: $KVTEST_NUMA_NODE" >&2
+    exit 1
+  fi
+  if ! command -v numactl >/dev/null 2>&1; then
+    echo "[FATAL] KVTEST_NUMA_NODE=$KVTEST_NUMA_NODE requires numactl in the container" >&2
+    exit 1
+  fi
+  allowed_cpus=$(grep '^Cpus_allowed_list:' /proc/self/status 2>/dev/null | awk '{print $2}')
+  allowed_mems=$(grep '^Mems_allowed_list:' /proc/self/status 2>/dev/null | awk '{print $2}')
+  echo "[kvtest] NUMA bind node=$KVTEST_NUMA_NODE cgroup_cpus=${allowed_cpus:-unknown} cgroup_mems=${allowed_mems:-unknown}"
+  LAUNCH_CMD=(numactl "--cpunodebind=$KVTEST_NUMA_NODE" "--membind=$KVTEST_NUMA_NODE")
+fi
+
 # stdout (kvtest narrative) and stderr (C++ glog, FLAGS_logtostderr=1) are
 # kept in SEPARATE files, mirroring run_benchmark_pipeline.sh.
-"$BINARY" "$FINAL_CONFIG" \
+"${LAUNCH_CMD[@]}" "$BINARY" "$FINAL_CONFIG" \
   > "$LOG_FILE" 2> "$LOG_FILE.glog"
 rc=$?
 # exit-code ledger: the orchestrator reads $LOG_FILE.exitrc after waiting
