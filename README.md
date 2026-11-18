@@ -136,8 +136,8 @@ writer.count_per_node=2；历史文件名的 `_n{N}` 后缀已随档位目录废
 | --- | --- | --- | --- |
 | `work_mode` | rank(精排) / recall(召排) | `rank` | `recall` |
 | `traffic_mode` | `balanced`=均衡（按 QPS 均匀节流）/ `pulse`=脉冲（每秒窗口集中突发） | 两者皆测 | 两者皆测 |
-| `base_qps` | 基准写入 QPS | 105 | 35 |
-| `qps_multiple` | QPS 倍数（总写入 = base × 倍数） | 1 / 2 / 3 | 1 / 2 / 3 |
+| `base_qps` | 单节点基准写入 QPS（节点内全部 writer/client 均分） | 105 | 35 |
+| `qps_multiple` | QPS 倍数（单节点写入 = base × 倍数；集群总写入再 × N） | 1 / 2 / 3 | 1 / 2 / 3 |
 | `notify_count` | 每个 writer 每批写完后**随机选择**的 reader 数（业务模型"1写10读"中的 10 读；单 writer 家族 = 名字中的 r 数；须 ≤ reader 池 cpn×N） | 档位相关：10r 档=10，稀疏档=读者总数 | 1 |
 | `client` | **双角色部署块（出现即选择 dual 模式）**：`{count_per_node, port_base}`——每节点 client 进程数（总数 = cpn×N，每个进程**同时是 writer+reader**，端口默认 9301，单端口四 endpoint）；出现该块时 writer/reader 块仅提供 operation/线程数等接口参数 | smoke 两用例必填 | 不使用 |
 | `writer` | `{count_per_node, operation, notify_threads, port_base}`：每节点 writer 数（总数 = cpn×N）/ 写接口（`put_batch`/`put`/`put_from`/`upsert_from`，真实驱动调用）/ notify 发送线程池 / HTTP /start 端口段（默认 9101） | cpn=1（notify_threads=notify_count） | cpn=1 |
@@ -226,6 +226,18 @@ store 节点列表），实际通信仍经 master 发现 store。
   notify 批数，`max_depth` 以此计）；
 - **warmup 语义**：正式测量前以相同部署形态运行 warmup.duration 秒（notify 带 warmup=1 标记，writer
   不输出 RESULT、reader 照常读取但不记录，SUMMARY 计入 warmup_total）；
+- **异步通知**：`writer.notify_async=true` 时，写入后提交 HTTP notify 即继续按目标 QPS 写入；
+  `notify_queue_size` 控制每个 writer 的发送队列容量（按目标 HTTP 请求计，不含正在发送的请求），
+  `notify_threads` 控制固定发送线程数。rank 配置使用 8192 条队列，队列满时才阻塞写入，不丢弃通知。
+  未设置 `notify_queue_size` 时回退到旧字段 `notify_max_inflight`（默认 256），旧字段现作为队列容量别名。
+  rank 已开启异步，其他配置默认 false（每批等待通知结束）。`notify_inflight_peak` 现在只统计正在发送的请求。
+  HTTP 请求使用按目标地址分组的长连接池，每个连接同时只处理一个请求，每个目标最多保留两条空闲连接；
+  接收端支持 HTTP/1.1、Content-Length，发送端完整读取响应后复用连接，连接异常后丢弃、不自动重试。
+  warmup 的通知在测量前排空，正式通知在测量结束后排空再退出；排空时间不计入配置的测量时长。
+  writer SUMMARY 和 CSV 记录 notify 提交/成功/失败、在途峰值、背压及排空耗时、平均/最大 HTTP 时延。
+  另记录 `notify_queue_peak`、`notify_queue_wait_avg_ms/max_ms`（入发送队列到开始发送的等待时间），
+  以及 `notify_connections_created/reused`（包含 warmup 的连接创建/复用次数）。TOTAL 行队列/在途峰值取各实例最大值。
+  异步发送不会消除接收端瓶颈；队列满时仍会背压，HTTP 超时仍计为失败且不自动重试。
 - **operation 角色化**：`writer.operation`（写接口）与 `reader.operation`（读接口）**真实驱动调用**
   ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`、`upsert_from`（逐 key 调用），reader 支持
   `get`/`get_into`/`get_buffer`（逐 key）与 `get_batch`（整批一次调用）；时延样本 = 单次接口调用
@@ -316,6 +328,7 @@ demo/ 另有 2 个传统分离角色冒烟配置。
 | --- | --- | --- |
 | throughput_mb_s / throughput_gb_s | 吞吐量（1024 进制，1 MB/s = 1024² B/s），详见下方公式 | MB/s、GB/s |
 | qps | 每秒操作数（total / wall_s） | ops/s |
+| actual_qps | 真实成功 QPS（success/ok / wall_s）；实例行按本实例真实时长计算，TOTAL 行为并发实例成功 QPS 汇总 | ops/s |
 | total | 总操作数；pipeline 场景按 key 数计（writer 为写入 key 数，reader 为读取 key 数） | ops |
 | success / ok、fail、fail_rate | 成功数 / 失败数 / 失败率（fail / total） | ops、% |
 | avg_ms / min_ms / max_ms / p99_ms / p999_ms / p9999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9 / P99.99），仅统计成功样本 | ms |
@@ -953,6 +966,11 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   两类测试；父任务按继承后的 `work_mode` 自动分组并同时启动两个 benchmark。统一日志以
   `[rank]` / `[recall]` 标记，产物收在同一 run 的 `rank/`、`recall/` 子目录；停止会同时
   通知两边并按各自 namespace 清理。该模式要求选择中两类配置均非空
+- **Rank + Recall 并行（真机 CLI）**：使用
+  `python3 scripts/run_rank_recall.py --ssh ...`；rank/recall 可共用 worker
+  cluster 配置，但必须指向两套独立 Store/global 配置，避免两边的 remove-keys
+  互相删除数据。kvtest smoke 已为两边配置不同的 HTTP 与传输端口基址。完整命令见
+  `configs/kvtest/README.md`。
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
   并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
   匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty、文本分页；

@@ -66,7 +66,7 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
   },
   "flags": {
     "mode": "ssh",                         // ssh | k8s
-    "launch_mode": "single",               // single | rank_recall（仅 k8s）
+    "launch_mode": "single",               // single | rank_recall（WebUI 仅 k8s）
     "dry_run": false, "no_warmup": false, "no_plot": false,
     "verbose": false,                     // 详细日志（上传路径/逐文件拉取/kubectl 命令/pod 详情）
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"

@@ -2,6 +2,7 @@
 """Run rank and recall benchmark groups concurrently as one managed task."""
 import argparse
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -62,12 +63,19 @@ def _unique_parent():
     return name
 
 
-def _child_argv(args, work_mode, files, parent):
+def _child_argv(args, work_mode, files, parent, ready_dir):
     cluster = getattr(args, work_mode + "_cluster")
     global_cfg = getattr(args, work_mode + "_global")
-    argv = [sys.executable, os.path.join(ROOT, "benchmark.py"), "--k8s",
+    mode = getattr(args, "mode", "k8s") or "k8s"
+    argv = [sys.executable, os.path.join(ROOT, "benchmark.py"), "--" + mode,
             "--cluster", cluster, "--global", global_cfg,
             "--profile", args.profile, "-f", ",".join(files)]
+    # Internal cross-child barrier: each benchmark child runs setup (Pods,
+    # data, smoke) and registers its clients, marks its own role ready at
+    # the /start gate, then waits until the peer marker exists so both
+    # children trigger /start together.
+    argv += ["--parallel-ready-dir", ready_dir,
+             "--parallel-ready-role", work_mode]
     if not args.dry_run:
         argv += ["--result-dir", os.path.join("outputs", parent, work_mode)]
     for enabled, flag in ((args.dry_run, "--dry-run"),
@@ -123,6 +131,14 @@ def _child_env(work_mode):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="run inherited rank and recall configs concurrently")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ssh", dest="mode", action="store_const",
+                      const="ssh",
+                      help="run both workloads on bare-metal SSH clusters")
+    mode.add_argument("--k8s", dest="mode", action="store_const",
+                      const="k8s",
+                      help="run both workloads on k8s (default)")
+    parser.set_defaults(mode="k8s")
     parser.add_argument("--config-dir", default="")
     parser.add_argument("-f", "--config", default="")
     parser.add_argument("--rank-cluster", required=True)
@@ -153,6 +169,7 @@ def main(argv=None):
         return 2
 
     parent = _unique_parent()
+    ready_dir = tempfile.mkdtemp(prefix="mcbench-rank-recall-ready-")
     if not args.dry_run:
         os.makedirs(os.path.join(bm.RESULTS_DIR, parent))
         print("results root: {}".format(os.path.join(bm.RESULTS_DIR, parent)),
@@ -161,6 +178,7 @@ def main(argv=None):
         len(groups["rank"]), len(groups["recall"])), flush=True)
 
     stop_requested = threading.Event()
+    peer_failure = False
 
     def request_stop(signum, _frame):
         stop_requested.set()
@@ -184,7 +202,8 @@ def main(argv=None):
     try:
         for work_mode in ("rank", "recall"):
             child = subprocess.Popen(
-                _child_argv(args, work_mode, groups[work_mode], parent),
+                _child_argv(args, work_mode, groups[work_mode], parent,
+                            ready_dir),
                 cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
                 env=_child_env(work_mode))
@@ -196,6 +215,14 @@ def main(argv=None):
         while any(proc.poll() is None for proc in children.values()):
             if args.stop_file and os.path.isfile(args.stop_file):
                 stop_requested.set()
+            failed = [name for name, proc in children.items()
+                      if proc.poll() not in (None, 0)]
+            if failed and not stop_requested.is_set():
+                # A child may fail before publishing its /start-gate marker.
+                # Wake the peer out of the barrier so it can clean up instead
+                # of waiting for the full barrier timeout.
+                peer_failure = True
+                request_stop("{}-failed".format(failed[0]), None)
             time.sleep(0.25)
     except KeyboardInterrupt:
         request_stop(signal.SIGINT, None)
@@ -211,6 +238,7 @@ def main(argv=None):
                 pass
         for thread in pumps:
             thread.join(timeout=2)
+        shutil.rmtree(ready_dir, ignore_errors=True)
         if owned_stop_file:
             try:
                 os.remove(args.stop_file)
@@ -221,7 +249,7 @@ def main(argv=None):
     print("[parallel] finished: rank rc={}, recall rc={}".format(
         codes.get("rank"), codes.get("recall")), flush=True)
     if stop_requested.is_set():
-        return 1 if spawn_error else 130
+        return 1 if (spawn_error or peer_failure) else 130
     return 0 if all(code == 0 for code in codes.values()) else 1
 
 

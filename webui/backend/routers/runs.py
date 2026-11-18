@@ -66,7 +66,8 @@ def _build_run_argv(body):
                 raise ApiError(400, "{} config not found: {}".format(
                     name, path or "<empty>"))
         dual_argv = [sys.executable,
-                     os.path.join(ROOT, "scripts", "run_rank_recall.py")]
+                     os.path.join(ROOT, "scripts", "run_rank_recall.py"),
+                     "--k8s"]
         dual_argv += argv
         dual_argv += ["--rank-cluster", flags["rank_cluster"],
                       "--rank-global", flags["rank_global"],
