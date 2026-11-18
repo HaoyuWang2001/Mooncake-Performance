@@ -14,7 +14,8 @@
 #     --client-id i --key-start S --key-end E into each. All other args are
 #     passed through. --client-binds is also script-level: ';'-separated
 #     per-client binding specs computed by the orchestrator (see bind_launch
-#     below); the runner only prepends numactl, never computes bindings.
+#     below). --numa-node is a K8s basic-mode script flag that binds both CPU
+#     and memory; the runner passes it back to the client for affinity logging.
 #
 # All scenario/cluster configuration comes from env.sh (sourced here), then
 # env.mooncake.sh (hand-editable mooncake store/SDK tuning defaults; same-name
@@ -60,9 +61,10 @@ print_client_env() {
     "${MC_URMA_TRANS_MODE:-<unset>}" "${SETUP_PROTOCOL:-<unset>}"
 }
 # Collect passthrough args; extract script-level flags (--num-clients and
-# --client-binds are consumed here and NOT forwarded to the client).
+# --client-binds/--numa-node are consumed here and NOT forwarded directly).
 NUM_CLIENTS=1
 CLIENT_BINDS=""
+NUMA_NODE=""
 ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -73,6 +75,11 @@ while [ $# -gt 0 ]; do
   fi
   if [ "$1" = "--client-binds" ] && [ $# -ge 2 ]; then
     CLIENT_BINDS=$2
+    shift 2
+    continue
+  fi
+  if [ "$1" = "--numa-node" ] && [ $# -ge 2 ]; then
+    NUMA_NODE=$2
     shift 2
     continue
   fi
@@ -104,6 +111,23 @@ IFS=';' read -r -a BIND_SPECS <<< "$CLIENT_BINDS"
 
 bind_launch() {
   local spec rest nn list
+  if [ -n "$NUMA_NODE" ]; then
+    if ! [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
+      echo "[FATAL] --numa-node must be a non-negative integer: $NUMA_NODE" >&2
+      exit 1
+    fi
+    if ! command -v numactl >/dev/null 2>&1; then
+      echo "[FATAL] --numa-node=$NUMA_NODE requires numactl in the container" >&2
+      exit 1
+    fi
+    if [ ! -d "/sys/devices/system/node/node$NUMA_NODE" ]; then
+      echo "[FATAL] NUMA node $NUMA_NODE does not exist in the container" >&2
+      exit 1
+    fi
+    LAUNCH_CMD=(numactl "--cpunodebind=$NUMA_NODE" "--membind=$NUMA_NODE")
+    BIND_ARGS="--numa-node $NUMA_NODE"
+    return
+  fi
   if [ "$1" -ge 1 ] && [ "$1" -le "${#BIND_SPECS[@]}" ]; then
     spec="${BIND_SPECS[$(($1 - 1))]}"
   else

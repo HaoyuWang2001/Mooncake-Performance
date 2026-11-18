@@ -10,6 +10,7 @@
   "duration": 30,
   "target_qps": 10,
   "numa_bind": true,
+  "k8s_numa_node": 0,
   "params": [
     {
       "num_clients": 1,

@@ -91,6 +91,7 @@ basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字
 | `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
 | `target_qps` | 总限速 QPS（可选）：按该总 QPS 对操作均匀限速（跨 client×thread 均分，绝对时间表自纠偏） | 空/0：计数模式极速连发（现行为）；设置后用于低压时延对比 |
 | `numa_bind` | 客户端 NUMA 绑定：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配）。解析优先级：用例/层级显式值 > global.json（默认 true）> 代码缺省 true | `true` |
+| `k8s_numa_node` | K8s basic 场景显式 NUMA 节点；通过 `numactl --cpunodebind/--membind` 同时绑定 CPU 和内存，未配置时 K8s basic 不绑定 | 未配置 |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
 - **核分片（cpu_shard）**：`"cpu_shard": N`（basic/pipeline 根基座或用例，缺省 null 关闭）时每个 client 绑

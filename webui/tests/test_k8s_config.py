@@ -35,6 +35,28 @@ def test_parse_size_bytes():
     assert bm.parse_size_bytes("1.5MB") == int(1.5 * 1024 ** 2)
 
 
+def test_basic_k8s_numa_node_validation():
+    assert bm.basic_k8s_numa_node({}) is None
+    assert bm.basic_k8s_numa_node({"k8s_numa_node": 0}) == 0
+    for value in (-1, True, "0"):
+        try:
+            bm.basic_k8s_numa_node({"k8s_numa_node": value})
+            raise AssertionError("should reject {!r}".format(value))
+        except RuntimeError as exc:
+            assert "k8s_numa_node" in str(exc)
+
+    demo = bm.load_scenario_config(
+        os.path.join(bm.CONFIGS_DIR, "basic", "demo.json"))
+    assert bm.basic_k8s_numa_node(demo) == 0
+
+
+def test_basic_runner_supports_k8s_cpu_and_memory_numa_binding():
+    runner = open(os.path.join(bm.SCRIPTS_DIR, "run_benchmark_basic.sh"),
+                  encoding="utf-8").read()
+    assert '"--cpunodebind=$NUMA_NODE"' in runner
+    assert '"--membind=$NUMA_NODE"' in runner
+
+
 def test_ssh_password_can_come_from_environment(monkeypatch):
     monkeypatch.setenv("MC_TEST_SSH_PASSWORD", "secret-from-env")
     assert u.node_passwd({"passwd": "",

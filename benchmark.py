@@ -2185,6 +2185,16 @@ def numa_node_check(node_name, numa_strict):
         "numa_bind requires numactl on node {} (numa_strict=true)".format(node_name))
 
 
+def basic_k8s_numa_node(cfg):
+    """Return the explicit NUMA node for a K8s basic client, if configured."""
+    node = cfg.get("k8s_numa_node")
+    if node is None:
+        return None
+    if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+        raise RuntimeError("k8s_numa_node must be a non-negative integer")
+    return node
+
+
 _LOG_PULL_ATTEMPTS = 3
 _LOG_PULL_BACKOFF_S = (1.0, 3.0)
 
@@ -3156,12 +3166,16 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
         if cpu_shard > 0 and not numa_bind:
             numa_bind = True
-        # containers do not do numactl: k8s primary node forces binding off
-        if is_k8s_node(node) and (numa_bind or cpu_shard > 0):
+        k8s_numa_node = basic_k8s_numa_node(cfg) if is_k8s_node(node) else None
+        if is_k8s_node(node):
             numa_bind = False
             cpu_shard = 0
-            log("k8s pod node {}: numa/cpu binding disabled (container)"
-                "".format(primary_node_name))
+            if k8s_numa_node is None:
+                log("k8s pod node {}: numa/cpu binding disabled (no "
+                    "k8s_numa_node)".format(primary_node_name))
+            else:
+                log("k8s pod node {}: bind basic clients to NUMA {}"
+                    "".format(primary_node_name, k8s_numa_node))
         # numactl policy: membind (strict, default) | preferred | off, and
         # strict/auto behavior when numactl is missing on the node
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
@@ -3218,7 +3232,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             remote_log = remote_log_path(remote_log_dir, cfg_name, name)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
-            if numa_bind:
+            if k8s_numa_node is not None:
+                command += " --numa-node {}".format(k8s_numa_node)
+            elif numa_bind:
                 # orchestrator-computed per-client bindings; the runner only
                 # prepends numactl (m/p/c spec) or falls back to client-side
                 # --cpu-bind when numactl is missing on the node

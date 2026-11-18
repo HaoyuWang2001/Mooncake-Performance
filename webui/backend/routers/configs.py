@@ -68,6 +68,10 @@ def validate_config_content(path, content):
         if not isinstance(params, list) or not params:
             errors.append("params must be a non-empty array of "
                           "{num_clients, num_threads} objects")
+        try:
+            bm.basic_k8s_numa_node(merged)
+        except RuntimeError as exc:
+            errors.append(str(exc))
     elif scenario_dir == "kvtest":
         try:
             bm.kvtest_plan(merged, 1)  # node_count=1: shape validation only
