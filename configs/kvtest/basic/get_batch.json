@@ -1,0 +1,5 @@
+{
+  "operation": "get_batch",
+  "batch_size": 16,
+  "work_mode": "get_batch"
+}

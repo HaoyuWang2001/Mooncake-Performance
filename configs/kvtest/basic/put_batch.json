@@ -1,11 +1,5 @@
 {
   "operation": "put_batch",
-  "batch_size": 4,
-  "data_size": ["1MB"],
-  "params": [
-    {
-      "num_clients": 1,
-      "num_threads": 4
-    }
-  ]
+  "batch_size": 16,
+  "work_mode": "put_batch"
 }

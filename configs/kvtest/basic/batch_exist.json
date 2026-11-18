@@ -1,0 +1,5 @@
+{
+  "operation": "batch_exist",
+  "batch_size": 16,
+  "work_mode": "batch_exist"
+}

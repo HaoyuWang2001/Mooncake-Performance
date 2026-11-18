@@ -1,4 +1,4 @@
 {
   "operation": "get_buffer",
-  "data_size": ["8MB"]
+  "work_mode": "get_buffer"
 }

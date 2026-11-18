@@ -694,6 +694,10 @@ def test_build_kvtest_basic_instance_config():
     assert inst["num_threads"] == 4
     assert inst["batch_keys_count"] == 4
     assert inst["target_qps"] == 50.0
+    assert inst["traffic_mode"] == "balanced"
+    assert inst["pulse_window_ms"] == 1000
+    assert inst["pacing_catch_up"] is True
+    assert inst["enable_jitter"] is True
     assert inst["duration"] == 10.0 and inst["warmup_duration"] == 2.0
     assert inst["start_paused"] is True
     assert inst["metrics_interval_ms"] == 0
@@ -702,6 +706,25 @@ def test_build_kvtest_basic_instance_config():
     assert inst["store"]["local_hostname"] == "__FABRIC_IP__:12346"
     assert inst["store"]["tenant_id"] == "tenant-x"
     assert inst["store"]["metadata_server"] == "http://master/metadata"
+
+
+def test_build_kvtest_basic_instance_config_pulse():
+    cfg = {
+        "scenario": "kvtest_basic", "protocol": "ub",
+        "operation": "get", "target_qps": 10, "duration": 5,
+        "traffic_mode": "pulse",
+        "kvtest": {"pulse_window_ms": 2000, "pacing_catch_up": False,
+                   "enable_jitter": False},
+    }
+    entry = {"iid": 0, "port": 9401, "_out_dir": "/remote/out",
+             "_lhost_port": 12345}
+    inst = bm.build_kvtest_basic_instance_config(
+        cfg, {}, "http://master/metadata", "10.0.0.10:50051", entry,
+        "1MB", "get", 1, 1, 0, 100)
+    assert inst["traffic_mode"] == "pulse"
+    assert inst["pulse_window_ms"] == 2000
+    assert inst["pacing_catch_up"] is False
+    assert inst["enable_jitter"] is False
 
 
 def test_write_kvtest_basic_csv_aggregates_clients(tmp_path):
