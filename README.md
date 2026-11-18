@@ -238,6 +238,13 @@ store 节点列表），实际通信仍经 master 发现 store。
   另记录 `notify_queue_peak`、`notify_queue_wait_avg_ms/max_ms`（入发送队列到开始发送的等待时间），
   以及 `notify_connections_created/reused`（包含 warmup 的连接创建/复用次数）。TOTAL 行队列/在途峰值取各实例最大值。
   异步发送不会消除接收端瓶颈；队列满时仍会背压，HTTP 超时仍计为失败且不自动重试。
+  **notify 热路径默认走轻量实现（C++ kvtest 之外，Python 侧也尽量少占 GIL）**：发送端用裸 socket
+  长连接，只按 Content-Length 定界读响应，不再为每个响应构造 `http.client` 响应对象和 email 头解析器；
+  接收端自实现 HTTP/1.1 keep-alive（手写 query 解析、预置响应字节），跳过
+  `BaseHTTPRequestHandler` 的请求行正则、头解析器与 Date 头拼装。`MC_NOTIFY_HTTP=legacy` 可切回旧
+  实现做 A/B 或回退。线程争用另可用 `BENCH_GIL_SWITCH_INTERVAL`（秒，默认不改解释器行为）调小
+  GIL 切换间隔（如 0.001），实际生效值写入 writer/reader SUMMARY 的 `gil_switch_interval`。
+  本地微基准（无需集群）：`python3 scripts/bench_notify_gil.py --server fast --threads 8`。
 - **operation 角色化**：`writer.operation`（写接口）与 `reader.operation`（读接口）**真实驱动调用**
   ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`、`upsert_from`（逐 key 调用），reader 支持
   `get`/`get_into`/`get_buffer`（逐 key）与 `get_batch`（整批一次调用）；时延样本 = 单次接口调用
@@ -516,7 +523,7 @@ env.sh 生成的环境变量按**消费者**分四组（各用独立前缀，Moo
 |---|---|---|---|
 | `MC_` | Mooncake C++ 进程直读 | C++ SDK `getenv` | 仅 `MC_TCP_BIND_ADDRESS`、`MC_YLT_LOG_PATH`（runner 逐 client inline 注入） |
 | `SETUP_` | wrapper→setup() 传参 | mooncake_benchmark_client.py 读取后显式传给 `store.setup()` | `SETUP_PROTOCOL/MASTER_TYPE/MASTER_ADDR/METADATA_SERVER/ETCD_ENDPOINTS/FABRIC_IP/UB_DEVICE/LOCAL_BUFFER_SIZE/TENANT_ID/RANDOM_SEED` |
-| `BENCH_` | 仓库基准逻辑自用 | 仅本仓库 | `BENCH_SCENARIO/WORK_MODE/OPERATION/KEY_PREFIX/KEY_COUNT/DATA_SIZE/BATCH_SIZE/PUT_RATIO/DURATION/WARMUP_DURATION/REMOTE_DATA_DIR/EXCLUDE_CPUS` + pipeline 族 |
+| `BENCH_` | 仓库基准逻辑自用 | 仅本仓库 | `BENCH_SCENARIO/WORK_MODE/OPERATION/KEY_PREFIX/KEY_COUNT/DATA_SIZE/BATCH_SIZE/PUT_RATIO/DURATION/WARMUP_DURATION/REMOTE_DATA_DIR/EXCLUDE_CPUS` + pipeline 族（`BENCH_NOTIFY_*`、`BENCH_GIL_SWITCH_INTERVAL`） |
 | `ORCH_` | 编排/runner 传输层 | runner 脚本 | `ORCH_VENV`（python 解释器）、`ORCH_CPU_SHARD`（绑核分片） |
 
 env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），与 env.sh 无同名冲突。

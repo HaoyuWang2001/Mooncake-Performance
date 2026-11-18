@@ -13,7 +13,6 @@ Output (stdout, captured by run_benchmark_*.sh into per-client log files):
 import argparse
 import copy
 import gc
-import http.client
 import json
 import os
 import random
@@ -1171,7 +1170,13 @@ def _normalize_local_readers(readers):
 
 
 class _NotifyHTTPPool:
-    """Exclusive checkout per connection; retain at most two idle per peer."""
+    """Exclusive checkout per connection; retain at most two idle per peer.
+
+    Uses a raw keep-alive socket instead of ``http.client``: the response
+    headers are framed by our own reader server (Content-Length always
+    present), so the email-based header parser `http.client` builds for every
+    response is pure GIL-bound overhead on the notify hot path."""
+
     def __init__(self, timeout=0.5):
         self.timeout = timeout
         self.idle = {}
@@ -1189,17 +1194,14 @@ class _NotifyHTTPPool:
             else:
                 self.created += 1
         if conn is None:
-            conn = http.client.HTTPConnection(*peer, timeout=self.timeout)
+            conn = socket.create_connection(peer, timeout=self.timeout)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
-            if conn.sock is None:
-                conn.connect()
-                conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            conn.request("GET", path)
-            response = conn.getresponse()
-            response.read()  # consume the complete body before reuse
-            if response.status != 200:
-                raise RuntimeError("HTTP {}".format(response.status))
-            if response.will_close:
+            conn.sendall(_notify_request_bytes(peer, path))
+            status, keep_alive = _read_notify_reply(conn)
+            if status != 200:
+                raise RuntimeError("HTTP {}".format(status))
+            if not keep_alive:
                 conn.close()
                 return
         except Exception:
@@ -1219,6 +1221,57 @@ class _NotifyHTTPPool:
                 for conn in available:
                     conn.close()
             self.idle.clear()
+
+
+def _notify_request_bytes(peer, path):
+    """One request head for the keep-alive notify connection (no body)."""
+    host, port = peer
+    return (b"GET " + path.encode("ascii", "replace") + b" HTTP/1.1\r\n"
+            b"Host: " + host.encode("ascii", "replace") + b":" +
+            str(port).encode("ascii") + b"\r\n"
+            b"Connection: keep-alive\r\n\r\n")
+
+
+def _read_notify_reply(sock):
+    """Read one Content-Length framed reply -> (status, keep_alive).
+
+    The notify server (both implementations) always sends Content-Length, so
+    a fixed framing read replaces a full HTTP response object."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("notify peer closed before the reply")
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        raise ValueError("malformed notify status line: {!r}".format(
+            lines[0][:80]))
+    length = 0
+    keep_alive = True
+    for line in lines[1:]:
+        name, _, value = line.partition(b":")
+        name = name.strip().lower()
+        if name == b"content-length":
+            try:
+                length = int(value.strip())
+            except ValueError:
+                raise ValueError("malformed notify Content-Length: {!r}".format(
+                    value[:40]))
+        elif name == b"connection" and value.strip().lower() == b"close":
+            keep_alive = False
+    if len(body) > length:
+        # Pipelined/desynchronised peer: never reuse a stream we cannot align.
+        keep_alive = False
+    while len(body) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("notify peer closed mid-body")
+        body += chunk
+    return status, keep_alive
 
 
 class _NotifySendQueue(Queue):
@@ -1568,6 +1621,7 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
         "wall_s": duration, "ok": stats["keys_ok"], "fail": stats["keys_fail"],
         "qps": (keys_total / duration) if duration > 0 else 0.0,
         "fail_rate": (stats["keys_fail"] / keys_total) if keys_total else 0.0,
+        "gil_switch_interval": _GIL_SWITCH_INTERVAL[0],
         "notify_async": notify_async,
         "notify_max_inflight": notify_max_inflight,
         "notify_queue_size": notify_queue_size,
@@ -1748,6 +1802,140 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # suppress HTTP server logs
     do_GET = do_POST
+
+
+def _parse_notify_query(query):
+    """urlencoded query -> {name: [values]}.
+
+    Matches ``urllib.parse.parse_qs`` defaults (blank values dropped,
+    ``+`` -> space, ``%XX`` decoded) without its dict/list machinery.
+    """
+    values = {}
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        name, sep, value = pair.partition("=")
+        if not sep or not value:
+            continue  # blank value: parse_qs drops it by default
+        if "+" in name:
+            name = name.replace("+", " ")
+        if "%" in name:
+            name = urllib.parse.unquote(name)
+        if "+" in value:
+            value = value.replace("+", " ")
+        if "%" in value:
+            value = urllib.parse.unquote(value)
+        values.setdefault(name, []).append(value)
+    return values
+
+
+def _http_reply(body, close=False):
+    """Static 200 reply with Content-Length framing (keep-alive safe)."""
+    return (b"HTTP/1.1 200 OK\r\nContent-Length: " +
+            str(len(body)).encode("ascii") + b"\r\n" +
+            (b"Connection: close\r\n" if close else b"") +
+            b"\r\n" + body)
+
+
+# Both HTTP implementations share the legacy handler's class-level reader
+# state (queue / deadline / exit_grace / start_event / qdepth / qlock):
+# _pipeline_reader and _pipeline_dual keep writing exactly one place.
+_NotifyState = _PipelineNotifyHandler
+
+
+class _FastNotifyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 512
+
+
+class _FastNotifyHandler(socketserver.StreamRequestHandler):
+    """Minimal HTTP/1.1 keep-alive notify server.
+
+    `http.server.BaseHTTPRequestHandler` pays, per request, a regex request-
+    line parse, an email-based header parser, per-header date/server
+    formatting and one write() syscall per header. On the reader hot path
+    (every notify from every writer) that Python work competes with the
+    reader workers for the GIL, so the same protocol is implemented directly
+    on the socket here: read the request line + discard headers, parse the
+    query by hand, write one prebuilt reply."""
+
+    rbufsize = -1          # buffered line reads
+    wbufsize = 0           # one write syscall per reply
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30.0)
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def handle(self):
+        _mark_reader_thread()
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                return
+            if line in (b"\r\n", b"\n"):
+                continue
+            parts = line.rstrip(b"\r\n").split(b" ")
+            if len(parts) < 2:
+                return
+            target = parts[1]
+            keep_alive = True
+            while True:
+                header = self.rfile.readline(65536)
+                if not header or header in (b"\r\n", b"\n"):
+                    break
+                if header[:11].lower() == b"connection:" and \
+                        b"close" in header.lower():
+                    keep_alive = False
+            try:
+                self.wfile.write(_http_reply(self._dispatch(target),
+                                             close=not keep_alive))
+            except OSError:
+                return
+            if not keep_alive:
+                return
+
+    @staticmethod
+    def _dispatch(target):
+        path, _, query = target.partition(b"?")
+        if path == b"/notify":
+            params = _parse_notify_query(query.decode("latin-1"))
+            keys = params.get("key", [])
+            writer_id = params.get("writer_id", ["0"])[0]
+            write_ts = float(params.get("write_ts", ["0"])[0])
+            is_warmup = params.get("warmup", ["0"])[0] == "1"
+            # phase markers from the notify stream itself (see the legacy
+            # handler: once-semantics, first warmup/first measured notify)
+            _phase_marker("warmup" if is_warmup else "measured", "start")
+            if time.time() < _NotifyState.deadline + _NotifyState.exit_grace:
+                _NotifyState.queue.put(
+                    (keys, int(writer_id), write_ts, is_warmup,
+                     time.perf_counter()))
+                with _NotifyState.qlock:
+                    _NotifyState.qdepth += 1
+                    if _NotifyState.qdepth > _NotifyState.qmax:
+                        _NotifyState.qmax = _NotifyState.qdepth
+            return b"OK"
+        if path == b"/health":
+            return b"HEALTHY"
+        if path == b"/start" and _NotifyState.start_event is not None:
+            _NotifyState.start_event.set()
+            return b"STARTED"
+        if path == b"/shutdown":
+            _NotifyState.deadline = -1.0
+            return b"SHUTDOWN"
+        return b"UNKNOWN:" + target
+
+
+def _notify_server_impl():
+    """Reader HTTP implementation: 'fast' (default) or 'legacy' rollback."""
+    choice = (os.environ.get("MC_NOTIFY_HTTP") or "fast").strip().lower()
+    if choice == "legacy":
+        return _PipelineNotifyServer, _PipelineNotifyHandler
+    return _FastNotifyServer, _FastNotifyHandler
+
+
 def _reader_worker(args, store, queue, deadline, results, ctx=None):
     """Reader worker thread: dequeue a notify batch, run the optional exist
     pre-checks, then execute the configured get interface (reader.operation).
@@ -1885,8 +2073,9 @@ def _pipeline_reader(args, store):
     # failure fails fast (workers would otherwise block the exception for the
     # whole reader lifetime)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
+    server_cls, handler_cls = _notify_server_impl()
     try:
-        server = _PipelineNotifyServer(("0.0.0.0", my_port), _PipelineNotifyHandler)
+        server = server_cls(("0.0.0.0", my_port), handler_cls)
     except OSError as exc:
         raise SystemExit("[ERROR] reader failed to bind port {}: {}".format(my_port, exc))
     server.daemon_threads = True
@@ -1961,6 +2150,7 @@ def _emit_reader_summary(args, results, num_threads, meas_duration, out=None):
         "work_mode": args.work_mode or "recall", "protocol": args.protocol,
         "client_id": args.client_id, "reader_count": args.reader_count,
         "num_threads": num_threads,
+        "gil_switch_interval": _GIL_SWITCH_INTERVAL[0],
         "total": total, "bytes": total_bytes, "wall_s": meas_duration,
         "warmup_total": warmup_total,
         "ok": ok_keys, "fail": fail_keys,
@@ -2042,9 +2232,9 @@ def _pipeline_dual(args, store):
     _PipelineNotifyHandler.qlock = threading.Lock()
     _PipelineNotifyHandler.start_event = started
     socketserver.ThreadingTCPServer.allow_reuse_address = True
+    server_cls, handler_cls = _notify_server_impl()
     try:
-        server = _PipelineNotifyServer(("0.0.0.0", my_port),
-                                                 _PipelineNotifyHandler)
+        server = server_cls(("0.0.0.0", my_port), handler_cls)
     except OSError as exc:
         raise SystemExit("[ERROR] dual client failed to bind port {}: {}"
                          "".format(my_port, exc))
@@ -2222,9 +2412,38 @@ def _resolve_env(args):
     if args.rendezvous_timeout is None:
         args.rendezvous_timeout = int(
             os.environ.get("BENCH_RENDEZVOUS_TIMEOUT", "120"))
+
+
+_GIL_SWITCH_INTERVAL = [0.0]
+
+
+def _apply_gil_switch_interval():
+    """BENCH_GIL_SWITCH_INTERVAL -> sys.setswitchinterval().
+
+    The notify hot path is threaded Python (writer send workers + reader HTTP
+    handlers + reader queue workers). With the default 5 ms switch interval a
+    runnable thread can wait milliseconds for the GIL, which shows up as
+    notify latency and queue build-up; a smaller interval lets the I/O and
+    queue threads hand off faster. Unset = interpreter default (no change)."""
+    raw = (os.environ.get("BENCH_GIL_SWITCH_INTERVAL") or "").strip()
+    if not raw:
+        return
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit("[ERROR] BENCH_GIL_SWITCH_INTERVAL must be a float")
+    if value <= 0:
+        raise SystemExit("[ERROR] BENCH_GIL_SWITCH_INTERVAL must be > 0")
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(value)
+    _GIL_SWITCH_INTERVAL[0] = value
+    log("gil switch interval: {:.6f} -> {:.6f}".format(old, value))
+
+
 def main():
     init_role_logs()
     unbuffer_stdio()
+    _apply_gil_switch_interval()
     # TEST-ONLY hook: simulate the C++ SDK writing its glog stream straight
     # to OS fd 1 (the stream the runner captures into <base>.glog). Lets the
     # hermetic runner e2e assert the three-stream separation without the

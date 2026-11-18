@@ -77,9 +77,12 @@ def test_phase_markers_go_to_stderr_not_stdout():
 
 
 def test_all_call_sites_wired():
-    """源级断言：9 个调用点（basic 3 / writer 3 / notify 1 / reader end 2）。"""
+    """源级断言：10 个调用点（basic 3 / writer 3 / notify 2 / reader end 2）。
+
+    notify 有两个实现（legacy BaseHTTPRequestHandler 与 fast 轻量 handler），
+    两者都必须发 warmup/measured 阶段标记。"""
     src = open(CLIENT, encoding="utf-8").read()
-    assert src.count("_phase_marker(") == 10   # 1 def + 9 call sites
+    assert src.count("_phase_marker(") == 11   # 1 def + 10 call sites
     for needle in (
             '_phase_marker("warmup", "start")   # warmup window opens (incl. prefill puts)',
             '_phase_marker("measured", "start")   # measured window opens',
