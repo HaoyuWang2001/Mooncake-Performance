@@ -400,6 +400,46 @@ def test_kvtest_report_is_warn_only_on_bad_samples(tmp_path):
     assert bm._kvtest_generate_reports(cfg, str(logs), _args()) is None
 
 
+def test_kvtest_full_lifecycle_matches_documented_artifacts(tmp_path):
+    """CSV -> map -> reduce -> overview -> success cleanup, in run order.
+
+    Final contract for a successful kvtest run: <cfg>.csv + per-instance
+    report/<size>/report.html + report/overview.html + stats.json kept,
+    raw summary/samples removed."""
+    root = tmp_path / "run"
+    logs = root / "logs" / "kvtest_life"
+    logs.mkdir(parents=True)
+    for iid, port in ((0, 9301), (1, 9302)):
+        _write_instance(str(logs), iid, port, "8MB", [1.0, 2.0], [3.0],
+                        cfg_name="kvtest_life")
+    cfg = _cfg()
+    cfg["__cfg_path__"] = str(tmp_path / "kvtest_life.json")
+    # 1) CSV aggregation (main() does this before the report)
+    rows = bm.write_scenario_csv(str(logs), cfg, "ts", cfg["__cfg_path__"],
+                                 cluster=None, mooncake_store_nodes=[],
+                                 result_dir=str(root))
+    assert rows
+    assert (root / "kvtest_life.csv").is_file()
+    # 2) the runner writes the report sidecar while pulling artifacts
+    bm._kvtest_write_report_meta(str(logs), cfg)
+    # 3) map + reduce
+    written = bm._kvtest_generate_reports(cfg, str(logs), _args())
+    assert written and len(written) == 1
+    # 4) run overview
+    assert bm._render_run_overview(str(root), "ssh")
+    # 5) success cleanup (plot succeeded in the real flow)
+    removed = bm._cleanup_kvtest_success_intermediates(str(logs))
+    assert removed == 4                      # 2 instances x (summary+samples)
+    assert not list(logs.glob("*.samples.csv"))
+    assert not list(logs.glob("*.summary.json"))
+    assert len(list(logs.glob("*.stats.json"))) == 4   # 2 roles x 2 instances
+    assert (logs / "report" / "8MB" / "report.html").is_file()
+    assert (logs / "report" / "8MB" / "data.js").is_file()
+    assert (root / "report" / "overview.html").is_file()
+    assert (logs / bm.KVTEST_REPORT_META).is_file()
+
+
+# --------------------------------------------------------------------- CLI
 # --------------------------------------------------------------------- CLI
 
 def test_logstats_cli_kvtest_mode(tmp_path):

@@ -688,8 +688,9 @@ def iter_kvtest_rows(path, start_epoch, ops=None):
                 elapsed = 0.0
             epoch = (float(start_epoch) + elapsed) if start_epoch else None
             ts = _epoch_to_ts(epoch) if epoch is not None else ""
+            index = str(row.get("request_index") or "").strip()
             yield {"ts": ts, "op": op,
-                   "key": str(row.get("request_index") or ""),
+                   "key": ("req#" + index) if index else "",
                    "lat": lat, "status": status, "qw": None,
                    "kc": 1, "lineno": lineno, "epoch": epoch}
 
