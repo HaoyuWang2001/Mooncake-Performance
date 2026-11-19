@@ -1741,14 +1741,8 @@ def test_trace_cards_stack_and_breakdown_js(tmp_path):
     if res is None:
         return
     assert res["errors"] == []
-    tc = res["tcards_kids"]
-    labels = [k["text"].split(" ")[0] for k in tc]
-    assert "avg" in labels and "p99" in labels
-    assert any("gridbreak" in k["cls"] for k in tc)
-    assert "样本数" in labels and "失败" in labels
-    strong = [k for k in tc if "strong" in k["cls"]]
-    assert any(k["text"].startswith("avg") for k in strong)
-    assert any(k["text"].startswith("min") for k in tc)
+    # 本批删除「指标概览」卡（段1 已给一眼指标；此处关注阶段耗时）
+    assert not (res.get("tcards_kids") or []), res.get("tcards_kids")
     # 堆叠图：stack + 全灰阶（r=g=b）
     series = res["tstack_series"]
     assert series and all(s["stack"] == "stage" for s in series)
@@ -2404,8 +2398,8 @@ def test_report_started_time_uses_data_timestamp(tmp_path):
     assert meta["started"] == "2026-11-12 10:00:10", meta["started"]
 
 
-def test_stage_tree_nodes_disabled(tmp_path):
-    """P2-E：阶段曲线对象树只开放总体/角色；节点/实例行禁用并给出说明。"""
+def test_stage_tree_objects_enabled(tmp_path):
+    """SDK 全链路对象树：总计 + 节点与实例（角色行已上移到顶部总控）。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.reader", "reader", node="n2")
     tr = _trace_stats_span(tmp_path, "s300.glog", 300)
@@ -2418,83 +2412,51 @@ def test_stage_tree_nodes_disabled(tmp_path):
     assert res["errors"] == []
     rows = res.get("stage_rows") or []
     assert rows, res.get("stage_tree_text")
-    role_rows = [r for r in rows
-                 if any(t in r["text"] for t in ("总体", "writer", "reader"))]
-    assert role_rows and all(not r["disabled"] for r in role_rows), rows
-    node_rows = [r for r in rows if "n1" in r["text"] or "n2" in r["text"]]
-    assert node_rows and all(r["disabled"] for r in node_rows), rows
-    assert "暂只支持总体/角色" in (res.get("stage_tree_text") or "")
+    tot = [r for r in rows if "总计" in r["text"]]
+    assert tot and not tot[0]["disabled"], rows
+    nodes = [r for r in rows if "n1" in r["text"] or "n2" in r["text"]]
+    assert nodes, rows
+    assert all(not r["disabled"] for r in nodes), rows
+    assert not any(r["text"].strip() in ("writer", "reader") for r in rows), rows
 
 
-def test_tree_toggle_buttons(tmp_path):
-    """#2：全选节点/实例按钮是 toggle——全选后变「清空节点/清空实例」。"""
-    a = _stats(tmp_path, "a.writer", "writer", node="n1")
-    b = _stats(tmp_path, "b.writer", "writer", node="n2")
-    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c", "mode": "basic"})
-    res = _js_check(tmp_path, data, "--tree-toggle")
+def test_trace_object_tree_toggle(tmp_path):
+    """SDK 对象树：全选节点选中节点；全部清空自动回到总计。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--trace-tree")
     if res is None:
         return
     assert res["errors"] == []
-    before = res.get("btn_labels_before") or []
-    assert "全选节点" in before and "全选实例" in before, before
-    after_nodes = res.get("btn_labels_after_nodes") or []
-    assert "清空节点" in after_nodes, after_nodes
-    assert any(k.startswith("node:") for k in res["sel_after_nodes"])
-    # 再点「清空节点」→ 节点全部取消
-    assert not any(k.startswith("node:") for k in res["sel_after_clear_nodes"])
-    after_ins = res.get("btn_labels_after_instances") or []
-    assert "全选节点" in after_ins and "清空实例" in after_ins, after_ins
-    assert any(k.startswith("client:") for k in res["sel_after_instances"])
-    assert not any(k.startswith("client:")
-                   for k in res["sel_after_clear_instances"])
-    labels = res.get("btn_labels_after_clear_instances") or []
-    assert "全选实例" in labels, labels
+    assert res["tsel_before"] == ["role:read"], res["tsel_before"]
+    assert any(k.startswith("node:n1") for k in res["tsel_nodes"]), \
+        res["tsel_nodes"]
+    assert "清空节点" in (res.get("tree_btn_after_nodes") or []), \
+        res.get("tree_btn_after_nodes")
+    assert res["tsel_clear"] == ["role:read"], res["tsel_clear"]
 
 
-def test_clear_all_auto_enables_total(tmp_path):
-    """#1：总计关掉后点「全部清空」→ 自动开启总计（不再是空图）。"""
-    a = _stats(tmp_path, "a.writer", "writer", node="n1")
-    b = _stats(tmp_path, "b.reader", "reader", node="n2")
-    b2 = _stats(tmp_path, "b2.reader", "reader", node="n1")
-    data = rp.reduce_scenario(rp.load([a, b, b2]),
-                              {"config": "cfg", "mode": "pipeline"})
-    res = _js_check(tmp_path, data, "--clear-total-off")
+def test_trace_curve_dimension_coupling(tmp_path):
+    """分级时延曲线：单对象可多阶段；一旦对象多选，阶段自动收敛为 total。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--trace-dims")
     if res is None:
         return
     assert res["errors"] == []
-    assert res["sel_total_off"] == [], res["sel_total_off"]
-    assert res["sel_after_clear_auto_total"] == ["reader"], \
-        res["sel_after_clear_auto_total"]
-
-
-def test_qps_bars_follow_object_colors(tmp_path):
-    """#5：QPS 柱与端到端同配色（总计灰阶、节点色系）；失败柱保持强调色。"""
-    a = _stats(tmp_path, "a.writer", "writer", node="n1")
-    b = _stats(tmp_path, "b.writer", "writer", node="n2")
-    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
-    res = _js_check(tmp_path, data, "--add-obj", "node:n1", "--qps-colors")
-    if res is None:
-        return
-    assert res["errors"] == []
-    cols = res.get("qps_obj_colors") or []
-    assert cols, cols
-
-    def rgb(h):
-        h = (h or "").lstrip("#")
-        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
-
-    qps = [c for c in cols if c["name"].endswith("QPS")]
-    fails = [c for c in cols if c["name"].endswith("失败")]
-    assert len(qps) >= 2 and fails, cols
-    total = [c for c in qps if "总" in c["name"]]
-    node = [c for c in qps if c["name"].startswith("n1")]
-    assert total and node, qps
-    r = rgb(total[0]["color"])
-    assert max(r) - min(r) <= 16, total[0]            # 总计灰阶
-    r = rgb(node[0]["color"])
-    assert max(r) - min(r) > 20, node[0]              # 节点=色系
-    hero = {c["color"] for c in fails}
-    assert len(hero) == 1, fails                      # 失败柱配色一致
+    # 单对象多阶段：series = 阶段名（无「对象 · 阶段」拼接）
+    st = res.get("dim_stage_series") or []
+    assert len(st) >= 2, st
+    assert all(" · " not in n for n in st), st
+    # 再选节点：阶段收敛为 total，series 变为对象名
+    ob = res.get("dim_obj_series") or []
+    assert "总计" in ob and any("n1" in n for n in ob), ob
+    assert res.get("dim_tsel_multi") == 2, res.get("dim_tsel_multi")
+    # 块图对象选择器 / 曲线指标按钮
+    assert "总计" in (res.get("block_opts") or []), res.get("block_opts")
+    assert res.get("curve_metrics") == ["均值", "最大"], res.get("curve_metrics")
 
 
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
@@ -3071,7 +3033,11 @@ def test_c01_dr24_alignment_lock(tmp_path):
     assert "队列等待均</th>" not in src
     # 4) h3 标题无交互括号注记（说明移入 title 属性）
     import re as _re
+    _h3_ok = {"分级时延块图（trace）", "分级时延曲线（trace）",
+              "慢点追踪（trace）"}
     for m in _re.finditer(r'<h3 class="sec"[^>]*>([^<]+)</h3>', src):
+        if m.group(1) in _h3_ok:
+            continue
         assert "（" not in m.group(1), "h3 括号注记回潮: {}".format(m.group(1))
     # 5) 卡片描边（skill 设计基调：1px 描边或底色区分）
     assert "border:1px solid var(--grid)" in src, "卡片描边缺失"

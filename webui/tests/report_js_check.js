@@ -777,6 +777,66 @@ if (!errs.length) {
       out.sel_after_clear_auto_total=sel();
     } catch (e) { errs.push("clear-total-off: " + String(e && e.stack || e)); }
   }
+  if (process.argv.includes("--trace-tree")) {
+    try {
+      const tsel = function () {
+        return (sandbox.window && sandbox.window.__MC_TSEL)
+          ? sandbox.window.__MC_TSEL() : [];
+      };
+      out.tsel_before = tsel();
+      const nb = findBtn(getEl("stageObjTree"), "全选节点");
+      if (nb && nb.onclick) nb.onclick();
+      out.tsel_nodes = tsel();
+      out.tree_btn_after_nodes = treeMiniLabels(getEl("stageObjTree"));
+      const cb = findBtn(getEl("stageObjTree"), "全部清空");
+      if (cb && cb.onclick) cb.onclick();
+      out.tsel_clear = tsel();
+      const ib = findBtn(getEl("stageObjTree"), "全选实例");
+      out.has_inst_btn = !!ib;
+    } catch (e) { errs.push("trace-tree: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--trace-dims")) {
+    try {
+      const seriesNames = function () {
+        const a = charts.tchart || [];
+        const o = a.length ? a[a.length - 1] : null;
+        return ((o && o.series) || []).map(function (s) { return s.name; });
+      };
+      const chips = (getEl("stageBtns").children || []).filter(function (b) {
+        return b && b.onclick && b.className !== "mini";
+      });
+      out.dim_chips = chips.length;
+      // 单对象多阶段：点第二个阶段 chip
+      if (chips[1] && chips[1].onclick) chips[1].onclick();
+      out.dim_stage_series = seriesNames();
+      out.dim_tsel_after_stage = (sandbox.window.__MC_TSEL
+        ? sandbox.window.__MC_TSEL() : []);
+      // 再选一个节点：阶段应收敛为单选、series 变为对象名
+      let clicked = false;
+      (function walk(n) {
+        if (clicked || !n) return;
+        (n.children || []).forEach(function (c) {
+          const k = c.getAttribute && c.getAttribute("data-key");
+          if (k && k.indexOf("node:") === 0 && c.onclick) {
+            c.onclick(); clicked = true; return;
+          }
+          walk(c);
+        });
+      })(getEl("stageObjTree"));
+      out.dim_obj_series = seriesNames();
+      out.dim_stage_sel = (sandbox.window.__MC_TSEL
+        ? "obj-multi" : "?");
+      out.dim_tsel_multi = (sandbox.window.__MC_TSEL
+        ? sandbox.window.__MC_TSEL().length : 0);
+      // 块图对象选择器
+      const bs = getEl("tBlockObj");
+      out.block_opts = (bs.children || []).map(function (o) { return o._text; });
+      out.block_value = bs.value;
+      // 曲线指标按钮
+      const cm = getEl("tCurveMetric");
+      out.curve_metrics = (cm.children || []).map(function (b) { return b._text; });
+    } catch (e) { errs.push("trace-dims: " + String(e && e.stack || e)); }
+  }
   if (process.argv.includes("--qps-colors")) {
     try {
       const q=charts.qpschart||[];

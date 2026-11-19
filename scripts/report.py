@@ -4068,7 +4068,9 @@ function traceSizes(){return Object.keys(S).filter(function(k){
   return S[k]&&S[k].trace;});}
 let tGroup='',tOp='',tChart=null;
 let tLevelMetric='avg',tStageSel=['total_us'];
-let tStageObjs=['all'];          /* 阶段曲线对象树选择（独立） */
+let tCurveMetric='avg';          /* 分级时延曲线指标：avg / max */
+let tObjSel=[];                  /* 曲线对象多选（trace objects，当前 group 作用域） */
+let tBlockObj='';                /* 分级时延块图对象（单选） */
 let tStageTier='cnt';            /* 粒度：1 秒/10 秒/1 分钟/自适应(默认) */
 const T_METRIC_OPTS=[['min','最小'],['avg','平均'],['p50','p50'],['p99','p99'],
   ['p999','p999'],['p9999','p9999'],['max','最大']];
@@ -4102,6 +4104,110 @@ function tPick(){
   if(!ops.length) return null;
   if(tOp===''||ops.indexOf(tOp)<0) tOp=ops[0];
   return {g:tGroup,op:tOp,data:t.groups[tGroup].ops[tOp]};
+}
+/* ---- trace 对象模型（总计/节点/实例，当前读写组作用域） ---- */
+const STAGE_PALETTE_L=['#3B6FB6','#C77C2B','#3E7D4F','#A64B5B','#6B5BA7',
+  '#2F7F7C','#8C6D31','#A04B87','#4F6B2F','#B05A2E'];
+const STAGE_PALETTE_D=['#7EA7E8','#E0A968','#7CBF8C','#E08C9B','#B3A5E8',
+  '#6FC5C0','#D8B36A','#DFA3CF','#A9C98A','#E6996E'];
+function stageColor(i){
+  const p=LF_DARK?STAGE_PALETTE_D:STAGE_PALETTE_L;
+  return p[Math.abs(Number(i)||0)%p.length];
+}
+function tObjAll(){
+  const z=Z();
+  const e=(z&&z.trace&&z.trace.objects)||{};
+  const f=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&
+           FULL.sizes[curSize].trace&&FULL.sizes[curSize].trace.objects)||{};
+  const out={};
+  Object.keys(e).forEach(function(k){out[k]=e[k];});
+  Object.keys(f).forEach(function(k){out[k]=f[k];});
+  return out;
+}
+function tRoleKey(){return 'role:'+tGroup;}
+function tObjKeys(){
+  const all=tObjAll(); const g=tGroup;
+  const roles=[],nodes=[],clients=[];
+  Object.keys(all).forEach(function(k){
+    const o=all[k]; if(!o||o.role!==g) return;
+    if(o.kind==='role') roles.push(k);
+    else if(o.kind==='node') nodes.push(k);
+    else clients.push(k);
+  });
+  nodes.sort(function(a,b){
+    return String(all[a].node||'').localeCompare(String(all[b].node||''));
+  });
+  clients.sort(function(a,b){
+    const na=String(all[a].node||''), nb=String(all[b].node||'');
+    if(na!==nb) return na.localeCompare(nb);
+    return String(all[a].label||'').localeCompare(String(all[b].label||''));
+  });
+  return roles.concat(nodes, clients);
+}
+function traceObjLabel(key){
+  const o=tObjAll()[key]||{};
+  if(o.kind==='role') return '总计';
+  return String(o.label||key);
+}
+function traceNodeColor(name){
+  const all=tObjAll(); const names=[];
+  Object.keys(all).forEach(function(k){
+    const o=all[k];
+    if(o&&o.role===tGroup&&o.kind==='node'&&names.indexOf(o.node)<0)
+      names.push(o.node);
+  });
+  names.sort();
+  const hues=LF_DARK?NODE_HUES_D:NODE_HUES_L;
+  const i=Math.max(0,names.indexOf(String(name)));
+  return hues[i%hues.length];
+}
+function traceObjColor(key){
+  const o=tObjAll()[key]; if(!o) return C.fg;
+  if(o.kind==='role') return latColor('p99');          /* 总计=灰阶 */
+  if(o.kind==='node') return traceNodeColor(o.node);
+  const base=traceNodeColor(o.node||'');               /* 实例=节点色阶 */
+  const nm=String(o.label||key); let h=0;
+  for(let i=0;i<nm.length;i++)h=(h*31+nm.charCodeAt(i))>>>0;
+  return mixHex(base, LF_DARK?'#101010':'#FFFFFF', 0.18+0.14*(h%4));
+}
+function tObjPick(key){
+  const o=tObjAll()[key]; if(!o) return null;
+  const g=(o.groups||{})[tGroup]; if(!g) return null;
+  return (g.ops||{})[tOp]||null;
+}
+function tStageName(k){
+  return k==='total_us'?'total（端到端）':(k==='residual'?'残差':k);
+}
+function tStageKeys(){
+  const cur=tPick(); if(!cur) return ['total_us'];
+  const keys=['total_us'];
+  tTree(cur.g).forEach(function(x){
+    if(x[1]===1&&keys.indexOf(x[0])<0)keys.push(x[0]);});
+  if(cur.data&&cur.data.residual) keys.push('residual');
+  return keys;
+}
+function ensureTraceSel(){
+  const keys=tObjKeys();
+  if(!keys.length) return;
+  tObjSel=tObjSel.filter(function(k){return keys.indexOf(k)>=0;});
+  if(!tObjSel.length) tObjSel=[tRoleKey()];
+  if(keys.indexOf(tBlockObj)<0) tBlockObj=tRoleKey();
+  const stages=tStageKeys();
+  tStageSel=tStageSel.filter(function(k){return stages.indexOf(k)>=0;});
+  if(!tStageSel.length) tStageSel=['total_us'];
+  /* 维度联动：对象多选 => 阶段单选（阶段多选时的反向收敛在交互处做） */
+  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=['total_us'];
+}
+/* 通用：按序列名集合压暗/恢复（用于曲线标签聚焦） */
+function focusSeriesOn(ch,names){
+  let sers=[];
+  try{ sers=(ch.getOption().series)||[]; }catch(e){ return; }
+  const partials=sers.map(function(sr){
+    const hit=!names||names.indexOf(String(sr.name||''))>=0;
+    const v=hit?1:0.15;
+    return {lineStyle:{opacity:v},itemStyle:{opacity:v}};
+  });
+  try{ ch.setOption({series:partials}); }catch(e){}
 }
 function tStat(key,cur){
   if(key==='residual') return cur.data.residual||{};
@@ -4501,72 +4607,30 @@ function tXWindowMs(){
   return [zs.min+ext*s/100, zs.min+ext*e/100];
 }
 function tLayoutEndLabels(ch){
+  /* 固定槽位标签（与端到端曲线多对象同构）：不画引线、不绑端点；
+     悬浮压暗其他曲线。 */
   const ov=document.getElementById('tEndlabels');
   if(!ov) return;
   ov.innerHTML='';
-  if(!ch||!ch.convertToPixel) return;
-  const w=tXWindowMs();
-  const anchorX=ch.getWidth()-STAGE_GRID.right+8;
-  const items=[];
-  tLabelMeta.forEach(function(m,idx){
-    let last=null;
-    const data=m.data||[];
-    for(let i=data.length-1;i>=0;i--){
-      const d=data[i];
-      if(d&&d[1]!=null&&d[0]<=w[1]&&d[0]>=w[0]){last=d;break;}
-    }
-    if(!last) return;
-    let p=null;
-    try{ p=ch.convertToPixel({seriesIndex:(m.seriesIndex!=null?m.seriesIndex:idx)},[last[0],last[1]]); }
-    catch(e){ p=null; }
-    if(!p||isNaN(p[0])||isNaN(p[1])) return;
-    // 引线端点限制在绘图区内（x 轴放大后数据点可能在窗口外，端点不得跑出）
-    const plotL=STAGE_GRID.left, plotR=ch.getWidth()-STAGE_GRID.right;
-    items.push({px:Math.max(plotL,Math.min(plotR,p[0])),py:p[1],ly:p[1],
-      name:m.name,color:m.color});
-  });
-  if(!items.length) return;
+  let sers=[];
+  try{ sers=(ch.getOption().series)||[]; }catch(e){ sers=[]; }
+  if(!sers.length) return;
+  const W=ch.getWidth?ch.getWidth():0;
   const H=ch.getHeight?ch.getHeight():400;
-  const MIN=19, top=STAGE_GRID.top+8, bot=H-STAGE_GRID.bottom-8;
-  items.sort(function(a,b){return a.py-b.py;});
-  for(let i=1;i<items.length;i++)
-    if(items[i].ly-items[i-1].ly<MIN) items[i].ly=items[i-1].ly+MIN;
-  let over=items[items.length-1].ly-bot;
-  if(over>0) items.forEach(function(it){it.ly-=over;});
-  if(items[0].ly<top){
-    const d=top-items[0].ly;
-    items.forEach(function(it){it.ly+=d;});
-  }
-  items.forEach(function(it){
-    /* A5：单对象=该指标序列；多对象=该对象全部指标序列（曲线簇） */
-    function focusCluster(on){
-      let names=[];
-      try{
-        const opt=ch.getOption();
-        names=((opt&&opt.series)||[]).map(function(sr){return sr.name;})
-          .filter(function(n){ return n===it.name||
-            String(n).indexOf(it.name+' ')===0; });
-      }catch(e){ names=[it.name]; }
-      names.forEach(function(n){
-        try{ ch.dispatchAction({type:on?'highlight':'downplay',
-          seriesName:n}); }catch(e){}
-      });
-    }
-    const dx=anchorX-it.px, dy=it.ly-it.py;
-    const len=Math.max(1,Math.sqrt(dx*dx+dy*dy));
-    const line=el('div','endleader');
-    line.style.left=it.px+'px'; line.style.top=it.py+'px';
-    line.style.width=len+'px'; line.style.height='1px';
-    line.style.background=it.color;
-    line.style.transformOrigin='0 50%';
-    line.style.transform='rotate('+Math.atan2(dy,dx)+'rad)';
-    ov.appendChild(line);
-    const lab=el('div','endlabel',it.name);
-    lab.style.left=anchorX+'px'; lab.style.top=it.ly+'px';
-    lab.style.color=it.color;
-    lab.title='悬浮聚焦该曲线（多对象时高亮整个曲线簇）';
-    lab.onmouseenter=function(){focusCluster(true);};
-    lab.onmouseleave=function(){focusCluster(false);};
+  if(!W) return;
+  const top=STAGE_GRID.top+8, bot=H-STAGE_GRID.bottom-8;
+  const n=sers.length;
+  sers.forEach(function(sr,i){
+    const nm=String(sr.name||'');
+    const color=((sr.lineStyle||{}).color)||C.fg;
+    const y=(n===1)?(top+bot)/2:top+i*(bot-top)/(n-1);
+    const lab=el('div','endlabel fixed',nm);
+    lab.style.left=(W-STAGE_GRID.right+8)+'px';
+    lab.style.top=y+'px';
+    lab.style.color=color;
+    lab.title=nm+'：悬浮聚焦该曲线';
+    lab.onmouseenter=function(){focusSeriesOn(ch,[nm]);};
+    lab.onmouseleave=function(){focusSeriesOn(ch,null);};
     ov.appendChild(lab);
   });
 }
@@ -4707,96 +4771,86 @@ function tFmSpan(cur){
 function buildStageChart(cur){
   const box=document.getElementById('tchart'); if(!box) return;
   const cap=document.getElementById('tchartEmpty');
-  const fm=cur.data.fminutes||{};
-  const hasF=Object.keys(fm).length>0;
-  // 对象过滤：总体/角色有数据；节点/实例暂空态（后端分组待补）
-  /* P2-E：阶段曲线只支持总体/角色对象；节点/实例为已知欠账（见 R-TRACE-9），
-     选择集里没有角色对象时明确提示，而不是静默丢对象后显示空图。 */
-  tStageObjs=tStageObjs.filter(function(k){
-    return k==='all'||k==='writer'||k==='reader';});
-  if(!tStageObjs.length) tStageObjs=['all'];
-  const objHasData=tStageObjs.length>0;
-  // 粒度：后端日志桶已按 1s 采集（fminutes 实际是秒桶），前端在当前档位
-  // 聚合后只要还剩 ≥2 个桶就算有数据；旧产物（ftier=60，只有分钟桶）
-  // 在低于 60s 的档位上仍按 60s 聚合，因此不会误报空态。
-  const metricHasData=(tLevelMetric==='avg'||tLevelMetric==='max');
-  const hasData=hasF&&objHasData&&metricHasData;
-  if(cap){
-    cap.style.display=hasData?'none':'';
-    if(!hasData){
-      if(!hasF) cap.textContent='阶段曲线暂无数据：该 trace 产物是旧版格式（缺少阶段时间桶 fminutes）。重新执行 map 阶段（scripts/tracestats.py）生成新版 trace 产物后即可显示。';
-      else if(!objHasData) cap.textContent='该对象暂无 trace 数据：阶段曲线暂支持总体/角色（writer/reader），节点/实例分组将在后端 mapreduce 补齐后开放。';
-      else if(!metricHasData) cap.textContent='该指标（'+tLevelMetric+'）暂无数据：分位数需后端时间桶存直方图后还原，当前仅 avg/max 可用。';
-    }
-  }
-  if(!tChart) tChart=echarts.init(box);
-  bindClickTip(tChart);
-  if(!hasData){ try{tChart.clear();}catch(e){} return; }
-  // 当前档位；'auto' 按可见跨度挑一个桶数适中的档（约 30~120 桶），
-  // 短 run 自然落在 1 秒档；后端降过档（ftier>1）时不能比步长更细。
-  const ftierMin=Number(cur.data.ftier)||1;
+  ensureTraceSel();
+  const objs=tObjSel.slice();
+  const stages=tStageSel.slice();
+  const multiObj=objs.length>1;
+  const multiStage=!multiObj&&stages.length>1;
+  const base=tObjPick(objs[0]||tRoleKey())||(cur&&cur.data)||{};
+  const ftierMin=Number(base.ftier)||1;
   let tier;
   if(tStageTier==='auto'||tStageTier==='cnt'){
-    const span=tFmSpan(cur)||0;
+    const span=tFmSpan({data:base})||0;
     tier=adaptiveStepFor(span,tierScalesFor(span,ftierMin));
   }else{
     tier=Number(tStageTier)||60;
   }
   tier=Math.max(tier,ftierMin);
-  const pal=objPalette();
-  const series=[]; let ci=0;
+  const series=[]; let t0=null,t1=null;
   tLabelMeta=[];
-  tStageSel.forEach(function(key){
-    if(key==='total_us'){
-      const color=pal[0];
-      const data=totalSeriesData(cur,tier,tLevelMetric);
-      tLabelMeta.push({name:'total（端到端）',color:color,data:data});
-      series.push({name:'total（端到端）',type:'line',showSymbol:false,clip:true,
-        lineStyle:{width:1.0,color:color},itemStyle:{color:color},z:6,
-        emphasis:{focus:'series',lineStyle:{width:1.0+EMPHASIS_ADD}},
-        data:data});
-      return;
-    }
-    const rows=fm[key]||[];
-    if(!rows.length) return;
-    const color=pal[1+(ci++)%Math.max(1,pal.length-1)];
-    const nm=(key==='residual'?'残差':key);
-    /* 行格式 [t, n, avg, max]：按当前档位聚合（秒桶 -> tier），avg 按样本
-       数加权、max 取区间最大值，保证换档后形态一致且不被单点尖刺主导。 */
-    const acc={};
-    rows.forEach(function(r){
-      const k=Math.floor(r[0]/tier)*tier;
-      const a=acc[k]||(acc[k]={t:k,n:0,sum:0,max:0});
-      const n=Number(r[1])||0;
-      a.n+=n;
-      a.sum+=(Number(r[2])||0)*n;
-      a.max=Math.max(a.max,Number(r[3])||0);
-    });
-    const data=Object.keys(acc).map(Number).sort(function(x,y){return x-y;})
-      .map(function(k){
-        const a=acc[k];
-        return [a.t*1000,
-          tLevelMetric==='max'?a.max:(a.n?a.sum/a.n:0)];});
+  function addSeries(nm,color,data,wide){
+    if(!data||!data.length) return;
+    const w=wide?1.0:0.8;
     tLabelMeta.push({name:nm,color:color,data:data});
     series.push({name:nm,type:'line',showSymbol:false,clip:true,
-      lineStyle:{width:0.8,color:color},itemStyle:{color:color},z:3,
-      emphasis:{focus:'series',lineStyle:{width:0.8+EMPHASIS_ADD}},
+      lineStyle:{width:w,color:color},itemStyle:{color:color},z:3,
+      emphasis:{focus:'series',lineStyle:{width:w+EMPHASIS_ADD}},
       data:data});
-  });
+    data.forEach(function(d){
+      const t=d[0]/1000;
+      if(t0===null||t<t0)t0=t;
+      if(t1===null||t>t1)t1=t;
+    });
+  }
+  const stageOrder=tStageKeys();
+  if(multiObj){
+    /* 单阶段 × 多对象：每个对象一条（总计灰阶/节点色系/实例色阶） */
+    const stage=stages[0]||'total_us';
+    objs.forEach(function(k){
+      const op=tObjPick(k);
+      addSeries(traceObjLabel(k), traceObjColor(k),
+        tStageSeriesData(op,stage,tier,tCurveMetric),
+        stage==='total_us');
+    });
+  }else{
+    /* 单对象 × 多阶段（或单阶段单对象）：阶段调色板 */
+    const k=objs[0]||tRoleKey();
+    const op=tObjPick(k);
+    const list=multiStage?stages:['total_us'];
+    const isRole=(k===tRoleKey());
+    list.forEach(function(stage){
+      const nm=(multiStage||isRole)?tStageName(stage):
+        (traceObjLabel(k)+' · '+tStageName(stage));
+      addSeries(nm,stageColor(stageOrder.indexOf(stage)),
+        tStageSeriesData(op,stage,tier,tCurveMetric),
+        stage==='total_us');
+    });
+  }
+  const hasData=series.length>0;
+  if(cap){
+    cap.style.display=hasData?'none':'';
+    if(!hasData){
+      if(!objs.length)
+        cap.textContent='请选择总计/节点/实例任一对象后查看分级时延曲线。';
+      else if(!tObjKeys().length)
+        cap.textContent='该数据大小没有 trace 对象数据（节点/实例阶段桶）。';
+      else
+        cap.textContent='所选对象暂无可用的阶段时间桶（旧产物或该对象未内嵌；完整数据见 data.js）。';
+    }
+  }
+  if(!tChart) tChart=echarts.init(box);
+  bindClickTip(tChart);
+  if(!hasData){
+    try{tChart.clear();}catch(e){}
+    safe('stage-endlabels',function(){tLayoutEndLabels(tChart);});
+    return;
+  }
   const o=axisCommon();
   o.grid=STAGE_GRID;
   o.tooltip=lfTooltip({trigger:'axis'});
   o.tooltip.valueFormatter=function(v){return fmtUs(v);};
   o.yAxis=[lfAxisValue({name:'µs',scale:true,nameLocation:'end',nameGap:14})];
   o.dataZoom=zoomModel('main');
-  // x 轴显式范围（value 轴默认从 0 开始会把数据挤到最右端）
-  let t0=null,t1=null;
-  series.forEach(function(sr){
-    (sr.data||[]).forEach(function(d){
-      const t=d[0]/1000;
-      if(t0===null||t<t0)t0=t;
-      if(t1===null||t>t1)t1=t;});
-  });
   if(t0!==null) o.xAxis=lfAxisTime(xExtent(t0,t1,
     plotWidthOf(tChart,STAGE_GRID)),'stage');
   o.series=series;
@@ -4821,42 +4875,102 @@ function buildStageChart(cur){
     }catch(e){}
   });}
 }
+/* 阶段序列：total 用秒桶（[t,n,ok,fail,avg,max,...]），阶段用 fminutes
+   的 [t,n,avg,max]；按档位聚合（avg 按样本数加权，max 取最大）。 */
+function tAggFm(rows,tier,metric){
+  const acc={};
+  (rows||[]).forEach(function(r){
+    const k=Math.floor(r[0]/tier)*tier;
+    const a=acc[k]||(acc[k]={t:k,n:0,sum:0,max:0});
+    const n=Number(r[1])||0;
+    a.n+=n;
+    a.sum+=(Number(r[2])||0)*n;
+    a.max=Math.max(a.max,Number(r[3])||0);
+  });
+  return Object.keys(acc).map(Number).sort(function(x,y){return x-y;})
+    .map(function(k){
+      const a=acc[k];
+      return [a.t*1000, metric==='max'?a.max:(a.n?a.sum/a.n:0)];
+    });
+}
+function tAggTotal(op,tier,metric){
+  const acc={};
+  ((op&&op.seconds)||[]).forEach(function(r){
+    const k=Math.floor(r[0]/tier)*tier;
+    const a=acc[k]||(acc[k]={t:k,n:0,sum:0,max:0});
+    const n=Number(r[1])||0;
+    a.n+=n;
+    a.sum+=(Number(r[4])||0)*n;
+    a.max=Math.max(a.max,Number(r[5])||0);
+  });
+  return Object.keys(acc).map(Number).sort(function(x,y){return x-y;})
+    .map(function(k){
+      const a=acc[k];
+      return [a.t*1000, metric==='max'?a.max:(a.n?a.sum/a.n:0)];
+    });
+}
+function tStageSeriesData(op,stage,tier,metric){
+  if(!op) return [];
+  if(stage==='total_us') return tAggTotal(op,tier,metric);
+  return tAggFm(((op.fminutes||{})[stage])||[],tier,metric);
+}
 function stageObjToggle(key){
-  if(!(key==='all'||key==='writer'||key==='reader')) return;
-  const i=tStageObjs.indexOf(key);
-  if(i>=0) tStageObjs.splice(i,1); else tStageObjs.push(key);
-  if(!tStageObjs.length) tStageObjs=['all'];
+  if(tObjKeys().indexOf(key)<0) return;
+  const i=tObjSel.indexOf(key);
+  if(i>=0) tObjSel.splice(i,1); else tObjSel.push(key);
+  if(!tObjSel.length) tObjSel=[tRoleKey()];
+  /* 维度联动：对象多选 => 阶段收敛为单选 */
+  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=['total_us'];
   renderStageObjTree(); renderTrace();
 }
 function stageObjSetMany(keys,on){
   keys.forEach(function(k){
-    if(!(k==='all'||k==='writer'||k==='reader')) return;
-    const i=tStageObjs.indexOf(k);
-    if(on&&i<0) tStageObjs.push(k);
-    if(!on&&i>=0) tStageObjs.splice(i,1);
+    if(tObjKeys().indexOf(k)<0) return;
+    const i=tObjSel.indexOf(k);
+    if(on&&i<0) tObjSel.push(k);
+    if(!on&&i>=0) tObjSel.splice(i,1);
   });
-  if(!tStageObjs.length) tStageObjs=['all'];
+  if(!tObjSel.length) tObjSel=[tRoleKey()];
+  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=['total_us'];
   renderStageObjTree(); renderTrace();
+}
+function stageTreeModel(){
+  const all=tObjAll(); const g=tGroup;
+  const roles=[],nodes=[],clients=[];
+  Object.keys(all).forEach(function(k){
+    const o=all[k]; if(!o||o.role!==g) return;
+    if(o.kind==='role') roles.push(k);
+    else if(o.kind==='node') nodes.push(k);
+    else clients.push(k);
+  });
+  nodes.sort(function(a,b){
+    return String(all[a].node||'').localeCompare(String(all[b].node||''));});
+  clients.sort(function(a,b){
+    const na=String(all[a].node||''),nb=String(all[b].node||'');
+    if(na!==nb) return na.localeCompare(nb);
+    return String(all[a].label||'').localeCompare(String(all[b].label||''));});
+  const byNode={};
+  clients.forEach(function(k){
+    const n=all[k].node||'未归属节点';
+    (byNode[n]=byNode[n]||[]).push(k);
+  });
+  return {all:all,roles:roles,nodes:nodes,clients:clients,byNode:byNode};
 }
 function renderStageObjTree(){
   const box=document.getElementById('stageObjTree'); if(!box) return;
+  ensureTraceSel();
   box.innerHTML='';
-  const m=objTreeModel(true);
-  function row(key,label,depth,lead,minis,note,unsupported){
-    const on=!unsupported&&tStageObjs.indexOf(key)>=0;
+  const m=stageTreeModel();
+  function row(key,label,depth,lead,minis,note){
+    const on=tObjSel.indexOf(key)>=0;
     const r=el('div','tree-row'+(on?' on':''));
     r.style.paddingLeft=(depth>1?36:0)+'px';
     if(lead) r.appendChild(lead);
     const b=el('button','tree-check');
+    b.setAttribute('data-key',key);
     b.appendChild(el('span','tree-box',on?'✓':''));
     b.appendChild(el('span','tree-name',label));
-    if(unsupported){
-      /* P2-E：节点/实例暂不支持阶段曲线 —— 显式禁用，不再静默丢弃 */
-      b.disabled=true;
-      b.title='阶段曲线暂只支持总体/角色（节点/实例分组为已知欠账 R-TRACE-9）';
-    }else{
-      b.onclick=function(){stageObjToggle(key);};
-    }
+    b.onclick=function(){stageObjToggle(key);};
     r.appendChild(b);
     (minis||[]).forEach(function(x){r.appendChild(x);});
     if(note) r.appendChild(el('span','tree-note',note));
@@ -4867,38 +4981,71 @@ function renderStageObjTree(){
     b.onclick=function(){stageObjSetMany(keys,on);};
     return b;
   }
-  const isBasic=(D.meta&&String(D.meta.mode))==='basic';
-  if(isBasic){
-    /* 与端到端时延曲线的对象树一致：basic 顶部单行「总览」，无角色分组 */
-    box.appendChild(row('all',objLabel('all'),1));
-  }else{
+  /* 总计：当前读写组的全部实例聚合（角色由顶部总控决定，这里不再有角色行） */
+  if(m.roles.length){
     const g1=el('div','tree-group');
-    g1.appendChild(el('span','tree-group-title','总体与角色'));
-    g1.appendChild(mini('全选',m.roles,true));
-    g1.appendChild(mini('清空',m.roles,false));
-    m.roles.forEach(function(k){g1.appendChild(row(k,objLabel(k),1));});
+    g1.appendChild(el('span','tree-group-title','总计'));
+    m.roles.forEach(function(k){
+      g1.appendChild(row(k,traceObjLabel(k),1));
+    });
     box.appendChild(g1);
   }
-  if(m.clients.length<=1&&m.nodes.length<=1) return;   /* 单实例单元：省掉等价组 */
+  if(!m.nodes.length&&!m.clients.length) return;
   const g2=el('div','tree-group node-group');
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','节点与实例'));
-  head.appendChild(el('span','tree-note',
-    '阶段曲线暂只支持总体/角色（节点/实例分组欠账）'));
+  head.appendChild(el('span','objtree-count','已选 '+tObjSel.length+' 项'));
   g2.appendChild(head);
+  function kindKeys(kind){
+    return m.all?Object.keys(m.all).filter(function(k){
+      const o=m.all[k];
+      return o&&o.role===tGroup&&o.kind===kind;}).sort():[];
+  }
+  function kindAll(kind){
+    const ks=kindKeys(kind);
+    return ks.length>0&&ks.every(function(k){
+      return tObjSel.indexOf(k)>=0;});
+  }
+  function clearAll(){
+    tObjSel=[tRoleKey()];
+    renderStageObjTree(); renderTrace();
+  }
+  function actBtn(label,title,fn){
+    const b=el('button','mini',label);
+    b.title=title; b.onclick=fn; return b;
+  }
+  const ndAll=kindAll('node'), clAll=kindAll('client');
+  const acts=el('div','node-group-acts');
+  acts.appendChild(actBtn(ndAll?'清空节点':'全选节点',
+    ndAll?'取消全部节点选择':'选中当前范围内全部节点',
+    function(){stageObjSetMany(kindKeys('node'),!ndAll);}));
+  acts.appendChild(actBtn(clAll?'清空实例':'全选实例',
+    clAll?'取消全部实例选择':'选中当前范围内全部实例',
+    function(){stageObjSetMany(kindKeys('client'),!clAll);}));
+  acts.appendChild(actBtn('全部清空','清空节点与实例，并只保留总计',
+    clearAll));
+  g2.appendChild(acts);
   const list=el('div','tree-list');
-  /* P2-E：角色化模型里同名节点会出现多行（每角色一行）；这里本就不可选，
-     按节点名去重，避免「node1 ×2」的噪音。 */
-  const seen={};
   m.nodes.forEach(function(k){
     const nodeName=String((m.all[k]&&m.all[k].node)||k.replace(/^node:/,''));
-    const key='n:'+nodeName;
-    if(seen[key]) return;
-    seen[key]=true;
     const kids=m.byNode[nodeName]||[];
-    list.appendChild(row(k,objLabel(k),1,null,[],
-      kids.length?(kids.length+' 实例'):'',true));
+    const open=!!treeOpen['stage:'+k];
+    let caret=null;
+    if(kids.length){
+      caret=el('button','tree-caret',open?'▾':'▸');
+      caret.onclick=function(){treeOpen['stage:'+k]=!treeOpen['stage:'+k];
+        renderStageObjTree();};
+    }
+    list.appendChild(row(k,traceObjLabel(k),1,caret,kids.length?[
+      mini('全选',kids,true),mini('清空',kids,false)]:[],
+      kids.length?(kids.length+' 实例'):''));
+    if(open&&kids.length) kids.forEach(function(ck){
+      list.appendChild(row(ck,traceObjLabel(ck),2));
+    });
   });
+  if(!m.nodes.length){
+    list.appendChild(el('div','tree-empty','该读写组没有节点聚合对象'));
+  }
   g2.appendChild(list);
   box.appendChild(g2);
 }
@@ -4906,50 +5053,71 @@ function renderStageBtns(cur){
   const stb=document.getElementById('stageTierBtns');
   if(stb){
     stb.innerHTML='';
-    /* 与端到端曲线同一策略：档位 s 仅在 span/s >= 8（且不细于产物步长
-       ftier）时提供；不满足的档位直接隐藏（30s run 只有 1秒 + 自适应）。 */
-    const span=tFmSpan(cur);
-      const ftierMin=Number((cur&&cur.data&&cur.data.ftier)||1);
-    const steps=[['1','1 秒',1],['10','10 秒',10],['60','1 分钟',60]];
+    const base=(cur&&cur.data)||{};
+    const span=tFmSpan({data:base})||0;
+    const ftierMin=Number(base.ftier)||1;
     const scales=tierScalesFor(span||0,ftierMin);
-    const offered=steps.filter(function(t){
-      return scales.indexOf(t[2])>=0;});
-    if(tStageTier!=='cnt'&&
-       !offered.some(function(t){return t[0]===tStageTier;}))
-      tStageTier='cnt';               /* 选中档失效 -> 回落自适应 */
-    /* 自适应是默认档：按钮固定放最左 */
-    const aStep=adaptiveStepFor(span||0,scales);
     const ac=el('button',tStageTier==='cnt'?'on':'','自适应');
-    ac.title='自适应：'+tierHintFor(aStep,scales,span||0);
+    ac.title='自适应按 30~120 桶自动选档';
     ac.onclick=function(){tStageTier='cnt';renderStageBtns(cur);
       buildStageChart(cur);};
     stb.appendChild(ac);
-    offered.forEach(function(t){
-      const b=el('button',tStageTier===t[0]?'on':'',t[1]);
-      b.title='时间桶 '+t[2]+' 秒（约 '+Math.max(1,Math.floor(span/t[2]))+' 桶）';
-      b.onclick=function(){tStageTier=t[0];renderStageBtns(cur);
+    [[1,'1 秒'],[10,'10 秒'],[60,'1 分钟']].forEach(function(s){
+      if(scales.indexOf(s[0])<0) return;
+      const b=el('button',tStageTier===String(s[0])?'on':'',s[1]);
+      b.title='时间桶 '+s[0]+' 秒（约 '+Math.max(1,Math.floor(span/s[0]))+' 桶）';
+      b.onclick=function(){tStageTier=String(s[0]);renderStageBtns(cur);
         buildStageChart(cur);};
       stb.appendChild(b);
     });
   }
   const box=document.getElementById('stageBtns'); if(!box) return;
   box.innerHTML='';
-  const tree=tTree(cur.g);
-  const list=['total_us'].concat(tree.filter(function(x){
-    return x[1]===1;}).map(function(x){return x[0];}));
+  const list=tStageKeys();
   list.forEach(function(k){
     const on=tStageSel.indexOf(k)>=0;
-    const b=el('button',on?'on':'',k==='residual'?'残差':k);
+    const b=el('button',on?'on':'');
+    const dot=el('span','dot');
+    dot.style.background=stageColor(list.indexOf(k));
+    b.appendChild(dot);
+    b.appendChild(el('span',null,tStageName(k)));
     b.title='点击加入/移出阶段曲线对比';
     b.onclick=function(){
       const i=tStageSel.indexOf(k);
-      if(i>=0)tStageSel.splice(i,1); else tStageSel.push(k);
+      if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
       if(!tStageSel.length) tStageSel=['total_us'];
-      renderStageBtns(cur); buildStageChart(cur);
+      /* 维度联动：阶段多选 => 对象收敛为单选 */
+      if(tStageSel.length>1&&tObjSel.length>1)
+        tObjSel=[tBlockObj||tRoleKey()];
+      renderStageObjTree(); renderStageBtns(cur); buildStageChart(cur);
     };
     box.appendChild(b);
   });
-
+  const allb=el('button','mini','全选');
+  allb.title='选中全部阶段（阶段多选时对象自动收敛为单选）';
+  allb.onclick=function(){
+    tStageSel=list.slice();
+    if(tObjSel.length>1) tObjSel=[tBlockObj||tRoleKey()];
+    renderStageObjTree(); renderStageBtns(cur); buildStageChart(cur);
+  };
+  const clrb=el('button','mini','清空');
+  clrb.title='只保留端到端 total';
+  clrb.onclick=function(){
+    tStageSel=['total_us'];
+    renderStageBtns(cur); buildStageChart(cur);
+  };
+  box.appendChild(allb); box.appendChild(clrb);
+}
+function renderCurveMetric(){
+  const box=document.getElementById('tCurveMetric'); if(!box) return;
+  box.innerHTML='';
+  [['avg','均值'],['max','最大']].forEach(function(m){
+    const b=el('button',tCurveMetric===m[0]?'on':'',m[1]);
+    b.title='阶段桶的 '+m[1]+'（map 侧仅保存均值/最大）';
+    b.onclick=function(){tCurveMetric=m[0];renderCurveMetric();
+      buildStageChart(tPick());};
+    box.appendChild(b);
+  });
 }
 function renderTree(cur){
   const box=document.getElementById('ttree'); if(!box) return;
@@ -5316,25 +5484,26 @@ function renderTrace(){
     sel.onchange=function(){tOp=sel.value;renderTrace();};
   }
   const cur=tPick(); if(!cur) return;
-  const d=cur.data; const f=d.fields||{}; const tot=f.total_us||{};
-  const cards=document.getElementById('tcards'); cards.innerHTML='';
-  /* 与段1 同构：第一行加粗 平均/P99/P9999，第二行其余指标 */
-  let bold=false;
-  if(tot.avg!=null){cards.appendChild(kvStrong('avg',fmtUs(tot.avg)));bold=true;}
-  if(tot.p99!=null){cards.appendChild(kvStrong('p99',fmtUs(tot.p99)));bold=true;}
-  if(tot.p9999!=null&&(tot.n||0)>=10000){
-    cards.appendChild(kvStrong('p9999',fmtUs(tot.p9999)));bold=true;}
-  if(bold)cards.appendChild(gridBreak());
-  cards.appendChild(kv('样本数',d.count));
-  cards.appendChild(kv('失败',d.fail));
-  if(tot.p50!=null)cards.appendChild(kv('p50',fmtUs(tot.p50)));
-  if(tot.p95!=null)cards.appendChild(kv('p95',fmtUs(tot.p95)));
-  if(tot.p999!=null)cards.appendChild(kv('p999',fmtUs(tot.p999)));
-  if(tot.min!=null)cards.appendChild(kv('min',fmtUs(tot.min)));
-  if(tot.max!=null)cards.appendChild(kv('max',fmtUs(tot.max)));
-  safe('trace-levels',function(){renderLevelMetric();renderLevels(cur);});
+  ensureTraceSel();
+  /* 分级时延块图：对象单选（总计/节点/实例） */
+  const bs=document.getElementById('tBlockObj');
+  if(bs){
+    const keys=tObjKeys();
+    bs.innerHTML='';
+    keys.forEach(function(k){
+      const o=el('option',null,traceObjLabel(k)); o.value=k;
+      bs.appendChild(o);
+    });
+    bs.value=tBlockObj;
+    bs.style.display=keys.length>1?'':'none';
+    bs.onchange=function(){tBlockObj=bs.value;renderTrace();};
+  }
+  const bcur=tObjPick(tBlockObj)||cur.data;
+  safe('trace-levels',function(){
+    renderLevelMetric();
+    renderLevels({g:cur.g,op:cur.op,data:bcur});});
   safe('trace-stage-chart',function(){renderStageObjTree();renderStageBtns(cur);
-    buildStageChart(cur);});
+    renderCurveMetric();buildStageChart(cur);});
   safe('trace-tree',function(){renderTree(cur);renderTreeDetail(cur);});
   safe('trace-top',function(){renderTraceTop(cur);});
   safe('trace-stack',function(){renderTraceStack();});
@@ -5342,6 +5511,7 @@ function renderTrace(){
 }
 
 window.__MC_SEL=function(){return selObjs.slice();};
+window.__MC_TSEL=function(){return tObjSel.slice();};
 window.__MC_FULL_READY__=function(){renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """
@@ -5519,15 +5689,16 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 <div class="sub" id="tmeta"></div>
 <div class="toolbar"><span id="tgroups" class="toolbar"></span>
 <select id="topSel" style="display:none"></select></div>
-<div id="tcards" class="grid"></div>
 <div class="objtree-strip">
 <div class="objtree-body" id="stageObjTree"></div>
 </div>
-<div class="toolbar"><span class="tl-label">指标</span>
+<h3 class="sec" title="块宽 = 占父项百分比；点击块聚焦，下一级在新行展开">分级时延块图（trace）</h3>
+<div class="toolbar"><span class="tl-label">对象</span>
+<select id="tBlockObj"></select>
+<span class="tl-label" style="margin-left:16px">指标</span>
 <span id="lvlMetric" class="toolbar"></span></div>
-<h3 class="sec" title="块宽 = 占父项百分比；点击块聚焦，下一级在新行展开">分级时延</h3>
 <div id="levels" class="levels"></div>
-<h3 class="sec" title="粒度 + 阶段，与分级时延共享对象与指标">阶段曲线</h3>
+<h3 class="sec" title="阶段 + 指标 + 对象：单对象可多阶段，单阶段可多对象">分级时延曲线（trace）</h3>
 <div class="toolbar" id="tLatToolbar">
 <span id="stageTierBtns" class="toolbar"></span>
 <button id="tResetBtn" title="恢复初始缩放范围">重置视图</button>
@@ -5535,6 +5706,10 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 <div class="toolbar">
 <span class="tl-label">阶段</span>
 <span id="stageBtns" class="toolbar"></span>
+</div>
+<div class="toolbar">
+<span class="tl-label">指标</span>
+<span id="tCurveMetric" class="toolbar"></span>
 </div>
 <div id="tchartEmpty" class="empty-tip" style="display:none"></div>
 <div class="chart-frame">
@@ -5551,16 +5726,17 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 </div>
 </div>
 <div class="chart-canvas">
-<div id="tchart" class="chart" role="img" aria-label="阶段曲线图"></div>
+<div id="tchart" class="chart" role="img" aria-label="分级时延曲线图"></div>
 <div id="tEndlabels" class="endlabels"></div>
 <div id="tXpan" class="xpan" title="拖动平移时间轴（缩放请用滚轮）">
 <div id="tXpanWin" class="xpan-win" title="拖动平移时间轴"></div>
 </div>
 </div>
 </div>
-<div class="note">阶段曲线的时间桶按跨度提供：档位 s 仅当 span/s ≥ 8 时可选
-（30s run 只有 1 秒与自适应；默认自适应按 30~120 桶自动选档）；
-平均/最大值来自 SDK 字段统计；端到端曲线由 1s 桶聚合到同一档位。</div>
+<div class="note">分级时延曲线是「阶段 × 指标 × 对象」三重维度：单对象可多阶段对比，
+单阶段可多对象对比（多选一侧时另一侧自动收敛为单选）；指标为均值/最大
+（map 侧阶段桶只保存这两项）。时间桶档位按跨度提供；节点/实例阶段数据
+在预算内嵌，完整数据见 data.js。</div>
 <h3 class="sec" style="display:none" title="点击节点，右侧显示该阶段指标套件">阶段树</h3>
 <div class="stage-split" style="display:none">
 <div class="ttree" id="ttree"></div>
