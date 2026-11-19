@@ -2264,10 +2264,12 @@ def test_all_charts_tooltip_hover_pointer_click_box(tmp_path):
         assert tips[cid]["enterable"] is True, (cid, tips[cid])
 
 
-def test_tooltip_click_pins_content(tmp_path):
-    """#4：点击 → showContent 切 true + showTip 钉住；空白点击/离开 → hideTip 复原。"""
+def test_tooltip_click_anywhere_opens(tmp_path):
+    """点击绘图区任意位置（含空白）→ 按点击 x 打开详情框；区外点击 → 收起。
+    分级时延曲线走同一 bindClickTip，必须同样生效。"""
     a = _stats(tmp_path, "a.reader", "reader")
-    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
     res = _js_check(tmp_path, data, "--tip-click")
     if res is None:
         return
@@ -2275,11 +2277,34 @@ def test_tooltip_click_pins_content(tmp_path):
     assert res["tip_after_click"] == {"triggerOn": "none",
                                       "showContent": True}, \
         res["tip_after_click"]
-    assert "showTip" in res["tip_click_actions"], res["tip_click_actions"]
-    assert res["tip_after_blank"] == {"triggerOn": "mousemove",
-                                     "showContent": False}, \
-        res["tip_after_blank"]
-    assert "hideTip" in res["tip_blank_actions"], res["tip_blank_actions"]
+    act = [a for a in res["tip_click_actions"] if a.get("type") == "showTip"]
+    assert act and act[0].get("x") == 600 and act[0].get("y") == 200, act
+    assert res["tip_after_outside"] == {"triggerOn": "mousemove",
+                                       "showContent": False}, \
+        res["tip_after_outside"]
+    assert any(a.get("type") == "hideTip"
+               for a in res["tip_outside_actions"]), res["tip_outside_actions"]
+    # 分级时延曲线：空白点击同样 showTip（x/y = 点击位置）
+    tacts = [a for a in (res.get("tchart_tip_actions") or [])
+             if a.get("type") == "showTip"]
+    assert tacts and tacts[0].get("x") == 500, tacts
+    assert res["tchart_tip"] == {"triggerOn": "none",
+                                 "showContent": True}, res["tchart_tip"]
+
+
+def test_latency_metric_select_all_clear(tmp_path):
+    """时延曲线选择：全选=8 项全开（含队列等待）；清空=仅保留 avg。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--lat-buttons")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert len(res["lat_before"]) == 8, res["lat_before"]
+    on = [x for x in res["lat_all"] if not x["off"]]
+    assert len(on) == 8, on
+    left = [x for x in res["lat_clear"] if not x["off"]]
+    assert [x["t"] for x in left] == [" avg"], left
 
 
 def test_report_started_time_uses_data_timestamp(tmp_path):
@@ -2592,9 +2617,13 @@ def test_a06_metric_list_locked_to_spec(tmp_path):
     if res is None:
         return
     assert res["errors"] == []
-    names = [b["t"].strip() for b in (res.get("lat_btns") or [])]
+    names = [b["t"].strip() for b in (res.get("lat_btns") or [])
+             if b["t"].strip() not in ("全选", "清空")]
     expected = {"avg", "p50", "p99", "p999", "p9999", "min", "max", "队列等待"}
     assert set(names) == expected, names
+    # 全选 / 清空 两个操作按钮存在（指标清单本身仍锁定）
+    allt = [b["t"].strip() for b in (res.get("lat_btns") or [])]
+    assert "全选" in allt and "清空" in allt, allt
 
 
 def test_a07_anomalies_capped_at_50(tmp_path):

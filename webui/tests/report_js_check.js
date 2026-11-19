@@ -102,7 +102,16 @@ function echartsInit(el) {
     getOption() { const a = charts[id]; return a.length ? a[a.length - 1] : {}; },
     dispatchAction(a) { (c.__acts = c.__acts || []).push(a); },
     on(ev, fn) { (c.__h = c.__h || {}); (c.__h[ev] = c.__h[ev] || []).push(fn); },
-    getZr() { return { on() {} }; },
+    getZr() {
+      if (!c.__zr) {
+        const h = {};
+        c.__zr = {
+          on(ev, fn) { (h[ev] = h[ev] || []).push(fn); },
+          fire(ev, e) { (h[ev] || []).forEach(function (f) { f(e); }); },
+        };
+      }
+      return c.__zr;
+    },
     getDom() { return makeEl("chartdom"); },
     getWidth() { return 960; },
     getHeight() { return 420; },
@@ -687,25 +696,52 @@ if (!errs.length) {
   }
   if (process.argv.includes("--tip-click")) {
     try {
-      const c=chartRefs.mainchart;
-      const n0=((c&&c.__acts)||[]).length;
-      const hs=(c&&c.__h&&c.__h.click)||[];
-      hs.forEach(function(fn){
-        fn({seriesType:'line',seriesIndex:0,dataIndex:10,
-            event:{clientX:600,clientY:200,offsetX:600,offsetY:200}});});
-      const o=mainOpt();
-      out.tip_after_click={triggerOn:o.tooltip&&o.tooltip.triggerOn,
-        showContent:o.tooltip&&o.tooltip.showContent};
-      out.tip_click_actions=((c&&c.__acts)||[]).slice(n0)
-        .map(function(a){return a.type;});
-      const n1=((c&&c.__acts)||[]).length;
-      hs.forEach(function(fn){ fn({event:{clientX:10,clientY:10}}); });
-      const o2=mainOpt();
-      out.tip_after_blank={triggerOn:o2.tooltip&&o2.tooltip.triggerOn,
-        showContent:o2.tooltip&&o2.tooltip.showContent};
-      out.tip_blank_actions=((c&&c.__acts)||[]).slice(n1)
-        .map(function(a){return a.type;});
+      const c = chartRefs.mainchart;
+      const n0 = ((c && c.__acts) || []).length;
+      const zr = c.getZr();
+      // 空白处（不命中任何曲线）点击：按点击 x 打开详情框
+      zr.fire("click", {offsetX: 600, offsetY: 200, clientX: 700, clientY: 300});
+      const o = mainOpt();
+      out.tip_after_click = {triggerOn: o.tooltip && o.tooltip.triggerOn,
+        showContent: o.tooltip && o.tooltip.showContent};
+      out.tip_click_actions = ((c.__acts) || []).slice(n0);
+      // 绘图区外点击（x 轴左侧边距）：收起
+      const n1 = ((c.__acts) || []).length;
+      zr.fire("click", {offsetX: 10, offsetY: 200, clientX: 20, clientY: 300});
+      const o2 = mainOpt();
+      out.tip_after_outside = {triggerOn: o2.tooltip && o2.tooltip.triggerOn,
+        showContent: o2.tooltip && o2.tooltip.showContent};
+      out.tip_outside_actions = ((c.__acts) || []).slice(n1);
+      // 分级时延曲线同策略：空白点击同样打开（x/y 来自点击位置）
+      const tc = chartRefs.tchart;
+      if (tc) {
+        const m0 = ((tc.__acts) || []).length;
+        tc.getZr().fire("click", {offsetX: 500, offsetY: 180,
+          clientX: 600, clientY: 1800});
+        out.tchart_tip_actions = ((tc.__acts) || []).slice(m0);
+        const to = (charts.tchart || []).slice(-1)[0] || {};
+        out.tchart_tip = {triggerOn: to.tooltip && to.tooltip.triggerOn,
+          showContent: to.tooltip && to.tooltip.showContent};
+      }
     } catch (e) { errs.push("tip-click: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--lat-buttons")) {
+    try {
+      const states = function () {
+        return (getEl("latSel").children || []).filter(function (b) {
+          return b._text !== "全选" && b._text !== "清空";
+        }).map(function (b) {
+          return {t: textOf(b), off: String(b.className || "").indexOf("off") >= 0};
+        });
+      };
+      out.lat_before = states();
+      const allb = findBtn(getEl("latSel"), "全选");
+      if (allb && allb.onclick) allb.onclick();
+      out.lat_all = states();
+      const clrb = findBtn(getEl("latSel"), "清空");
+      if (clrb && clrb.onclick) clrb.onclick();
+      out.lat_clear = states();
+    } catch (e) { errs.push("lat-buttons: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--tree-toggle")) {
     try {

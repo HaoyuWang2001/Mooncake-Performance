@@ -1698,15 +1698,33 @@ function lfTooltip(extra){
   return o;
 }
 /* 点击显示 tooltip（所有图）：悬浮只走 axisPointer（竖线+各曲线交点），
-   不弹内容框；点击后把 showContent 切 true、triggerOn 切 none 并 showTip，
-   框钉在点击处。鼠标在框内或锚点 16px 内保持，两者都离开 250ms 后收起；
-   点击空白、离开图表、缩放时收起。桩环境（无 on/getZr）自动跳过。 */
+   不弹内容框；点击**绘图区内任意位置**（不要求命中曲线）即视为点击了
+   竖线所在时间点，按点击 x 轴 showTip 并钉住内容框。鼠标在框内或图内
+   保持，离开两者 250ms 收起；Esc / 缩放 / 点击绘图区外收起。
+   网格从 option.grid 读取（主图/阶段图/慢点/监控各自 grid 自动适配），
+   桩环境（无 on/getZr）自动跳过。 */
 function bindClickTip(ch){
   if(!ch||!ch.on||!ch.getZr||ch.__mcTipBound) return;
   ch.__mcTipBound=true;
-  let anchor=null, hideTimer=null, docMove=null;
+  let anchor=null, hideTimer=null, docMove=null, docKey=null;
   function tipDom(){
     try{ return ch.getDom().querySelector('.mc-tip'); }catch(e){ return null; }
+  }
+  function chartRect(){
+    try{ return ch.getDom().getBoundingClientRect(); }catch(e){ return null; }
+  }
+  function plotRect(){
+    let g=null;
+    try{
+      const o=ch.getOption();
+      g=(o&&o.grid)||null;
+      if(Array.isArray(g)) g=g[0];
+    }catch(e){ g=null; }
+    const W=ch.getWidth?ch.getWidth():0, H=ch.getHeight?ch.getHeight():0;
+    if(!W||!H) return null;
+    const left=Number((g&&g.left)||0), right=Number((g&&g.right)||0);
+    const top=Number((g&&g.top)||0), bot=Number((g&&g.bottom)||0);
+    return {x0:left, x1:W-right, y0:top, y1:H-bot};
   }
   function boxHover(e){
     const d=tipDom(); if(!d||!e) return false;
@@ -1715,6 +1733,11 @@ function bindClickTip(ch){
       return e.clientX>=r.left&&e.clientX<=r.right&&
         e.clientY>=r.top&&e.clientY<=r.bottom;
     }catch(err){ return false; }
+  }
+  function inChart(e){
+    const r=chartRect(); if(!r||!e) return false;
+    return e.clientX>=r.left&&e.clientX<=r.right&&
+      e.clientY>=r.top&&e.clientY<=r.bottom;
   }
   function hoverMode(){
     try{ ch.setOption({tooltip:{showContent:false,triggerOn:'mousemove'}}); }
@@ -1726,6 +1749,10 @@ function bindClickTip(ch){
       try{ document.removeEventListener('mousemove',docMove); }catch(e){}
       docMove=null;
     }
+    if(docKey){
+      try{ document.removeEventListener('keydown',docKey); }catch(e){}
+      docKey=null;
+    }
   }
   function hide(){
     anchor=null; unlisten();
@@ -1736,43 +1763,15 @@ function bindClickTip(ch){
     if(hideTimer) return;
     hideTimer=setTimeout(function(){hideTimer=null;hide();},250);
   }
-  function pin(p){
-    const ev=p.event||{};
-    let cx=ev.clientX, cy=ev.clientY;
-    if(typeof cx!=='number'){
-      try{
-        const r=ch.getDom().getBoundingClientRect();
-        cx=r.left+(ev.offsetX||0); cy=r.top+(ev.offsetY||0);
-      }catch(e){ cx=0; cy=0; }
-    }
-    anchor=[cx,cy];
+  function pinAt(x,y,ev){
+    const r=chartRect();
+    anchor=r?[r.left+x,r.top+y]:[x,y];
     try{ ch.setOption({tooltip:{showContent:true,triggerOn:'none'}}); }
     catch(e){}
-    let trig='axis';
-    try{
-      const opt=ch.getOption();
-      trig=((opt.tooltip&&opt.tooltip[0]&&opt.tooltip[0].trigger)||'axis');
-    }catch(e){}
-    let ok=false;
-    if(trig==='item'&&p.seriesIndex!=null&&p.dataIndex!=null){
-      try{ ch.dispatchAction({type:'showTip',seriesIndex:p.seriesIndex,
-        dataIndex:p.dataIndex}); ok=true; }catch(e){}
-    }
-    if(!ok){
-      let x=ev.offsetX, y=ev.offsetY;
-      if(typeof x!=='number'){
-        try{
-          const r=ch.getDom().getBoundingClientRect();
-          x=cx-r.left; y=cy-r.top;
-        }catch(e){ x=cx; y=cy; }
-      }
-      try{ ch.dispatchAction({type:'showTip',x:x,y:y}); }catch(e){}
-    }
+    try{ ch.dispatchAction({type:'showTip',x:x,y:y}); }catch(e){}
     if(!docMove){
       docMove=function(e){
-        if(boxHover(e)){ if(hideTimer){clearTimeout(hideTimer);hideTimer=null;} return; }
-        const dx=(e.clientX||0)-anchor[0], dy=(e.clientY||0)-anchor[1];
-        if(dx*dx+dy*dy<=16*16){
+        if(boxHover(e)||inChart(e)){
           if(hideTimer){clearTimeout(hideTimer);hideTimer=null;}
           return;
         }
@@ -1780,12 +1779,21 @@ function bindClickTip(ch){
       };
       try{ document.addEventListener('mousemove',docMove); }catch(e){}
     }
+    if(!docKey){
+      docKey=function(e){
+        if(e&&(e.key==='Escape'||e.keyCode===27)) hide();
+      };
+      try{ document.addEventListener('keydown',docKey); }catch(e){}
+    }
   }
-  ch.on('click',function(p){
-    if(!p||!(p.event||p.seriesType)){ hide(); return; }
-    if(p.seriesType) pin(p); else hide();
-  });
   const zr=ch.getZr();
+  zr.on('click',function(e){
+    if(!e) { hide(); return; }
+    const pr=plotRect();
+    const x=e.offsetX, y=e.offsetY;
+    if(!pr||x<pr.x0||x>pr.x1||y<pr.y0||y>pr.y1){ hide(); return; }
+    pinAt(x,y,e);
+  });
   zr.on('globalout',function(){ if(anchor) scheduleHide(); });
   ch.on('datazoom',function(){ hide(); });
 }
@@ -2093,6 +2101,20 @@ function renderLatSel(){
     };
     box.appendChild(b);
   });
+  const allb=el('button','mini','全选');
+  allb.title='显示全部指标（含队列等待）';
+  allb.onclick=function(){
+    LAT_LINES.forEach(function(L){latShown[L[0]]=true;});
+    renderLatSel(); buildChart();
+  };
+  const clrb=el('button','mini','清空');
+  clrb.title='关闭全部指标（保留 avg 防止空图）';
+  clrb.onclick=function(){
+    LAT_LINES.forEach(function(L){latShown[L[0]]=false;});
+    latShown.avg=true;
+    renderLatSel(); buildChart();
+  };
+  box.appendChild(allb); box.appendChild(clrb);
 }
 function ensureSel(){
   const all=objAll();
