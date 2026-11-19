@@ -2473,6 +2473,10 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
         if not loaded:
             continue
         t0, t1 = _stats_window(loaded)
+        # P1-B：页头「测试开始于」取数据中最早的采样时刻（节点的绝对时间），
+        # 而不是报表生成时刻（旧实现写入 time.strftime 的构建墙钟）
+        _started = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0))
+                    if t0 is not None else time.strftime("%Y-%m-%d %H:%M:%S"))
         # basic 的合并日志每个 combo 一份，客户端数取自文件名 c{C}；
         # pipeline 一个单元 = 一个 size，客户端数按实际 stats 计。
         n_clients = (u["c"] if (mode == "basic" and u["c"])
@@ -2484,7 +2488,7 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
             "clients": n_clients,
             "qps_target": qps_target,
             "protocol": cfg.get("protocol") or "",
-            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started": _started,
             "early_stop": bool(early_stop),
             "cluster_cfg": os.path.basename(getattr(args, "cluster", "") or ""),
             "global_cfg": os.path.basename(getattr(args, "global_cfg", "") or ""),
@@ -6024,14 +6028,19 @@ def rebuild_reports(ts):
                 params = _override_param(params, "线程数", u["t"])
             n_clients = (u["c"] if (mode == "basic" and u["c"])
                          else len(loaded))
+            # P1-B：重建同样以数据最早采样时刻作为「测试开始于」
+            _started = (time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(t0))
+                        if t0 is not None else
+                        (base.get("started")
+                         or time.strftime("%Y-%m-%d %H:%M:%S")))
             meta = {
                 "config": name, "mode": mode,
                 "launch_mode": base.get("launch_mode") or "",
                 "clients": n_clients,
                 "qps_target": base.get("qps_target") or 0,
                 "protocol": base.get("protocol") or "",
-                "started": base.get("started")
-                or time.strftime("%Y-%m-%d %H:%M:%S"),
+                "started": _started,
                 "early_stop": False,      # unknown for historical runs
                 "cluster_cfg": base.get("cluster_cfg") or "",
                 "global_cfg": base.get("global_cfg") or "",

@@ -89,14 +89,28 @@ function getEl(id) {
 }
 
 const charts = {};        // elId -> [opt]
+const chartRefs = {};     // elId -> 最新一次 init 的对象（含 __h/__acts）
 function echartsInit(el) {
   const id = el.id || "anon";
   if (!charts[id]) charts[id] = [];
-  return {
-    setOption(opt) { charts[id].push(opt); },
+  const c = {
+    setOption(opt, notMerge) {
+      const a = charts[id];
+      const base = a.length ? a[a.length - 1] : null;
+      a.push(notMerge || !base ? opt : Object.assign({}, base, opt));
+    },
+    getOption() { const a = charts[id]; return a.length ? a[a.length - 1] : {}; },
+    dispatchAction(a) { (c.__acts = c.__acts || []).push(a); },
+    on(ev, fn) { (c.__h = c.__h || {}); (c.__h[ev] = c.__h[ev] || []).push(fn); },
+    getZr() { return { on() {} }; },
+    getDom() { return makeEl("chartdom"); },
+    getWidth() { return 960; },
+    getHeight() { return 420; },
     clear() {},
     resize() {},
   };
+  chartRefs[id] = c;
+  return c;
 }
 
 let domReady = null;
@@ -237,6 +251,35 @@ if (!errs.length) {
   }
   out.selobjs = (sandbox.window && sandbox.window.__MC_SEL)
     ? sandbox.window.__MC_SEL() : [];
+  function lwOf(id) {
+    const a = charts[id] || [];
+    const o = a.length ? a[a.length - 1] : null;
+    return ((o && o.series) || []).map(function (sr) {
+      return {name: sr.name, width: (sr.lineStyle || {}).width,
+              emphasis: ((sr.emphasis || {}).lineStyle || {}).width};
+    });
+  }
+  out.main_line_w = lwOf("mainchart");
+  out.tchart_line_w = lwOf("tchart");
+  // A6：所有图表 tooltip 均为点击触发、可进入
+  out.tooltips = {};
+  Object.keys(charts).forEach(function (id) {
+    const a = charts[id] || [];
+    const o = a.length ? a[a.length - 1] : null;
+    if (o && o.tooltip) out.tooltips[id] = {triggerOn: o.tooltip.triggerOn,
+                                            showContent: o.tooltip.showContent,
+                                            enterable: o.tooltip.enterable};
+  });
+  // P2-E：阶段对象树行（角色可用；节点/实例禁用）
+  out.stage_rows = [];
+  (function walk(node) {
+    (node.children || []).forEach(function (c) {
+      if (String(c.className || "").indexOf("tree-check") >= 0)
+        out.stage_rows.push({text: textOf(c), disabled: !!c.disabled});
+      walk(c);
+    });
+  })(getEl("stageObjTree"));
+  out.stage_tree_text = textOf(getEl("stageObjTree"));
   out.lat_btns = (getEl("latSel").children || []).map(function (c) {
     return {t: textOf(c), off: String(c.className || "").indexOf("off") >= 0};
   });
@@ -262,19 +305,22 @@ if (!errs.length) {
       out.slow_tip = _fmt({ data: _row });
     } catch (e) { out.slow_tip = "ERR:" + e.message; }
   }
-  if (process.argv.includes("--sel-all-clear")) {
+  if (process.argv.includes("--tree-select")) {
     try {
       const sel = function () {
         return (sandbox.window && sandbox.window.__MC_SEL)
           ? sandbox.window.__MC_SEL() : [];
       };
-      const sa = getEl("selAllBtn");
-      if (sa && sa.onclick) sa.onclick();
-      out.selobjs_all = sel();
-      const sc = getEl("selClearBtn");
-      if (sc && sc.onclick) sc.onclick();
-      out.selobjs_cleared = sel();
-    } catch (e) { errs.push("selall: " + String(e && e.stack || e)); }
+      const nb = findBtn(getEl("objTree"), "全选节点");
+      if (nb && nb.onclick) nb.onclick();
+      out.sel_after_nodes = sel();
+      const ib = findBtn(getEl("objTree"), "全选实例");
+      if (ib && ib.onclick) ib.onclick();
+      out.sel_after_instances = sel();
+      const cb = findBtn(getEl("objTree"), "全部清空");
+      if (cb && cb.onclick) cb.onclick();
+      out.sel_after_clear = sel();
+    } catch (e) { errs.push("tree-select: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--expand-tree")) {
     try {
@@ -342,8 +388,13 @@ if (!errs.length) {
       out.slow_series_writer = ((o1 && o1.series) || []).map(function (s) {
         return {name: s.name, symbol: s.symbol};
       });
-      const ab = findBtn(getEl("slowctl"), "全选");
-      if (ab && ab.onclick) ab.onclick();
+      out.slow_btn_before = treeMiniLabels(getEl("slowctl"));
+      const nb = findBtn(getEl("slowctl"), "全选节点");
+      if (nb && nb.onclick) nb.onclick();
+      out.slow_btn_after_nodes = treeMiniLabels(getEl("slowctl"));
+      const ib = findBtn(getEl("slowctl"), "全选实例");
+      if (ib && ib.onclick) ib.onclick();
+      out.slow_btn_after_instances = treeMiniLabels(getEl("slowctl"));
       const q2 = charts.slowchart || [];
       const o2 = q2.length ? q2[q2.length - 1] : null;
       out.slow_series_all = ((o2 && o2.series) || []).map(function (s) {
@@ -569,6 +620,137 @@ if (!errs.length) {
       out.main_series_after = (mo1 && mo1.series) ? mo1.series.length : null;
     } catch (e) { errs.push("clickclient: " + String(e && e.stack || e)); }
   }
+
+  function treeMiniLabels(root){
+    const acc=[];
+    (function walk(n){
+      (n.children||[]).forEach(function(c){
+        if (String(c.className||"").indexOf("mini")>=0 && c._text)
+          acc.push(String(c._text));
+        walk(c);
+      });
+    })(root);
+    return acc;
+  }
+  function labelEls(root){
+    return ((root&&root.children)||[]).filter(function(c){
+      return String(c.className||"").indexOf("endlabel")>=0;});
+  }
+  if (process.argv.includes("--cluster-hover")) {
+    try {
+      const ov=getEl("endlabels");
+      const labels=labelEls(ov);
+      out.cluster_labels=labels.map(function(c){return textOf(c);});
+      out.cluster_titles=labels.map(function(c){return String(c.title||"");});
+      out.cluster_classes=labels.map(function(c){return String(c.className||"");});
+      out.leader_count=((ov.children||[]).filter(function(c){
+        return String(c.className||"").indexOf("endleader")>=0;})).length;
+      const opt0=mainOpt();
+      out.cluster_series=((opt0&&opt0.series)||[]).map(function(x){
+        return x.name;});
+      const lab=labels.length>1?labels[1]:labels[0];
+      if(lab&&lab.onmouseenter){
+        lab.onmouseenter();
+        const o1=mainOpt();
+        out.cluster_dims=((o1&&o1.series)||[]).map(function(x){
+          return (x.lineStyle||{}).opacity;});
+        if(lab.onmouseleave) lab.onmouseleave();
+        const o2=mainOpt();
+        out.cluster_restored=((o2&&o2.series)||[]).map(function(x){
+          return (x.lineStyle||{}).opacity;});
+      }
+    } catch (e) { errs.push("cluster-hover: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--mlabels")) {
+    try {
+      const all=(sandbox.objAll?sandbox.objAll():{})||{};
+      const byKind=function(kind){
+        return Object.keys(all).filter(function(k){
+          const o=all[k]||{}; return (o.kind||'client')===kind;}).sort();
+      };
+      const nodes=byKind('node');
+      nodes.slice(0,2).forEach(function(k){ sandbox.toggleObj(k); });
+      const clients=byKind('client');
+      if(clients[0]) sandbox.toggleObj(clients[0]);
+      const ov=getEl("endlabels");
+      const labels=labelEls(ov);
+      out.fixed_labels=labels.map(function(c){return textOf(c);});
+      out.fixed_titles=labels.map(function(c){return String(c.title||"");});
+      out.fixed_classes=labels.map(function(c){return String(c.className||"");});
+      out.leader_count=((ov.children||[]).filter(function(c){
+        return String(c.className||"").indexOf("endleader")>=0;})).length;
+      out.ml_node_labels=nodes.slice(0,2).map(function(k){
+        return String(all[k].label||k);});
+      out.ml_client_label=clients[0]
+        ? String((all[clients[0]]||{}).label||clients[0]) : null;
+    } catch (e) { errs.push("mlabels: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--tip-click")) {
+    try {
+      const c=chartRefs.mainchart;
+      const n0=((c&&c.__acts)||[]).length;
+      const hs=(c&&c.__h&&c.__h.click)||[];
+      hs.forEach(function(fn){
+        fn({seriesType:'line',seriesIndex:0,dataIndex:10,
+            event:{clientX:600,clientY:200,offsetX:600,offsetY:200}});});
+      const o=mainOpt();
+      out.tip_after_click={triggerOn:o.tooltip&&o.tooltip.triggerOn,
+        showContent:o.tooltip&&o.tooltip.showContent};
+      out.tip_click_actions=((c&&c.__acts)||[]).slice(n0)
+        .map(function(a){return a.type;});
+      const n1=((c&&c.__acts)||[]).length;
+      hs.forEach(function(fn){ fn({event:{clientX:10,clientY:10}}); });
+      const o2=mainOpt();
+      out.tip_after_blank={triggerOn:o2.tooltip&&o2.tooltip.triggerOn,
+        showContent:o2.tooltip&&o2.tooltip.showContent};
+      out.tip_blank_actions=((c&&c.__acts)||[]).slice(n1)
+        .map(function(a){return a.type;});
+    } catch (e) { errs.push("tip-click: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--tree-toggle")) {
+    try {
+      const sel=function(){return (sandbox.window&&sandbox.window.__MC_SEL)
+        ?sandbox.window.__MC_SEL():[];};
+      out.btn_labels_before=treeMiniLabels(getEl("objTree"));
+      const nb=findBtn(getEl("objTree"),"全选节点");
+      if(nb&&nb.onclick)nb.onclick();
+      out.sel_after_nodes=sel();
+      out.btn_labels_after_nodes=treeMiniLabels(getEl("objTree"));
+      const cb=findBtn(getEl("objTree"),"清空节点");
+      if(cb&&cb.onclick)cb.onclick();
+      out.sel_after_clear_nodes=sel();
+      const ib=findBtn(getEl("objTree"),"全选实例");
+      if(ib&&ib.onclick)ib.onclick();
+      out.sel_after_instances=sel();
+      out.btn_labels_after_instances=treeMiniLabels(getEl("objTree"));
+      const ic=findBtn(getEl("objTree"),"清空实例");
+      if(ic&&ic.onclick)ic.onclick();
+      out.sel_after_clear_instances=sel();
+      out.btn_labels_after_clear_instances=treeMiniLabels(getEl("objTree"));
+    } catch (e) { errs.push("tree-toggle: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--clear-total-off")) {
+    try {
+      const sel=function(){return (sandbox.window&&sandbox.window.__MC_SEL)
+        ?sandbox.window.__MC_SEL():[];};
+      const tb=findBtn(getEl("objTree"),"总计");
+      if(tb&&tb.onclick)tb.onclick();
+      out.sel_total_off=sel();
+      const cb=findBtn(getEl("objTree"),"全部清空");
+      if(cb&&cb.onclick)cb.onclick();
+      out.sel_after_clear_auto_total=sel();
+    } catch (e) { errs.push("clear-total-off: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--qps-colors")) {
+    try {
+      const q=charts.qpschart||[];
+      const o=q.length?q[q.length-1]:null;
+      out.qps_obj_colors=((o&&o.series)||[]).map(function(x){
+        return {name:x.name,color:(x.itemStyle||{}).color};});
+    } catch (e) { errs.push("qps-colors: " + String(e && e.stack || e)); }
+  }
+  out.legend_selmode = (mainOpt()&&mainOpt().legend)
+    ? mainOpt().legend.selectedMode : null;
 
   if (process.argv.includes("--endlabels")) {
     try {

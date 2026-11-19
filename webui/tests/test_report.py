@@ -188,6 +188,10 @@ def test_rebuild_reports_local(tmp_path, monkeypatch):
     unit_meta = json.loads(
         (logs / "report" / "8MB" / "meta.json").read_text(encoding="utf-8"))
     assert unit_meta["unit_size"] == "8MB"
+    # P1-B：重建同样以数据最早采样时刻为准（RESULT 行为 10:00:10 起），
+    # 覆盖 meta.json 里的旧「生成时刻」10:00:00
+    assert unit_meta["started"] == "2026-11-12 10:00:10", \
+        unit_meta["started"]
     assert "场景" in html and "节点数" in html and "目标 QPS" in html
     import re as _re
     emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
@@ -1964,7 +1968,9 @@ def test_multi_object_node_hues_and_metric_buttons_removed(tmp_path):
     html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
     src = open(html, encoding="utf-8").read()
     assert 'id="metricBtns"' not in src          # 指标弹出行已删除
-    assert 'id="selAllBtn"' in src and 'id="selClearBtn"' in src
+    assert 'id="selAllBtn"' not in src and 'id="selClearBtn"' not in src
+
+    assert '全选节点' in src and '全选实例' in src and '全部清空' in src
     res = _js_check(tmp_path, data, "--add-obj", "node:n2")
     if res is None:
         return
@@ -1991,17 +1997,405 @@ def test_multi_object_node_hues_and_metric_buttons_removed(tmp_path):
     assert any(max(rgb(c["color"])) - min(rgb(c["color"])) > 20 for c in hues), hues
 
 
-def test_select_all_clear_buttons(tmp_path):
+def test_tree_group_select_buttons(tmp_path):
+    """树「节点与实例」组：全选节点 / 全选实例 / 全部清空（总计保留）。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.writer", "writer", node="n2")
     data = rp.reduce_scenario(rp.load([a, b]), {"config": "c", "mode": "basic"})
-    res = _js_check(tmp_path, data, "--sel-all-clear")
+    res = _js_check(tmp_path, data, "--tree-select")
     if res is None:
         return
     assert res["errors"] == []
-    assert "all" in res["selobjs_all"] and "node:n1" in res["selobjs_all"]
-    assert any(k.startswith("client:") for k in res["selobjs_all"])
-    assert res["selobjs_cleared"] == ["all"]
+    assert "all" in res["sel_after_nodes"] and "node:n1" in res["sel_after_nodes"]
+    assert "node:n2" in res["sel_after_nodes"]
+    assert any(k.startswith("client:") for k in res["sel_after_instances"])
+    # 全部清空：节点+实例清掉，总计（basic=总览 all）保留
+    assert res["sel_after_clear"] == ["all"]
+    # pipeline：全部清空后保留当前角色（总计）
+    a2 = _stats(tmp_path, "a2.writer", "writer", node="n1")
+    b2 = _stats(tmp_path, "b2.reader", "reader", node="n2")
+    d2 = rp.reduce_scenario(rp.load([a2, b2]),
+                            {"config": "c", "mode": "pipeline"})
+    r2 = _js_check(tmp_path, d2, "--tree-select")
+    if r2 is None:
+        return
+    assert r2["sel_after_clear"] == ["reader"], r2["sel_after_clear"]
+
+
+def test_basic_summary_unchanged_by_role_split(tmp_path):
+    """basic 无角色分块：合并卡正常显示，单元行仍是 数据大小/客户端数/线程数/时长。"""
+    a = _stats(tmp_path, "a.merged", "client")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c", "mode": "basic"})
+    assert data["sizes"]["8MB"]["role_summaries"] == {}
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["rolecards_shown"] is False
+    assert res["perf_shown"] is True
+    labels = [k["text"] for k in res["unit_kids"]]
+    assert any(t.startswith("数据大小") for t in labels), labels
+    assert any(t.startswith("线程数") for t in labels), labels
+
+
+def test_build_report_params_pipeline_qps_total():
+    """pipeline 参数：目标写 QPS 全口径 + 读 QPS + store 数量。"""
+    cfg = {"scenario": "pipeline", "protocol": "tcp", "work_mode": "rank",
+           "base_qps": 25, "qps_multiple": 1, "notify_count": 4,
+           "client": {"count_per_node": 2}, "store_count_per_node": 1,
+           "data_size": ["128KB"], "duration": 600,
+           "warmup": {"duration": 10}}
+    meta = {"mode": "ssh", "launch_mode": "rank_recall", "clients": 8,
+            "started": "2026-11-19 00:00:00"}
+    ps = dict(bm._build_report_params(cfg, meta, nodes=4))
+    assert ps["目标写 QPS"] == "25 × 4 节点 = 100"
+    assert ps["目标读 QPS"] == "100 × 4 读 = 400"
+    assert ps["store_count_per_node"] == 1
+    assert ps["client.count_per_node"] == 2
+
+
+def test_pipeline_tree_role_radio_total_and_scoped_nodes(tmp_path):
+    """pipeline 对象树：角色单选（默认 reader）+ 总计（默认开）+ 角色化节点对象。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    a2 = _stats(tmp_path, "a2.writer", "writer", node="n2")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    b2 = _stats(tmp_path, "b2.reader", "reader", node="n1")
+    data = rp.reduce_scenario(rp.load([a, a2, b, b2]),
+                              {"config": "cfg", "mode": "pipeline"})
+    z = data["sizes"]["8MB"]
+    # 服务端：节点对象按角色拆分；basic 形态的 node:<n> 不再存在
+    assert "node:n1:writer" in z["objects"]
+    assert "node:n2:reader" in z["objects"]
+    assert not any(k.startswith("node:") and k.count(":") == 1
+                   for k in z["objects"])
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["selobjs"] == ["reader"]          # 默认 reader + 仅总计
+    joined = " ".join(res["tree_rows"])
+    assert "角色" in joined and "总计" in joined
+    assert "reader" in joined and "writer" in joined
+    # reader 视角的节点与实例组存在，且只列 reader 角色节点（内嵌数据保留 role）
+    assert "节点与实例" in joined, res["tree_rows"]
+    tail = joined.split("节点与实例")[-1]
+    assert "n1" in tail and "n2" in tail, tail
+    # 展开后：每个节点下只有 reader 实例（writer 实例不在该角色视图里）
+    rx = _js_check(tmp_path, data, "--expand-tree")
+    if rx is None:
+        return
+    exp = " ".join(rx.get("tree_rows_expanded") or [])
+    assert "b.reader" in exp and "b2.reader" in exp, exp
+    assert "a.writer" not in exp and "a2.writer" not in exp, exp
+    # 切到 writer：选中集切换、QPS 副图跟随
+    r2 = _js_check(tmp_path, data, "--role-writer")
+    if r2 is None:
+        return
+    assert r2["errors"] == []
+    assert r2["selobjs_after_role"] == ["writer"]
+    assert any(str(n).startswith("writer") for n in r2["qps_after_role"]), \
+        r2["qps_after_role"]
+    # 关闭总计：当前角色未选节点/实例 -> 空
+    r3 = _js_check(tmp_path, data, "--total-off")
+    if r3 is None:
+        return
+    assert r3["selobjs_total_off"] == []
+    # 切换角色不丢弃选择：按角色记忆，切回自动恢复
+    r4 = _js_check(tmp_path, data, "--role-roundtrip")
+    if r4 is None:
+        return
+    assert r4["errors"] == []
+    assert "node:n2:reader" in r4["selobjs_reader_selected"]
+    assert r4["selobjs_writer_view"] == ["writer"]
+    assert "node:n2:reader" in r4["selobjs_back_reader"], r4["selobjs_back_reader"]
+
+
+def test_basic_tree_keeps_single_overview_selection(tmp_path):
+    """basic：选中集仍是「总览」，没有角色 radio/总计。"""
+    a = _stats(tmp_path, "a.merged", "client")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c", "mode": "basic"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["selobjs"] == ["all"]
+    joined = " ".join(res["tree_rows"])
+    assert "总览" in joined and "角色" not in joined
+
+
+def test_multi_object_node_hues_and_metric_buttons_removed(tmp_path):
+    """S4：节点色系/实例同系色阶、总计灰阶；指标弹出行删除；队列等待入选择且默认关。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c", "mode": "basic"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert 'id="metricBtns"' not in src          # 指标弹出行已删除
+    assert 'id="selAllBtn"' not in src and 'id="selClearBtn"' not in src
+
+    assert '全选节点' in src and '全选实例' in src and '全部清空' in src
+    res = _js_check(tmp_path, data, "--add-obj", "node:n2")
+    if res is None:
+        return
+    assert res["errors"] == []
+    # 队列等待在时延曲线选择中且默认关闭
+    qw = [x for x in res["lat_btns"]
+          if x["t"].strip().startswith("队列等待")]
+    assert qw, res["lat_btns"]
+    assert qw[0]["off"]                         # 默认不展示
+    # 多对象颜色：总计(role) 为灰阶；node:n2 为彩色色系（通道不等）
+    cols = [c for c in (res.get("overlay_colors") or res["main_colors"])
+            if c["color"]]
+    grays = [c for c in cols
+             if "all" in c["name"] or c["name"].startswith("总览")]
+    hues = [c for c in cols if c["name"].startswith("n2")]
+    assert grays and hues, cols
+    import re as _re
+    def rgb(h):
+        h = h.lstrip("#")
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    for c in grays[:4]:
+        r = rgb(c["color"])
+        assert max(r) - min(r) <= 16, c       # 总计灰阶
+    assert any(max(rgb(c["color"])) - min(rgb(c["color"])) > 20 for c in hues), hues
+
+
+def test_line_widths_avg_thicker_only(tmp_path):
+    """A3：avg 1.0 / 其余 0.8，hover 强调 +0.2（不再是首对象 ×1.2）；
+    阶段曲线 total 1.0 / 阶段 0.8。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"},
+                              traces=[tr])
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    lw = {x["name"]: x for x in res["main_line_w"]}
+    assert lw["avg"]["width"] == 1.0 and lw["avg"]["emphasis"] == 1.2, lw["avg"]
+    for k in ("p50", "p99", "p999", "min", "max", "队列等待"):
+        if k in lw:
+            assert lw[k]["width"] == 0.8, (k, lw[k])
+            assert lw[k]["emphasis"] == 1.0, (k, lw[k])
+    tc = {x["name"]: x for x in res["tchart_line_w"]}
+    total = tc.get("total（端到端）")
+    assert total and total["width"] == 1.0, tc
+    # 阶段序列（若本次产物带阶段秒桶）同样 0.8 / 1.0
+    for nm, x in tc.items():
+        if nm != "total（端到端）":
+            assert x["width"] == 0.8 and x["emphasis"] == 1.0, (nm, x)
+
+
+def test_endlabel_fixed_slots_and_cluster_focus(tmp_path):
+    """#3：多对象标签=对象名、固定槽位、无引线、带全名 title；
+    悬浮标签压暗其他对象、保留该对象整簇，离开复原。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--add-obj", "node:n1",
+                    "--cluster-hover")
+    if res is None:
+        return
+    assert res["errors"] == []
+    labels = res.get("cluster_labels") or []
+    assert len(labels) == 2, labels            # 总计 + node:n1
+    assert "总" in labels[0], labels           # 总计/总体/总览在最上
+    assert labels[1] == "n1", labels
+    assert res.get("leader_count") == 0        # 无引线
+    classes = res.get("cluster_classes") or []
+    assert all("fixed" in c for c in classes), classes
+    titles = res.get("cluster_titles") or []
+    assert all("悬浮聚焦" in t for t in titles), titles
+    names = res.get("cluster_series") or []
+    dims = res.get("cluster_dims") or []
+    assert len(dims) == len(names) and dims
+    for nm, op in zip(names, dims):
+        want = 1 if (nm == "n1" or str(nm).startswith("n1 ")) else 0.15
+        assert op == want, (nm, op)
+    assert res.get("cluster_restored") and \
+        all(x == 1 for x in res["cluster_restored"]), res.get("cluster_restored")
+
+
+def test_multilabel_tree_order_and_truncation(tmp_path):
+    """#3：固定标签顺序 = 总计 → 节点 → 实例（树序平铺）；超长名靠 CSS 截断+title。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    c = _stats(tmp_path, "c.writer", "writer", node="n3")
+    data = rp.reduce_scenario(rp.load([a, b, c]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--mlabels")
+    if res is None:
+        return
+    assert res["errors"] == []
+    labels = res.get("fixed_labels") or []
+    assert len(labels) == 4, labels            # 总计 + 2 节点 + 1 实例
+    assert "总" in labels[0], labels
+    nodes = res.get("ml_node_labels") or []
+    cl = res.get("ml_client_label")
+    assert cl in labels, (cl, labels)
+    # 树序平铺：节点按序、其实例紧跟在该节点之后
+    i0, i1, ic = labels.index(nodes[0]), labels.index(nodes[1]), \
+        labels.index(cl)
+    assert labels[1] == nodes[0], labels
+    assert i0 < i1, labels
+    assert ic == i0 + 1, labels                # a.writer 属于 n1，紧跟其后
+    assert res.get("leader_count") == 0
+    classes = res.get("fixed_classes") or []
+    assert all("fixed" in x for x in classes), classes
+    titles = res.get("fixed_titles") or []
+    assert all(t for t in titles), titles      # 全名挂在 title 上（截断时悬浮可看）
+    # 图例可看不可点
+    assert res.get("legend_selmode") is False, res.get("legend_selmode")
+
+
+def test_all_charts_tooltip_hover_pointer_click_box(tmp_path):
+    """#4：tooltip 悬浮只显示竖线+交点（showContent=false），内容框点击才出现。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    tips = res.get("tooltips") or {}
+    for cid in ("mainchart", "qpschart", "histchart", "slowchart",
+                "tchart", "tstackchart"):
+        assert cid in tips, (cid, tips.keys())
+        assert tips[cid]["triggerOn"] == "mousemove", (cid, tips[cid])
+        assert tips[cid]["showContent"] is False, (cid, tips[cid])
+        assert tips[cid]["enterable"] is True, (cid, tips[cid])
+
+
+def test_tooltip_click_pins_content(tmp_path):
+    """#4：点击 → showContent 切 true + showTip 钉住；空白点击/离开 → hideTip 复原。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--tip-click")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["tip_after_click"] == {"triggerOn": "none",
+                                      "showContent": True}, \
+        res["tip_after_click"]
+    assert "showTip" in res["tip_click_actions"], res["tip_click_actions"]
+    assert res["tip_after_blank"] == {"triggerOn": "mousemove",
+                                     "showContent": False}, \
+        res["tip_after_blank"]
+    assert "hideTip" in res["tip_blank_actions"], res["tip_blank_actions"]
+
+
+def test_report_started_time_uses_data_timestamp(tmp_path):
+    """P1-B：页头「测试开始于」= 数据最早采样时刻（不是生成时刻）。"""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "cfg.pipeline_c1_t1_8MB.dual_n1_c0_p9301.writer.log").write_text(
+        "".join("RESULT\t2026-11-12 10:00:{:02d}.{:06d}\tpipeline_write\t"
+                "k{}\t1.0\tOK\t4\n".format(10 + i // 10, i % 10, i)
+                for i in range(30)), encoding="utf-8")
+
+    class A:
+        cluster = ""
+        global_cfg = ""
+        profile = ""
+        no_plot = False
+        dry_run = False
+
+    written = bm._generate_report_units({}, str(logs), A(), mode="pipeline")
+    assert written, "report not generated"
+    meta = json.loads((logs / "report" / "8MB" / "meta.json")
+                      .read_text(encoding="utf-8"))
+    assert meta["started"] == "2026-11-12 10:00:10", meta["started"]
+
+
+def test_stage_tree_nodes_disabled(tmp_path):
+    """P2-E：阶段曲线对象树只开放总体/角色；节点/实例行禁用并给出说明。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a, b]),
+                              {"config": "cfg", "mode": "pipeline"},
+                              traces=[tr])
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    rows = res.get("stage_rows") or []
+    assert rows, res.get("stage_tree_text")
+    role_rows = [r for r in rows
+                 if any(t in r["text"] for t in ("总体", "writer", "reader"))]
+    assert role_rows and all(not r["disabled"] for r in role_rows), rows
+    node_rows = [r for r in rows if "n1" in r["text"] or "n2" in r["text"]]
+    assert node_rows and all(r["disabled"] for r in node_rows), rows
+    assert "暂只支持总体/角色" in (res.get("stage_tree_text") or "")
+
+
+def test_tree_toggle_buttons(tmp_path):
+    """#2：全选节点/实例按钮是 toggle——全选后变「清空节点/清空实例」。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c", "mode": "basic"})
+    res = _js_check(tmp_path, data, "--tree-toggle")
+    if res is None:
+        return
+    assert res["errors"] == []
+    before = res.get("btn_labels_before") or []
+    assert "全选节点" in before and "全选实例" in before, before
+    after_nodes = res.get("btn_labels_after_nodes") or []
+    assert "清空节点" in after_nodes, after_nodes
+    assert any(k.startswith("node:") for k in res["sel_after_nodes"])
+    # 再点「清空节点」→ 节点全部取消
+    assert not any(k.startswith("node:") for k in res["sel_after_clear_nodes"])
+    after_ins = res.get("btn_labels_after_instances") or []
+    assert "全选节点" in after_ins and "清空实例" in after_ins, after_ins
+    assert any(k.startswith("client:") for k in res["sel_after_instances"])
+    assert not any(k.startswith("client:")
+                   for k in res["sel_after_clear_instances"])
+    labels = res.get("btn_labels_after_clear_instances") or []
+    assert "全选实例" in labels, labels
+
+
+def test_clear_all_auto_enables_total(tmp_path):
+    """#1：总计关掉后点「全部清空」→ 自动开启总计（不再是空图）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    b2 = _stats(tmp_path, "b2.reader", "reader", node="n1")
+    data = rp.reduce_scenario(rp.load([a, b, b2]),
+                              {"config": "cfg", "mode": "pipeline"})
+    res = _js_check(tmp_path, data, "--clear-total-off")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["sel_total_off"] == [], res["sel_total_off"]
+    assert res["sel_after_clear_auto_total"] == ["reader"], \
+        res["sel_after_clear_auto_total"]
+
+
+def test_qps_bars_follow_object_colors(tmp_path):
+    """#5：QPS 柱与端到端同配色（总计灰阶、节点色系）；失败柱保持强调色。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--add-obj", "node:n1", "--qps-colors")
+    if res is None:
+        return
+    assert res["errors"] == []
+    cols = res.get("qps_obj_colors") or []
+    assert cols, cols
+
+    def rgb(h):
+        h = (h or "").lstrip("#")
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+
+    qps = [c for c in cols if c["name"].endswith("QPS")]
+    fails = [c for c in cols if c["name"].endswith("失败")]
+    assert len(qps) >= 2 and fails, cols
+    total = [c for c in qps if "总" in c["name"]]
+    node = [c for c in qps if c["name"].startswith("n1")]
+    assert total and node, qps
+    r = rgb(total[0]["color"])
+    assert max(r) - min(r) <= 16, total[0]            # 总计灰阶
+    r = rgb(node[0]["color"])
+    assert max(r) - min(r) > 20, node[0]              # 节点=色系
+    hero = {c["color"] for c in fails}
+    assert len(hero) == 1, fails                      # 失败柱配色一致
 
 
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
@@ -2050,6 +2444,12 @@ def test_slow_capture_independent_controls(tmp_path):
                for x in r2["slow_series_writer"]), r2["slow_series_writer"]
     assert len(r2["slow_series_all"]) > 1, r2["slow_series_all"]
     assert r2["slow_series_all"][0]["name"].startswith("总计")
+    # #2：慢点控件同样是 toggle 按钮（全选后变「清空节点/清空实例」）
+    assert "全选节点" in (r2.get("slow_btn_before") or []), r2.get("slow_btn_before")
+    assert "清空节点" in (r2.get("slow_btn_after_nodes") or []), \
+        r2.get("slow_btn_after_nodes")
+    assert "清空实例" in (r2.get("slow_btn_after_instances") or []), \
+        r2.get("slow_btn_after_instances")
 
 
 def test_slow_capture_basic_has_no_role_radio(tmp_path):

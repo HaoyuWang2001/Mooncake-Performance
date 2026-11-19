@@ -1541,6 +1541,7 @@ border-radius:99px;margin-right:5px;vertical-align:middle}
 .endlabel{pointer-events:auto;cursor:pointer}
 .endlabel{position:absolute;font-size:12px;font-weight:700;white-space:nowrap;
 transform:translateY(-50%)}
+.endlabel.fixed{max-width:96px;overflow:hidden;text-overflow:ellipsis}
 .endleader{position:absolute;height:1px;transform-origin:0 50%;opacity:.85}
 /* ---- 阶段树：左树右详情 ---- */
 .stage-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
@@ -1683,13 +1684,110 @@ const LFTIP = LF_DARK
       _src:(LF_M&&LF_M.tipLight)});
 const LFFONT="'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif";
 function lfTooltip(extra){
+  /* 所有图统一：悬浮=竖线+交点（axisPointer），不弹内容框；点击才钉住内容框
+     （bindClickTip 把 showContent 切到 true + triggerOn 切到 none + showTip） */
   const o={trigger:'axis',confine:true,
+    triggerOn:'mousemove',showContent:false,
+    enterable:true,hideDelay:250,className:'mc-tip',
+    extraCssText:'max-height:46vh;overflow-y:auto',
     backgroundColor:LFTIP.backgroundColor,borderWidth:0,
     padding:LFTIP.padding,
     textStyle:Object.assign({fontFamily:LFFONT,fontSize:13},
       LFTIP.textStyle||{})};
   if(extra)Object.keys(extra).forEach(function(k){o[k]=extra[k];});
   return o;
+}
+/* 点击显示 tooltip（所有图）：悬浮只走 axisPointer（竖线+各曲线交点），
+   不弹内容框；点击后把 showContent 切 true、triggerOn 切 none 并 showTip，
+   框钉在点击处。鼠标在框内或锚点 16px 内保持，两者都离开 250ms 后收起；
+   点击空白、离开图表、缩放时收起。桩环境（无 on/getZr）自动跳过。 */
+function bindClickTip(ch){
+  if(!ch||!ch.on||!ch.getZr||ch.__mcTipBound) return;
+  ch.__mcTipBound=true;
+  let anchor=null, hideTimer=null, docMove=null;
+  function tipDom(){
+    try{ return ch.getDom().querySelector('.mc-tip'); }catch(e){ return null; }
+  }
+  function boxHover(e){
+    const d=tipDom(); if(!d||!e) return false;
+    try{
+      const r=d.getBoundingClientRect();
+      return e.clientX>=r.left&&e.clientX<=r.right&&
+        e.clientY>=r.top&&e.clientY<=r.bottom;
+    }catch(err){ return false; }
+  }
+  function hoverMode(){
+    try{ ch.setOption({tooltip:{showContent:false,triggerOn:'mousemove'}}); }
+    catch(e){}
+  }
+  function unlisten(){
+    if(hideTimer){clearTimeout(hideTimer);hideTimer=null;}
+    if(docMove){
+      try{ document.removeEventListener('mousemove',docMove); }catch(e){}
+      docMove=null;
+    }
+  }
+  function hide(){
+    anchor=null; unlisten();
+    try{ ch.dispatchAction({type:'hideTip'}); }catch(e){}
+    hoverMode();
+  }
+  function scheduleHide(){
+    if(hideTimer) return;
+    hideTimer=setTimeout(function(){hideTimer=null;hide();},250);
+  }
+  function pin(p){
+    const ev=p.event||{};
+    let cx=ev.clientX, cy=ev.clientY;
+    if(typeof cx!=='number'){
+      try{
+        const r=ch.getDom().getBoundingClientRect();
+        cx=r.left+(ev.offsetX||0); cy=r.top+(ev.offsetY||0);
+      }catch(e){ cx=0; cy=0; }
+    }
+    anchor=[cx,cy];
+    try{ ch.setOption({tooltip:{showContent:true,triggerOn:'none'}}); }
+    catch(e){}
+    let trig='axis';
+    try{
+      const opt=ch.getOption();
+      trig=((opt.tooltip&&opt.tooltip[0]&&opt.tooltip[0].trigger)||'axis');
+    }catch(e){}
+    let ok=false;
+    if(trig==='item'&&p.seriesIndex!=null&&p.dataIndex!=null){
+      try{ ch.dispatchAction({type:'showTip',seriesIndex:p.seriesIndex,
+        dataIndex:p.dataIndex}); ok=true; }catch(e){}
+    }
+    if(!ok){
+      let x=ev.offsetX, y=ev.offsetY;
+      if(typeof x!=='number'){
+        try{
+          const r=ch.getDom().getBoundingClientRect();
+          x=cx-r.left; y=cy-r.top;
+        }catch(e){ x=cx; y=cy; }
+      }
+      try{ ch.dispatchAction({type:'showTip',x:x,y:y}); }catch(e){}
+    }
+    if(!docMove){
+      docMove=function(e){
+        if(boxHover(e)){ if(hideTimer){clearTimeout(hideTimer);hideTimer=null;} return; }
+        const dx=(e.clientX||0)-anchor[0], dy=(e.clientY||0)-anchor[1];
+        if(dx*dx+dy*dy<=16*16){
+          if(hideTimer){clearTimeout(hideTimer);hideTimer=null;}
+          return;
+        }
+        scheduleHide();
+      };
+      try{ document.addEventListener('mousemove',docMove); }catch(e){}
+    }
+  }
+  ch.on('click',function(p){
+    if(!p||!(p.event||p.seriesType)){ hide(); return; }
+    if(p.seriesType) pin(p); else hide();
+  });
+  const zr=ch.getZr();
+  zr.on('globalout',function(){ if(anchor) scheduleHide(); });
+  ch.on('datazoom',function(){ hide(); });
 }
 /* ---- x 轴刻度：双图共用显式范围/间隔（上下对齐）+ 跨度自适应格式 ----
    主图与吞吐面板传同一个 ext -> min/max/interval 完全一致，且两图
@@ -1814,9 +1912,11 @@ const LAT_COLORS = LF_DARK
   : {avg:'#6E6D66',p99:'#6E6D66',p9999:'#6E6D66',
      p50:'#8F8E86',p999:'#8F8E86',max:'#8F8E86',min:'#8F8E86',
      qw:'#6E6D66'};
-const LAT_LINES=[['avg','avg',1.6],['p50','p50',1.8],['p99','p99',2.2],
-  ['p999','p999',1.6],['p9999','p9999',1.1],['min','min',1.1],
-  ['max','max',1.3],['qw','队列等待',1.2]];
+/* 线宽（S4b）：avg 1.0，其余 0.8；emphasis +0.2；所有对象等宽（不再首对象加粗） */
+const LAT_LINES=[['avg','avg',1.0],['p50','p50',0.8],['p99','p99',0.8],
+  ['p999','p999',0.8],['p9999','p9999',0.8],['min','min',0.8],
+  ['max','max',0.8],['qw','队列等待',0.8]];
+const EMPHASIS_ADD=0.2;
 const MAIN_GRID={left:56,right:104,top:44,bottom:58};
 const QPS_GRID={left:56,right:104,top:48,bottom:34};
 function latColor(k){return LAT_COLORS[k]||C.fg;}
@@ -1894,15 +1994,17 @@ function outlierScatter(key,name,color){
     emphasis:{focus:'series',itemStyle:{borderColor:C.ink,borderWidth:1}},
     data:pts};
 }
-function latLineSeries(col,x,meta){
+function latLineSeries(col,x,meta,key){
+  /* 颜色：节点=节点色系、实例=实例色阶（单/多对象一致）；总计/总览=灰阶 */
+  const objColor=key?objLineColor(key):null;
   return LAT_LINES.filter(function(L){return latShown[L[0]];}).map(function(L){
-    const k=L[0], color=latColor(k), arr=col[k]||[];
+    const k=L[0], color=objColor||latColor(k), arr=col[k]||[];
     const data=arr.map(function(v,i){return [x[i],v==null?0:v];});
     if(meta) meta.push({name:L[1],color:color,data:data,seriesIndex:meta.length});
     return {name:L[1],type:'line',showSymbol:false,clip:true,
       lineStyle:{width:L[2],color:color}, itemStyle:{color:color},
       z:(k==='p99')?6:3,
-      emphasis:{focus:'series',lineStyle:{width:L[2]+0.8}},
+      emphasis:{focus:'series',lineStyle:{width:L[2]+EMPHASIS_ADD}},
       data:data};
   });
 }
@@ -2020,6 +2122,7 @@ function emptyOpt(){const o=axisCommon();o.yAxis={type:'value'};o.series=[];retu
 function buildChart(){
   const box=document.getElementById('mainchart'); if(!box) return;
   if(!chart) chart=echarts.init(box);
+  bindClickTip(chart);
   const z=Z();
   if(!z){chart.clear();return;}
   ensureSel();
@@ -2038,70 +2141,6 @@ function buildChart(){
   });
   safe('end-labels',function(){layoutEndLabels(chart);});
 }
-function bindTooltipGate(){
-  const box=document.getElementById('mainchart');
-  if(!box) return;
-  let hideTimer=null, showTimer=null, lastNear=-1;
-  function hideTip(){
-    if(chart&&chart.dispatchAction){
-      try{ chart.dispatchAction({type:'hideTip'}); }catch(e){}
-    }
-  }
-  function showTip(i){
-    if(chart&&chart.dispatchAction){
-      try{ chart.dispatchAction({type:'showTip',seriesIndex:0,dataIndex:i}); }
-      catch(e){}
-    }
-  }
-  let pxCache=null;
-  function pxList(){
-    if(pxCache) return pxCache;
-    try{
-      const opt=chart.getOption();
-      const xs=(opt.series&&opt.series[0]&&opt.series[0].data)||[];
-      pxCache=xs.map(function(d){
-        try{return chart.convertToPixel({seriesIndex:0},[d[0],0]);}
-        catch(e){return null;}});
-    }catch(e){ pxCache=[]; }
-    return pxCache;
-  }
-  try{
-    chart.on('finished',function(){pxCache=null;});
-    chart.on('dataZoom',function(){pxCache=null;});
-  }catch(e){}
-  box.addEventListener('mousemove',function(ev){
-    const r=box.getBoundingClientRect();
-    const x=ev.clientX-r.left;
-    if(!chart||!chart.convertToPixel) return;
-    let near=-1, best=1e9;
-    const px=pxList();
-    for(let i=0;i<px.length;i++){
-      if(px[i]==null) continue;
-      const d=Math.abs(px[i]-x);
-      if(d<best){best=d;near=i;}
-    }
-    const isNear=(best<=12);
-    if(!isNear){
-      if(showTimer){clearTimeout(showTimer);showTimer=null;}
-      if(hideTimer) clearTimeout(hideTimer);
-      hideTimer=setTimeout(hideTip,80);
-      lastNear=-1;
-    }else{
-      if(hideTimer){clearTimeout(hideTimer);hideTimer=null;}
-      if(near!==lastNear){
-        if(showTimer) clearTimeout(showTimer);
-        showTimer=setTimeout(function(){showTip(near);},400);
-        lastNear=near;
-      }
-    }
-  });
-  box.addEventListener('mouseleave',function(){
-    if(showTimer){clearTimeout(showTimer);showTimer=null;}
-    if(hideTimer) clearTimeout(hideTimer);
-    hideTip();
-    lastNear=-1;
-  });
-}
 function richOpt(tier,key){
   const col=colsOf(key,tier);
   if(!col||!col.t.length) return emptyOpt();
@@ -2109,8 +2148,7 @@ function richOpt(tier,key){
   const x=col.t.map(function(t){return t*1000;});
   const o=axisCommon();
   o.grid=MAIN_GRID;
-  o.tooltip=lfTooltip({trigger:'axis',show:true,showContent:true,
-    triggerOn:'mousemove',enterable:false,hideDelay:120});
+  o.tooltip=lfTooltip({trigger:'axis',show:true});
   o.tooltip.formatter=function(ps){
     const i=ps[0].dataIndex; const t=col.t[i];
     const rows=[['时间',fullts(t)],['请求数',col.c[i]],['成功',col.ok[i]],
@@ -2123,7 +2161,7 @@ function richOpt(tier,key){
   };
   o.yAxis=[lfAxisValue({name:'ms',scale:true,nameLocation:'end',nameGap:14})];
   mainLabelMeta=[];
-  o.series=latLineSeries(col,x,mainLabelMeta);
+  o.series=latLineSeries(col,x,mainLabelMeta,key);
   if(outlierOn){
     const os=outlierScatter(key,'离群点',C.hero);
     if(os) o.series.push(os);
@@ -2143,6 +2181,22 @@ function richOpt(tier,key){
 function multiOpt(tier){
   const o=axisCommon();
   o.grid=MAIN_GRID;
+  o.tooltip=lfTooltip({trigger:'axis',show:true});
+  /* 多对象 tooltip：时间 + 各对象各指标（带对象颜色圆点），不再落回
+     ECharts 默认的原始毫秒时间戳 */
+  o.tooltip.formatter=function(ps){
+    if(!ps||!ps.length) return '';
+    const v0=(ps[0].value&&ps[0].value[0]);
+    const t=(v0!=null)?v0/1000:(ps[0].axisValue||0);
+    const rows=ps.filter(function(p){
+      return p.componentSubType==='line'||p.seriesType==='line';
+    }).map(function(p){
+      const v=(p.value&&p.value[1]!=null)?p.value[1]:null;
+      return (p.marker||'')+p.seriesName+'：'+
+        (v==null?'-':(Math.round(v*1000)/1000)+' ms');
+    });
+    return '<b>'+fullts(t)+'</b>'+(rows.length?'<br>'+rows.join('<br>'):'');
+  };
   o.yAxis=[lfAxisValue({name:'ms',scale:true,
     nameLocation:'end',nameGap:14})];
   o.series=[];
@@ -2168,10 +2222,10 @@ function multiOpt(tier){
       const data=v.map(function(val,i){return [x[i],val==null?0:val];});
       const seriesName=nm+' '+L[1];
       o.series.push({name:seriesName,type:'line',showSymbol:false,clip:true,
-        lineStyle:{width:L[2]*(idx===0?1.2:1),color:color},
+        lineStyle:{width:L[2],color:color},
         itemStyle:{color:color},
         z:(k==='p99')?(zbase+2):zbase,
-        emphasis:{focus:'series',lineStyle:{width:L[2]+0.8}},
+        emphasis:{focus:'series',lineStyle:{width:L[2]+EMPHASIS_ADD}},
         data:data});
     });
     if(outlierOn){
@@ -2192,8 +2246,9 @@ function multiOpt(tier){
     mainLabelMeta.push({name:nm,seriesName:nm+' p99',color:p99Color,data:d99,
       seriesIndex:idx*LAT_LINES.filter(function(L){return latShown[L[0]];}).length+p99Idx});
   });
+  /* 图例只用于区分对象颜色：点击不得隐藏指标曲线（固定显示） */
   o.legend={show:true,top:0,type:'scroll',icon:'roundRect',itemWidth:14,
-    itemHeight:3,itemGap:16,selectedMode:true,
+    itemHeight:3,itemGap:16,selectedMode:false,
     textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
   if(minT!==null) o.xAxis=lfAxisTime(xExtent(minT,maxT,
     plotWidthOf(chart,MAIN_GRID)),'main');
@@ -2266,6 +2321,8 @@ function layoutEndLabels(ch){
   const ov=document.getElementById('endlabels');
   if(!ov) return;
   ov.innerHTML='';
+  /* 多对象：固定槽位对象名标签（不绑任何曲线、不画引线） */
+  if(selObjs.length>1){ layoutFixedLabels(ch,ov); return; }
   if(!ch||!ch.convertToPixel) return;          /* 桩环境跳过 */
   const w=xWindowMs(ch,'main');
   const anchorX=ch.getWidth()-MAIN_GRID.right+8;   /* 固定锚点 */
@@ -2294,6 +2351,20 @@ function layoutEndLabels(ch){
   if(!items.length) return;
   endLabelLayout(items,top,bot);
   items.forEach(function(it){
+    /* A5：单对象=该指标序列；多对象=该对象全部指标序列（曲线簇） */
+    function focusCluster(on){
+      let names=[];
+      try{
+        const opt=ch.getOption();
+        names=((opt&&opt.series)||[]).map(function(sr){return sr.name;})
+          .filter(function(n){ return n===it.name||
+            String(n).indexOf(it.name+' ')===0; });
+      }catch(e){ names=[it.name]; }
+      names.forEach(function(n){
+        try{ ch.dispatchAction({type:on?'highlight':'downplay',
+          seriesName:n}); }catch(e){}
+      });
+    }
     const dx=anchorX-it.px, dy=it.ly-it.py;
     const len=Math.max(1,Math.sqrt(dx*dx+dy*dy));
     const line=el('div','endleader');
@@ -2306,13 +2377,72 @@ function layoutEndLabels(ch){
     const lab=el('div','endlabel',it.name);
     lab.style.left=anchorX+'px'; lab.style.top=it.ly+'px';
     lab.style.color=it.color;
-    lab.title='悬浮聚焦该曲线';
-    lab.onmouseenter=function(){
-      try{ ch.dispatchAction({type:'highlight',seriesName:it.name}); }catch(e){}
-    };
-    lab.onmouseleave=function(){
-      try{ ch.dispatchAction({type:'downplay',seriesName:it.name}); }catch(e){}
-    };
+    lab.title='悬浮聚焦该曲线（多对象时高亮整个曲线簇）';
+    lab.onmouseenter=function(){focusCluster(true);};
+    lab.onmouseleave=function(){focusCluster(false);};
+    ov.appendChild(lab);
+  });
+}
+
+/* 多对象右侧标签：总计最上，其余按对象树顺序（节点 → 其下实例）平铺；
+   固定槽位、不画引线、不依赖任何曲线的端点（某条线消失不影响标签）；
+   超长名称截断显示开头，悬浮时浏览器 title 展示全名；
+   悬浮标签压暗其他对象、保留该对象整簇（不用 highlight 动作，避免
+   emphasis.focus 的 blur 互相覆盖导致只亮一条）。 */
+function fixedLabelText(key){
+  const o=objAll()[key]||{};
+  if(o.kind==='role'&&isPipeMode()&&key===curRole) return '总计';
+  return String(objLabel(key));
+}
+function fixedLabelOrder(){
+  const m=objTreeModel();
+  const sel={}; selObjs.forEach(function(k){sel[k]=1;});
+  const out=[];
+  const roles=selObjs.filter(function(k){
+    const o=objAll()[k]; return o&&o.kind==='role';});
+  const ord={'all':0,'writer':1,'reader':2};
+  roles.sort(function(a,b){
+    return (ord[a]===undefined?9:ord[a])-(ord[b]===undefined?9:ord[b]);});
+  roles.forEach(function(k){out.push(k);});
+  m.nodes.forEach(function(nk){
+    if(sel[nk]) out.push(nk);
+    const nn=String((m.all[nk]&&m.all[nk].node)||nk.replace(/^node:/,''));
+    (m.byNode[nn]||[]).forEach(function(ck){ if(sel[ck]) out.push(ck); });
+  });
+  selObjs.forEach(function(k){ if(out.indexOf(k)<0) out.push(k); });
+  return out;
+}
+function focusObjectSeries(prefix){
+  let sers=[];
+  try{ sers=(chart.getOption().series)||[]; }catch(e){ return; }
+  const partials=sers.map(function(sr){
+    const nm=String(sr.name||'');
+    const hit=!prefix||nm===prefix||nm.indexOf(prefix+' ')===0;
+    const v=hit?1:0.15;
+    return {lineStyle:{opacity:v},itemStyle:{opacity:v}};
+  });
+  try{ chart.setOption({series:partials}); }catch(e){}
+}
+function layoutFixedLabels(ch,ov){
+  const keys=fixedLabelOrder();
+  if(!keys.length) return;
+  const W=(ch&&ch.getWidth)?ch.getWidth():0;
+  const H=(ch&&ch.getHeight)?ch.getHeight():0;
+  if(!W) return;
+  const top=MAIN_GRID.top+8, bot=H-MAIN_GRID.bottom-8;
+  const n=keys.length;
+  keys.forEach(function(k,i){
+    const name=fixedLabelText(k);
+    const color=objLineColor(k)||latColor('p99');
+    const y=(n===1)?(top+bot)/2:top+i*(bot-top)/(n-1);
+    const lab=el('div','endlabel fixed',name);
+    lab.style.left=(W-MAIN_GRID.right+8)+'px';
+    lab.style.top=y+'px';
+    lab.style.color=color;
+    lab.title=name+'：悬浮聚焦该对象全部指标曲线';
+    const pref=String(objLabel(k));
+    lab.onmouseenter=function(){focusObjectSeries(pref);};
+    lab.onmouseleave=function(){focusObjectSeries(null);};
     ov.appendChild(lab);
   });
 }
@@ -2528,7 +2658,8 @@ function qpsOpt(tier){
   o.dataZoom=zoomModel('xonly','none');
   o.series=[];
   const keys=selObjs.length?selObjs:(isPipeMode()?[]:['all']);
-  const pal=objPalette();
+  /* QPS 柱与端到端曲线同配色：总计灰阶 / 节点色系 / 实例色阶；
+     失败柱保持强调色不变 */
   const qcolors=LF_DARK?['#8F8E88','#B3B0A4','#6A6963','#DCDAD2']
                       :['#8F8E86','#6E6D66','#A5A49C','#4A4944'];
   let minT=null,maxT=null;
@@ -2539,9 +2670,10 @@ function qpsOpt(tier){
     const qps=colQps(col,t);
     const x=col.t.map(function(v){return v*1000;});
     const nm=objLabel(key);
+    const qc=objLineColor(key)||qcolors[idx%qcolors.length];
     o.series.push({name:nm+' QPS',type:'bar',yAxisIndex:0,clip:true,
       barMaxWidth:7,
-      itemStyle:{color:qcolors[idx%qcolors.length],borderRadius:[99,99,0,0]},
+      itemStyle:{color:qc,borderRadius:[99,99,0,0]},
       z:3, data:x.map(function(v,i){return [v,qps[i]];})});
     o.series.push({name:nm+' 失败',type:'bar',yAxisIndex:1,clip:true,
       barMaxWidth:3,barGap:'-100%',
@@ -2583,6 +2715,7 @@ function totalFails(tier){
 function buildQpsChart(){
   const box=document.getElementById('qpschart'); if(!box) return;
   if(!qpsChart) qpsChart=echarts.init(box);
+  bindClickTip(qpsChart);
   const z=Z(); if(!z){qpsChart.clear();return;}
   const tier=currentTier();
   qpsChart.setOption(qpsOpt(tier),true);
@@ -2882,6 +3015,7 @@ function renderHist(){
   card.style.display='';
   const box=document.getElementById('histchart');
   if(!histChart) histChart=echarts.init(box);
+  bindClickTip(histChart);
   const labels=[], counts=[];
   bins.forEach(function(x){
     const lo=edges[x[0]]!=null?edges[x[0]]:0;
@@ -3009,10 +3143,11 @@ function slowToggle(key){
   if(i>=0) slowSel.splice(i,1); else slowSel.push(key);
   renderSlowStrip();
 }
-function slowAllKeys(){
+function slowAllKeys(kind){
   const out=[]; const all=objAll();
   Object.keys(all).forEach(function(k){
     const o=all[k];
+    if(kind&&o.kind!==kind) return;
     if(o.kind!=='node'&&o.kind!=='client') return;
     if(isPipeMode()&&o.role!==slowRole) return;
     out.push(k);
@@ -3048,11 +3183,32 @@ function renderSlowControls(){
   box.appendChild(row1);
   const row2=el('div','row');
   row2.appendChild(el('span','tl-label','节点与实例'));
-  const sa=el('button','mini','全选');
-  sa.onclick=function(){slowSel=slowAllKeys();renderSlowStrip();};
-  const sc=el('button','mini','清空');
-  sc.onclick=function(){slowSel=[];renderSlowStrip();};
-  row2.appendChild(sa); row2.appendChild(sc);
+  function sbtn(label,title,fn){
+    const b=el('button','mini',label);
+    b.title=title; b.onclick=fn; return b;
+  }
+  function slowKindAll(kind){
+    const ks=slowAllKeys(kind);
+    return ks.length>0&&ks.every(function(k){return slowSel.indexOf(k)>=0;});
+  }
+  function slowKindSet(kind,on){
+    const ks=slowAllKeys(kind);
+    if(on){
+      ks.forEach(function(k){if(slowSel.indexOf(k)<0)slowSel.push(k);});
+    }else{
+      slowSel=slowSel.filter(function(k){return ks.indexOf(k)<0;});
+    }
+    renderSlowStrip();
+  }
+  const sndAll=slowKindAll('node'), sclAll=slowKindAll('client');
+  row2.appendChild(sbtn(sndAll?'清空节点':'全选节点',
+    sndAll?'取消全部节点慢点高亮':'高亮当前范围内全部节点的慢点',
+    function(){slowKindSet('node',!sndAll);}));
+  row2.appendChild(sbtn(sclAll?'清空实例':'全选实例',
+    sclAll?'取消全部实例慢点高亮':'高亮当前范围内全部实例的慢点',
+    function(){slowKindSet('client',!sclAll);}));
+  row2.appendChild(sbtn('全部清空','清空节点与实例高亮，并自动显示总计',
+    function(){slowSel=[];slowTotal=true;renderSlowStrip();}));
   box.appendChild(row2);
   const nodes={};
   (z.clients||[]).forEach(function(c){
@@ -3093,6 +3249,7 @@ function renderSlowStrip(){
   card.style.display='';
   const box=document.getElementById('slowchart');
   if(!slowChart) slowChart=echarts.init(box);
+  bindClickTip(slowChart);
   const pts=rows.filter(function(r){return rowEpoch(r)!=null;});
   const shape=(isPipeMode()&&slowRole==='writer')?'rect':'circle';
   const series=[];
@@ -3384,8 +3541,51 @@ function renderObjTree(){
   head.appendChild(el('span','objtree-count','已选 '+selObjs.length+' 项'));
   g2.appendChild(head);
   const acts=el('div','node-group-acts');
-  acts.appendChild(miniBtn('全选',m.nodes,'选中本级全部对象',true));
-  acts.appendChild(miniBtn('清空',m.nodes,'取消本级全部对象',false));
+  /* 全选/清空节点、全选/清空实例（按当前是否已全选动态切换）、全部清空 */
+  function kindKeys(kind){
+    const all=objAll(); const keys=[];
+    Object.keys(all).forEach(function(k){
+      const o=all[k];
+      if(o.kind!==kind) return;
+      if(isPipeMode()&&o.role!==curRole) return;
+      keys.push(k);
+    });
+    return keys;
+  }
+  function selKind(kind,on){setMany(kindKeys(kind),on);}
+  function kindAll(kind){
+    const keys=kindKeys(kind);
+    return keys.length>0&&keys.every(function(k){
+      return selObjs.indexOf(k)>=0;});
+  }
+  function clearAll(){
+    selObjs=selObjs.filter(function(k){
+      const o=objAll()[k];
+      return !!o&&o.kind==='role';
+    });
+    /* 全部清空后自动开启总计/总览，避免落到空图 */
+    if(isPipeMode()){
+      totalOn=true;
+      if(selObjs.indexOf(curRole)<0) selObjs.push(curRole);
+    }else if(objAll()['all']&&selObjs.indexOf('all')<0){
+      selObjs.push('all');
+    }
+    renderAll();
+  }
+  function actBtn(label,title,fn){
+    const b=el('button','mini',label);
+    b.title=title; b.onclick=fn;
+    return b;
+  }
+  const ndAll=kindAll('node'), clAll=kindAll('client');
+  acts.appendChild(actBtn(ndAll?'清空节点':'全选节点',
+    ndAll?'取消当前范围内全部节点的选择':'选中当前范围内全部节点',
+    function(){selKind('node',!ndAll);}));
+  acts.appendChild(actBtn(clAll?'清空实例':'全选实例',
+    clAll?'取消当前范围内全部实例的选择':'选中当前范围内全部实例',
+    function(){selKind('client',!clAll);}));
+  acts.appendChild(actBtn('全部清空','清空节点与实例，并自动开启总计',
+    clearAll));
   g2.appendChild(acts);
   const list=el('div','tree-list');
   m.nodes.forEach(function(k){
@@ -3437,25 +3637,6 @@ function renderControls(){
     b.onclick=function(){curTier=t.key;renderControls();buildChart();};
     box.appendChild(b);
   });
-  /* 全选/清空：当前范围内的节点与实例（pipeline 按当前角色） */
-  const sa=document.getElementById('selAllBtn');
-  if(sa) sa.onclick=function(){
-    const all=objAll(); const keep=[];
-    Object.keys(all).forEach(function(k){
-      const o=all[k];
-      if(o.kind==='role'){
-        if(isPipeMode()){ if(k===curRole&&totalOn) keep.push(k); }
-        else keep.push(k);
-      }else if(!isPipeMode()||o.role===curRole) keep.push(k);
-    });
-    selObjs=keep; renderAll();
-  };
-  const sc=document.getElementById('selClearBtn');
-  if(sc) sc.onclick=function(){
-    if(isPipeMode()) selObjs=(totalOn?[curRole]:[]);
-    else selObjs=(objAll()['all']?['all']:[]);
-    renderAll();
-  };
   const ob=document.getElementById('outlierBtn');
   if(ob){
     const z=Z(); const hasOut=!!(z&&(z.outliers||[]).length);
@@ -3510,6 +3691,7 @@ let monCharts={};
 function _monChart(id, series, yname){
   const box=document.getElementById(id); if(!box||!series.length) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
+  bindClickTip(c);
   const o=axisCommon();
   o.grid={left:104,right:104,top:26,bottom:42};
   o.yAxis=[lfAxisValue({name:yname,scale:true,nameLocation:'end',nameGap:14})];
@@ -4188,6 +4370,20 @@ function tLayoutEndLabels(ch){
     items.forEach(function(it){it.ly+=d;});
   }
   items.forEach(function(it){
+    /* A5：单对象=该指标序列；多对象=该对象全部指标序列（曲线簇） */
+    function focusCluster(on){
+      let names=[];
+      try{
+        const opt=ch.getOption();
+        names=((opt&&opt.series)||[]).map(function(sr){return sr.name;})
+          .filter(function(n){ return n===it.name||
+            String(n).indexOf(it.name+' ')===0; });
+      }catch(e){ names=[it.name]; }
+      names.forEach(function(n){
+        try{ ch.dispatchAction({type:on?'highlight':'downplay',
+          seriesName:n}); }catch(e){}
+      });
+    }
     const dx=anchorX-it.px, dy=it.ly-it.py;
     const len=Math.max(1,Math.sqrt(dx*dx+dy*dy));
     const line=el('div','endleader');
@@ -4200,13 +4396,9 @@ function tLayoutEndLabels(ch){
     const lab=el('div','endlabel',it.name);
     lab.style.left=anchorX+'px'; lab.style.top=it.ly+'px';
     lab.style.color=it.color;
-    lab.title='悬浮聚焦该曲线';
-    lab.onmouseenter=function(){
-      try{ ch.dispatchAction({type:'highlight',seriesName:it.name}); }catch(e){}
-    };
-    lab.onmouseleave=function(){
-      try{ ch.dispatchAction({type:'downplay',seriesName:it.name}); }catch(e){}
-    };
+    lab.title='悬浮聚焦该曲线（多对象时高亮整个曲线簇）';
+    lab.onmouseenter=function(){focusCluster(true);};
+    lab.onmouseleave=function(){focusCluster(false);};
     ov.appendChild(lab);
   });
 }
@@ -4262,57 +4454,6 @@ function tBindXPan(){
   };
 }
 /* tooltip 延迟 + 邻域触发 */
-function tBindTooltipGate(){
-  const box=document.getElementById('tchart');
-  if(!box) return;
-  let hideTimer=null;
-  function hideTip(){
-    if(tChart&&tChart.dispatchAction){
-      try{ tChart.dispatchAction({type:'hideTip'}); }catch(e){}
-    }
-  }
-  let pxCache=null;
-  function pxList(){
-    if(pxCache) return pxCache;
-    try{
-      const opt=tChart.getOption();
-      const xs=(opt.series&&opt.series[0]&&opt.series[0].data)||[];
-      pxCache=xs.map(function(d){
-        try{return tChart.convertToPixel({seriesIndex:0},[d[0],0]);}
-        catch(e){return null;}});
-    }catch(e){ pxCache=[]; }
-    return pxCache;
-  }
-  try{
-    tChart.on('finished',function(){pxCache=null;});
-    tChart.on('dataZoom',function(){pxCache=null;});
-  }catch(e){}
-  box.addEventListener('mousemove',function(ev){
-    const r=box.getBoundingClientRect();
-    const x=ev.clientX-r.left;
-    if(!tChart||!tChart.convertToPixel) return;
-    let near=false;
-    const px=pxList();
-    let best=1e9;
-    for(let i=0;i<px.length;i++){
-      if(px[i]==null) continue;
-      const d=Math.abs(px[i]-x);
-      if(d<best) best=d;
-    }
-    near=best<=12;
-    if(!near){
-      if(hideTimer) clearTimeout(hideTimer);
-      hideTimer=setTimeout(hideTip,80);
-    }else if(hideTimer){
-      clearTimeout(hideTimer); hideTimer=null;
-    }
-  });
-  box.addEventListener('mouseleave',function(){
-    if(hideTimer) clearTimeout(hideTimer);
-    hideTip();
-  });
-}
-
 function totalSeriesData(cur,tier,metric){
   /* total（端到端）曲线：优先用 1s 秒桶现算目标档位（短 run 在 1s/10s
      档才有足够点数）；旧产物只有 minutes（1 分钟桶）时退回分桶聚合，
@@ -4401,8 +4542,12 @@ function buildStageChart(cur){
   const fm=cur.data.fminutes||{};
   const hasF=Object.keys(fm).length>0;
   // 对象过滤：总体/角色有数据；节点/实例暂空态（后端分组待补）
-  const objHasData=tStageObjs.some(function(k){
+  /* P2-E：阶段曲线只支持总体/角色对象；节点/实例为已知欠账（见 R-TRACE-9），
+     选择集里没有角色对象时明确提示，而不是静默丢对象后显示空图。 */
+  tStageObjs=tStageObjs.filter(function(k){
     return k==='all'||k==='writer'||k==='reader';});
+  if(!tStageObjs.length) tStageObjs=['all'];
+  const objHasData=tStageObjs.length>0;
   // 粒度：后端日志桶已按 1s 采集（fminutes 实际是秒桶），前端在当前档位
   // 聚合后只要还剩 ≥2 个桶就算有数据；旧产物（ftier=60，只有分钟桶）
   // 在低于 60s 的档位上仍按 60s 聚合，因此不会误报空态。
@@ -4417,6 +4562,7 @@ function buildStageChart(cur){
     }
   }
   if(!tChart) tChart=echarts.init(box);
+  bindClickTip(tChart);
   if(!hasData){ try{tChart.clear();}catch(e){} return; }
   // 当前档位；'auto' 按可见跨度挑一个桶数适中的档（约 30~120 桶），
   // 短 run 自然落在 1 秒档；后端降过档（ftier>1）时不能比步长更细。
@@ -4438,8 +4584,8 @@ function buildStageChart(cur){
       const data=totalSeriesData(cur,tier,tLevelMetric);
       tLabelMeta.push({name:'total（端到端）',color:color,data:data});
       series.push({name:'total（端到端）',type:'line',showSymbol:false,clip:true,
-        lineStyle:{width:2.2,color:color},itemStyle:{color:color},z:6,
-        emphasis:{focus:'series',lineStyle:{width:3}},
+        lineStyle:{width:1.0,color:color},itemStyle:{color:color},z:6,
+        emphasis:{focus:'series',lineStyle:{width:1.0+EMPHASIS_ADD}},
         data:data});
       return;
     }
@@ -4465,13 +4611,13 @@ function buildStageChart(cur){
           tLevelMetric==='max'?a.max:(a.n?a.sum/a.n:0)];});
     tLabelMeta.push({name:nm,color:color,data:data});
     series.push({name:nm,type:'line',showSymbol:false,clip:true,
-      lineStyle:{width:1.6,color:color},itemStyle:{color:color},z:3,
-      emphasis:{focus:'series',lineStyle:{width:2.4}},
+      lineStyle:{width:0.8,color:color},itemStyle:{color:color},z:3,
+      emphasis:{focus:'series',lineStyle:{width:0.8+EMPHASIS_ADD}},
       data:data});
   });
   const o=axisCommon();
   o.grid=STAGE_GRID;
-  o.tooltip=lfTooltip({trigger:'axis',showDelay:400,enterable:false,hideDelay:120});
+  o.tooltip=lfTooltip({trigger:'axis'});
   o.tooltip.valueFormatter=function(v){return fmtUs(v);};
   o.yAxis=[lfAxisValue({name:'µs',scale:true,nameLocation:'end',nameGap:14})];
   o.dataZoom=zoomModel('main');
@@ -4495,7 +4641,7 @@ function buildStageChart(cur){
   safe('stage-xpan',function(){tSyncXPan();});
   if(!tChartBound){tChartBound=true;safe('stage-interactions',function(){
     bindInteract(tChart,STAGE_GRID);
-    tBindYScale(); tBindXPan(); tBindTooltipGate();
+    tBindYScale(); tBindXPan();
     try{
       tChart.on('finished',function(){
         safe('stage-endlabels',function(){tLayoutEndLabels(tChart);});});
@@ -4508,6 +4654,7 @@ function buildStageChart(cur){
   });}
 }
 function stageObjToggle(key){
+  if(!(key==='all'||key==='writer'||key==='reader')) return;
   const i=tStageObjs.indexOf(key);
   if(i>=0) tStageObjs.splice(i,1); else tStageObjs.push(key);
   if(!tStageObjs.length) tStageObjs=['all'];
@@ -4515,6 +4662,7 @@ function stageObjToggle(key){
 }
 function stageObjSetMany(keys,on){
   keys.forEach(function(k){
+    if(!(k==='all'||k==='writer'||k==='reader')) return;
     const i=tStageObjs.indexOf(k);
     if(on&&i<0) tStageObjs.push(k);
     if(!on&&i>=0) tStageObjs.splice(i,1);
@@ -4526,15 +4674,21 @@ function renderStageObjTree(){
   const box=document.getElementById('stageObjTree'); if(!box) return;
   box.innerHTML='';
   const m=objTreeModel(true);
-  function row(key,label,depth,lead,minis,note){
-    const on=tStageObjs.indexOf(key)>=0;
+  function row(key,label,depth,lead,minis,note,unsupported){
+    const on=!unsupported&&tStageObjs.indexOf(key)>=0;
     const r=el('div','tree-row'+(on?' on':''));
     r.style.paddingLeft=(depth>1?36:0)+'px';
     if(lead) r.appendChild(lead);
     const b=el('button','tree-check');
     b.appendChild(el('span','tree-box',on?'✓':''));
     b.appendChild(el('span','tree-name',label));
-    b.onclick=function(){stageObjToggle(key);};
+    if(unsupported){
+      /* P2-E：节点/实例暂不支持阶段曲线 —— 显式禁用，不再静默丢弃 */
+      b.disabled=true;
+      b.title='阶段曲线暂只支持总体/角色（节点/实例分组为已知欠账 R-TRACE-9）';
+    }else{
+      b.onclick=function(){stageObjToggle(key);};
+    }
     r.appendChild(b);
     (minis||[]).forEach(function(x){r.appendChild(x);});
     if(note) r.appendChild(el('span','tree-note',note));
@@ -4561,29 +4715,21 @@ function renderStageObjTree(){
   const g2=el('div','tree-group node-group');
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','节点与实例'));
-  head.appendChild(el('span','objtree-count','已选 '+tStageObjs.length+' 项'));
+  head.appendChild(el('span','tree-note',
+    '阶段曲线暂只支持总体/角色（节点/实例分组欠账）'));
   g2.appendChild(head);
-  const acts=el('div','node-group-acts');
-  acts.appendChild(mini('全选',m.nodes,true));
-  acts.appendChild(mini('清空',m.nodes,false));
-  g2.appendChild(acts);
   const list=el('div','tree-list');
+  /* P2-E：角色化模型里同名节点会出现多行（每角色一行）；这里本就不可选，
+     按节点名去重，避免「node1 ×2」的噪音。 */
+  const seen={};
   m.nodes.forEach(function(k){
     const nodeName=String((m.all[k]&&m.all[k].node)||k.replace(/^node:/,''));
+    const key='n:'+nodeName;
+    if(seen[key]) return;
+    seen[key]=true;
     const kids=m.byNode[nodeName]||[];
-    const open=!!treeOpen['stage:'+k];
-    let caret=null;
-    if(kids.length){
-      caret=el('button','tree-caret',open?'▾':'▸');
-      caret.onclick=function(){treeOpen['stage:'+k]=!treeOpen['stage:'+k];
-        renderStageObjTree();};
-    }
-    list.appendChild(row(k,objLabel(k),1,caret,kids.length?[
-      mini('全选',kids,true),mini('清空',kids,false)]:[],
-      kids.length?(kids.length+' 实例'):''));
-    if(open&&kids.length) kids.forEach(function(ck){
-      list.appendChild(row(ck,objLabel(ck),2));
-    });
+    list.appendChild(row(k,objLabel(k),1,null,[],
+      kids.length?(kids.length+' 实例'):'',true));
   });
   g2.appendChild(list);
   box.appendChild(g2);
@@ -4714,6 +4860,7 @@ function renderTreeDetail(cur){
     const keys=Object.keys(st.hist).map(Number)
       .sort(function(a,b){return a-b;});
     tdetailChart=echarts.init(div);
+    bindClickTip(tdetailChart);
     tdetailChart.setOption({animation:false,
       textStyle:{fontFamily:LFFONT,color:C.fg,fontSize:12},
       tooltip:{trigger:'axis'},grid:{left:56,right:16,top:16,bottom:40},
@@ -4841,6 +4988,7 @@ function renderTraceStack(){
   if(!rows.length){box.style.display='none';return;}
   box.style.display='';
   if(!tStackChart) tStackChart=echarts.init(box);
+  bindClickTip(tStackChart);
   const tree=tTree(g).filter(function(x){return x[1]===1;});
   const keys=tree.map(function(x){return x[0];});
   function l1sum(r){
@@ -5147,8 +5295,6 @@ _SEC_LATENCY = """<div class="card"><h2>端到端时延曲线</h2>
 </div>
 <div class="toolbar" id="latToolbar">
 <span id="tierBtns" class="toolbar"></span>
-<button id="selAllBtn" title="选中当前范围内的全部节点与实例">全选</button>
-<button id="selClearBtn" title="清空节点与实例选择">清空</button>
 <button id="outlierBtn">剔除离群值</button>
 <button id="resetBtn" title="恢复初始缩放范围">重置视图</button>
 </div>

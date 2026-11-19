@@ -66,3 +66,37 @@
 ⑤ **全量回归 + 验收**（完成条件四件套）+ 重跑双模板 critique 记趋势 + 更新 REQUIREMENTS 状态标记（`[新增]`→`[已固化]`）
 
 **风险**：业务 agent 修复可能与 B 类重叠（如页头时间即 R-SHELL-5 相关）——执行前逐项核对现状，重叠的跳过实现只补测试。
+
+---
+
+## 后续批次 · UI 调整收口（2026-11-19，已完成）
+
+按用户逐条验收的 6 项 UI 调整 + 上批遗留 P1-B/P2-E 已全部落地（见 DR-27 / REQUIREMENTS v0.8）：
+
+| 项 | 内容 | 测试 |
+|---|---|---|
+| A1 | 删除工具栏 `selAllBtn/selClearBtn` | test_multi_object…（断言不存在） |
+| A2 | 树「节点与实例」组 → 全选节点 / 全选实例 / 全部清空 | test_tree_group_select_buttons |
+| A3 | 线宽 avg 1.0 / 其余 0.8、强调 +0.2、删首对象 ×1.2 | test_line_widths_avg_thicker_only |
+| A4 | 单/多对象统一色语义（总览/总计灰、节点色系、实例色阶） | test_a03 + S4 色阶测试 |
+| A5 | 端点标签簇聚焦（主图 + 阶段图） | test_endlabel_cluster_focus |
+| A6 | 全图 tooltip 点击触发（bindClickTip） | test_all_charts_tooltip_click_trigger |
+| B | P1-B 页头开始时间 = 数据最早采样 | test_report_started_time_uses_data_timestamp / test_rebuild_reports_local |
+| C | P2-E 阶段树节点/实例禁用 + 说明 | test_stage_tree_nodes_disabled |
+
+验证：388 passed；双模板 SSR 8/8；0910 / 0811 / demo 三份报表已重建。
+
+---
+
+## 后续批次 · 交互增强收口（2026-11-19，已完成，见 DR-28 / v0.9）
+
+| 项 | 内容 | 测试 |
+|---|---|---|
+| 1 | 全部清空 → 自动开启总计（主树 + 慢点控件） | test_clear_all_auto_enables_total |
+| 2 | 全选节点/实例 → 全选后变「清空节点/清空实例」 | test_tree_toggle_buttons / slow 断言 |
+| 3 | 多对象固定槽位标签（顺序/无引线/截断+title/常显）+ 压暗聚焦 + 图例禁点 | test_endlabel_fixed_slots_and_cluster_focus / test_multilabel_tree_order_and_truncation |
+| 4 | tooltip 悬浮/点击分离（悬浮=竖线+交点，点击=钉框） | test_all_charts_tooltip_hover_pointer_click_box / test_tooltip_click_pins_content |
+| 5 | QPS 柱配色随对象（失败保持橙） | test_qps_bars_follow_object_colors |
+
+验证：393 passed；Edge/CDP 实浏览器核对（标签顺序与截断、悬浮压暗、悬浮指针、点击钉框与格式化 tooltip）。
+
