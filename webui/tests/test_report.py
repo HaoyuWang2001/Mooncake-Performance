@@ -2334,8 +2334,8 @@ def test_endlabel_fixed_slots_and_cluster_focus(tmp_path):
     assert res.get("leader_count") == 0        # 无引线
     classes = res.get("cluster_classes") or []
     assert all("fixed" in c for c in classes), classes
-    titles = res.get("cluster_titles") or []
-    assert all("悬浮聚焦" in t for t in titles), titles
+    fulls = res.get("cluster_fulls") or []
+    assert fulls and all(fulls), fulls        # 全名挂在 data-full（悬浮详情框）
     names = res.get("cluster_series") or []
     dims = res.get("cluster_dims") or []
     assert len(dims) == len(names) and dims
@@ -2371,8 +2371,8 @@ def test_multilabel_tree_order_and_truncation(tmp_path):
     assert res.get("leader_count") == 0
     classes = res.get("fixed_classes") or []
     assert all("fixed" in x for x in classes), classes
-    titles = res.get("fixed_titles") or []
-    assert all(t for t in titles), titles      # 全名挂在 title 上（截断时悬浮可看）
+    fulls = res.get("fixed_fulls") or []
+    assert all(f for f in fulls), fulls        # 全名挂在 data-full（截断时悬浮详情框）
     # 图例可看不可点
     assert res.get("legend_selmode") is False, res.get("legend_selmode")
 
@@ -2910,11 +2910,44 @@ def test_label_focus_hover_restores(tmp_path):
     assert res.get("lf_count", 0) >= 2, res.get("lf_count")
     hv = res.get("lf_hover") or []
     assert any(x == 0.15 for x in hv) and any(x == 1 for x in hv), hv
+    # 截断长名：悬浮用详情框展示全名（不用原生 title）
+    full = res.get("lf_tip_full")
+    assert full and res.get("lf_tip") == full, (res.get("lf_tip"), full)
     assert all(x == 1 for x in (res.get("lf_after_move") or [])), \
         res.get("lf_after_move")
+    assert not (res.get("lf_tip_after_move") or ""), res.get("lf_tip_after_move")
+    # 移出图表（globalout）也必须恢复（长标签右移残留的回归）
+    assert any(x == 0.15 for x in (res.get("lf_hover2") or [])), \
+        res.get("lf_hover2")
+    assert all(x == 1 for x in (res.get("lf_after_globalout") or [])), \
+        res.get("lf_after_globalout")
+    assert not (res.get("lf_tip_after_go") or ""), res.get("lf_tip_after_go")
     assert all(x == 1 for x in (res.get("lf_after_leave") or [])), \
         res.get("lf_after_leave")
     assert "locked" not in (res.get("lf_cls") or "")
+
+
+def test_qps_single_pointer_and_all_object_tooltip(tmp_path):
+    """QPS：一个时间点只用一根竖直虚线（axisPointer dashed line）；点击详情框
+    （自绘）同时列出该桶全部对象的 QPS+失败；柱不逐根强调。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--add-obj", "node:n1", "--qps-colors")
+    if res is None:
+        return
+    assert res["errors"] == []
+    ap = res.get("qps_axis_pointer") or {}
+    assert ap.get("type") == "line", ap
+    assert (ap.get("lineStyle") or {}).get("type") == "dashed", ap
+    tip = res.get("qps_custom_tip") or ""
+    assert "2026-" in tip, tip                       # 时间已格式化
+    assert tip.count("：QPS ") >= 2, tip             # 全部对象在同一框
+    assert "失败 " in tip, tip
+    names = [n for n in ("总体（全部）", "n1") if n in tip]
+    assert names, tip
+    assert res.get("qps_emphasis") and all(res["qps_emphasis"]), \
+        res.get("qps_emphasis")
 
 
 def test_qps_grouped_thin_bars(tmp_path):

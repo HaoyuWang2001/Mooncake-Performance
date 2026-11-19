@@ -1744,6 +1744,12 @@ border-radius:99px;margin-right:5px;vertical-align:middle}
 .endlabel{position:absolute;font-size:12px;font-weight:700;white-space:nowrap;
 transform:translateY(-50%)}
 .endlabel.fixed{max-width:96px;overflow:hidden;text-overflow:ellipsis}
+.mc-label-tip{pointer-events:none;max-width:360px;white-space:normal;
+word-break:break-all;font-size:12px;z-index:45;line-height:1.5}
+.mc-tip-box{position:absolute;z-index:40;pointer-events:auto;
+background:var(--paper);color:var(--ink);border:1px solid var(--grid);
+border-radius:4px;padding:8px 10px;font-size:13px;line-height:1.55;
+font-variant-numeric:tabular-nums;max-height:46vh;overflow-y:auto}
 .endleader{position:absolute;height:1px;transform-origin:0 50%;opacity:.85}
 /* ---- 阶段树：左树右详情 ---- */
 .stage-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
@@ -1959,6 +1965,10 @@ function bindClickTip(ch){
   function hide(){
     anchor=null; unlisten();
     try{ ch.dispatchAction({type:'hideTip'}); }catch(e){}
+    if(ch.__mcTipEl){
+      try{ ch.__mcTipEl.parentNode.removeChild(ch.__mcTipEl); }catch(e){}
+      ch.__mcTipEl=null;
+    }
     hoverMode();
   }
   function scheduleHide(){
@@ -1968,9 +1978,14 @@ function bindClickTip(ch){
   function pinAt(x,y,ev){
     const r=chartRect();
     anchor=r?[r.left+x,r.top+y]:[x,y];
-    try{ ch.setOption({tooltip:{showContent:true,triggerOn:'none'}}); }
-    catch(e){}
-    try{ ch.dispatchAction({type:'showTip',x:x,y:y}); }catch(e){}
+    if(ch.__mcCustomTip){
+      /* 自绘详情框（value 轴分组柱的槽位偏移会破坏 ECharts axis 匹配） */
+      try{ ch.__mcCustomTip(x,y); }catch(e){}
+    }else{
+      try{ ch.setOption({tooltip:{showContent:true,triggerOn:'none'}}); }
+      catch(e){}
+      try{ ch.dispatchAction({type:'showTip',x:x,y:y}); }catch(e){}
+    }
     if(!docMove){
       docMove=function(e){
         if(boxHover(e)||inChart(e)){
@@ -2001,8 +2016,24 @@ function bindClickTip(ch){
     if(!pr||x<pr.x0||x>pr.x1||y<pr.y0||y>pr.y1){ hide(); return; }
     pinAt(x,y,e);
   });
-  zr.on('globalout',function(){ if(anchor) scheduleHide(); });
+  zr.on('globalout',function(){
+    mcClearFocus(ch);            /* 移出图表也必定结束悬浮聚焦 */
+    if(anchor) scheduleHide();
+  });
   ch.on('datazoom',function(){ hide(); });
+  /* 兜底：指针移动到任何「标签之外」的元素即结束悬浮聚焦
+     （修复长截断标签向右移出后事件不再命中导致聚焦残留） */
+  try{
+    document.addEventListener('mousemove',function(ev){
+      if(!ch.__mcFocus) return;
+      const box=ch.__mcLabelBox;
+      let inside=false;
+      try{
+        inside=!!(box&&box.contains&&ev&&ev.target&&box.contains(ev.target));
+      }catch(e){}
+      if(!inside) mcClearFocus(ch);
+    });
+  }catch(e){}
 }
 /* ---- x 轴刻度：双图共用显式范围/间隔（上下对齐）+ 跨度自适应格式 ----
    主图与吞吐面板传同一个 ext -> min/max/interval 完全一致，且两图
@@ -2670,10 +2701,38 @@ function mcMarkLabels(ch){
   const box=ch&&ch.__mcLabelBox; if(!box) return;
   Array.prototype.slice.call(box.children||[]).forEach(function(c){
     if(String(c.className||'').indexOf('endlabel')<0) return;
-    const nm=c.getAttribute&&c.getAttribute('data-name');
-    if(nm) c.title=nm+'：悬浮聚焦该曲线';
     c.className=String(c.className||'').replace(/\s*locked/g,'');
   });
+}
+/* 长名截断时，悬浮标签用详情框展示全名（替代原生 title） */
+function mcHideLabelTip(ch){
+  if(ch&&ch.__mcLabelTipEl){
+    try{ ch.__mcLabelTipEl.parentNode.removeChild(ch.__mcLabelTipEl); }
+    catch(e){}
+    ch.__mcLabelTipEl=null;
+  }
+}
+function mcShowLabelTip(ch,lab){
+  const box=ch&&ch.__mcLabelBox; if(!box||!lab) return;
+  const full=lab.getAttribute&&lab.getAttribute('data-full');
+  if(!full) return;
+  /* 桩环境没有 scrollWidth → 视为可能截断（测试可覆盖） */
+  const trunc=(typeof lab.scrollWidth!=='number')||
+    (lab.scrollWidth>lab.clientWidth+1);
+  if(!trunc) return;
+  mcHideLabelTip(ch);
+  const el=document.createElement('div');
+  el.className='mc-tip-box mc-label-tip';
+  el.textContent=full;
+  el.style.left='0px'; el.style.top='0px';
+  box.appendChild(el);
+  ch.__mcLabelTipEl=el;
+  const bw=el.offsetWidth||240, bh=el.offsetHeight||24;
+  const lx=(parseFloat(lab.style.left)||0)-bw-8;
+  const ly=(parseFloat(lab.style.top)||0)-bh/2;
+  const H=(ch.getHeight?ch.getHeight():400);
+  el.style.left=Math.max(4,lx)+'px';
+  el.style.top=Math.max(4,Math.min(ly,H-bh-4))+'px';
 }
 function mcFocus(ch,prefixes){
   if(!ch) return;
@@ -2683,13 +2742,14 @@ function mcFocus(ch,prefixes){
 }
 function mcClearFocus(ch){
   if(!ch) return;
+  mcHideLabelTip(ch);
   if(!ch.__mcFocus&&!ch.__mcDimActive) return;
   ch.__mcFocus=null;
   mcApplyFocus(ch); mcMarkLabels(ch);
 }
 function mcBindLabel(ch,lab,prefix){
   lab.setAttribute('data-prefix',prefix);
-  lab.onmouseenter=function(){ mcFocus(ch,[prefix]); };
+  lab.onmouseenter=function(){ mcFocus(ch,[prefix]); mcShowLabelTip(ch,lab); };
   lab.onmouseleave=function(){ mcClearFocus(ch); };
 }
 function mcAnchorY(ch,srIndex,last){
@@ -2732,6 +2792,7 @@ function mcRenderLabels(ch,ov,items,grid){
   items.forEach(function(it){
     const lab=el('div','endlabel fixed',it.name);
     lab.setAttribute('data-name',it.name);
+    lab.setAttribute('data-full',it.name);
     lab.style.left=(ch.getWidth()-grid.right+8)+'px';
     lab.style.top=it.ly+'px';
     lab.style.color=it.color;
@@ -2983,7 +3044,9 @@ function bindXPan(){
 function qpsOpt(tier){
   const o=axisCommon();
   o.grid=QPS_GRID;
-  o.tooltip=lfTooltip({trigger:'axis'});
+  /* 一个时间点只用一根竖直虚线锁定；点击弹出该桶**全部对象**的 QPS+失败 */
+  o.tooltip=lfTooltip({trigger:'axis',
+    axisPointer:{type:'line',lineStyle:{type:'dashed',width:1,color:C.faint}}});
   o.xAxis=lfAxisTime(null,'main');
   o.yAxis=[lfAxisValue({name:'QPS',scale:true,nameLocation:'end',nameGap:16}),
            lfAxisValue({name:'失败',position:'right',splitLine:{show:false},
@@ -3027,17 +3090,17 @@ function qpsOpt(tier){
   const failW=n>1?barW:3;
   const rad=n>1?0:[99,99,0,0];
   qpsEntries=entries.map(function(e){return {nm:e.nm,qps:e.qps,
-    fail:(e.col.fail||[]),t:e.col.t};});
+    fail:(e.col.fail||[]),t:e.col.t,color:e.qc};});
   entries.forEach(function(e,i){
     const x=e.col.t.map(function(v){return v*1000;});
     const off=n>1?((i-(n-1)/2)*slot):0;
     o.series.push({name:e.nm+' QPS',type:'bar',yAxisIndex:0,clip:true,
-      barMaxWidth:barW,
+      barMaxWidth:barW,emphasis:{disabled:true},
       itemStyle:{color:e.qc,borderRadius:rad},
       z:3, data:x.map(function(v,j){return [v+off,e.qps[j]];})});
     /* 失败柱：与所属对象的 QPS 细柱同槽位对齐（位置即对象），保持强调橙 */
     o.series.push({name:e.nm+' 失败',type:'bar',yAxisIndex:1,clip:true,
-      barMaxWidth:failW,
+      barMaxWidth:failW,emphasis:{disabled:true},
       itemStyle:{color:C.hero,borderRadius:rad},z:4,
       data:x.map(function(v,j){return [v+off,(e.col.fail&&e.col.fail[j])||0];})});
   });
@@ -3096,6 +3159,54 @@ function buildQpsChart(){
     qpsChart.__slotBound=true;
     try{ qpsChart.on('dataZoom',refreshQpsSlots); }catch(e){}
   }
+  /* 点击详情框（自绘）：按像素换算到最近时间桶，列出全部对象 QPS+失败 */
+  qpsChart.__mcBuildTipAt=function(bi){
+    if(!qpsEntries.length) return '';
+    const t0=qpsEntries[0].t[bi];
+    if(t0==null) return '';
+    const rows=qpsEntries.map(function(e){
+      const q=e.qps[bi], f=e.fail[bi]||0;
+      const dot='<span class="dot" style="display:inline-block;width:8px;'+
+        'height:8px;border-radius:99px;margin-right:5px;background:'+
+        (e.color||C.fg)+'"></span>';
+      return dot+e.nm+'：QPS '+(q==null?'-':Math.round(q*100)/100)+
+        ' · 失败 '+f;
+    });
+    return '<b>'+fullts(t0)+'</b><br>'+rows.join('<br>');
+  };
+  qpsChart.__mcCustomTip=function(px,py){
+    if(!qpsEntries.length) return;
+    let v=null;
+    try{
+      const r=qpsChart.convertFromPixel({xAxisIndex:0},[px,py]);
+      v=Array.isArray(r)?r[0]:r;
+    }catch(e){}
+    if(v==null) return;
+    const tArr=qpsEntries[0].t;
+    let bi=0,best=Infinity;
+    tArr.forEach(function(t,i){
+      const d=Math.abs(t*1000-v);
+      if(d<best){best=d;bi=i;}
+    });
+    const html=qpsChart.__mcBuildTipAt(bi);
+    if(!html) return;
+    let el=qpsChart.__mcTipEl;
+    if(!el||!el.parentNode){
+      el=document.createElement('div');
+      el.className='mc-tip mc-tip-box';
+      qpsChart.getDom().appendChild(el);
+      qpsChart.__mcTipEl=el;
+    }
+    el.innerHTML=html;
+    /* confine：靠近点击点，超出则翻转/夹紧 */
+    const W=qpsChart.getWidth(),H=qpsChart.getHeight();
+    const bw=el.offsetWidth||260,bh=el.offsetHeight||90;
+    let lx=px+12,ly=py+12;
+    if(lx+bw>W-8) lx=px-bw-12;
+    if(lx<8) lx=8;
+    if(ly+bh>H-8) ly=Math.max(8,H-bh-8);
+    el.style.left=lx+'px'; el.style.top=ly+'px';
+  };
   const z=Z(); if(!z){qpsChart.clear();return;}
   const tier=currentTier();
   qpsChart.setOption(qpsOpt(tier),true);
@@ -6028,6 +6139,10 @@ function renderTrace(){
 window.__MC_SEL=function(){return selObjs.slice();};
 window.__MC_TSEL=function(){return tObjSel.slice();};
 window.__MC_SSEL=function(){return tStageSel.slice();};
+window.__MC_FOCUS=function(){
+  return {main:!!(chart&&chart.__mcDimActive),
+    stage:!!(tChart&&tChart.__mcDimActive)};
+};
 window.__MC_FULL_READY__=function(){renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """

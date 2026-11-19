@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 217 条 · ✓190 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 218 条 · ✓191 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -260,8 +260,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.V6 无数据窗口浅带，**仅第一处**标注时长；判定用真实缺失桶 —— R-LAT-9 〔test_a01_gap_markarea_between_runs, test_a02_no_gap_no_markarea, test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C5.I1 点击绘图区任意位置（含空白）按竖线时间点开框；点击其它处换钉位；区外/Esc/缩放收起 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
 - C5.I2 悬浮只显示竖线+交点（showContent:false），不弹框 —— R-SHELL-14 〔test_all_charts_tooltip_hover_pointer_click_box〕
-- C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断+title；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve〕
-- C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；指针移入画布或离开标签立即恢复全部。**不做点击锁定**（锁定在分级图 `finished` 重渲下易失联，已放弃）。画布 mousemove 兜底清除预览（防标签重建丢 mouseleave 卡死） —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
+- C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断，**悬浮时用详情框展示全名**（`data-full` + `.mc-label-tip`，不用原生 title）；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
+- C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；**离开标签/移入画布/移出图表（globalout）都必须恢复**；不做点击锁定。清除机制三重兜底：标签 mouseleave + 画布 mousemove + **document mousemove（指针不在标签上即清）+ globalout**——修复长截断标签向右移出后事件不再命中而聚焦残留 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
 - C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠 —— R-LAT-7/14 〔test_end_label_layout_stays_inside_plot〕
 - C5.I6 离群开关：无可命中桶时置灰/隐藏，不呈现无效控件 —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge〕
 - C5.D1 离群 = 单请求 > 客户端 p99×10（样本≥1000）；从桶标量剔除、计数/直方图全量 —— R-LAT-4 〔test_outlier_scatter_toggle_and_merge〕
@@ -291,6 +291,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C7.V1 双轴：QPS 柱（左）+ 失败柱（右，独立计数）；**多对象时 QPS 用细柱（按槽位像素宽自适应 1–3px）、同桶按槽位并排**（第 i 个对象 x 偏移 `(i-(n-1)/2)·桶距×0.8/n`，不重叠；全览桶密时必然贴拢，放大后分开）；失败柱**与所属对象同槽位对齐**（位置即归属）、统一强调橙、同宽；单对象维持 7px/3px 且不偏移 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only, test_qps_grouped_thin_bars, test_qps_single_object_bars_unchanged〕
 - C7.V2 柱色随对象：总计灰阶 / 节点色系 / 实例色阶 —— R-LAT-8 〔test_qps_bars_follow_object_colors〕
 - C7.V3 图例固定不可点，**只列各对象的 QPS**（失败统一橙色，不逐个列）；无失败显示「本次测试无失败」；副图上方无小标题 —— R-LAT-8 〔test_qps_legend_fixed_and_caption_removed, test_qps_grouped_thin_bars〕
+- C7.V4 同一时间点只用**一根竖直虚线**（`axisPointer` line/dashed）锁定；柱不逐根强调（`emphasis.disabled`）；点击详情框一次性列出该时间桶**全部对象**的 QPS+失败（`对象：QPS x · 失败 y`，带对象色圆点） —— R-LAT-8 〔test_qps_single_pointer_and_all_object_tooltip〕
 - C7.I1 x 缩放时 y 不重算（`filterMode:'none'`） —— R-LAT-8 〔test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C7.I2 主图与 QPS 缩放联动（zoomState 同步） —— R-LAT-6 〔test_a13_zoom_links_main_and_qps〕
 - C7.D1 QPS 分母 = 实测 wall_s（writer elapsed / reader notify 跨度），不是数据 span —— DR-25 〔test_measured_wall_prefers_notify_span〕
