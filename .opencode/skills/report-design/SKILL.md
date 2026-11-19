@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 209 条 · ✓181 · ◐26 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 211 条 · ✓183 · ◐26 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -365,7 +365,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### C14 SDK 全链路 · 分级时延曲线（trace）
 
-- C14.V1 标题「分级时延曲线（trace）」；**控台 = 行1 粒度档+指标+重置，行2 两栏（对象树 | 阶段树）**；图在控台下方 —— R-TRACE-5/12 〔test_trace_toolbar_stage_rows, test_render_trace_section〕
+- C14.V1 标题「分级时延曲线（trace）」；控件与**端到端同构**：一行 plain `.toolbar`（粒度档+指标+重置）+ **两个标准 `.objtree-strip` 并排**（对象树 | 阶段树，`.trace-cols` 仅做 grid 布局、无底色/描边）；禁止自定义控台盒 —— R-TRACE-5/12 〔test_trace_toolbar_stage_rows, test_control_style_consistency, test_render_trace_section〕
 - C14.V2 阶段按树序列出（total 根行 → L1 → L2 子阶段），L1 带稳定颜色点 —— R-TRACE-12 〔test_stage_tree_l2_disabled〕
 - C14.V8 阶段树 **L2 子阶段显示但禁用**（map 只回传 L1+残差时间桶），行尾注明「无时间桶」，title 说明仅用于块图展开 —— R-TRACE-12 〔test_stage_tree_l2_disabled〕
 - C14.V3 指标单选 = 均值 / 最大（map 阶段桶仅存 avg/max） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
@@ -450,6 +450,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C20.V5 卡片仅 1px 描边或底色区分（无阴影/渐变/装饰图形） —— 设计基调 〔test_c01_dr24_alignment_lock〕
 - C20.V6 章节顺序与标题：SDK → 错误与异常 → 实例与日志现场 → 监控 → 页脚 —— R-SHELL-15 〔test_section_order_and_footer_note, test_section_order_and_renames〕
 - C20.V7 body 卡片层级完整（`div` 闭合平衡） —— 模板架构 〔test_body_div_balance_cards_inside_wrap〕
+- C20.V8 **控件风格统一**：新控件必须复用既有形态（`.toolbar` 行 / `.tl-label` 标签 / `.objtree-strip` 树条 / `.tree-*` 树行 / 既有按钮）；**禁止引入新的容器底色或描边风格**；多栏布局只允许无样式 grid（先例 `.stage-split`/`.trace-cols`） —— 设计基调 〔test_control_style_consistency〕
 - C20.D1 正确性口径：总计=同桶按请求数加权平均、max 取最大、直方图全量合并、离群剔除口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕
 - C20.D2 跨节点时间戳：当前用绝对秒 + 节点时区归一；相对秒 + 编排机参考钟为欠账 —— V-6 〔◐ test_slowest_ts_epoch_matches_buckets〕
 - C20.D3 data.js 规模与嵌入预算（对象/档位/行预算） —— R-SHELL-2 〔test_objects_and_budget_trimming, test_long_run_embed_tier_and_datajs_finer〕
@@ -459,6 +460,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C20.B3 SSR 冒烟兜底：桩环境测不出的真实渲染异常（markLine undefined 杀整页） —— DR-18 〔test_real_echarts_render_smoke〕
 - C20.B4 大范围删改前必须 grep 引用（曾两次误删相邻函数/测试基建） —— 工程流程 〔n/a〕
 - C20.B5 测试改名/删除必须同步本规则册（由完整性检查拦截） —— 工程流程 〔test_skill_rulebook_integrity〕
+- C20.B6 曾给 SDK 曲线控台引入「灰底+描边的 tconsole 盒」，凭空造出第三种容器形态（与端到端 plain toolbar + objtree-strip 不一致）→ 删除该样式，用测试锁死（CSS 不得含 tconsole；trace-cols 规则不得含 background/border） —— DR-32 〔test_control_style_consistency〕
 
 ## 模板架构规范
 

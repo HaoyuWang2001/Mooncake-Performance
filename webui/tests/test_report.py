@@ -1464,7 +1464,7 @@ def test_objtree_strip_scrolls_from_top(tmp_path):
     html, _dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS)
     src = open(html, encoding="utf-8").read()
     import re as _re
-    m = _re.search(r"\.objtree-strip\{([^}]*)\}", src)
+    m = _re.search(r"^\.objtree-strip\{([^}]*)\}", src, _re.M)
     assert m, "objtree-strip rule missing"
     rule = m.group(1)
     assert "align-items:flex-start" in rule
@@ -1823,7 +1823,8 @@ def test_stage_tier_policy_by_span(tmp_path):
 
 
 def test_trace_toolbar_stage_rows(tmp_path):
-    """trace 工具栏：顶部仅读写/op；曲线控台=粒度+指标+重置一行、对象树|阶段树两栏。"""
+    """trace 工具栏：顶部仅读写/op；曲线控件与端到端同构
+    （plain toolbar 行 + 两个标准 objtree-strip 并排，无自定义底色容器）。"""
     a = _stats(tmp_path, "a.reader", "reader")
     tr = _trace_stats(tmp_path, "c.glog")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
@@ -1831,18 +1832,32 @@ def test_trace_toolbar_stage_rows(tmp_path):
     src = open(html, encoding="utf-8").read()
     assert 'id="tsizeSel"' not in src
     assert 'id="tgroups"' in src
-    # 顶部不再有对象树：对象树/阶段树在曲线控台两栏内
-    i_console = src.index('class="tconsole"')
+    # 样式锁：不得回潮自定义控台盒
+    assert "tconsole" not in src
+    # 曲线控件行（与端到端 latToolbar 同形）+ 两栏 objtree-strip
+    i_tool = src.index('id="tLatToolbar"')
     i_obj = src.index('id="stageObjTree"')
     i_stage = src.index('id="stageTree"')
-    assert i_console < i_obj and i_console < i_stage, (i_console, i_obj, i_stage)
-    head = src[i_console:src.index("</div>", i_console)]
+    assert i_tool < i_obj < i_stage, (i_tool, i_obj, i_stage)
+    head = src[i_tool:src.index("</div>", i_tool)]
     for cid in ('id="stageTierBtns"', 'id="tCurveMetric"', 'id="tResetBtn"'):
-        assert cid in src[i_console:src.index('id="stageObjTree"')], cid
-    # 块图对象选择：按钮 + 弹层树
-    assert 'id="tBlockObj"' in src and 'id="tBlockObjMenu"' in src
+        assert cid in head, cid
     # 阶段平铺 chips 已移除
     assert 'id="stageBtns"' not in src
+    # 端到端 1 个 + trace 2 个 = 3 个标准树条容器
+    assert src.count('class="objtree-strip"') >= 3
+
+
+def test_control_style_consistency():
+    """控件风格锁：新控件必须复用既有形态，不得引入新的带底色/描边的控件容器。
+    （事故：SDK 曲线曾用灰底描边 tconsole 盒，与端到端风格不一致 —— DR-32）"""
+    css = rp._PAGE_CSS
+    assert "tconsole" not in css, "灰底控台盒回潮"
+    i = css.find(".trace-cols{")
+    assert i >= 0, "缺少 .trace-cols 布局规则"
+    rule = css[i:css.index("}", i) + 1]
+    assert "background" not in rule and "border" not in rule, rule
+    assert 'class="tconsole' not in rp._SEC_TRACE
 
 
 def test_client_site_tree_readonly_rows(tmp_path):

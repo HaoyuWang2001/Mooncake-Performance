@@ -1563,14 +1563,16 @@ text-overflow:ellipsis;min-width:0}
 overflow:hidden;text-overflow:ellipsis;min-width:0}
 .lvl-children{align-self:start;overflow-x:auto;padding-top:5px}
 .lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 6px}
-.tconsole{border:1px solid var(--grid);background:var(--quiet);
-border-radius:4px;padding:8px 10px;margin:0 0 10px}
-.tconsole-top{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;
-overflow-x:auto;margin:0 0 8px}
-.tconsole-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
-gap:14px}
-.tconsole-col{min-width:0}
-.tconsole-head{font-size:12px;color:var(--mut);font-weight:700;margin:0 0 4px}
+/* 分级时延曲线：与端到端同构——plain toolbar + 两个标准 objtree-strip 并排
+   （仅布局，无底色/无新容器视觉；窄屏回退单栏） */
+.trace-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+gap:12px;margin-bottom:10px}
+.trace-cols .objtree-strip{margin-bottom:0}
+@media (max-width:1000px){.trace-cols{grid-template-columns:1fr}}
+.blockobj-row{margin-bottom:6px}
+.blockobj-row .tl-label,.blockobj-row #lvlMetric{align-items:center}
+#lvlMetric.toolbar{margin-bottom:0;flex-wrap:nowrap;align-items:center}
+#lvlMetric button{vertical-align:middle;line-height:1}
 .objdrop-wrap{position:relative;display:inline-block}
 .objdrop-btn{font-size:12px;padding:2px 10px;border-radius:4px;
 border:1px solid var(--grid);background:transparent;color:var(--ink);
@@ -5297,7 +5299,8 @@ function renderStageTree(cur){
   const tree=tTree(g);
   const order=stageSelectableKeys(cur);
   const head=el('div','node-group-head');
-  head.appendChild(el('span','tree-group-title','已选 '+tStageSel.length+' 项'));
+  head.appendChild(el('span','tree-group-title','阶段'));
+  head.appendChild(el('span','objtree-count','已选 '+tStageSel.length+' 项'));
   box.appendChild(head);
   const acts=el('div','node-group-acts');
   const allb=el('button','mini','全选');
@@ -6029,29 +6032,25 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 <div class="toolbar"><span id="tgroups" class="toolbar"></span>
 <select id="topSel" style="display:none"></select></div>
 <h3 class="sec" title="块宽 = 占父项百分比；点击块聚焦，下一级在新行展开">分级时延块图（trace）</h3>
-<div class="toolbar"><span class="tl-label">对象</span>
+<div class="toolbar blockobj-row"><span class="tl-label">对象</span>
 <span class="objdrop-wrap"><button id="tBlockObj" class="objdrop-btn" type="button">总计 ▾</button>
-<div id="tBlockObjMenu" class="objdrop-menu" style="display:none"></div></span>
-<span class="tl-label" style="margin-left:16px">指标</span>
+<div id="tBlockObjMenu" class="objdrop-menu" style="display:none"></div></span></div>
+<div class="toolbar blockobj-row"><span class="tl-label">指标</span>
 <span id="lvlMetric" class="toolbar"></span></div>
 <div id="levels" class="levels"></div>
 <h3 class="sec" title="阶段 × 指标 × 对象：单对象可多阶段，单阶段可多对象">分级时延曲线（trace）</h3>
-<div class="tconsole">
-<div class="toolbar tconsole-top">
+<div class="toolbar" id="tLatToolbar">
 <span id="stageTierBtns" class="toolbar"></span>
 <span class="tl-label" style="margin-left:16px">指标</span>
 <span id="tCurveMetric" class="toolbar"></span>
 <button id="tResetBtn" title="恢复缩放窗口">重置视图</button>
 </div>
-<div class="tconsole-cols">
-<div class="tconsole-col">
-<div class="tconsole-head">对象（总计 / 节点 / 实例）</div>
+<div class="trace-cols">
+<div class="objtree-strip">
 <div class="objtree-body" id="stageObjTree"></div>
 </div>
-<div class="tconsole-col">
-<div class="tconsole-head">阶段（total → L1 → L2）</div>
+<div class="objtree-strip">
 <div class="objtree-body" id="stageTree"></div>
-</div>
 </div>
 </div>
 <div id="tchartEmpty" class="empty-tip" style="display:none"></div>
