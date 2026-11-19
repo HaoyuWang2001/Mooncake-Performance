@@ -2632,6 +2632,128 @@ def test_qps_bars_follow_object_colors(tmp_path):
     assert len(hero) == 1, fails                      # 失败柱配色一致
 
 
+def test_skill_rulebook_integrity():
+    """规则册完整性：ID 唯一/格式合法、引用的测试真实存在、覆盖率汇总与实际一致。"""
+    import re as _re
+    import pathlib as _pl
+    skill = (_pl.Path(__file__).resolve().parents[2]
+             / ".opencode/skills/report-design/SKILL.md").read_text(
+        encoding="utf-8")
+    start = skill.index("## 组件规则册")
+    end = skill.index("## 模板架构规范")
+    body = skill[start:end]
+    entries = [(m.group(1), m.group(2)) for m in _re.finditer(
+        r"^- (C\d{1,2}\.[VIDB]\d{1,2}) (.+)$", body, _re.M)]
+    assert len(entries) >= 200, len(entries)
+    ids = [e[0] for e in entries]
+    assert len(ids) == len(set(ids)), "重复规则 ID: {}".format(
+        sorted({i for i in ids if ids.count(i) > 1}))
+    for i in ids:
+        assert _re.fullmatch(r"C\d{1,2}\.[VIDB]\d{1,2}", i), i
+    names = set()
+    for p in _pl.Path(__file__).parent.glob("test_*.py"):
+        names |= set(_re.findall(r"^def (test_[a-z0-9_]+)\(",
+                                 p.read_text(encoding="utf-8"), _re.M))
+    refs = set()
+    for _, line in entries:
+        for m in _re.finditer(r"〔([^〕]*)〕", line):
+            refs |= set(_re.findall(r"test_[a-z0-9_]+", m.group(1)))
+    missing = sorted(r for r in refs if r not in names)
+    assert not missing, "规则册引用了不存在的测试: {}".format(missing)
+
+    def status(line):
+        if "〔✗" in line:
+            return "none"
+        if "〔◐" in line:
+            return "part"
+        if "〔n/a" in line:
+            return "na"
+        if _re.search(r"〔[^〕]*test_[a-z0-9_]+", line):
+            return "ok"
+        return "none"
+
+    counts = {"ok": 0, "part": 0, "none": 0, "na": 0}
+    for _, line in entries:
+        counts[status(line)] += 1
+    m = _re.search(r"覆盖率（自动校验）\**：共 (\d+) 条 · ✓(\d+) · ◐(\d+) · "
+                   r"✗(\d+) · n/a(\d+)", skill)
+    assert m, "缺少覆盖率汇总行"
+    got = tuple(int(x) for x in m.groups())
+    want = (len(entries), counts["ok"], counts["part"], counts["none"],
+            counts["na"])
+    assert got == want, "覆盖率汇总与实际不一致: {} != {}".format(got, want)
+
+
+def test_reset_view_restores_zoom(tmp_path):
+    """C6.I3：重置视图把时间轴回到 0..100、y 倍率回 1x（不改档位/选择）。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--reset-view")
+    if res is None:
+        return
+    assert res["errors"] == []
+    acts = res.get("reset_actions") or []
+    assert any(a.get("type") == "dataZoom" and a.get("start") == 0
+               and a.get("end") == 100 for a in acts), acts
+    assert res.get("reset_cap") == "1.0x", res.get("reset_cap")
+
+
+def test_trace_stage_row_all_clear(tmp_path):
+    """C14.I2：阶段行 全选=多阶段曲线；清空=只留 total。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--trace-stage-all")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert len(res.get("tstage_all") or []) >= 2, res.get("tstage_all")
+    assert res.get("tstage_clear") == ["total（端到端）"], res.get(
+        "tstage_clear")
+
+
+def test_trace_curve_fixed_labels_and_focus(tmp_path):
+    """C14.I3：分级时延曲线固定槽位标签（无引线）+ 悬浮压暗其他曲线。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--tchart-labels")
+    if res is None:
+        return
+    assert res["errors"] == []
+    texts = res.get("tlabel_texts") or []
+    assert len(texts) >= 2, texts
+    assert res.get("tlabel_leader") == 0, res.get("tlabel_leader")
+    assert all("fixed" in c for c in (res.get("tlabel_classes") or [])), \
+        res.get("tlabel_classes")
+    dims = res.get("tlabel_dims") or []
+    assert dims and dims[0] == 1 and all(x == 0.15 for x in dims[1:]), dims
+    assert res.get("tlabel_restored") and \
+        all(x == 1 for x in res["tlabel_restored"]), res.get("tlabel_restored")
+
+
+def test_combo_hidden_client_falls_back(tmp_path):
+    """C4.I4：切参数组后，被隐藏的选中实例回落到「总体」，避免空图。"""
+    stats = []
+    for c, t in ((2, 4), (4, 8)):
+        st = _minimal_stats([3600 + i for i in range(60)], [3600],
+                            bucket_unit="s")
+        st["meta"].update({
+            "source": "benchmark_c{}_t{}_128KB.log".format(c, t),
+            "node": "n1", "ts_from": 3600, "ts_to": 3659})
+        stats.append(st)
+    data = rp.reduce_scenario(stats, {"config": "c"})
+    res = _js_check(tmp_path, data, "--combo-fallback")
+    if res is None:
+        return
+    assert res["errors"] == []
+    before = res.get("combo_sel_before") or []
+    after = res.get("combo_sel_after") or []
+    assert any(k.startswith("client:") for k in before), before
+    assert not any(k.startswith("client:") for k in after), after
+    assert after == ["all"], after
+
+
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
     """S6：QPS 副图 x 缩放不重算 y（filterMode none）；无数据窗口仅首处标注。"""
     a = _stats(tmp_path, "a.writer", "writer")

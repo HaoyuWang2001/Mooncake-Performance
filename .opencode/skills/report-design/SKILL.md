@@ -184,6 +184,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 状态：`〔test_<name>〕` 已锁 · `〔◐ 说明〕` 部分/桩局限 · `〔✗〕` 无测试 · `〔n/a〕` 静态/流程。
 > **维护闭环**：任何 UI 批次 = 代码 + 本册条目 + 测试 三件套；删改测试必须先改条目；
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
+>
+> **覆盖率（自动校验）**：共 207 条 · ✓178 · ◐27 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -242,7 +244,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C4.I1 切换角色互斥；按角色记忆节点/实例选择，切回自动恢复 —— R-LAT-1 〔test_pipeline_tree_role_radio_total_and_scoped_nodes〕
 - C4.I2 全选节点/全选实例为 toggle：未全选显示「全选*」，全选后变「清空*」 —— R-LAT-17 〔test_tree_toggle_buttons〕
 - C4.I3 全部清空：清节点与实例并**自动开启总计/总览** —— R-LAT-17 〔test_clear_all_auto_enables_total, test_tree_group_select_buttons〕
-- C4.I4 参数组筛选隐藏不在该 combo 的实例；被隐藏实例处于选中态时选中集回落「总体」 —— R-INST-2 〔◐ 仅 combo 点击被覆盖〕
+- C4.I4 参数组筛选隐藏不在该 combo 的实例；被隐藏实例处于选中态时选中集回落「总体」 —— R-INST-2 〔test_combo_hidden_client_falls_back〕
 - C4.I5 对象条横向滚动位置从顶部开始（切换 size/renderAll 后不残留旧滚动） —— R-LAT-1 〔test_objtree_strip_scrolls_from_top〕
 - C4.B1 树行点击失效（onclick 绑错元素/重渲染丢事件） —— DR-27 〔test_tree_group_select_buttons〕
 - C4.B2 角色行残留/节点重复行（角色化 key 未去重） —— DR-29 〔test_pipeline_tree_role_radio_total_and_scoped_nodes〕
@@ -276,7 +278,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C6.V2 粒度档：自适应固定最左、不可用档隐藏、tooltip 标注折叠方案；当前档失效回落自适应 —— R-LAT-2 〔test_tier_buttons_and_ladder, test_tier_policy_by_span〕
 - C6.I1 时延曲线选择 = 指标 toggle + 全选/清空（清空保底 avg，防空图） —— R-LAT-3 〔test_latency_metric_select_all_clear〕
 - C6.I2 「队列等待」默认不展示 —— R-LAT-3 〔test_a06_metric_list_locked_to_spec〕
-- C6.I3 重置视图：恢复默认档位与缩放窗口 —— R-LAT-2 〔✗〕
+- C6.I3 重置视图 = 时间轴回 0..100、y 倍率回 1x（不改档位/选择；档位由「自适应」按钮恢复） —— R-LAT-2 〔test_reset_view_restores_zoom〕
 - C6.D1 分桶常量前后端一致：59 / 8192 / 2048 / 4096 —— R-LAT-2 〔test_tier_policy_by_span, test_adaptive_tier_folds_time_buckets〕
 - C6.B1 等样本桶已删除（只有时间片桶 + 自适应折叠） —— DR-? 〔test_tier_policy_by_span〕
 - C6.B2 嵌套 `.toolbar` margin 未清 → 按钮整体上移/错行 —— R-LAT-13 〔◐〕
@@ -369,8 +371,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C14.V6 分桶策略与端到端一致（span/s∈[59,8192] 且 ≥ftier；自适应默认） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
 - C14.V7 空态：无对象/旧产物/对象未内嵌各有明确文案 —— R-TRACE-12 〔◐〕
 - C14.I1 **维度联动**：单对象可阶段多选；单阶段可对象多选；多选一侧时另一侧自动收敛为单选 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
-- C14.I2 阶段行 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔✗〕
-- C14.I3 右侧固定槽位标签（无引线）+ 悬浮压暗聚焦（与端到端同构） —— R-TRACE-12 〔✗〕
+- C14.I2 阶段行 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔test_trace_stage_row_all_clear〕
+- C14.I3 右侧固定槽位标签（无引线）+ 悬浮压暗聚焦（与端到端同构） —— R-TRACE-12 〔test_trace_curve_fixed_labels_and_focus〕
 - C14.I4 点击绘图区任意位置开框（含空白），内容为格式化时间 + 各序列值 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
 - C14.I5 粒度档/重置/缩放/平移与端到端同构（含 y 滑块） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
 - C14.B1 tooltip 落回原始毫秒时间戳（无 formatter） —— DR-29 〔test_tooltip_click_anywhere_opens〕
@@ -389,6 +391,72 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C15.B1 图例 solo 依赖事件回传状态会误判（点击已 solo 项被当成「全隐」）；用自身 solo 状态机 + 防重入锁 —— DR-29 〔test_slow_tracking_ranked_colors_and_legend_solo〕
 - C15.B2 灰阶阶段色导致相邻阶段无法区分 —— DR-29 〔test_trace_cards_stack_and_breakdown_js〕
 
+### C16 错误与异常
+
+- C16.V1 按**写路径 → 读路径**平铺（basic 单块）；每块为「节点 → 客户端」两级表：节点汇总行（实例数/总数/失败/状态码前 3）+ 客户端行（总数/失败/状态码明细） —— R-ERR-1 〔test_errors_split_by_role_and_client〕
+- C16.V2 保留首错误原文摘录（≤16KB）与全局「状态分布」；无错误显示「无错误」 —— R-ERR-1 〔◐〕
+- C16.V3 异常窗口列表（≤100）：时刻 + 类型（错误突发/时延突增）+ 数值 + **归属（角色 · 节点 · 实例）** —— R-ERR-2 〔◐〕
+- C16.I1 状态码按次数降序，取前 3 个显示（`503×3 / 500×1`） —— R-ERR-1 〔test_errors_split_by_role_and_client〕
+- C16.D1 reduce 保留 per-client errors 直方图（不再只合并为全局） —— R-ERR-1 〔test_errors_split_by_role_and_client〕
+- C16.D2 异常窗口按 (时刻, 类型, 节点) 去重并携带归属 —— R-ERR-2 〔◐〕
+- C16.B1 全局错误地图丢失节点/客户端精度 —— DR-29 〔test_errors_split_by_role_and_client〕
+- C16.B2 异常窗口时刻的时区错位（节点 UTC vs 宿主 CST） —— DR-18 〔test_slowest_ts_epoch_matches_buckets〕
+
+### C17 实例与日志现场（合并卡）
+
+- C17.V1 节点树：节点行可展开/收起 → 客户端行；同一节点内 **writer 在前、reader 在后** —— R-INST-1 〔test_client_site_tree_readonly_rows, test_client_site_contribution_and_writer_first〕
+- C17.V2 列 = 角色 / 节点 / 客户端 / 总数 / 成功 / 失败 / 日志 + **对慢点追踪的贡献**（Top-N 条数） —— R-INST-1 〔test_client_site_header_and_columns, test_client_site_contribution_and_writer_first〕
+- C17.V3 无 C++ trace 时「贡献」整列隐藏 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
+- C17.V4 日志列 = 大小 · 文件名（CSS 截断），title = 远程全路径 —— R-INST-1 〔✗〕
+- C17.V5 不再展示性能指标（avg/p50/p99/队列等待） —— R-INST-1 〔test_client_site_header_and_columns〕
+- C17.V6 「节点与登录现场」小节：节点汇总 + 登录命令 + 非客户端产物（glog/monitor）索引 —— R-SRC-1 〔◐〕
+- C17.I1 客户端行只读（无点击/不叠加曲线）；仅节点行可点击展开 —— R-INST-3 〔test_client_site_tree_readonly_rows〕
+- C17.I2 节点行展开状态跨重渲染保持（clientOpen 记忆） —— R-INST-1 〔◐〕
+- C17.D1 贡献 = 该客户端（名称/pod）在慢点追踪 Top-N 中的条数 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
+- C17.B1 性能指标列残留（旧 13 列表格） —— DR-29 〔test_client_site_header_and_columns〕
+- C17.B2 实例表点击曾叠加主图曲线 —— R-INST-3 〔test_client_site_tree_readonly_rows〕
+
+### C18 节点监控（内存 / URMA）
+
+- C18.V1 三图：宿主内存（mem.host）/ 进程 RSS（mem.proc）/ URMA 端口流量（urma.flits）；标题后缀 —— R-MON-1 〔test_render_new_charts_structure, test_render_scenario_has_monitor_card〕
+- C18.V2 部分缺失分支：URMA 无数据不留空占位、标题与图注同步 —— R-MON-4 〔test_b06_monitor_card_partial_missing〕
+- C18.V3 进程 RSS 增幅排序、疑似泄露标记 —— R-MON-2/3 〔test_monitor_proc_growth_sorted〕
+- C18.V4 无监控数据整卡隐藏 —— R-MON-1 〔test_render_scenario_without_monitors_hides_card〕
+- C18.D1 监控时间窗与主图对齐（reduce 按 t0/t1 切片） —— R-MON-1 〔test_reduce_monitors_window_slice〕
+- C18.D2 URMA 计数器回绕/重置不产生尖峰 —— R-MON-3 〔test_urma_counter_wrap_and_reset_no_spike〕
+- C18.D3 产物下采样有界（compact_monitors） —— R-MON-1 〔test_compact_monitors_downsamples〕
+- C18.I1 图表 tooltip 同构（悬浮指针 / 点击开框） —— R-SHELL-14 〔◐ 通用 tooltip 测试仅覆盖主图族〕
+- C18.B1 监控卡在页脚之后（曾被追加到 body 末尾） —— R-SHELL-15 〔test_section_order_and_footer_note〕
+
+### C19 overview.html（run 总览）
+
+- C19.V1 每配置一卡 + 单元链接（`report/<unit>/report.html`） —— R-OV-1/3 〔test_render_overview, test_overview_groups_units_per_config〕
+- C19.V2 跨单元聚合口径：计数求和、分位数取最差单元、注明单元数 —— R-OV-2 〔test_overview_sums_all_data_sizes〕
+- C19.V3 节点日志量卡（节点/客户端数/字节） —— R-OV-1 〔test_render_overview〕
+- C19.V4 监控摘要随 run 展示 —— R-MON-1 〔test_overview_shows_monitor_summary〕
+- C19.I1 单元链接新标签打开 —— R-OV-3 〔test_overview_links_open_new_tab〕
+- C19.I2 相对链接在 WebUI raw 模式下改写为 /api/file（`..` 逐级解析，不裁前缀） —— R-OV-3 〔test_render_overview_has_rel_base_and_adapter, test_adapter_resolves_parent_relative_links〕
+- C19.B1 链接被 `slice(3)` 裁掉 `../` → 404 —— R-OV-3 〔test_adapter_resolves_parent_relative_links〕
+
+### C20 跨切面（排版 / 数据口径 / 工程约束）
+
+- C20.V1 全站字号 ≥12px（无微字幕） —— DR-24 〔test_report_has_no_micro_captions_and_tiny_fonts〕
+- C20.V2 正文/标题文本对比度 ≥4.5:1（亮暗两套） —— C-5 〔test_b04_text_contrast_c5〕
+- C20.V3 数字 `tabular-nums`；时延 `fmtUs` 自适应 µs/ms/s —— R-SHELL-10 〔test_a16_theme_and_numeric_css, test_a17_fmt_us_adaptive_units〕
+- C20.V4 中文全角标点、省略号 `…`、中英混排保留技术词 —— 设计基调 〔◐〕
+- C20.V5 卡片仅 1px 描边或底色区分（无阴影/渐变/装饰图形） —— 设计基调 〔test_c01_dr24_alignment_lock〕
+- C20.V6 章节顺序与标题：SDK → 错误与异常 → 实例与日志现场 → 监控 → 页脚 —— R-SHELL-15 〔test_section_order_and_footer_note, test_section_order_and_renames〕
+- C20.V7 body 卡片层级完整（`div` 闭合平衡） —— 模板架构 〔test_body_div_balance_cards_inside_wrap〕
+- C20.D1 正确性口径：总计=同桶按请求数加权平均、max 取最大、直方图全量合并、离群剔除口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕
+- C20.D2 跨节点时间戳：当前用绝对秒 + 节点时区归一；相对秒 + 编排机参考钟为欠账 —— V-6 〔◐ test_slowest_ts_epoch_matches_buckets〕
+- C20.D3 data.js 规模与嵌入预算（对象/档位/行预算） —— R-SHELL-2 〔test_objects_and_budget_trimming, test_long_run_embed_tier_and_datajs_finer〕
+- C20.I1 单区块异常隔离（`safe()`），其余区块正常渲染 —— R-SHELL-8 〔test_a14_safe_isolation_single_block〕
+- C20.B1 单文件自包含/零外部请求/纯标准库 —— R-SHELL-1 〔test_render_self_contained_and_data_js, test_a15_report_stdlib_only〕
+- C20.B2 死 CSS 回潮（`.gkv/.gtick/.tb-sep` 等） —— DR-24 〔test_c01_dr24_alignment_lock〕
+- C20.B3 SSR 冒烟兜底：桩环境测不出的真实渲染异常（markLine undefined 杀整页） —— DR-18 〔test_real_echarts_render_smoke〕
+- C20.B4 大范围删改前必须 grep 引用（曾两次误删相邻函数/测试基建） —— 工程流程 〔n/a〕
+- C20.B5 测试改名/删除必须同步本规则册（由完整性检查拦截） —— 工程流程 〔test_skill_rulebook_integrity〕
+
 ## 模板架构规范
 
 - 共享：`_PAGE_CSS`、`_APP_JS`、`_PAGE_ADAPTER_JS`、外壳 `_page_html()`、以及各区块片段常量（`_SEC_*`）。
@@ -399,7 +467,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ## 验证流程（改完必过）
 
-1. `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY python3 -m pytest webui/tests -q`（全绿）
+1. `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY python3 -m pytest webui/tests -q`（全绿）；其中 `-k rulebook_integrity` 校验规则册 ID/测试引用/覆盖率汇总一致
+1b. **改代码前先 `grep` 引用**：大范围删改（splice/区域替换）前确认目标区间内没有其它函数/测试（曾两次误删相邻实现与测试基建）
 2. `python3 -c "import report; open('/tmp/a.js','w').write(report._APP_JS)"` + `node --check /tmp/a.js`
 3. 真实 ECharts SSR：`python3 /tmp/opencode/real_render.py <report.html> | timeout 90 node`（`MOUNT_FAIL/TOTAL` 检查）
 4. 真实浏览器截图（Windows Edge headless：`--headless=new --virtual-time-budget=6000 --window-size=1400,5200`），必要项交互可用注入脚本点击后截图；至少检查 1000px 与 1400px 两种宽度
@@ -416,4 +485,5 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - [ ] 图例固定、滑块无描边、端点标签不越界不重叠
 - [ ] 标题无括号注记；指标名 avg/max；说明文字极简且与行为一致
 - [ ] basic/pipeline 模板选择正确（标记注释与标题徽记）
+- [ ] 规则册条目与测试同步（新增/变更行为先改 C* 条目；`rulebook_integrity` 绿）
 - [ ] pytest / node --check / SSR / 截图 / 8500 全部通过

@@ -929,6 +929,97 @@ if (!errs.length) {
   out.clients_text = textOf(getEl("clients"));
   out.sources_text = textOf(getEl("sources"));
 
+  if (process.argv.includes("--reset-view")) {
+    try {
+      const c = chartRefs.mainchart;
+      const n0 = ((c && c.__acts) || []).length;
+      const rb = getEl("resetBtn");
+      if (rb && rb.onclick) rb.onclick();
+      out.reset_actions = ((c && c.__acts) || []).slice(n0);
+      out.reset_cap = textOf(getEl("zsliderCap"));
+    } catch (e) { errs.push("reset-view: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--trace-stage-all")) {
+    try {
+      const series = function () {
+        const a = charts.tchart || [];
+        const o = a.length ? a[a.length - 1] : null;
+        return ((o && o.series) || []).map(function (x) { return x.name; });
+      };
+      out.tstage_before = series();
+      const allb = findBtn(getEl("stageBtns"), "全选");
+      if (allb && allb.onclick) allb.onclick();
+      out.tstage_all = series();
+      const clrb = findBtn(getEl("stageBtns"), "清空");
+      if (clrb && clrb.onclick) clrb.onclick();
+      out.tstage_clear = series();
+    } catch (e) { errs.push("trace-stage-all: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--tchart-labels")) {
+    try {
+      // 先点第二个阶段 chip → 两条序列（多阶段模式）
+      const chips = (getEl("stageBtns").children || []).filter(function (b) {
+        return b && b.onclick && b.className !== "mini";});
+      if (chips[1] && chips[1].onclick) chips[1].onclick();
+      const ov = getEl("tEndlabels");
+      const labels = (ov.children || []).filter(function (c) {
+        return String(c.className || "").indexOf("endlabel") >= 0;});
+      out.tlabel_texts = labels.map(function (c) { return textOf(c); });
+      out.tlabel_classes = labels.map(function (c) {
+        return String(c.className || "");});
+      out.tlabel_leader = (ov.children || []).filter(function (c) {
+        return String(c.className || "").indexOf("endleader") >= 0;}).length;
+      const series = function () {
+        const a = charts.tchart || [];
+        const o = a.length ? a[a.length - 1] : null;
+        return ((o && o.series) || []).map(function (x) {
+          return (x.lineStyle || {}).opacity;});
+      };
+      if (labels[0] && labels[0].onmouseenter) {
+        labels[0].onmouseenter();
+        out.tlabel_dims = series();
+        if (labels[0].onmouseleave) labels[0].onmouseleave();
+        out.tlabel_restored = series();
+      }
+    } catch (e) { errs.push("tchart-labels: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--combo-fallback")) {
+    try {
+      const sel = function () {
+        return (sandbox.window && sandbox.window.__MC_SEL)
+          ? sandbox.window.__MC_SEL() : [];
+      };
+      // 先展开第一个节点，让客户端行出现
+      (function walk(n) {
+        let done = false;
+        (function go(n) {
+          if (done || !n) return;
+          (n.children || []).forEach(function (c) {
+            if (done) return;
+            if (String(c.className || "").indexOf("tree-caret") >= 0 &&
+                c.onclick) { c.onclick(); done = true; return; }
+            go(c);
+          });
+        })(n);
+      })(getEl("objTree"));
+      let clicked = false;
+      (function walk(n) {
+        if (clicked || !n) return;
+        (n.children || []).forEach(function (c) {
+          const k = c.getAttribute && c.getAttribute("data-key");
+          if (k && k.indexOf("client:") === 0 && c.onclick) {
+            c.onclick(); clicked = true; return;
+          }
+          walk(c);
+        });
+      })(getEl("objTree"));
+      out.combo_sel_before = sel();
+      const btns = (getEl("comboBtns").children || []);
+      const target = btns[btns.length - 1];
+      if (target && target.onclick) target.onclick();
+      out.combo_sel_after = sel();
+    } catch (e) { errs.push("combo-fallback: " + String(e && e.stack || e)); }
+  }
   if (process.argv.includes("--endlabels")) {
     try {
       const top = 52, bot = 350;
