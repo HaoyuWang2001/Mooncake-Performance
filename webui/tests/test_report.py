@@ -431,9 +431,9 @@ def test_render_trace_section(tmp_path):
     assert 'id="tsizeSel"' not in src
     assert 'id="tstackchart"' in src
     assert 'id="nodeModal"' not in src
-    assert "分级时延" in src and "阶段树" in src
+    assert "分级时延块图（trace）" in src and "分级时延曲线（trace）" in src
     assert "残差（total − 阶段和）" in src
-    assert "最慢请求" in src
+    assert "慢点追踪（trace）" in src
     # embedded data carries the trace block
     import re as _re
     emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
@@ -1743,15 +1743,18 @@ def test_trace_cards_stack_and_breakdown_js(tmp_path):
     assert res["errors"] == []
     # 本批删除「指标概览」卡（段1 已给一眼指标；此处关注阶段耗时）
     assert not (res.get("tcards_kids") or []), res.get("tcards_kids")
-    # 堆叠图：stack + 全灰阶（r=g=b）
+    # 堆叠图：stack + 阶段彩色（每个阶段不同颜色，不再是灰阶）
     series = res["tstack_series"]
     assert series and all(s["stack"] == "stage" for s in series)
+    cols = []
     for s in series:
         h = (s["color"] or "").lstrip("#")
         assert len(h) == 6, s
-        rgb = [int(h[i:i + 2], 16) for i in (0, 2, 4)]
-        # 灰阶（主题灰是暖灰，允许极小通道差）
-        assert max(rgb) - min(rgb) <= 16, (rgb, s)
+        cols.append(h)
+    assert len(set(cols)) == len(cols), cols      # 阶段之间颜色互不相同
+    def _rgb(h):
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    assert any(max(_rgb(c)) - min(_rgb(c)) > 20 for c in cols), cols
     assert res["tstack_cats"] and res["tstack_cats"] >= 1
     # 展开行：残差 + 多个主要原因的二级展开（该请求自己的组）
     t = res["tbreak_text"]
@@ -2457,6 +2460,35 @@ def test_trace_curve_dimension_coupling(tmp_path):
     # 块图对象选择器 / 曲线指标按钮
     assert "总计" in (res.get("block_opts") or []), res.get("block_opts")
     assert res.get("curve_metrics") == ["均值", "最大"], res.get("curve_metrics")
+
+
+def test_slow_tracking_ranked_colors_and_legend_solo(tmp_path):
+    """慢点追踪：按时延降序、阶段彩色、图例 solo 切换、表展开无 total。
+    """
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--slow-tracking")
+    if res is None:
+        return
+    assert res["errors"] == []
+    tots = res.get("stack_totals") or []
+    assert len(tots) >= 2, tots
+    for i in range(1, len(tots)):
+        assert tots[i - 1] + 1e-6 >= tots[i], tots      # 降序
+    names = res.get("stack_names") or []
+    assert len(set(names)) == len(names), names        # 阶段名唯一
+    # 图例 solo：点某阶段 -> 只剩它；再点 -> 全部恢复
+    solo = res.get("legend_solo") or {}
+    assert solo.get(names[0]) is True, solo
+    assert all(solo.get(n) is False for n in names[1:]), solo
+    rest = res.get("legend_restored") or {}
+    assert rest and all(rest.values()), rest
+    # 表格展开：紧凑块图，无 total 根行
+    assert "compact" in (res.get("detail_cls") or ""), res.get("detail_cls")
+    rows = res.get("detail_rows") or []
+    assert rows, res.get("detail_rows")
+    assert all("root" not in c for c in rows), rows
 
 
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):

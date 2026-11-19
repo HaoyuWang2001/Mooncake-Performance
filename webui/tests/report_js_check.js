@@ -837,6 +837,60 @@ if (!errs.length) {
       out.curve_metrics = (cm.children || []).map(function (b) { return b._text; });
     } catch (e) { errs.push("trace-dims: " + String(e && e.stack || e)); }
   }
+  if (process.argv.includes("--slow-tracking")) {
+    try {
+      const seq = charts.tstackchart || [];
+      const o = seq.length ? seq[seq.length - 1] : null;
+      out.stack_names = ((o && o.series) || []).map(function (x) {
+        return x.name;});
+      const totals = [];
+      ((o && o.series) || []).forEach(function (x) {
+        (x.data || []).forEach(function (v, i) {
+          totals[i] = (totals[i] || 0) + (Number(v) || 0);
+        });
+      });
+      out.stack_totals = totals;
+      // 图例 solo：模拟 ECharts 点击后「只剩被点项」的状态
+      const c = chartRefs.tstackchart;
+      const hs = (c && c.__h && c.__h.legendselectchanged) || [];
+      const names = out.stack_names;
+      const clicked = names[0];
+      const after = {};
+      names.forEach(function (n) { after[n] = (n === clicked); });
+      hs.forEach(function (fn) { fn({name: clicked, selected: after}); });
+      const o2 = (charts.tstackchart || []).slice(-1)[0] || {};
+      out.legend_solo = (o2.legend && o2.legend.selected) || null;
+      // 再次点击（此时它是唯一选中 → 恢复全部）
+      const after2 = {};
+      names.forEach(function (n) { after2[n] = false; });
+      hs.forEach(function (fn) { fn({name: clicked, selected: after2}); });
+      const o3 = (charts.tstackchart || []).slice(-1)[0] || {};
+      out.legend_restored = (o3.legend && o3.legend.selected) || null;
+      // 表格展开：点击第一行，检查紧凑块图（无 total 根行）
+      const tb = getEl("ttop");
+      const tbody = (tb.children || []).find(function (c) {
+        return String(c.tagName || "").toLowerCase() === "tbody";}) ||
+        (tb.children || [])[1];
+      const body = tbody || getEl("#ttop tbody");
+      const tr0 = (body.children || [])[0];
+      if (tr0 && tr0.onclick) {
+        tr0.onclick();
+        const detail = (body.children || [])[(body.children || []).length - 1];
+        const td = detail && (detail.children || [])[0];
+        const sbrk = td && (td.children || [])[0];
+        out.detail_cls = sbrk ? String(sbrk.className || "") : "";
+        const rows = [];
+        (function walk(n) {
+          (n.children || []).forEach(function (c) {
+            if (String(c.className || "").indexOf("lvl-row") >= 0)
+              rows.push(String(c.className || ""));
+            walk(c);
+          });
+        })(sbrk || getEl("none"));
+        out.detail_rows = rows;
+      }
+    } catch (e) { errs.push("slow-tracking: " + String(e && e.stack || e)); }
+  }
   if (process.argv.includes("--qps-colors")) {
     try {
       const q=charts.qpschart||[];

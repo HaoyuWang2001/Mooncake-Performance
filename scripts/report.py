@@ -34,6 +34,7 @@ import logstats as ls   # noqa: E402  (histogram ladder + percentile shared)
 EMBED_SECONDS_MAX = 86400        # ≤1 天：1s 桶内嵌；否则内嵌 1min
 SCATTER_MAX_POINTS = 200000      # per-client raw scatter cap (small runs)
 TOPK_DEFAULT = 20
+TRACE_TOP_N = 100            # 慢点追踪 Top-N（后续可调 1000：map 侧 --top-n 同步）
 TRACE_EMBED_POINTS = 192     # 节点/实例阶段桶嵌入抽稀点数（总计不抽稀）
 TRACE_EMBED_ROWS = 60000     # 节点/实例阶段行嵌入预算（超出留 data.js）
 
@@ -1074,7 +1075,7 @@ def reduce_trace_size(trace_list):
     for _e in tops:
         _e["ts_epoch"] = _node_ts_epoch(_e.get("start_time"))
     tops.sort(key=lambda e: -float(e.get("total_us") or 0))
-    return {"meta": metad, "groups": groups, "top": tops[:100],
+    return {"meta": metad, "groups": groups, "top": tops[:TRACE_TOP_N],
             "clients": clients, "objects": objects,
             "object_total": len(objects)}
 
@@ -1555,6 +1556,14 @@ overflow:hidden;text-overflow:ellipsis;min-width:0}
 .lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 6px}
 .sbrk{padding:10px 0 4px;width:min(100%,1250px)}
 .sbrk .lvl-row{margin-bottom:6px}
+/* 慢点追踪表格展开：去 total、单行压缩、横向滚动 */
+.sbrk.compact{padding:4px 0 2px;width:100%}
+.sbrk.compact .lvl-row{margin-bottom:3px}
+.sbrk.compact .lvl-blk{flex-direction:row;align-items:baseline;gap:5px;
+padding:2px 6px;border-radius:3px}
+.sbrk.compact .lvl-name,.sbrk.compact .lvl-val{font-size:12px;
+font-weight:600;opacity:.95}
+.sbrk.compact .lvl-note{font-size:12px;margin:2px 0}
 .focus-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 .focus-empty{color:var(--mut);font-size:12.5px}
 /* 阶段树（F5 Tick Rows 语法） */
@@ -5219,14 +5228,15 @@ function renderTreeDetail(cur){
     box.appendChild(b);
   }
 }
-function stageBreakdownRow(r){
+function stageBreakdownRow(r,opts){
+  opts=opts||{};
   /* 单请求「完整」分级时延：
      - 第一行 = 树序全部 L1（含 0/缺失，便于判断其他部分是否正常）+ 残差
      - 其后：每个「有二级子区间且值>0」的 L1 各一行二级展开（含未归因）；
        按占比降序排列（可能有多个主要原因同时展开）
      - 每块 tooltip 附全局均值与倍率（本次值 vs 全局 avg）
      - 压缩：小号灰标签 + 块行横向滚动（.lvl-row）+ 悬浮细节（tooltip） */
-  const wrap=el('div','sbrk');
+  const wrap=el('div','sbrk'+(opts.compact?' compact':''));
   const total=Number(r.total_us)||0;
   const stages=r.stages||{};
   function stAvg(cur,k){
@@ -5287,7 +5297,7 @@ function stageBreakdownRow(r){
       });
     const ssum=items.reduce(function(a,b){return a+b.v;},0);
     items.push({key:'residual',label:'残差',v:Math.max(0,total-ssum)});
-    wrap.appendChild(blockRow(items,total,cur));
+    if(!opts.noTotal) wrap.appendChild(blockRow(items,total,cur));
     /* 全部「有二级子区间且有值」的 L1：每个都展开二级（不止一个主要原因） */
     const causes=items.filter(function(it){
       return it.key!=='residual'&&it.v>0&&
@@ -5310,17 +5320,19 @@ function stageBreakdownRow(r){
   render();
   return wrap;
 }
-let tStackChart=null;
+let tStackChart=null, tStackLegendBound=false, tStackLegendLock=false;
+let tStackSolo=null;   /* 当前被 solo 的阶段名（null=全部显示） */
 function renderTraceStack(){
-  /* 慢请求阶段构成堆叠柱：x = 各慢请求时刻（按时间排序），柱高 = 端到端时延，
-     自下而上 = 一级阶段（树序，残差最后）；灰阶 = 平均占比越大越深。 */
+  /* 慢点追踪：柱按端到端时延降序排列（x 标签=时延值，便于看出
+     1000ms/500ms 等聚集簇）；柱高=端到端时延，自下而上=一级阶段；
+     每个阶段一种颜色；图例点击=solo（只留该阶段），再点还原全部。 */
   const box=document.getElementById('tstackchart'); if(!box) return;
   const t=traceOf(); if(!t){box.style.display='none';return;}
   const g=tGroup;
   const ops=((t.groups||{})[g]||{}).ops||{};
   const rows=(t.top||[]).filter(function(r){
-    return Number(r.total_us)>0&&r.ts_epoch!=null&&ops[r.op];
-  }).sort(function(a,b){return a.ts_epoch-b.ts_epoch;});
+    return Number(r.total_us)>0&&ops[r.op];
+  }).sort(function(a,b){return Number(b.total_us)-Number(a.total_us);});
   if(!rows.length){box.style.display='none';return;}
   box.style.display='';
   if(!tStackChart) tStackChart=echarts.init(box);
@@ -5337,30 +5349,14 @@ function renderTraceStack(){
       ?Math.max(0,(Number(r.total_us)||0)-l1sum(r))
       :(Number((r.stages||{})[k])||0);
   }
-  const sums={};
-  keys.forEach(function(k){
-    sums[k]=rows.reduce(function(a,r){return a+valOf(r,k);},0);});
-  const ranked=keys.slice().sort(function(a,b){
-    return (sums[b]||0)-(sums[a]||0);});
-  const ramp=LF_DARK
-    ?['#F0EFEB','#DCDAD2','#C9C7BD','#B3B0A4','#8F8E88','#6A6963','#4A4944']
-    :['#2A2926','#4A4944','#6E6D66','#8F8E86','#A5A49C','#B5B4AC','#C9C7BD'];
-  const colOf={};
-  ranked.forEach(function(k,i){
-    colOf[k]=ramp[Math.min(ramp.length-1,
-      Math.round(i*(ramp.length-1)/Math.max(1,ranked.length-1)))];});
-  function clockOf(r){
-    const ep=Number(r.ts_epoch);
-    if(!isFinite(ep)) return String(r.start_time||'').slice(11,19)||'';
-    const d=new Date(ep*1000);
-    const p=function(n){return (n<10?'0':'')+n;};
-    return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
-  }
-  const cats=rows.map(clockOf);
+  const names=keys.map(function(k){
+    return k==='residual'?'残差':k;});
+  const cats=rows.map(function(r){return fmtUs(r.total_us);});
   const o=axisCommon();
   o.grid={left:64,right:24,top:38,bottom:36};
   o.legend={top:0,type:'scroll',icon:'roundRect',itemWidth:14,itemHeight:3,
-    itemGap:14,textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
+    itemGap:14,selectedMode:true,
+    textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
   o.tooltip=lfTooltip({trigger:'axis',axisPointer:{type:'shadow'},
     formatter:function(ps){
       if(!ps||!ps.length) return '';
@@ -5368,7 +5364,9 @@ function renderTraceStack(){
       const wl=(r.ts_epoch!=null)?fullts(r.ts_epoch)
         :String(r.start_time||'');
       const lines=[wl+' · '+String(r.op||'')+
-        '<br>端到端 '+fmtUs(r.total_us)];
+        '<br>端到端 '+fmtUs(r.total_us)+
+        ((r.node||r.pod)?('<br>'+(r.node||'')+' · '+
+          (r.pod||r.client||'')):'')];
       ps.forEach(function(p){
         const v=Number(p.value)||0;
         if(v>0) lines.push(p.marker+String(p.seriesName)+' '+fmtUs(v));
@@ -5377,16 +5375,40 @@ function renderTraceStack(){
     }});
   o.xAxis={type:'category',data:cats,axisLine:{show:false},
     axisTick:{show:false},splitLine:{show:false},
-    axisLabel:{color:C.mut,fontSize:12,fontWeight:600,fontFamily:LFFONT,
-      interval:Math.max(0,Math.floor(cats.length/10)),rotate:0}};
+    axisLabel:{color:C.mut,fontSize:12,fontFamily:LFFONT,
+      interval:Math.max(0,Math.floor(cats.length/12)),rotate:0}};
   o.yAxis=[lfAxisValue({name:'µs',scale:true,nameLocation:'end',nameGap:12})];
   o.dataZoom=[];
-  o.series=keys.map(function(k){
+  o.series=keys.map(function(k,i){
     return {name:(k==='residual'?'残差':k),type:'bar',stack:'stage',
-      barMaxWidth:12,itemStyle:{color:colOf[k]},
+      barMaxWidth:12,itemStyle:{color:stageColor(i)},
       data:rows.map(function(r){return valOf(r,k);})};
   });
   tStackChart.setOption(o,true);
+  if(!tStackLegendBound){
+    tStackLegendBound=true;
+    try{
+      tStackChart.on('legendselectchanged',function(ev){
+        if(tStackLegendLock) return;
+        const all=names.slice();
+        const clicked=String((ev&&ev.name)||'');
+        if(!clicked) return;
+        const target={};
+        if(tStackSolo===clicked){
+          /* 再次点击同一图例：恢复全部阶段 */
+          all.forEach(function(n){target[n]=true;});
+          tStackSolo=null;
+        }else{
+          /* 点击其他图例：只保留该阶段 */
+          all.forEach(function(n){target[n]=(n===clicked);});
+          tStackSolo=clicked;
+        }
+        tStackLegendLock=true;
+        try{ tStackChart.setOption({legend:{selected:target}}); }catch(e){}
+        tStackLegendLock=false;
+      });
+    }catch(e){}
+  }
 }
 function renderTraceTop(cur){
   const tb=document.querySelector('#ttop tbody'); if(!tb) return;
@@ -5409,7 +5431,7 @@ function renderTraceTop(cur){
         if(!detail){
           detail=el('tr');
           const td=el('td'); td.colSpan=10;
-          td.appendChild(stageBreakdownRow(r));
+          td.appendChild(stageBreakdownRow(r,{noTotal:true,compact:true}));
           detail.appendChild(td);
         }
         tr.parentNode.insertBefore(detail,tr.nextSibling);
@@ -5742,16 +5764,17 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 <div class="ttree" id="ttree"></div>
 <div class="tdetail" id="tdetail"></div>
 </div>
-<h3 class="sec" title="Top-100，点击行展开全链路时延及占比">最慢请求</h3>
-<div class="sub">慢请求阶段构成：柱高 = 端到端时延，自下而上 = 一级阶段；
-灰阶 = 各阶段平均占比越大越深</div>
+<h3 class="sec" title="按端到端时延降序（Top-N），点击行展开该请求的阶段构成">慢点追踪（trace）</h3>
+<div class="sub">柱按端到端时延从最慢到较慢排列（横轴标签=时延值，可看出聚集簇）；
+柱高=端到端时延，自下而上=一级阶段；每个阶段一种颜色；点击图例只保留该阶段，
+再点还原全部。</div>
 <div id="tstackchart" class="chart" style="height:210px" role="img" aria-label="慢请求阶段构成堆叠直方图"></div>
 <div class="wrapx"><table id="ttop"><thead><tr>
 <th>start_time</th><th>trace_id</th><th>key</th><th>op</th><th>状态</th>
 <th>节点</th><th>实例</th>
 <th class="n">size</th><th class="n">total (µs)</th><th>主要阶段</th>
 </tr></thead><tbody></tbody></table></div>
-<div class="note">说明：① 采样门控——主行仅在采样命中或失败时出现；② put/upsert 的
+<div class="note">说明：① 慢点表 Top-N（当前 100）按端到端时延降序；② 采样门控——主行仅在采样命中或失败时出现；③ put/upsert 的
 memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total_us 为全部副本合计）；
 ③ `-1` 表示该阶段拿不到时间戳（不参与时延统计）；④ slice 明细行 P1 仅计数。</div>
 </div>
