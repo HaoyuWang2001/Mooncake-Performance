@@ -184,6 +184,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 状态：`〔test_<name>〕` 已锁 · `〔◐ 说明〕` 部分/桩局限 · `〔✗〕` 无测试 · `〔n/a〕` 静态/流程。
 > **维护闭环**：任何 UI 批次 = 代码 + 本册条目 + 测试 三件套；删改测试必须先改条目；
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
+> **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
 > **覆盖率（自动校验）**：共 207 条 · ✓178 · ◐27 · ✗1 · n/a1
 
