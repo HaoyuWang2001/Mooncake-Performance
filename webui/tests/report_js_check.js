@@ -464,6 +464,14 @@ if (!errs.length) {
   const _qo = _qseq.length ? _qseq[_qseq.length - 1] : null;
   out.qps_markarea = (_qo && _qo.series && _qo.series[0] &&
     _qo.series[0].markArea && _qo.series[0].markArea.data) || null;
+  out.qps_meta = ((_qo && _qo.series) || []).map(function (s) {
+    const d = s.data || [];
+    return {name: s.name, type: s.type, width: s.barMaxWidth,
+            x0: d.length ? d[0][0] : null,
+            color: (s.itemStyle || {}).color,
+            radius: (s.itemStyle || {}).borderRadius};
+  });
+  out.qps_legend_data = (_qo && _qo.legend && _qo.legend.data) || null;
   out.qps_colors = ((_qo && _qo.series) || []).map(function (s) {
     return { name: s.name, color: (s.itemStyle || {}).color };
   });
@@ -1098,6 +1106,13 @@ if (!errs.length) {
       const o=q.length?q[q.length-1]:null;
       out.qps_obj_colors=((o&&o.series)||[]).map(function(x){
         return {name:x.name,color:(x.itemStyle||{}).color};});
+      out.qps_meta=((o&&o.series)||[]).map(function(x){
+        const d=x.data||[];
+        return {name:x.name,type:x.type,width:x.barMaxWidth,
+          x0:d.length?d[0][0]:null,
+          color:(x.itemStyle||{}).color,
+          radius:(x.itemStyle||{}).borderRadius};});
+      out.qps_legend_data=(o&&o.legend&&o.legend.data)||null;
     } catch (e) { errs.push("qps-colors: " + String(e && e.stack || e)); }
   }
   out.legend_selmode = (mainOpt()&&mainOpt().legend)

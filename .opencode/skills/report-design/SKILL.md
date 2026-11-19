@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 215 条 · ✓188 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 216 条 · ✓189 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -288,13 +288,14 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### C7 QPS 副图
 
-- C7.V1 双轴：QPS 柱（左）+ 失败柱（右，独立计数）；失败柱强调色 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only〕
+- C7.V1 双轴：QPS 柱（左）+ 失败柱（右，独立计数）；**多对象时 QPS 用细柱（按槽位像素宽自适应 1–3px）、同桶按槽位并排**（第 i 个对象 x 偏移 `(i-(n-1)/2)·桶距×0.8/n`，不重叠；全览桶密时必然贴拢，放大后分开）；失败柱**与所属对象同槽位对齐**（位置即归属）、统一强调橙、同宽；单对象维持 7px/3px 且不偏移 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only, test_qps_grouped_thin_bars, test_qps_single_object_bars_unchanged〕
 - C7.V2 柱色随对象：总计灰阶 / 节点色系 / 实例色阶 —— R-LAT-8 〔test_qps_bars_follow_object_colors〕
-- C7.V3 图例固定不可点；无失败显示「本次测试无失败」；副图上方无小标题 —— R-LAT-8 〔test_qps_legend_fixed_and_caption_removed〕
+- C7.V3 图例固定不可点，**只列各对象的 QPS**（失败统一橙色，不逐个列）；无失败显示「本次测试无失败」；副图上方无小标题 —— R-LAT-8 〔test_qps_legend_fixed_and_caption_removed, test_qps_grouped_thin_bars〕
 - C7.I1 x 缩放时 y 不重算（`filterMode:'none'`） —— R-LAT-8 〔test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C7.I2 主图与 QPS 缩放联动（zoomState 同步） —— R-LAT-6 〔test_a13_zoom_links_main_and_qps〕
 - C7.D1 QPS 分母 = 实测 wall_s（writer elapsed / reader notify 跨度），不是数据 span —— DR-25 〔test_measured_wall_prefers_notify_span〕
 - C7.B1 失败柱误用曲线色 / 图例点击隐藏柱 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only, test_qps_legend_fixed_and_caption_removed〕
+- C7.B2 x 轴放大时柱**画出绘图区**（越界）且多对象柱完全重叠：value 轴上 `barGap` 不生效（fail 系列 `-100%` 无意义）→ 改为显式槽位偏移 + 细柱 + 全部 `clip:true`；不再依赖带状布局 —— DR-36 〔test_qps_grouped_thin_bars, test_qps_single_object_bars_unchanged〕
 
 ### C8 缩放滑块（y 轨 / x pan）
 

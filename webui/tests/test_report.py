@@ -2914,6 +2914,47 @@ def test_label_focus_hover_restores(tmp_path):
     assert "locked" not in (res.get("lf_cls") or "")
 
 
+def test_qps_grouped_thin_bars(tmp_path):
+    """多对象 QPS：细柱（2px）按槽位并排（不重叠）；失败柱与所属对象同槽位、
+    保持强调色；图例只列对象 QPS（失败不逐个列）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--add-obj", "node:n1", "--qps-colors")
+    if res is None:
+        return
+    assert res["errors"] == []
+    meta = res.get("qps_meta") or []
+    qps = [m for m in meta if m["name"].endswith(" QPS")]
+    fails = [m for m in meta if m["name"].endswith(" 失败")]
+    assert len(qps) >= 2 and len(fails) >= 2, meta
+    assert all(1 <= m["width"] <= 3 for m in qps), qps     # 细线（1–3px 自适应）
+    xs = [m["x0"] for m in qps]
+    assert len(set(xs)) == len(xs), xs                     # 槽位错开
+    by_name = {m["name"]: m for m in qps}
+    for f in fails:
+        base = f["name"][:-3]
+        assert by_name[base + " QPS"]["x0"] == f["x0"], (f, by_name)
+    assert all((m["color"] or "").upper() == "#F5572F" for m in fails), fails
+    legend = res.get("qps_legend_data") or []
+    assert legend and all(n.endswith(" QPS") for n in legend), legend
+
+
+def test_qps_single_object_bars_unchanged(tmp_path):
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    meta = res.get("qps_meta") or []
+    qps = [m for m in meta if m["name"].endswith(" QPS")]
+    fails = [m for m in meta if m["name"].endswith(" 失败")]
+    assert qps and qps[0]["width"] == 7, qps
+    assert fails and fails[0]["width"] == 3, fails
+    assert qps[0]["radius"] == [99, 99, 0, 0], qps[0]
+    assert fails[0]["x0"] == qps[0]["x0"]                 # 单对象不加偏移
+
+
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
     """S6：QPS 副图 x 缩放不重算 y（filterMode none）；无数据窗口仅首处标注。"""
     a = _stats(tmp_path, "a.writer", "writer")

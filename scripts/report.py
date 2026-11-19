@@ -2983,10 +2983,6 @@ function bindXPan(){
 function qpsOpt(tier){
   const o=axisCommon();
   o.grid=QPS_GRID;
-  /* 图例只用于区分对象颜色：点击不得隐藏 QPS/失败柱（固定显示） */
-  o.legend={top:0,type:'scroll',icon:'roundRect',itemWidth:14,itemHeight:3,
-    itemGap:16,selectedMode:false,
-    textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
   o.tooltip=lfTooltip({trigger:'axis'});
   o.xAxis=lfAxisTime(null,'main');
   o.yAxis=[lfAxisValue({name:'QPS',scale:true,nameLocation:'end',nameGap:16}),
@@ -3000,39 +2996,59 @@ function qpsOpt(tier){
      失败柱保持强调色不变 */
   const qcolors=LF_DARK?['#8F8E88','#B3B0A4','#6A6963','#DCDAD2']
                       :['#8F8E86','#6E6D66','#A5A49C','#4A4944'];
-  let minT=null,maxT=null;
+  /* 先收集有数据的对象（决定并排槽位），再建 series */
+  const entries=[];
+  let minT=null,maxT=null,stepMs=null;
   keys.forEach(function(key,idx){
     const t=colsOf(key,tier)?tier:'cnt';
     const col=colsOf(key,t);
     if(!col||!col.t.length) return;
-    const qps=colQps(col,t);
-    const x=col.t.map(function(v){return v*1000;});
-    const nm=objLabel(key);
-    const qc=objLineColor(key)||qcolors[idx%qcolors.length];
-    o.series.push({name:nm+' QPS',type:'bar',yAxisIndex:0,clip:true,
-      barMaxWidth:7,
-      itemStyle:{color:qc,borderRadius:[99,99,0,0]},
-      z:3, data:x.map(function(v,i){return [v,qps[i]];})});
-    o.series.push({name:nm+' 失败',type:'bar',yAxisIndex:1,clip:true,
-      barMaxWidth:3,barGap:'-100%',
-      itemStyle:{color:C.hero,borderRadius:[99,99,0,0]},z:4,
-      data:x.map(function(v,i){return [v,(col.fail&&col.fail[i])||0];})});
-    if(col.t.length){
-      const t0=col.t[0], t1=col.t[col.t.length-1];
-      if(minT===null||t0<minT)minT=t0;
-      if(maxT===null||t1>maxT)maxT=t1;
+    entries.push({key:key,col:col,t:t,qps:colQps(col,t),
+      nm:objLabel(key),qc:objLineColor(key)||qcolors[idx%qcolors.length]});
+    for(let i=1;i<col.t.length;i++){
+      const d=(col.t[i]-col.t[i-1])*1000;
+      if(d>0&&(stepMs===null||d<stepMs)) stepMs=d;
     }
+    const t0=col.t[0], t1=col.t[col.t.length-1];
+    if(minT===null||t0<minT)minT=t0;
+    if(maxT===null||t1>maxT)maxT=t1;
   });
+  if(!stepMs) stepMs=1000;
+  const n=entries.length;
+  /* 槽位宽度按像素自适应：桶间距(px) 的 80% 均分给 n 个对象。
+     全览时桶密（<1px/槽）必然重叠；放大后自然分开。 */
+  const plotW=plotWidthOf(qpsChart,QPS_GRID);
+  const spanMs=Math.max(1000,(maxT===null?0:(maxT-minT)*1000));
+  const stepPx=plotW*stepMs/spanMs;
+  /* 槽内留 1px 间隙：barW = floor(槽宽)-1，clamp 1..3 */
+  const barW=n>1?Math.max(1,Math.min(3,Math.floor(stepPx*0.8/n)-1)):7;
+  const slot=n>1?stepMs*0.8/n:0;
+  const failW=n>1?barW:3;
+  const rad=n>1?0:[99,99,0,0];
+  entries.forEach(function(e,i){
+    const x=e.col.t.map(function(v){return v*1000;});
+    const off=n>1?((i-(n-1)/2)*slot):0;
+    o.series.push({name:e.nm+' QPS',type:'bar',yAxisIndex:0,clip:true,
+      barMaxWidth:barW,
+      itemStyle:{color:e.qc,borderRadius:rad},
+      z:3, data:x.map(function(v,j){return [v+off,e.qps[j]];})});
+    /* 失败柱：与所属对象的 QPS 细柱同槽位对齐（位置即对象），保持强调橙 */
+    o.series.push({name:e.nm+' 失败',type:'bar',yAxisIndex:1,clip:true,
+      barMaxWidth:failW,
+      itemStyle:{color:C.hero,borderRadius:rad},z:4,
+      data:x.map(function(v,j){return [v+off,(e.col.fail&&e.col.fail[j])||0];})});
+  });
+  /* 图例只列对象（QPS 色）；失败统一橙色，按槽位对齐辨识归属，不逐个列 */
+  o.legend={top:0,type:'scroll',icon:'roundRect',itemWidth:14,itemHeight:3,
+    itemGap:16,selectedMode:false,
+    data:entries.map(function(e){return e.nm+' QPS';}),
+    textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
   if(minT!==null) o.xAxis=lfAxisTime(xExtent(minT,maxT,
     plotWidthOf(qpsChart,QPS_GRID)),'main');
   /* 无数据窗口：QPS 为 0 的空白段看不出是「没跑」还是「挂了」，标注出来 */
   if(o.series.length){
     var qall=[];
-    keys.forEach(function(key){
-      var t=colsOf(key,tier)?tier:'cnt';
-      var cc=colsOf(key,t);
-      if(cc&&cc.t&&cc.t.length>1) qall=qall.concat(cc.t);
-    });
+    entries.forEach(function(e){ qall=qall.concat(e.col.t); });
     qall.sort(function(a,b){return a-b;});
     var qg=gapMarkArea(qall,gapThreshold(qall));
     if(qg) o.series[0].markArea=qg;
