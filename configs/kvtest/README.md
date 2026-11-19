@@ -188,8 +188,11 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
    角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口，
    若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
 3. **重建**：`python benchmark.py --rebuild-report <ts>`。失败 run 保留了
-   `samples.csv` 时，会自动先补跑 map 再重建报表（缺少运行配置时，`/start`
-   时刻用 `summary.json` 的 mtime 减去 `elapsed_seconds` 估算）。
+   `samples.csv` 时，会自动先补跑 map 再重建报表。运行期会把
+   `iid→节点/节点数/每个 size 的 /start 时刻`写进
+   `logs/<cfg>/kvtest_report_meta.json`（旁挂文件，成功后也保留），重建据此
+   恢复真实节点名与精确时间轴；该文件缺失时才回退为
+   `summary.json` 的 mtime 减去 `elapsed_seconds` 估算。
 
 报表参数卡沿用 pipeline 字段（场景/协议/工作模式/QPS/notify/操作/节点数/客户端
 总数/KV 配置名等），并标记「运行模式 = kvtest」。注意：
@@ -198,9 +201,16 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
 - 报表生成是 WARN-only，失败不影响压测结论；
 - 成功清理只删除 `summary.json`/`samples.csv`，`*.stats.json` 与
   `report/` 目录保留；
-- `notify_http` / `notify_queue_wait` 目前只有 summary 聚合值（进入 CSV），
-  请求级 HTML 图表只覆盖 writer/reader 数据接口；
-- STOP（Ctrl+C）路径不生成 kvtest 部分报表：C++ 样本在 `/stop` 时才落盘。
+- **只存在于 summary 的指标也已进 HTML**：reader 的「值校验失败」
+  （`verify_failures`，数据正确性信号）与「队列等待均/峰」
+  （`notify_queue_wait` 的 avg/max）由 map 从 `summary.json` 提升进 reader
+  角色概要；`notify_http`（通知提交/失败/平均/最大）仍只在 CSV；
+- **节点日志体积取真实日志**：stats 的 `meta.bytes` 优先用该实例
+  `log + glog` 体积（另存 `meta.samples_bytes` 为样本文件体积），
+  run 总览的“节点日志量”不再被样本 CSV 低估；
+- **STOP（Ctrl+C）也出部分报表**：中断时先向实例发 `/stop`（C++ 只在
+  这里落盘样本）、等待退出、拉回样本与 summary，再做 map-reduce；
+  报表标注 `early_stop`。收集中按 Ctrl+C 第二次仍为强制退出。
 
 kvtest 实例文件使用紧凑名称
 `kv<配置哈希>.i<instance>_p<port>.kvtest_<size>.*`。K8s Pod 全名不再进入

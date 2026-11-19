@@ -48,7 +48,7 @@ def _cfg(**over):
 
 
 def _write_instance(logs, iid, port, ds, writer_lats, reader_lats,
-                    bad=(), cfg_name="kvtest_demo"):
+                    bad=(), cfg_name="kvtest_demo", verify=0, qw=None):
     """One kvtest instance: samples.csv + summary.json (writer+reader rows)."""
     base = bm._kvtest_artifact_base(cfg_name, iid, port, ds)
     rows = []
@@ -77,16 +77,25 @@ def _write_instance(logs, iid, port, ds, writer_lats, reader_lats,
         w.writeheader()
         for row in rows:
             w.writerow(row)
-    summary = {
-        "instance_id": iid, "elapsed_seconds": 10.0, "verify_failures": 0,
-        "operations": {
+    operations = {
             "upsert_from": {"count": len(writer_lats), "total": len(writer_lats),
                             "success": len(writer_lats), "failure": 0,
                             "bytes": len(writer_lats) * 8388608},
             "get_buffer": {"count": len(reader_lats), "total": len(reader_lats),
                            "success": len(reader_lats), "failure": 0,
                            "bytes": len(reader_lats) * 8388608},
-        },
+    }
+    if qw:
+        operations["notify_queue_wait"] = {
+            "count": int(qw.get("count") or 0),
+            "total": int(qw.get("count") or 0),
+            "success": int(qw.get("count") or 0), "failure": 0,
+            "avg_ms": float(qw.get("avg_ms") or 0.0),
+            "max_ms": float(qw.get("max_ms") or 0.0), "bytes": 0}
+    summary = {
+        "instance_id": iid, "elapsed_seconds": 10.0,
+        "verify_failures": verify,
+        "operations": operations,
     }
     with open(os.path.join(logs, base + ".summary.json"), "w",
               encoding="utf-8") as f:
@@ -97,10 +106,13 @@ def _write_instance(logs, iid, port, ds, writer_lats, reader_lats,
 @pytest.fixture(autouse=True)
 def _clean_report_acc():
     saved = list(bm._REPORT_ACC)
+    saved_ctx = dict(bm._STOP_CTX)
     bm._REPORT_ACC.clear()
     yield
     bm._REPORT_ACC.clear()
     bm._REPORT_ACC.extend(saved)
+    bm._STOP_CTX.clear()
+    bm._STOP_CTX.update(saved_ctx)
 
 
 def _args():
@@ -181,6 +193,53 @@ def test_kvtest_map_records_failures_and_epochs(tmp_path):
     assert slow["ts_epoch"] is not None
     # time buckets share the /start origin (no host-timezone shift)
     assert writer["meta"]["ts_from"] == START
+
+
+def test_kvtest_map_surfaces_summary_only_metrics(tmp_path):
+    """summary.json-only signals must reach the stats product.
+
+    Reader value-verification failures (correctness) and the notify queue
+    wait (backlog) have no per-request sample column; the map lifts them from
+    the C++ summary so the HTML report can show them."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0],
+                    verify=3, qw={"count": 10, "avg_ms": 0.2, "max_ms": 1.1})
+    mapped = bm._kvtest_map_stats(str(logs), _cfg())
+    writer = json.load(open(
+        [p for p in mapped if ".writer.stats.json" in p][0], encoding="utf-8"))
+    reader = json.load(open(
+        [p for p in mapped if ".reader.stats.json" in p][0], encoding="utf-8"))
+    assert reader["global"]["verify_failures"] == 3
+    assert reader["global"]["qw_avg_ms"] == 0.2
+    assert reader["global"]["qw_max_ms"] == 1.1
+    assert reader["global"]["qw_n"] == 10
+    # writer side carries neither signal (they belong to the read path)
+    assert "verify_failures" not in writer["global"]
+    assert writer["global"].get("qw_avg_ms") is None
+
+
+def test_kvtest_map_prefers_raw_log_bytes(tmp_path):
+    """The report's node-log volume must be the pulled .log/.glog size, not
+    the (much smaller) map input samples.csv."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0])
+    (logs / (base + ".log")).write_bytes(b"x" * 300)
+    (logs / (base + ".log.glog")).write_bytes(b"y" * 120)
+    mapped = bm._kvtest_map_stats(str(logs), _cfg())
+    reader = json.load(open(
+        [p for p in mapped if ".reader.stats.json" in p][0], encoding="utf-8"))
+    samples_bytes = (logs / (base + ".samples.csv")).stat().st_size
+    assert reader["meta"]["bytes"] == 420
+    assert reader["meta"]["samples_bytes"] == samples_bytes
+    # no raw logs pulled (older binary / stats-only): fall back to样本大小
+    (logs / (base + ".log")).unlink()
+    (logs / (base + ".log.glog")).unlink()
+    mapped = bm._kvtest_map_stats(str(logs), _cfg())
+    reader = json.load(open(
+        [p for p in mapped if ".reader.stats.json" in p][0], encoding="utf-8"))
+    assert reader["meta"]["bytes"] == samples_bytes
 
 
 def test_kvtest_start_epoch_falls_back_to_summary_mtime(tmp_path):
@@ -336,7 +395,8 @@ def test_kvtest_report_js_does_not_crash(tmp_path):
     logs = tmp_path / "logs" / "kvtest_js"
     logs.mkdir(parents=True)
     _write_instance(str(logs), 0, 9301, "8MB", [1.0, 2.0], [3.0],
-                    bad=(800.0,), cfg_name="kvtest_js")
+                    bad=(800.0,), cfg_name="kvtest_js", verify=2,
+                    qw={"count": 5, "avg_ms": 0.4, "max_ms": 2.5})
     _write_instance(str(logs), 1, 9302, "8MB", [4.0], [5.0, 6.0],
                     cfg_name="kvtest_js")
     cfg = _cfg()
@@ -356,6 +416,9 @@ def test_kvtest_report_js_does_not_crash(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = json.loads(proc.stdout)
     assert out["init_len"] > 0
+    # summary-only kvtest signals must be rendered (not just in data.js)
+    assert "值校验失败" in out["cards_text"]
+    assert "队列等待均" in out["cards_text"]
 
 
 def test_kvtest_cleanup_keeps_stats_and_report(tmp_path):
@@ -439,7 +502,83 @@ def test_kvtest_full_lifecycle_matches_documented_artifacts(tmp_path):
     assert (logs / bm.KVTEST_REPORT_META).is_file()
 
 
-# --------------------------------------------------------------------- CLI
+def test_kvtest_partial_report_on_stop(tmp_path, monkeypatch):
+    """STOP path: the scenario handler already pulled samples, _stop_reports
+    must map+reduce them into an early_stop-marked report and the overview."""
+    root = tmp_path / "run"
+    logs = root / "logs" / "kvtest_stop"
+    logs.mkdir(parents=True)
+    _write_instance(str(logs), 0, 9301, "8MB", [1.0, 2.0], [3.0],
+                    cfg_name="kvtest_stop", verify=1,
+                    qw={"count": 3, "avg_ms": 0.3, "max_ms": 2.0})
+    bm._kvtest_write_report_meta(str(logs), {
+        "_kvtest_nodes": 1, "_kvtest_iid_nodes": {"0": "nodeA"},
+        "_kvtest_start_epochs": {"8MB": START}})
+    cfg = _cfg()
+    cfg["__cfg_path__"] = str(tmp_path / "kvtest_stop.json")
+    pulled = []
+    monkeypatch.setattr(bm, "pull_logs",
+                        lambda *a, **k: pulled.append(True))
+    monkeypatch.setattr(bm, "_STOP_CTX", {
+        "cluster": {"nodes": {}}, "args": _args(),
+        "report": {"cfg": cfg, "cfg_name": "kvtest_stop",
+                   "result_dir": str(root), "local_log_dir": str(logs),
+                   "remote_log_dir": "/remote/logs", "involved_nodes": [],
+                   "mode": "kvtest", "skip_pull": True}})
+    bm._stop_reports()
+    assert pulled == []                       # skip_pull honoured
+    out = logs / "report" / "8MB"
+    assert (out / "report.html").is_file()
+    meta = json.load(open(out / "meta.json", encoding="utf-8"))
+    assert meta["early_stop"] is True
+    assert (root / "report" / "overview.html").is_file()
+    raw = (out / "data.js").read_text(encoding="utf-8")
+    data = json.loads(re.search(r"=\s*(\{.*\})\s*;?\s*$", raw,
+                                re.S).group(1))
+    blk = data["sizes"]["8MB"]
+    assert blk["summary"]["verify_failures"] == 1
+    assert blk["role_summaries"]["reader"]["verify_failures"] == 1
+    assert blk["role_summaries"]["reader"]["qw_avg_ms"] == 0.3
+
+
+def test_kvtest_stop_collect_stops_flushes_and_pulls(tmp_path, monkeypatch):
+    """The STOP collector must /stop (samples flush there), wait, flatten,
+    pull and hand the context over to _stop_reports."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    cfg = _cfg()
+    entry = {"iid": 0, "node": "nodeA", "port": 9301,
+             "_base": "kvx.i0_p9301.kvtest_8MB"}
+    items = [({"ip": "1.2.3.4", "node": "nodeA"}, 9301, "", "kvtest i0")]
+    calls = {"http": [], "wait": False, "pull": []}
+    monkeypatch.setattr(bm, "get_node",
+                        lambda cluster, name: {"ip": "1.2.3.4", "node": name})
+    monkeypatch.setattr(
+        bm, "_pipeline_http_parallel",
+        lambda cluster, items, path, timeout=5, dry=False:
+        calls["http"].append(path) or [(it[3], True, "") for it in items])
+    monkeypatch.setattr(
+        bm, "_wait_kvtest_processes",
+        lambda *a, **k: calls.__setitem__("wait", True) or [True])
+    monkeypatch.setattr(bm, "_kvtest_flatten_artifacts",
+                        lambda *a, **k: (True, "summary=OK samples=OK"))
+    monkeypatch.setattr(
+        bm, "_pipeline_pull_parallel",
+        lambda cluster, groups, local_log_dir, dry: calls["pull"].append(groups))
+    bm._kvtest_stop_collect({"nodes": {}}, cfg, "kvtest_stop", "/remote/logs",
+                            str(logs), str(tmp_path), [(entry, "pid")], items)
+    assert calls["http"] == ["/stop"]
+    assert calls["wait"] is True
+    files = calls["pull"][0][0][1]
+    assert any(f.endswith(".samples.csv") for f in files)
+    assert any(f.endswith(".summary.json") for f in files)
+    assert (logs / bm.KVTEST_REPORT_META).is_file()
+    ctx = bm._STOP_CTX["report"]
+    assert ctx["skip_pull"] is True
+    assert ctx["mode"] == "kvtest"
+    assert ctx["involved_nodes"] == ["nodeA"]
+
+
 # --------------------------------------------------------------------- CLI
 
 def test_logstats_cli_kvtest_mode(tmp_path):

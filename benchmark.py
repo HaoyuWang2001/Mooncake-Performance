@@ -2814,8 +2814,10 @@ def _stop_reports():
     by design), so this is the only chance to turn a stopped run into
     evidence: pull the raw logs while the remote processes/pods are still
     alive, reduce locally (no remote map — a stop must not wait for it), then
-    render the scenario report and the run overview. WARN-only; disable with
-    MC_STOP_REPORT=0."""
+    render the scenario report and the run overview. kvtest runs /stop first
+    in the scenario handler (C++ flushes samples only there) and hands the
+    already-pulled artifacts in via skip_pull; this function then runs the
+    map + reduce chain on them. WARN-only; disable with MC_STOP_REPORT=0."""
     if os.environ.get("MC_STOP_REPORT", "1") == "0":
         log_detail("[STOP] partial report disabled (MC_STOP_REPORT=0)")
         return
@@ -2829,12 +2831,34 @@ def _stop_reports():
         log_detail("[STOP] no scenario in flight; nothing to report")
         return
     clear_stop()          # the pull must be allowed to run
-    log("[STOP] collecting logs for a partial report ...")
-    try:
-        pull_logs(cluster, ctx["involved_nodes"], ctx["remote_log_dir"],
-                  ctx["cfg_name"], ctx["local_log_dir"], False)
-    except Exception as exc:
-        log("[WARN] [STOP] log pull for report failed: {}".format(exc))
+    mode = ctx.get("mode", "pipeline")
+    if ctx.get("skip_pull"):
+        log("[STOP] {} artifacts already collected; building the partial "
+            "report ...".format(mode))
+    else:
+        log("[STOP] collecting logs for a partial report ...")
+        try:
+            pull_logs(cluster, ctx["involved_nodes"], ctx["remote_log_dir"],
+                      ctx["cfg_name"], ctx["local_log_dir"], False)
+        except Exception as exc:
+            log("[WARN] [STOP] log pull for report failed: {}".format(exc))
+    if mode == "kvtest":
+        # kvtest samples are mapped on the orchestrator (same chain as the
+        # normal path); _kvtest_stop_collect already pulled them, so this is
+        # map + reduce only
+        try:
+            data = _kvtest_generate_reports(
+                ctx["cfg"], ctx["local_log_dir"], args, early_stop=True)
+            if data is not None:
+                _render_run_overview(ctx["result_dir"], "kvtest")
+                log("[STOP] partial kvtest report written (early_stop "
+                    "flagged)")
+            else:
+                log_detail("[STOP] no kvtest samples locally; partial report "
+                           "skipped")
+        except Exception as exc:
+            log("[WARN] [STOP] kvtest report failed: {}".format(exc))
+        return
     qps_target, launch_mode = 0, "single"
     if ctx.get("mode") == "pipeline":
         try:
@@ -5620,6 +5644,59 @@ def _kvtest_read_report_meta(local_log_dir):
         return {}
 
 
+def _kvtest_summary_doc(path):
+    """Parse one instance summary.json (None when missing/corrupt)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _kvtest_apply_summary_metrics(stats, summary_doc):
+    """Surface C++ aggregates the request samples cannot carry.
+
+    The binary reports reader value-verification failures and the notify
+    queue wait only in summary.json; without this the HTML report cannot show
+    the two correctness/backlog signals at all (the CSV already has them)."""
+    if not summary_doc:
+        return
+    try:
+        verify = int(summary_doc.get("verify_failures") or 0)
+    except (TypeError, ValueError):
+        verify = 0
+    if verify:
+        stats["global"]["verify_failures"] = verify
+    qw = (summary_doc.get("operations") or {}).get("notify_queue_wait") or {}
+    try:
+        avg = float(qw.get("avg_ms") or 0.0)
+        mx = float(qw.get("max_ms") or 0.0)
+        n = int(qw.get("total") or qw.get("count") or 0)
+    except (TypeError, ValueError):
+        return
+    if n > 0 and (avg > 0 or mx > 0):
+        stats["global"]["qw_avg_ms"] = round(avg, 6)
+        stats["global"]["qw_max_ms"] = round(mx, 6)
+        stats["global"]["qw_n"] = n
+
+
+def _kvtest_instance_log_bytes(local_log_dir, base):
+    """Raw per-instance log volume (log + glog + nohup + exitrc).
+
+    The map product's meta.bytes is what the report shows as the node's log
+    volume; for kvtest the map input is samples.csv, which is far smaller than
+    the actual client logs. Prefer the real log files when they were pulled.
+    """
+    total = 0
+    for suffix in (".log", ".log.glog", ".nohup", ".log.exitrc"):
+        try:
+            total += os.path.getsize(os.path.join(local_log_dir, base + suffix))
+        except OSError:
+            pass
+    return total
+
+
 def _kvtest_start_epoch(cfg, ds, samples_path, summary_path):
     """Epoch origin of one instance's samples (the /start trigger).
 
@@ -5686,6 +5763,14 @@ def _kvtest_map_stats(local_log_dir, cfg):
                             "scenario": "kvtest"})
             if not stats["meta"]["rows"]:
                 continue
+            if role == "reader":
+                # verify_failures / notify queue wait exist only in summary.json
+                _kvtest_apply_summary_metrics(
+                    stats, _kvtest_summary_doc(summary_path))
+            raw_bytes = _kvtest_instance_log_bytes(local_log_dir, base)
+            stats["meta"]["samples_bytes"] = stats["meta"]["bytes"]
+            if raw_bytes:
+                stats["meta"]["bytes"] = raw_bytes
             out = "{}.{}.stats.json".format(path, role)
             tmp = out + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -5696,7 +5781,7 @@ def _kvtest_map_stats(local_log_dir, cfg):
     return written
 
 
-def _kvtest_generate_reports(cfg, local_log_dir, args):
+def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False):
     """Inject the map-reduce report chain into a kvtest scenario.
 
     map:   request samples -> per-role stats.json (see _kvtest_map_stats)
@@ -5719,8 +5804,69 @@ def _kvtest_generate_reports(cfg, local_log_dir, args):
     except Exception:
         pass
     return _generate_reports(
-        cfg, local_log_dir, args, qps_target=qps_target, launch_mode="single",
-        mode="kvtest", nodes=int(cfg.get("_kvtest_nodes") or 0))
+        cfg, local_log_dir, args, early_stop=early_stop,
+        qps_target=qps_target, launch_mode="single", mode="kvtest",
+        nodes=int(cfg.get("_kvtest_nodes") or 0))
+
+
+def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
+                         local_log_dir, result_dir, instance_pids, items):
+    """Graceful artifact collection for a STOPped kvtest run.
+
+    The C++ binary writes latency_samples.csv only while handling /stop, so a
+    partial report needs this handshake first. Every step is best-effort: a
+    STOP must still exit when the cluster is unresponsive. The collected
+    evidence is turned into a report later by _stop_reports (skip_pull), which
+    is the only place left once StopRequested unwinds the scenario."""
+    clear_stop()          # the collection itself must be allowed to run
+    log("[STOP] kvtest: sending /stop so the C++ instances flush samples ...")
+    try:
+        for _what, ok, err in _pipeline_http_parallel(
+                cluster, items, "/stop", timeout=10):
+            if not ok:
+                log_detail("[STOP] {} /stop: {}".format(_what, err))
+    except Exception as exc:
+        log("[WARN] [STOP] kvtest /stop failed: {}".format(exc))
+    try:
+        _wait_kvtest_processes(cluster, instance_pids, 20,
+                               label_prefix="kvtest STOP")
+    except Exception as exc:
+        log("[WARN] [STOP] kvtest wait failed: {}".format(exc))
+    groups = []
+    for entry, _pid in instance_pids:
+        base = entry["_base"]
+        try:
+            ok, status = _kvtest_flatten_artifacts(
+                cluster, entry, remote_log_dir, attempts=2, retry_s=1)
+        except Exception as exc:
+            ok, status = False, str(exc)
+        if not ok:
+            log_detail("[STOP] kvtest i{} artifacts: {}".format(
+                entry["iid"], status))
+        files = ["{}/{}.log".format(remote_log_dir, base),
+                 "{}/{}.log.glog".format(remote_log_dir, base),
+                 "{}/{}.summary.json".format(remote_log_dir, base)]
+        if ok:
+            files.append("{}/{}.samples.csv".format(remote_log_dir, base))
+        try:
+            node_entry = get_node(cluster, entry["node"])
+        except Exception:
+            node_entry = entry
+        groups.append((node_entry, files,
+                       "kvtest i{}".format(entry["iid"])))
+    try:
+        _pipeline_pull_parallel(cluster, groups, local_log_dir, False)
+    except Exception as exc:
+        log("[WARN] [STOP] kvtest artifact pull failed: {}".format(exc))
+    _kvtest_write_report_meta(local_log_dir, cfg)
+    _STOP_CTX["report"] = {
+        "cfg": cfg, "cfg_name": cfg_name, "result_dir": result_dir,
+        "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
+        "involved_nodes": [e["node"] for e, _p in instance_pids],
+        "mode": "kvtest", "skip_pull": True,
+    }
+    log("[STOP] kvtest partial artifacts collected into {}".format(
+        os.path.relpath(local_log_dir, ROOT)))
 
 
 def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
@@ -5930,6 +6076,16 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # report context: node count drives the params card, and the /start
         # epoch is the origin of the samples' elapsed_us (map/reduce needs it)
         cfg["_kvtest_nodes"] = n_nodes
+        # mid-scenario STOP before the measurement loop (health gate / data
+        # gen) has no samples yet, but the context must still name the
+        # scenario so _stop_reports does not fall back to the basic path
+        _STOP_CTX["report"] = {
+            "cfg": cfg, "cfg_name": cfg_name,
+            "result_dir": local_result_dir, "local_log_dir": local_log_dir,
+            "remote_log_dir": remote_log_dir,
+            "involved_nodes": list(involved_nodes),
+            "mode": "kvtest", "skip_pull": False,
+        }
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
         # kvtest.binary_local: push the C++ binary to every node/pod; the
@@ -6196,10 +6352,19 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         time.strftime("%H:%M:%S",
                                       time.localtime(time.time() + duration))))
                 t0 = time.time()
-                while time.time() - t0 < duration:
-                    _check_stop()
-                    time.sleep(min(1.0, max(0.05,
-                                            duration - (time.time() - t0))))
+                try:
+                    while time.time() - t0 < duration:
+                        _check_stop()
+                        time.sleep(min(1.0, max(0.05,
+                                                duration - (time.time() - t0))))
+                except StopRequested:
+                    # /stop first: the C++ collector flushes its request
+                    # samples only there, and the partial HTML report is
+                    # built from exactly those samples
+                    _kvtest_stop_collect(
+                        cluster, cfg, cfg_name, remote_log_dir,
+                        local_log_dir, local_result_dir, instance_pids, items)
+                    raise
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
             for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
@@ -6326,9 +6491,11 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod; cleanup_pods runs in main()
         # after sweep-end. Hand the sweep-end pass this config's coordinates.
+        _STOP_CTX.pop("report", None)   # normal end: no partial report pending
         return {"host": host, "node": primary_node_name, "runner": remote_runner_pipeline,
                 "remote_log_dir": remote_log_dir}
     except Exception:
+        _STOP_CTX.pop("report", None)   # failure path, not a STOP report
         # FAIL path: preserve every remote log (summary.json is flushed by
         # /stop) and free ports, then re-raise for main's [FAIL]
         if not dry:

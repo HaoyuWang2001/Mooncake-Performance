@@ -310,6 +310,7 @@ def _summary_of(stats):
     qw_max = 0.0
     total_bytes = 0
     max_depth = 0
+    verify_failures = 0
     ts_from = ts_to = None
     hist = {}
     wall = 0.0
@@ -329,6 +330,7 @@ def _summary_of(stats):
         total += g.get("key_total") or 0
         ok += g.get("key_ok") or 0
         fail += g.get("key_fail") or 0
+        verify_failures += int(g.get("verify_failures") or 0)
         rows_ok = g.get("ok") or 0
         ok_rows += rows_ok
         lat_sum += (g.get("avg_ms") or 0.0) * rows_ok
@@ -384,6 +386,7 @@ def _summary_of(stats):
         "qw_avg_ms": round(qw_sum / qw_n, 4) if qw_n else None,
         "qw_max_ms": round(qw_max, 4) if qw_n else None,
         "max_depth": max_depth,
+        "verify_failures": verify_failures,
         "wall_s": round(wall, 3),
         "qps": round(total / wall, 2) if wall > 0 else 0.0,
         # None when the logs carry no timestamps (legacy) -> the card shows
@@ -422,6 +425,7 @@ def _client_entry(st, role):
         "max_depth": next((int(p.get("max_depth", 0) or 0)
                            for k, p in st.get("summaries") or []
                            if k == "summary"), 0),
+        "verify_failures": int(g.get("verify_failures") or 0),
         "slowest": st.get("slowest") or [],
         "errors": st.get("errors") or {},
     }
@@ -1485,6 +1489,7 @@ text-transform:uppercase;margin-bottom:2px}
 .kv .v{font-size:24px;font-weight:800;letter-spacing:-.02em;
 font-variant-numeric:tabular-nums;line-height:1.25}
 .kv .u{font-size:12px;font-weight:500;letter-spacing:.02em;color:var(--mut)}
+.kv.fail .v{color:var(--hero)}
 #perfcards .kv .v,#tcards .kv .v,#infocards .kv .v,
 #rolecards .kv .v{font-weight:500;font-size:18px}
 /* 指标名按小写显示（avg/p99/min/max…，与曲线一致），不套大写 */
@@ -3380,6 +3385,14 @@ function infoCardsInto(box,s){
     if(s.qw_avg_ms!=null)box.appendChild(kv('队列等待均', s.qw_avg_ms, 'ms'));
     if(s.qw_max_ms!=null)box.appendChild(kv('队列等待峰', s.qw_max_ms, 'ms'));
     if(s.max_depth)box.appendChild(kv('最大队列深度', s.max_depth));
+  }
+  // kvtest: read-path value verification failures (correctness signal)
+  const vf=Number(s.verify_failures)||0;
+  if(vf>0){
+    box.appendChild(gridBreak());
+    const w=kv('值校验失败', vf);
+    w.className='kv fail';
+    box.appendChild(w);
   }
 }
 function renderSummary(){

@@ -847,6 +847,9 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   `report.html`/`data.js`/`meta.json` 与 run 级 `overview.html`。map 在编排器本地
   执行（样本本就要拉回做 CSV/点位图），时间桶用显式 epoch，不受宿主时区影响。
   `--rebuild-report` 在失败 run 只留 `samples.csv` 时会先补跑 map。
+  只存在于 summary 的 reader「值校验失败」与「队列等待均/峰」也被提升进
+  reader 角色概要；节点日志体积取真实 `log+glog` 大小；Ctrl+C 的 STOP
+  路径先发 `/stop` 落盘样本、再收集并出 `early_stop` 报表。
 - **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
   渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
   `overview.html`（run 总览）。**`data.js` 必须与 report.html 同目录**：从磁盘双击打开时
@@ -866,8 +869,8 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
 - **新增图型（Lieflat 语法）**：F14 时延分布直方图（p50/p99 位置标注）、F5 状态分布横条、
   G10 进程 RSS 增幅正负条、F11 QPS 达成率刻度、G15 慢点分布（jitter strip）；节点监控
   仍为「节点监控（内存 / URMA 端口）」卡片。
-- **三路径**：done / failed / stopped 都会出报表（kvtest 的 stopped 例外：
-  C++ 样本在 `/stop` 时才落盘，见 `configs/kvtest/README.md`）。done/failed 走远端 map；stopped 在清理
+- **三路径**：done / failed / stopped 都会出报表（kvtest 的 stopped 会先发
+  `/stop` 让 C++ 落盘样本再收集，报表标注 `early_stop`）。done/failed 走远端 map；stopped 在清理
   前回拉原始日志、本地重算（不再静默无产物）。三种路径的报表都标注「提前停止/异常」。
 - **重建**：`benchmark.py --rebuild-report <ts>`（传时间戳目录名，**不要**带 `outputs/`
   前缀）仅用本地 stats/原始日志重建报表，覆盖「run 正常结束但报表阶段失败」；远端重建
