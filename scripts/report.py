@@ -560,11 +560,20 @@ def reduce_size(stats, meta):
     anomalies = []
     seen = set()
     for st in stats:
+        _m = st.get("meta") or {}
+        _node = _m.get("node") or ""
+        _role = _m.get("role") or ""
+        _cl = os.path.basename(str(_m.get("source") or "")).replace(
+            ".log", "")
         for a in st.get("anomalies") or []:
-            key = (a.get("t"), a.get("kind"))
+            key = (a.get("t"), a.get("kind"), _node)
             if key in seen:
                 continue
             seen.add(key)
+            a = dict(a)
+            a.setdefault("node", _node)
+            a.setdefault("role", _role)
+            a.setdefault("client", _cl)
             anomalies.append(a)
     anomalies.sort(key=lambda a: a.get("t") or 0)
     excerpt = None
@@ -1554,6 +1563,9 @@ text-overflow:ellipsis;min-width:0}
 overflow:hidden;text-overflow:ellipsis;min-width:0}
 .lvl-children{align-self:start;overflow-x:auto;padding-top:5px}
 .lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 6px}
+.node-row td{background:var(--quiet);font-weight:700}
+.node-row .node-name{color:var(--ink)}
+.client-row td:first-child{padding-left:14px}
 .sbrk{padding:10px 0 4px;width:min(100%,1250px)}
 .sbrk .lvl-row{margin-bottom:6px}
 /* 慢点追踪表格展开：去 total、单行压缩、横向滚动 */
@@ -3008,7 +3020,7 @@ function renderComboBar(){
         selObjs=keep.length?keep:['all'];
       }
       renderComboBar(); renderObjTree(); renderControls();
-      renderSummary(); renderTable(); renderSlowStrip();
+      renderSummary(); renderClientSite(); renderSlowStrip();
       buildChart(); buildQpsChart();
     };
     box.appendChild(b);
@@ -3496,41 +3508,171 @@ function renderSlowStrip(){
   o.series=series;
   slowChart.setOption(o,true);
 }
-function renderTable(){
-  const z=Z(); if(!z) return;
+/* 实例与日志现场（合并卡）：节点树（节点可展开）+ 客户端行（writer 在前）
+   + 日志文件/大小 + 对慢点追踪的贡献（无 C++ trace 时整列隐藏）。 */
+let clientOpen={};
+function contribMap(z){
+  const m={};
+  ((z&&z.trace&&z.trace.top)||[]).forEach(function(r){
+    const k=String(r.client||'').replace(/\.log$/,'');
+    if(k) m[k]=(m[k]||0)+1;
+  });
+  return m;
+}
+function renderClientSite(){
+  const box=document.getElementById('clients'); if(!box) return;
+  box.innerHTML='';
+  const z=Z(); if(!z){box.appendChild(el('div','note','无数据'));return;}
   const note=document.getElementById('datanote');
   if(note&&window.__mcDataMissing)note.style.display='';
-  const tb=document.querySelector('#ctable tbody'); tb.innerHTML='';
   const clients=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&
     FULL.sizes[curSize].clients)||z.clients||[];
-  clients.filter(function(c){return clientInCombo(c.name);})
-   .sort((a,b)=>(b.p99_ms-a.p99_ms)).forEach(c=>{
-    const tr=el('tr');
-    [c.name,c.role,c.node,c.total,c.ok,c.fail,
-     c.avg_ms,c.p50_ms,c.p99_ms,c.p999_ms,c.max_ms,
-     c.qw_avg_ms==null?'-':c.qw_avg_ms,fmtBytes(c.bytes)].forEach((v,i)=>{
-      const td=el('td', (i>=3?'n':''), String(v));
-      tr.appendChild(td);
-    });
-    tb.appendChild(tr);
+  const cs=clients.filter(function(c){return clientInCombo(c.name);});
+  const hasTrace=!!(z.trace&&(z.trace.top||[]).length);
+  const contrib=hasTrace?contribMap(z):null;
+  function contribOf(c){
+    if(!contrib) return 0;
+    return (contrib[c.name]||0)+(c.pod?(contrib[c.pod]||0):0);
+  }
+  function logName(c){
+    const p=String(c.remote_path||c.source||'');
+    const b=p.split('/').pop()||c.name;
+    return b+'（'+fmtBytes(c.bytes)+'）';
+  }
+  const nodes={};
+  cs.forEach(function(c){
+    const n=c.node||'未归属节点';
+    (nodes[n]=nodes[n]||[]).push(c);
   });
+  const names=Object.keys(nodes).sort();
+  const ro={writer:0,reader:1};
+  names.forEach(function(n){
+    nodes[n].sort(function(a,b){
+      return ((ro[a.role]===undefined?9:ro[a.role])-
+              (ro[b.role]===undefined?9:ro[b.role]))||
+        String(a.name).localeCompare(String(b.name));
+    });
+  });
+  const t=el('table');
+  const thead=el('thead'); const hr=el('tr');
+  ['节点','角色','客户端','总数','成功','失败','日志'].forEach(function(h,i){
+    hr.appendChild(el('th',(i>=3&&i<=5)?'n':'',h));});
+  if(hasTrace) hr.appendChild(el('th','n','对慢点追踪的贡献'));
+  thead.appendChild(hr); t.appendChild(thead);
+  const tb=el('tbody');
+  names.forEach(function(n){
+    const list=nodes[n];
+    const open=clientOpen[n]!==false;
+    const tr=el('tr','node-row');
+    tr.style.cursor='pointer';
+    tr.title='点击展开/收起该节点的客户端';
+    tr.onclick=function(){clientOpen[n]=!open;renderClientSite();};
+    const td=el('td','node-name',(open?'▾ ':'▸ ')+n);
+    td.colSpan=3; tr.appendChild(td);
+    const tot=list.reduce(function(a,c){return a+(Number(c.total)||0);},0);
+    const okc=list.reduce(function(a,c){return a+(Number(c.ok)||0);},0);
+    const fc=list.reduce(function(a,c){return a+(Number(c.fail)||0);},0);
+    tr.appendChild(el('td','n',String(tot)));
+    tr.appendChild(el('td','n',String(okc)));
+    tr.appendChild(el('td','n',String(fc)));
+    const bytes=list.reduce(function(a,c){return a+(Number(c.bytes)||0);},0);
+    tr.appendChild(el('td','mono',list.length+' 个文件 · '+fmtBytes(bytes)));
+    if(hasTrace){
+      tr.appendChild(el('td','n',String(list.reduce(function(a,c){
+        return a+contribOf(c);},0))));
+    }
+    tb.appendChild(tr);
+    if(open) list.forEach(function(c){
+      const tr2=el('tr','client-row');
+      tr2.appendChild(el('td',''));
+      tr2.appendChild(el('td','',c.role||'-'));
+      tr2.appendChild(el('td','mono',c.name));
+      tr2.appendChild(el('td','n',String(c.total)));
+      tr2.appendChild(el('td','n',String(c.ok)));
+      tr2.appendChild(el('td','n',String(c.fail)));
+      const lg=el('td','mono',logName(c));
+      if(c.remote_path) lg.title=String(c.remote_path);
+      tr2.appendChild(lg);
+      if(hasTrace) tr2.appendChild(el('td','n',String(contribOf(c))));
+      tb.appendChild(tr2);
+    });
+  });
+  t.appendChild(tb);
+  const wrapx=el('div','wrapx'); wrapx.appendChild(t);
+  box.appendChild(wrapx);
 }
 function renderErrors(){
   const z=Z(); if(!z) return;
   const wrap=document.getElementById('errors');
   wrap.innerHTML='';
-  const entries=Object.entries(z.errors||{});
-  if(!entries.length){wrap.appendChild(el('div','note','无错误'));}
-  else{
-    const t=el('table'); const thead=el('thead');
-    const hr=el('tr'); hr.appendChild(el('th',null,'状态码'));
-    hr.appendChild(el('th','n','次数')); thead.appendChild(hr); t.appendChild(thead);
-    const tb=el('tbody');
-    entries.sort((a,b)=>b[1]-a[1]).forEach(([k,n])=>{
-      const tr=el('tr'); tr.appendChild(el('td','mono',k));
-      tr.appendChild(el('td','n',String(n))); tb.appendChild(tr);
+  function stCodes(map){
+    const ks=Object.keys(map||{});
+    if(!ks.length) return '-';
+    return ks.sort(function(a,b){return (map[b]||0)-(map[a]||0);})
+      .slice(0,3).map(function(k){return k+'×'+map[k];}).join(' / ');
+  }
+  const cs=(z.clients||[]).slice();
+  if(!cs.length){
+    wrap.appendChild(el('div','note','无实例数据'));
+  }else{
+    /* 角色分组（写在前、读在后；basic 无角色则单块） */
+    const roles=[];
+    cs.forEach(function(c){
+      const r=c.role||'';
+      if(roles.indexOf(r)<0) roles.push(r);
     });
-    t.appendChild(tb); wrap.appendChild(t);
+    const ro={writer:0,reader:1};
+    roles.sort(function(a,b){return (ro[a]===undefined?9:ro[a])-
+      (ro[b]===undefined?9:ro[b]);});
+    roles.forEach(function(role){
+      const list=cs.filter(function(c){return (c.role||'')===role;});
+      if(!list.length) return;
+      if(roles.length>1){
+        wrap.appendChild(el('h3','sec',
+          role==='writer'?'写路径（writer）':
+          (role==='reader'?'读路径（reader）':role)));
+      }
+      const nodes={};
+      list.forEach(function(c){
+        const n=c.node||'未归属节点';
+        (nodes[n]=nodes[n]||[]).push(c);
+      });
+      const names=Object.keys(nodes).sort();
+      const t=el('table'); const thead=el('thead'); const hr=el('tr');
+      ['节点','客户端','总数','失败','状态码'].forEach(function(h,i){
+        hr.appendChild(el('th',(i===2||i===3)?'n':'',h));});
+      thead.appendChild(hr); t.appendChild(thead);
+      const tb=el('tbody');
+      names.forEach(function(n){
+        const ls=nodes[n].sort(function(a,b){
+          return String(a.name).localeCompare(String(b.name));});
+        const tot=ls.reduce((a,c)=>a+(Number(c.total)||0),0);
+        const fail=ls.reduce((a,c)=>a+(Number(c.fail)||0),0);
+        const agg={};
+        ls.forEach(function(c){
+          Object.keys(c.errors||{}).forEach(function(k){
+            agg[k]=(agg[k]||0)+Number(c.errors[k]||0);});
+        });
+        const trn=el('tr','node-row');
+        trn.appendChild(el('td','node-name',n));
+        trn.appendChild(el('td','','（'+ls.length+' 实例）'));
+        trn.appendChild(el('td','n',String(tot)));
+        trn.appendChild(el('td','n',String(fail)));
+        trn.appendChild(el('td','mono',stCodes(agg)));
+        tb.appendChild(trn);
+        ls.forEach(function(c){
+          const tr=el('tr','client-row');
+          tr.appendChild(el('td','', ''));
+          tr.appendChild(el('td','mono',c.name));
+          tr.appendChild(el('td','n',String(c.total)));
+          tr.appendChild(el('td','n',String(c.fail)));
+          tr.appendChild(el('td','mono',stCodes(c.errors)));
+          tb.appendChild(tr);
+        });
+      });
+      t.appendChild(tb);
+      const wrapx=el('div','wrapx'); wrapx.appendChild(t); wrap.appendChild(wrapx);
+    });
   }
   if(z.error_excerpt){
     const p=el('pre','term'); p.textContent=z.error_excerpt;
@@ -3538,13 +3680,15 @@ function renderErrors(){
       (z.error_excerpt_status||'?')+'）：'));
     wrap.appendChild(p);
   }
-
   if(z.anomalies&&z.anomalies.length){
     const ul=el('ul','anml');
-    z.anomalies.slice(0,100).forEach(a=>{
+    z.anomalies.slice(0,100).forEach(function(a){
+      const who=[a.role,a.node,a.client].filter(Boolean).join(' · ');
       ul.appendChild(el('li',null, fullts(a.t)+'  '+
-        (a.kind==='error_burst'?('错误突发：'+a.fail+'/'+a.count+' 失败'):
-         ('时延突增：均值 '+a.avg_ms+'ms / '+a.count+' 次'))));
+        (a.kind==='error_burst'
+          ?('错误突发：'+a.fail+'/'+a.count+' 失败')
+          :('时延突增：均值 '+a.avg_ms+'ms / '+a.count+' 次'))+
+        (who?'（'+who+'）':'')));
     });
     wrap.appendChild(el('div','note','异常窗口（主图上以强调色竖线标注）：'));
     wrap.appendChild(ul);
@@ -3555,27 +3699,37 @@ function renderSources(){
   const nodes=D.nodes||[]; const srcs=D.sources||[];
   if(nodes.length){
     const t=el('table'); const thead=el('thead'); const hr=el('tr');
-    ['节点','客户端数','日志量'].forEach((h,i)=>hr.appendChild(el('th',i?'n':'',h)));
+    ['节点','客户端数','日志量'].forEach(function(h,i){
+      hr.appendChild(el('th',i?'n':'',h));});
     thead.appendChild(hr); t.appendChild(thead); const tb=el('tbody');
-    nodes.forEach(n=>{const tr=el('tr');
+    nodes.forEach(function(n){
+      const tr=el('tr');
       tr.appendChild(el('td','mono',n.node));
       tr.appendChild(el('td','n',String(n.pods)));
       tr.appendChild(el('td','n',fmtBytes(n.bytes))); tb.appendChild(tr);});
-    t.appendChild(tb); box.appendChild(t); box.appendChild(el('div','note',
+    t.appendChild(tb); box.appendChild(t);
+    box.appendChild(el('div','note',
       '宿主机日志：<host_log_root>/<run_id>/<pod>/（CLEAN-UP 不删除）。'+
       '登录节点 ssh <node>；进入 pod：kubectl exec -it <pod> -n <ns> -- bash'));
   }
-  if(srcs.length){
+  /* 客户端日志文件已在实例树中给出；这里只保留非客户端产物（trace 等） */
+  const others=(srcs||[]).filter(function(x){
+    return x&&x.kind&&x.kind!=='client';});
+  if(others.length){
     const t=el('table'); const thead=el('thead'); const hr=el('tr');
-    ['节点','pod','角色','文件','远程路径','大小'].forEach((h,i)=>
-      hr.appendChild(el('th', i===5?'n':'', h)));
+    ['节点','pod','角色','文件','远程路径','大小'].forEach(function(h,i){
+      hr.appendChild(el('th', i===5?'n':'', h));});
     thead.appendChild(hr); t.appendChild(thead); const tb=el('tbody');
-    srcs.forEach(s=>{const tr=el('tr');
-      [s.node,s.pod,s.role,s.source,s.remote_path,fmtBytes(s.bytes)].forEach(
-        (v,i)=>tr.appendChild(el('td', (i===5?'n mono':'mono'), String(v||'-'))));
+    others.forEach(function(x){
+      const tr=el('tr');
+      [x.node,x.pod,x.role,x.source,x.remote_path,fmtBytes(x.bytes)].forEach(
+        function(v,i){
+          tr.appendChild(el('td',(i===5?'n mono':'mono'),
+            String(v==null?'-':v)));});
       tb.appendChild(tr);});
-    t.appendChild(tb); const wrapx=el('div','wrapx'); wrapx.appendChild(t);
-    box.appendChild(el('div','note','日志现场索引（按需登录节点/进入 pod 查看）：'));
+    t.appendChild(tb);
+    const wrapx=el('div','wrapx'); wrapx.appendChild(t);
+    box.appendChild(el('div','note','其它产物索引（trace / monitor）：'));
     box.appendChild(wrapx);
   }
 }
@@ -3857,7 +4011,7 @@ function renderAll(){
   safe('latency-chart',buildChart);
   safe('histogram',renderHist);
   safe('slow-strip',renderSlowStrip);
-  safe('client-table',renderTable);
+  safe('client-table',renderClientSite);
   safe('errors',renderErrors);
   safe('trace',renderTrace);
   safe('sources',function(){
@@ -5780,23 +5934,29 @@ memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total
 </div>
 <pre class="term" style="display:none"></pre>
 """
-_SEC_CLIENTS = """<div class="card"><h2>实例详情</h2><div class="wrapx">
-<table id="ctable"><thead><tr>
-<th>客户端</th><th>角色</th><th>节点</th><th class="n">总数</th><th class="n">成功</th>
-<th class="n">失败</th><th class="n">avg</th><th class="n">p50</th><th class="n">p99</th>
-<th class="n">p999</th><th class="n">max</th><th class="n">队列等待均值</th><th class="n">日志</th>
-</tr></thead><tbody></tbody></table></div>
-<div class="note" id="datanote" style="display:none">全量数据 data.js 未加载（例如通过
-WebUI/HTTP 直接打开）：客户端表按 p99 显示前 20 名。
-把 data.js 与 report.html 放在同一目录后重新打开即可查看全量。</div></div>
-"""
+
 _SEC_ERRORS = """<div class="card"><h2>错误与异常</h2><div id="errors"></div>
 <h3 class="sec">状态分布</h3><div id="terrs"></div></div>
 """
-_SEC_SOURCES = """<div class="card"><h2>现场索引</h2><div id="sources"></div></div>
+_SEC_CLIENTSITE = """<div class="card" id="clientsite"><h2>实例与日志现场</h2>
+<div class="note" id="datanote" style="display:none">全量数据 data.js 未加载（例如通过
+WebUI/HTTP 直接打开）：实例表按 p99 显示前 20 名。
+把 data.js 与 report.html 放在同一目录后重新打开即可查看全量。</div>
+<div id="clients"></div>
+<h3 class="sec">节点与登录现场</h3><div id="sources"></div></div>
 """
-_SEC_FOOTER = """<div class="note">数据文件：report.html（自包含）+ data.js（全量，深查用）。
-由 logstats（map）+ report.py（reduce）生成。</div>
+_SEC_FOOTER = """<div class="note" id="pipelineNote">
+<b>数据文件</b>：report.html（自包含，数据内嵌，可离线打开）+ data.js（全量，
+深查用；经 WebUI 打开时自动加载）。<br>
+<b>生成流程（map → reduce）</b>：测试结束后每节点本地运行 map（logstats 解析
+RESULT 日志、tracestats 解析 C++ trace），把 1 秒级聚合（计数/时延和/最大/
+直方图/离群与慢点清单/阶段秒桶）写入节点产物；编排机回拉后由 report.py
+reduce 按对象（总体/角色/节点/实例）与档位（1s/10s/1min/自适应）合并，
+生成 report.html + data.js。<br>
+<b>数据正确性</b>：总计 = 各节点同一时间桶按请求数加权平均（avg = Σ时延/Σ请求数，
+max 取各节点最大）；分位数在 map 侧按直方图归并后计算；时延直方图为全量样本合并；
+离群值（单请求 &gt; 客户端 p99×10）不计入桶的 avg/max，但计入计数与直方图。
+跨节点时间轴以各节点日志的绝对时刻对齐（时钟偏差问题见后续批次）。</div>
 """
 _MONITOR_CARD = """
 <div class="card" id="monitorcard"><h2>节点监控<span id="monTitleSuffix">（内存 / URMA 端口）</span></h2>
@@ -5813,11 +5973,11 @@ _MONITOR_CARD = """
 
 _BODY_BASIC = "<!-- tpl:basic -->\n" + "".join([
     _SEC_SUMMARY, _SEC_LATENCY, _SEC_HIST, _SEC_SLOW,
-    _SEC_TRACE, _SEC_CLIENTS, _SEC_ERRORS, _SEC_SOURCES,
+    _SEC_TRACE, _SEC_ERRORS, _SEC_CLIENTSITE, "<!-- monitor -->",
     _SEC_FOOTER])
 _BODY_PIPELINE = "<!-- tpl:pipeline -->\n" + "".join([
     _SEC_SUMMARY, _SEC_LATENCY, _SEC_HIST, _SEC_SLOW,
-    _SEC_TRACE, _SEC_CLIENTS, _SEC_ERRORS, _SEC_SOURCES,
+    _SEC_TRACE, _SEC_ERRORS, _SEC_CLIENTSITE, "<!-- monitor -->",
     _SEC_FOOTER])
 
 
@@ -5890,8 +6050,10 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     is_pipe = str(meta.get("mode") or "") == "pipeline"
     body = _BODY_PIPELINE if is_pipe else _BODY_BASIC
     mon = data.get("monitors") or {}
-    if mon.get("mem_host") or mon.get("mem_proc") or mon.get("urma"):
-        body += _MONITOR_CARD
+    body = body.replace("<!-- monitor -->",
+                        _MONITOR_CARD
+                        if (mon.get("mem_host") or mon.get("mem_proc")
+                            or mon.get("urma")) else "")
     # R-SHELL-11：title/h1 携带场景名与单元身份（meta.unit，如「c4×t8 · 128KB」）；
     # 报告生成时间已由副标题承载，不再占据页面最高层级（多标签页对照时
     # 同名不可区分的问题由此修复——pipeline 单元目录仅 size 一级时尤甚）。

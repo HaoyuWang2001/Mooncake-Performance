@@ -606,30 +606,47 @@ if (!errs.length) {
 
   if (process.argv.includes("--click-client")) {
     try {
-      const tb = getEl("#ctable tbody");
-      const tr0 = (tb.children || [])[0];
+      const box = getEl("clients");
+      const table = (box.children || []).find(function (c) {
+        return String(c.className || "").indexOf("wrapx") >= 0;});
+      const tb = table ? (table.children || [])[0] : null;
+      // 表格结构：thead + tbody
+      const body = tb && (tb.children || [])[1];
+      const rows = (body && body.children) || [];
+      const nodeRow = rows.find(function (r) {
+        return String(r.className || "").indexOf("node-row") >= 0;});
+      const clientRow = rows.find(function (r) {
+        return String(r.className || "").indexOf("client-row") >= 0;});
       const sel = function () {
         return (sandbox.window && sandbox.window.__MC_SEL)
           ? sandbox.window.__MC_SEL() : [];
       };
       const before = JSON.stringify(sel());
-      const mseq0 = charts.mainchart || [];
-      const mo0 = mseq0.length ? mseq0[mseq0.length - 1] : null;
-      out.main_series_before = (mo0 && mo0.series) ? mo0.series.length : null;
-      out.row_onclick = !!(tr0 && tr0.onclick);
-      if (tr0 && tr0.onclick) tr0.onclick();
+      out.main_series_before = (function () {
+        const a = charts.mainchart || [];
+        const o = a.length ? a[a.length - 1] : null;
+        return (o && o.series) ? o.series.length : null;
+      })();
+      out.node_row_clickable = !!(nodeRow && nodeRow.onclick);
+      out.client_row_clickable = !!(clientRow && clientRow.onclick);
+      out.rows_before = rows.length;
+      if (nodeRow && nodeRow.onclick) nodeRow.onclick();
+      const body2 = (function () {
+        const t = (getEl("clients").children || []).find(function (c) {
+          return String(c.className || "").indexOf("wrapx") >= 0;});
+        const tbl = t ? (t.children || [])[0] : null;
+        return tbl && (tbl.children || [])[1];
+      })();
+      out.rows_after_nodes = ((body2 && body2.children) || []).length;
       out.selobjs_before = before;
       out.selobjs_after = JSON.stringify(sel());
-      out.rows_after = (tb.children || []).length;
-      out.cld_rows = (tb.children || []).filter(function (r) {
-        return String(r.className || "").indexOf("cld-row") >= 0;
-      }).length;
-      const mseq1 = charts.mainchart || [];
-      const mo1 = mseq1.length ? mseq1[mseq1.length - 1] : null;
-      out.main_series_after = (mo1 && mo1.series) ? mo1.series.length : null;
+      out.main_series_after = (function () {
+        const a = charts.mainchart || [];
+        const o = a.length ? a[a.length - 1] : null;
+        return (o && o.series) ? o.series.length : null;
+      })();
     } catch (e) { errs.push("clickclient: " + String(e && e.stack || e)); }
   }
-
   function treeMiniLabels(root){
     const acc=[];
     (function walk(n){
@@ -901,6 +918,10 @@ if (!errs.length) {
   }
   out.legend_selmode = (mainOpt()&&mainOpt().legend)
     ? mainOpt().legend.selectedMode : null;
+  // 错误与异常 / 实例与日志现场（Phase 2）
+  out.errors_text = textOf(getEl("errors"));
+  out.clients_text = textOf(getEl("clients"));
+  out.sources_text = textOf(getEl("sources"));
 
   if (process.argv.includes("--endlabels")) {
     try {

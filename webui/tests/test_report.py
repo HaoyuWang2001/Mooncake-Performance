@@ -1843,8 +1843,8 @@ def test_trace_toolbar_stage_rows(tmp_path):
     assert src.index("</div>", j) > j
 
 
-def test_client_table_readonly_no_expand(tmp_path):
-    """实例详情：只读表格（每实例一行关键信息），点击不展开、不叠加曲线。"""
+def test_client_site_tree_readonly_rows(tmp_path):
+    """实例与日志现场：节点行可展开/收起，客户端行为只读（点击无交互）。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.reader", "reader", node="n2")
     data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"})
@@ -1852,20 +1852,25 @@ def test_client_table_readonly_no_expand(tmp_path):
     if res is None:
         return
     assert res["errors"] == []
-    assert res["row_onclick"] is False
-    assert res["rows_after"] == 2 and res["cld_rows"] == 0
+    assert res["node_row_clickable"] is True
+    assert res["client_row_clickable"] is False
+    assert res["rows_after_nodes"] != res["rows_before"]   # 展开/收起生效
+    # 对图表无副作用（不叠加曲线、不改选择）
     assert res["selobjs_before"] == res["selobjs_after"]
     assert res["main_series_before"] == res["main_series_after"]
 
 
-def test_client_table_header_text(tmp_path):
+def test_client_site_header_and_columns(tmp_path):
+    """合并卡：实例与日志现场（角色/节点/总数/成功/失败/日志 + 贡献列）。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
     html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
     src = open(html, encoding="utf-8").read()
-    assert "<h2>实例详情</h2>" in src
-    assert "实例详情（" not in src
-    assert "点击行查看该实例明细" not in src
+    assert "<h2>实例与日志现场</h2>" in src
+    # 性能指标列已移出本卡（段1/曲线负责）：旧表头不得回潮
+    for bad in ('<th class="n">p50</th>', '<th class="n">p99</th>',
+                '<th class="n">队列等待均值</th>'):
+        assert bad not in src, bad
 
 
 def test_pipeline_and_basic_templates_split(tmp_path):
@@ -1887,8 +1892,8 @@ def test_pipeline_and_basic_templates_split(tmp_path):
     assert "<!-- tpl:basic -->" not in sp
     assert "Pipeline 场景报表" in sp.split("<title>")[1]
     for sec in ("性能统计", "信息展示", "参数配置", "端到端时延曲线",
-                "时延分布", "慢点捕捉", "SDK 全链路", "实例详情",
-                "错误与异常", "现场索引"):
+                "时延分布", "慢点捕捉", "SDK 全链路",
+                "错误与异常", "实例与日志现场"):
         assert sec in sb, (sec, "basic")
         assert sec in sp, (sec, "pipeline")
 
@@ -2491,6 +2496,68 @@ def test_slow_tracking_ranked_colors_and_legend_solo(tmp_path):
     assert all("root" not in c for c in rows), rows
 
 
+def test_errors_split_by_role_and_client(tmp_path):
+    """错误与异常：按写→读平铺，精确到节点/客户端，带状态码。"""
+    sts = rp.load([_stats(tmp_path, "a.writer", "writer", node="n1"),
+                   _stats(tmp_path, "b.reader", "reader", node="n2")])
+    sts[0]["errors"] = {"503": 3}
+    sts[1]["errors"] = {"500": 1}
+    data = rp.reduce_scenario(sts, {"config": "cfg"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    et = res["errors_text"]
+    assert "写路径（writer）" in et and "读路径（reader）" in et, et
+    assert et.index("写路径（writer）") < et.index("读路径（reader）"), et
+    assert "503×3" in et and "500×1" in et, et
+    assert "a.writer" in et and "b.reader" in et, et
+    assert "n1" in et and "n2" in et, et
+
+
+def test_client_site_contribution_and_writer_first(tmp_path):
+    """实例与日志现场：同节点内 writer 在 reader 前；有 trace 才显示贡献列。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n1")
+    tr = _trace_stats2(tmp_path, "x.glog", node="n1", pod="p1")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"},
+                              traces=[tr])
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    ct = res["clients_text"]
+    assert "对慢点追踪的贡献" in ct, ct
+    assert ct.index("a.writer") < ct.index("b.reader"), ct
+    # 无 trace：整个贡献列隐藏
+    d2 = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"})
+    r2 = _js_check(tmp_path, d2)
+    if r2 is None:
+        return
+    assert "对慢点追踪的贡献" not in r2["clients_text"], r2["clients_text"]
+
+
+def test_section_order_and_footer_note(tmp_path):
+    """章节顺序：SDK → 错误与异常 → 实例与日志现场 →（监控）→ 页脚；
+    页脚解释 map-reduce 与数据正确性并在最底部。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    i_tr = src.index('id="tracecard"')
+    i_err = src.index("<h2>错误与异常</h2>")
+    i_cs = src.index('id="clientsite"')
+    i_ft = src.index('id="pipelineNote"')
+    assert i_tr < i_err < i_cs < i_ft, (i_tr, i_err, i_cs, i_ft)
+    # 监控卡插在页脚之前（模板 marker 顺序）
+    assert 'id="clientsite"' in rp._BODY_BASIC
+    assert rp._BODY_BASIC.index("<!-- monitor -->") < \
+        rp._BODY_BASIC.index('id="pipelineNote"')
+    # 页脚内容：数据文件 / map-reduce / 正确性口径
+    for kw in ("data.js", "map", "reduce", "加权平均", "直方图"):
+        assert kw in src, kw
+
+
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
     """S6：QPS 副图 x 缩放不重算 y（filterMode none）；无数据窗口仅首处标注。"""
     a = _stats(tmp_path, "a.writer", "writer")
@@ -3059,9 +3126,8 @@ def test_c01_dr24_alignment_lock(tmp_path):
     for dead in (".tb-sep", ".gkv", ".gtick", ".gtrack"):
         assert dead not in src, "死 CSS 回潮: {}".format(dead)
     # 3) 表头命名（skill 文案规则6：指标名 avg/max；队列等待均值不截断）
-    assert "<th class=\"n\">avg</th>" in src
-    assert "<th class=\"n\">max</th>" in src
-    assert "队列等待均值</th>" in src
+    assert "总数" in src and "成功" in src and "失败" in src
+    assert "实例与日志现场" in src and "对慢点追踪的贡献" in src
     assert "队列等待均</th>" not in src
     # 4) h3 标题无交互括号注记（说明移入 title 属性）
     import re as _re
