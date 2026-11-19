@@ -141,6 +141,7 @@ def test_render_scenario_has_monitor_card(tmp_path):
     src = open(html, encoding="utf-8").read()
     assert "节点监控（内存 / URMA 端口）" in src
     assert 'id="monitorcard"' in src and 'id="memchart"' in src
+    assert 'id="growth"' in src          # G10 RSS 增幅正负条容器
     assert "renderMonitors" in src
     dj_src = open(dj, encoding="utf-8").read()
     assert '"monitors"' in dj_src and '"urma"' in dj_src
@@ -222,3 +223,20 @@ def test_urma_counter_wrap_and_reset_no_spike(tmp_path):
     u = mon["urma"][0]
     assert u["rx_max"] <= 12.0, u["rx_max"]     # 无 310 GiB/s 假尖峰
     assert 8.0 <= max(u["rx"]) <= 12.0
+
+
+def test_reduce_monitors_window_slice(tmp_path):
+    """单元报表只带自己时间窗的监控数据（t0/t1），summary 按裁剪后重算。"""
+    log_dir = _write_monitors(tmp_path)
+    mon = rp.reduce_monitors(str(log_dir), t0=1001, t1=1001)
+    h = mon["mem_host"][0]
+    assert h["series"]["n0_used_mb"] == [150.0]
+    assert h["series"]["n1_used_mb"] == [250.0]
+    procs = {p["pid"]: p for p in mon["mem_proc"]}
+    assert procs[111]["rss_growth_mb"] == 0.0      # 只剩一个采样点
+    assert mon["urma"] == []                        # 单样本算不出速率 -> 无曲线
+    # peak_mem = 各节点 used_mb 之和的峰值（窗口内只剩 150+250）
+    assert mon["summary"]["peak_mem_mb"]["n1"] == 400.0
+    # 无窗口 = 原行为
+    full = rp.reduce_monitors(str(log_dir))
+    assert full["mem_host"][0]["series"]["n0_used_mb"] == [100.0, 150.0]

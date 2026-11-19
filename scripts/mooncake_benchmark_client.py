@@ -1364,9 +1364,13 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
         log("pipeline writer warmup done")
     log("pipeline writer measured start (duration={}s)".format(duration))
     _phase_marker("measured", "start")     # measured window opens
+    _measured_t0 = time.perf_counter()
     _run_phase(time.time() + duration, False)
-    log("pipeline writer measured done (keys_ok={}, keys_fail={})".format(
-        stats["keys_ok"], stats["keys_fail"]))
+    # 实际测量窗口的墙钟（配置 duration 只应作为计划值；早停/超时截断时
+    # 必须用真实 elapsed，否则报表“时长/QPS”会按计划值虚报）
+    measured_wall_s = time.perf_counter() - _measured_t0
+    log("pipeline writer measured done (keys_ok={}, keys_fail={}, wall_s={:.3f})".format(
+        stats["keys_ok"], stats["keys_fail"], measured_wall_s))
     _phase_marker("measured", "end")       # measured window closed
     sys.stdout.flush()
     if ctx is not None:
@@ -1385,8 +1389,9 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
         "traffic_mode": traffic_mode, "batch_size": batch_keys,
         "duration": duration, "warmup_duration": warmup_duration,
         "total": keys_total, "bytes": ok_bytes,
-        "wall_s": duration, "ok": stats["keys_ok"], "fail": stats["keys_fail"],
-        "qps": (keys_total / duration) if duration > 0 else 0.0,
+        "duration": duration, "wall_s": measured_wall_s,
+        "ok": stats["keys_ok"], "fail": stats["keys_fail"],
+        "qps": (keys_total / measured_wall_s) if measured_wall_s > 0 else 0.0,
         "fail_rate": (stats["keys_fail"] / keys_total) if keys_total else 0.0,
         # interface throughput = successful bytes / sum of successful
         # put_batch call durations (busy time, not wall clock)
@@ -1489,6 +1494,11 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     qdepth = 0
     qmax = 0
     qlock = None
+    # measured notify span (writer-side write_ts epochs): the reader's actual
+    # measurement window; used for wall_s/QPS instead of the configured
+    # duration (which lies when the run is truncated or paced differently)
+    m_ts0 = 0.0
+    m_ts1 = 0.0
     def do_GET(self):
         self._handle()
     def do_POST(self):
@@ -1507,6 +1517,13 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             # the measured window (once-semantics: in dual clients the
             # writer thread usually already emitted them)
             _phase_marker("warmup" if is_warmup else "measured", "start")
+            if not is_warmup and write_ts > 0:
+                with _PipelineNotifyHandler.qlock:
+                    if (_PipelineNotifyHandler.m_ts0 <= 0
+                            or write_ts < _PipelineNotifyHandler.m_ts0):
+                        _PipelineNotifyHandler.m_ts0 = write_ts
+                    if write_ts > _PipelineNotifyHandler.m_ts1:
+                        _PipelineNotifyHandler.m_ts1 = write_ts
             # one queue item per notify batch (the writer's whole batch); the
             # queue depth unit therefore counts pending notify batches
             if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
@@ -1674,6 +1691,8 @@ def _pipeline_reader(args, store):
     _PipelineNotifyHandler.qdepth = 0
     _PipelineNotifyHandler.qmax = 0
     _PipelineNotifyHandler.qlock = threading.Lock()
+    _PipelineNotifyHandler.m_ts0 = 0.0
+    _PipelineNotifyHandler.m_ts1 = 0.0
     # Start HTTP server in a daemon thread BEFORE starting workers so a bind
     # failure fails fast (workers would otherwise block the exception for the
     # whole reader lifetime)
@@ -1720,11 +1739,29 @@ def _pipeline_reader(args, store):
     log("pipeline reader done (items={})".format(len(results)))
     if ctx is not None:
         ctx.teardown(store)
-    _emit_reader_summary(args, results, num_threads, meas_duration)
+    _emit_reader_summary(
+        args, results, num_threads, meas_duration,
+        wall_s=_measured_wall_from_notifies(
+            _PipelineNotifyHandler.m_ts0, _PipelineNotifyHandler.m_ts1,
+            meas_duration))
 
 # --------------------------------------------------------------------------
 
-def _emit_reader_summary(args, results, num_threads, meas_duration, out=None):
+def _measured_wall_from_notifies(ts0, ts1, fallback):
+    """Actual measured wall from the notify (write) epoch span.
+
+    Falls back to the configured measurement window when no measured notify
+    was observed (e.g. zero-traffic run)."""
+    if ts1 > ts0 > 0:
+        return float(ts1 - ts0)
+    try:
+        return float(fallback or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _emit_reader_summary(args, results, num_threads, meas_duration, out=None,
+                        wall_s=None):
     """Flush the reader-side SUMMARY + RESULT rows (shared by the pure
     reader process and the dual-role client).
 
@@ -1749,15 +1786,17 @@ def _emit_reader_summary(args, results, num_threads, meas_duration, out=None):
     latencies = sorted(lat_ok)
     busy_s = (sum(lat_ok) / 1000.0) if lat_ok else 0.0
     queue_waits = [r[4] for r in results]
+    wall = float(wall_s) if wall_s and wall_s > 0 else float(meas_duration or 0)
     summary = {
         "mode": "pipeline_reader", "scenario": args.scenario,
         "work_mode": args.work_mode or "recall", "protocol": args.protocol,
         "client_id": args.client_id, "reader_count": args.reader_count,
         "num_threads": num_threads,
-        "total": total, "bytes": total_bytes, "wall_s": meas_duration,
+        "total": total, "bytes": total_bytes,
+        "duration": meas_duration, "wall_s": wall,
         "warmup_total": warmup_total,
         "ok": ok_keys, "fail": fail_keys,
-        "qps": (total / meas_duration) if meas_duration > 0 else 0.0,
+        "qps": (total / wall) if wall > 0 else 0.0,
         "fail_rate": (fail_keys / total) if total else 0.0,
         # interface throughput = successful bytes / sum of successful store.get
         # call durations (busy time, not wall clock)
@@ -1833,6 +1872,8 @@ def _pipeline_dual(args, store):
     _PipelineNotifyHandler.qdepth = 0
     _PipelineNotifyHandler.qmax = 0
     _PipelineNotifyHandler.qlock = threading.Lock()
+    _PipelineNotifyHandler.m_ts0 = 0.0
+    _PipelineNotifyHandler.m_ts1 = 0.0
     _PipelineNotifyHandler.start_event = started
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     try:
@@ -1908,8 +1949,12 @@ def _pipeline_dual(args, store):
         rctx.teardown(store)
     # reader output → its own log (writer rows stay on the writer log);
     # the handle is owned by init_role_logs (MC_READER_LOG), line-buffered
-    _emit_reader_summary(args, results, num_threads, meas_duration,
-                         out=_reader_log_handle())
+    _emit_reader_summary(
+        args, results, num_threads, meas_duration,
+        out=_reader_log_handle(),
+        wall_s=_measured_wall_from_notifies(
+            _PipelineNotifyHandler.m_ts0, _PipelineNotifyHandler.m_ts1,
+            meas_duration))
     if writer_error:
         raise SystemExit("[ERROR] dual {}: writer phase failed: {}"
                          "".format(my_id, writer_error[0]))

@@ -47,7 +47,8 @@ def test_new_dated_format_and_basic_fields(tmp_path):
     # 4 per-second buckets (epoch-second keyed)
     # 4 OK seconds + 1 error second (errors land in buckets too)
     assert len(st["seconds"]) == 5
-    assert st["minutes"][0][1] == 5  # minute bucket total count
+    assert st["meta"]["bucket_step"] == 1     # 短 run -> 1s
+    assert "minutes" not in st                # S1：minutes 不再产出
 
 
 def test_pipeline_reader_rows_qw_and_kc(tmp_path):
@@ -176,21 +177,24 @@ def test_summaries_and_per_op_stats(tmp_path):
     assert get["ok"] == 2 and get["avg_ms"] == 8.5 and get["min_ms"] == 8.0
 
 
-def test_minute_buckets_are_epoch_seconds(tmp_path):
-    """minutes 桶的 t 必须是 epoch 秒（历史上误存 epoch 分钟 -> 报表显示 1970）。"""
-    text = (
-        "RESULT\t2026-11-12 10:00:05.000000\tput\tk1\t1.000000\tOK\n"
-        "RESULT\t2026-11-12 10:00:35.000000\tput\tk2\t2.000000\tOK\n"
-        "RESULT\t2026-11-12 10:01:10.000000\tput\tk3\t3.000000\tOK\n"
-    )
+def test_bucket_step_follows_collection_rule(tmp_path):
+    """收集规则：最细的、桶数 ∈ [59, 8192] 的时间尺度；minutes 不再产出。"""
+    # 30s：无达标尺度 -> 回退 1s
+    text = "".join(
+        "RESULT\t2026-11-12 10:00:{:02d}.000000\tput\tk{}\t1.0\tOK\n".format(
+            i, i) for i in range(30))
     st = ls.compute_stats(_write(tmp_path, text))
-    assert st["meta"]["bucket_unit"] == "s"
-    assert all(r[0] % 60 == 0 for r in st["minutes"])
-    # 每个分钟桶的起点 = 其覆盖的秒桶起点向下取整到分钟
-    sec_minutes = {t - t % 60 for t in (r[0] for r in st["seconds"])}
-    assert {r[0] for r in st["minutes"]} == sec_minutes
-    assert len(st["minutes"]) == 2                  # 10:00 与 10:01
-    assert sum(r[1] for r in st["minutes"]) == 3
+    assert st["meta"]["bucket_step"] == 1
+    assert len(st["seconds"]) == 30
+    assert "minutes" not in st
+    # 3 小时（10800s）：1s 超 8192 -> 10s
+    text2 = "".join(
+        "RESULT\t2026-11-12 {:02d}:{:02d}:{:02d}.000000\tput\tk{}\t1.0\tOK\n"
+        .format(i // 3600, (i % 3600) // 60, i % 60, i) for i in range(10800))
+    st2 = ls.compute_stats(_write(tmp_path, text2, name="long.log"))
+    assert st2["meta"]["bucket_step"] == 10
+    assert len(st2["seconds"]) == 1080
+    assert st2["seconds"][0][1] == 10       # 每桶 10 个样本
 
 
 def test_dated_timestamp_is_local_epoch(tmp_path, monkeypatch):
@@ -266,3 +270,37 @@ def test_top_n_zero_does_not_crash(tmp_path):
         tmp_path, "RESULT\t2026-11-12 10:00:01.000000\tput\tk1\t1.0\tOK\n"),
         top_n=0)
     assert len(st["slowest"]) == 1
+
+
+def test_outliers_excluded_from_bucket_stats(tmp_path):
+    """离群值（>p99×10）：从 1s 桶标量统计剔除；计数/直方图全量；产出清单。"""
+    lines = []
+    for i in range(2000):
+        lines.append(
+            "RESULT\t2026-11-12 10:00:00.{:06d}\tput\tk{}\t1.000000\tOK\t8\n"
+            .format(i % 1000, i))
+    lines.append(
+        "RESULT\t2026-11-12 10:00:00.999999\tput\tkX\t100.000000\tOK\t8\n")
+    lines.append(
+        "RESULT\t2026-11-12 10:00:01.000000\tput\tkF\t1.000000\tERR:-1\n")
+    st = ls.compute_stats(_write(tmp_path, "".join(lines)))
+    assert st["meta"]["outlier_threshold_ms"] == 10.0
+    assert len(st["outliers"]) == 1
+    assert st["outliers"][0]["lat_ms"] == 100.0
+    assert st["outliers"][0]["key"] == "kX"
+    assert st["abnormal"] and st["abnormal"][0]["status"] == "ERR:-1"
+    buck = st["seconds"][0]
+    assert buck[1] == 2001                       # 计数含离群样本（QPS 口径不变）
+    assert sum(buck[8].values()) == 2001         # 直方图全量（时延分布不变）
+    assert buck[5] == 1.0                        # max 已剔除离群值
+    # avg 不被离群值拉高（分母仍含离群样本，只可能略低不可能被抬高）
+    assert abs(buck[4] / buck[2] - 1.0) < 1e-3
+
+
+def test_no_outlier_detection_for_small_samples(tmp_path):
+    lines = "\n".join(
+        "RESULT\t2026-11-12 10:00:00.{:06d}\tput\tk{}\t1.0\tOK\t8"
+        .format(i, i) for i in range(50))
+    st = ls.compute_stats(_write(tmp_path, lines))
+    assert st["meta"]["outlier_threshold_ms"] is None
+    assert st["outliers"] == []

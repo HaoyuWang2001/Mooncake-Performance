@@ -481,6 +481,7 @@ const InstanceView = {
       const pick =
         files.find(f => f === pref + "report/overview.html") ||
         files.find(f => f.startsWith(pref) && /(^|\/)report\/report\.html$/.test(f)) ||
+        files.find(f => f.startsWith(pref) && /(^|\/)report\/[^/]+\/report\.html$/.test(f)) ||
         files.find(f => /(^|\/)report\/overview\.html$/.test(f)) ||
         files.find(f => /(^|\/)report\/report\.html$/.test(f));
       if (!pick) {

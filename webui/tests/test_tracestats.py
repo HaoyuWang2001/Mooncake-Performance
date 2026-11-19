@@ -180,6 +180,13 @@ def test_time_buckets_and_topn(tmp_path):
     assert op["top"][0]["total_us"] >= op["top"][-1]["total_us"]
     assert op["top"][0]["trace_id"] == "18446744073"
     assert "stages" in op["top"][0]
+    # 展开明细需要 L1+L2：top 条目必须保留二级子阶段
+    st0 = op["top"][0]["stages"]
+    for k in ("query_total_us", "memread_total_us"):
+        assert k in st0
+    for k in ("query_route_us", "query_rpc_us", "read_urma_us",
+              "read_teardown_us"):
+        assert k in st0, (k, st0)
 
 
 def test_cli_writes_trace_json(tmp_path):
@@ -208,6 +215,14 @@ def test_minute_buckets_are_epoch_seconds(tmp_path):
     sec_minutes = {t - t % 60 for t in (r[0] for r in op["seconds"])}
     assert {r[0] for r in op["minutes"]} == sec_minutes
     assert len(op["minutes"]) == 2
+
+
+def test_top_entry_keeps_write_l2_fields(tmp_path):
+    st = ts.compute_trace_stats(_write(tmp_path, "w2.glog", [WRITE_OK]))
+    top = st["groups"]["write"]["ops"]["put"]["top"][0]["stages"]
+    for k in ("prep_buf_alloc_us", "prep_memcpy_us", "prep_split_us",
+              "memwrite_urma_us", "memwrite_queue_us"):
+        assert k in top, (k, top)
 
 
 def test_negative_total_not_in_top_and_bucket_counts_neg(tmp_path):
@@ -351,17 +366,48 @@ def test_field_minutes_l1_and_residual(tmp_path):
     assert len(rows) == 1
     t, n, avg, mx = rows[0]
     assert n == 1 and avg == 50 and mx == 50
-    assert t % 60 == 0                    # 1 分钟对齐的 epoch 秒
+    # 阶段桶按 1 秒采集（旧版写死 1 分钟，短 run 只剩 2 个点、曲线退化成
+    # 一条直线）；降档由 _fmb_rows 按桶数决定，短 run 保持 1 秒
+    assert read["ftier"] == 1
     # residual = 266 - (50+4+6+206) = 0
     assert fm["residual"][0][2] == 0
-    assert read["ftier"] == 60
     # σ 需要的平方和已累计
     assert read["fields"]["total_us"]["sumsq"] == 266 ** 2
 
 
-def test_field_minutes_auto_coarsen():
-    fb = {i * 60: [1, 10.0, 12.0] for i in range(1500)}
-    rows, tier = ts._fmb_rows(fb)
-    assert tier == 600                    # 超过 1440 桶 -> 10 分钟档
-    assert len(rows) <= ts.FIELD_MAX_BUCKETS
-    assert sum(r[1] for r in rows) == 1500
+def test_emit_step_collection_rule():
+    """收集规则：最细的、桶数 ∈ [59, 8192] 的时间尺度；无达标回退 1s。"""
+    assert ts._emit_step(30) == 1
+    assert ts._emit_step(600) == 1
+    assert ts._emit_step(3600) == 1
+    assert ts._emit_step(10800) == 10      # 1s 超 8192
+    assert ts._emit_step(90000) == 60      # 1s/10s 超上限
+    assert ts._emit_step(86400 * 5) == 60  # 60s=7200 达标
+
+
+def test_fmb_rows_aggregate_at_step():
+    fb = {i: [3, 30.0, 40.0] for i in range(31)}
+    rows = ts._fmb_rows(fb, 10)
+    assert len(rows) == 4                  # 0-9,10-19,20-29,30
+    assert rows[0] == [0, 30, 10.0, 40.0]   # sum=30 / n=30
+    assert sum(r[1] for r in rows) == 93
+
+
+def test_field_buckets_keep_seconds_when_short():
+    """短 run（几十秒）保留秒级桶。"""
+    fb = {1000 + i: [3, 30.0, 40.0] for i in range(31)}
+    step = ts._emit_step(31)
+    rows = ts._fmb_rows(fb, step)
+    assert step == 1 and len(rows) == 31
+    assert [r[0] for r in rows] == list(range(1000, 1031))
+
+
+def test_field_buckets_coarsen_when_dense():
+    """1s 桶数超过 8192 -> 10s 档，总量不丢。"""
+    fb = {i: [1, 5.0, 9.0] for i in range(9000)}
+    step = ts._emit_step(9000)
+    rows = ts._fmb_rows(fb, step)
+    assert step == 10 and len(rows) == 900
+    assert sum(r[1] for r in rows) == 9000
+
+

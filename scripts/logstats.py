@@ -56,6 +56,17 @@ EDGES_BY_VERSION = {1: BIN_EDGES, 2: BIN_EDGES_V2}
 BIN_EDGES_US = [0.001 * (1.2 ** i) for i in range(121)]
 BIN_EDGES_US[0] = 0.0
 EXACT_LIMIT = 5_000_000        # 样本数上限内用精确分位数，超出用直方图
+# 离群体系（S5）：离群值 = 单请求 > 该客户端 p99 × 10（需足够样本）；
+# 离群样本从 1s 桶的标量统计（sum/max/队列等待）中剔除；
+# 计数（c/ok/fail）与直方图保持全量（QPS 与时延分布口径不变）。
+OUTLIER_FACTOR = 10.0
+OUTLIER_MIN_SAMPLES = 1000     # 样本不足时 p99 不稳定 -> 不做离群判定
+LIST_CAP = 200                 # 异常请求 / 离群值清单每客户端上限
+# 时间尺度收集规则（与 report.py / tracestats.py 一致）：
+#   尺度 s 回传 ⇔ 桶数 span/s ∈ [MIN_TIER_BUCKETS, MAX_TIER_BUCKETS]
+TIER_STEPS = (1, 10, 60)
+MIN_TIER_BUCKETS = 59
+MAX_TIER_BUCKETS = 8192
 EXCERPT_CAP = 16 * 1024        # 错误摘录字节上限
 
 
@@ -246,6 +257,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     first_error_status = None
     slowest = []                    # min-heap of (lat, seq, row), size<=top_n
     slow_seq = 0
+    abnormal = []                   # 异常请求（未完成/失败）清单，<=LIST_CAP
     seconds = {}                    # epoch-second -> bucket dict
     ts_from = ts_to = None
 
@@ -296,6 +308,12 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             if first_error_line is None:
                 first_error_line = row["lineno"]
                 first_error_status = status
+            if len(abnormal) < LIST_CAP:
+                abnormal.append({
+                    "ts": row["ts"], "op": row["op"], "key": row["key"],
+                    "lat_ms": (round(row["lat"], 6)
+                               if row["lat"] is not None else None),
+                    "status": status})
             if row["lat"] is not None:
                 slow_seq += 1
                 if len(slowest) < top_n:
@@ -409,6 +427,57 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "p999_ms": opct(0.999), "p9999_ms": opct(0.9999),
         }
 
+    # ---- 离群体系：第二遍扫描（阈值需在全局 p99 之后才知道） ----
+    outliers = []
+    outlier_thr = None
+    if ok >= OUTLIER_MIN_SAMPLES:
+        try:
+            _p99 = pct(0.99)
+        except Exception:
+            _p99 = 0.0
+        if _p99 and _p99 > 0:
+            outlier_thr = _p99 * OUTLIER_FACTOR
+            excl = {}       # sec -> [sum_excl, qsum_excl]
+            mx = {}         # sec -> [max_non_outlier, qmax_non_outlier]
+            for row in iter_rows(path):
+                if row["status"] != "OK" or row["lat"] is None:
+                    continue
+                lat = row["lat"]
+                ep = _ts_to_epoch(row["ts"])
+                if lat > outlier_thr:
+                    if len(outliers) < LIST_CAP:
+                        outliers.append({
+                            "ts": row["ts"], "op": row["op"],
+                            "key": row["key"],
+                            "lat_ms": round(lat, 6), "status": "OK"})
+                    if ep is not None:
+                        e = excl.setdefault(int(ep), [0.0, 0.0])
+                        e[0] += lat
+                        if row["qw"] is not None:
+                            e[1] += row["qw"]
+                    continue
+                if ep is None:
+                    continue
+                s2 = int(ep)
+                m = mx.get(s2)
+                qw = row["qw"]
+                if m is None:
+                    mx[s2] = [lat, (qw if qw is not None else 0.0)]
+                else:
+                    if lat > m[0]:
+                        m[0] = lat
+                    if qw is not None and qw > m[1]:
+                        m[1] = qw
+            # 只改标量统计；c/ok/fail 与直方图保持全量
+            for s2, buck in seconds.items():
+                e = excl.get(s2)
+                if e:
+                    buck["sum"] = max(0.0, buck["sum"] - e[0])
+                    buck["qsum"] = max(0.0, buck["qsum"] - e[1])
+                m = mx.get(s2)
+                buck["max"] = m[0] if m else 0.0
+                buck["qmax"] = m[1] if m else 0.0
+
     # minute buckets: exact merge of the 1s buckets
     minutes = {}
     for sec in sorted(seconds):
@@ -426,6 +495,38 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         mb["qmax"] = max(mb["qmax"], buck["qmax"])
         for b, n in buck["h"].items():
             mb["h"][b] = mb["h"].get(b, 0) + n
+
+    def _acc_into(b, o):
+        b["c"] += o["c"]
+        b["ok"] += o["ok"]
+        b["fail"] += o["fail"]
+        b["sum"] += o["sum"]
+        b["max"] = max(b["max"], o["max"])
+        b["qsum"] += o["qsum"]
+        b["qmax"] = max(b["qmax"], o["qmax"])
+        for hk, hn in (o["h"] or {}).items():
+            b["h"][hk] = b["h"].get(hk, 0) + hn
+
+    # 收集尺度：最细的、桶数落在 [59, 8192] 的时间尺度；无达标尺度时回退 1s。
+    emit_step = 1
+    if ts_from is not None and ts_to is not None:
+        _span = max(0.0, float(ts_to) - float(ts_from))
+        for cand in TIER_STEPS:
+            if MIN_TIER_BUCKETS <= _span / cand <= MAX_TIER_BUCKETS:
+                emit_step = cand
+                break
+    if emit_step == 1:
+        emit_buckets = seconds
+    else:
+        emit_buckets = {}
+        for t in sorted(seconds):
+            k = t // emit_step * emit_step
+            b = emit_buckets.get(k)
+            if b is None:
+                b = emit_buckets[k] = {
+                    "c": 0, "ok": 0, "fail": 0, "sum": 0.0, "max": 0.0,
+                    "qsum": 0.0, "qmax": 0.0, "h": {}}
+            _acc_into(b, seconds[t])
 
     def buckets_to_list(bmap, base):
         # bucket keys are epoch-seconds (1s) or epoch-minutes (1min); the
@@ -469,6 +570,10 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             # time-bucket t unit; "s" = epoch seconds (absent in old products,
             # whose minutes used epoch minutes -> reduce multiplies by 60)
             "bucket_unit": "s",
+            # 本产物 seconds 行的桶步长（1/10/60）：map 按收集规则选最细达标尺度
+            "bucket_step": emit_step,
+            "outlier_threshold_ms": (round(outlier_thr, 6)
+                                     if outlier_thr else None),
             # histogram ladder of this product (1 = legacy 81-bin ms ladder)
             "hist_version": HIST_VERSION,
         },
@@ -488,14 +593,15 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         "histogram": {str(b): n for b, n in sorted(hist.items())},
         "ops": ops_out,
         "summaries": _scan_summaries(path),
-        "seconds": buckets_to_list(seconds, 1),
-        "minutes": buckets_to_list(minutes, 60),
+        "seconds": buckets_to_list(emit_buckets, 1),
         "errors": errors,
         "error_excerpt": (_read_context(path, first_error_line, context)
                           if first_error_line is not None else None),
         "error_excerpt_status": first_error_status,
         "slowest": top,
         "anomalies": anomalies,
+        "abnormal": abnormal,
+        "outliers": outliers,
     }
     return stats
 

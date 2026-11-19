@@ -47,7 +47,9 @@ def test_stop_reports_partial(tmp_path, monkeypatch):
         "report": _ctx(tmp_path, ts, logdir)})
     bm._stop_reports()
     assert pulled, "stop 前必须先把远端日志拉回来"
-    assert (logdir / "report" / "report.html").is_file()
+    units = sorted((logdir / "report").glob("*/report.html"))
+    assert units, "每个单元（size×combo）一份 report.html"
+    assert units[0].parent.name == "c1_t1_8MB"
     assert (tmp_path / ts / "report" / "overview.html").is_file()
 
 
@@ -61,4 +63,4 @@ def test_stop_reports_can_be_disabled(tmp_path, monkeypatch):
         "report": _ctx(tmp_path, ts, logdir)})
     monkeypatch.setenv("MC_STOP_REPORT", "0")
     bm._stop_reports()
-    assert not (logdir / "report" / "report.html").exists()
+    assert not list((logdir / "report").glob("*/report.html"))

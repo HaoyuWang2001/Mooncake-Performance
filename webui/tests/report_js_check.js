@@ -32,6 +32,7 @@ const expectTrace = arg("--expect-trace", null) === "1";
 const tierLabel = arg("--tier-label", null);
 const addObjKey = arg("--add-obj", null);
 const useReal = process.argv.includes("--real");
+const clickCombo = process.argv.includes("--click-combo");
 
 const elements = {};
 function makeEl(id) {
@@ -49,7 +50,28 @@ function makeEl(id) {
     getAttribute(k) { return this.attrs[k]; },
     onclick: null,
     onchange: null,
-    appendChild(c) { this.children.push(c); return c; },
+    parentNode: null,
+    nextSibling: null,
+    appendChild(c) {
+      c.parentNode = this; c.nextSibling = null;
+      this.children.push(c); return c;
+    },
+    insertBefore(node, ref) {
+      node.parentNode = this;
+      const i = ref ? this.children.indexOf(ref) : -1;
+      if (i >= 0) { this.children.splice(i, 0, node); node.nextSibling = ref; }
+      else { this.children.push(node); node.nextSibling = null; }
+      return node;
+    },
+    removeChild(node) {
+      const i = this.children.indexOf(node);
+      if (i >= 0) { this.children.splice(i, 1); node.parentNode = null; }
+      return node;
+    },
+    __attrs: {},
+    setAttribute(k, v) { this.__attrs[String(k)] = String(v); },
+    getAttribute(k) { return this.__attrs[String(k)]; },
+    addEventListener() {},
     querySelector() { return makeEl(""); },
     get textContent() { return this._text; },
     set textContent(v) { this._text = String(v); },
@@ -128,8 +150,9 @@ if (useReal) {
   realInit = (el) => {
     const id = (el && el.id) || "anon";
     if (!charts[id]) charts[id] = [];
+    const VC_W = Number(process.env.VC_WIDTH || 960);
     const c = realEcharts.init(null, null,
-      { renderer: "svg", ssr: true, width: 960, height: 420 });
+      { renderer: "svg", ssr: true, width: VC_W, height: 420 });
     realCharts.push({ id, chart: c });
     return new Proxy(c, {
       get(t, p) {
@@ -189,6 +212,134 @@ function seriesX0(opt, name) {
 if (!errs.length) {
   out.cards_text = [textOf(getEl("perfcards")), textOf(getEl("infocards")),
                     textOf(getEl("params"))].join(" ");
+  function kids(id){
+    return (getEl(id).children || []).map(function(c){
+      return {cls: String(c.className || ""), text: textOf(c)};
+    });
+  }
+  out.selobjs = (sandbox.window && sandbox.window.__MC_SEL)
+    ? sandbox.window.__MC_SEL() : [];
+  out.lat_btns = (getEl("latSel").children || []).map(function (c) {
+    return {t: textOf(c), off: String(c.className || "").indexOf("off") >= 0};
+  });
+  out.main_colors = ((mainOpt() && mainOpt().series) || []).map(function (s) {
+    return {name: s.name, color: (s.lineStyle || {}).color};
+  });
+  const sseq = charts.slowchart || [];
+  const so = sseq.length ? sseq[sseq.length - 1] : null;
+  out.slow_series = ((so && so.series) || []).map(function (s) {
+    return {name: s.name, type: s.type, symbol: s.symbol,
+            len: (s.data || []).length};
+  });
+  out.slow_x = (so && so.xAxis) ? [so.xAxis.min, so.xAxis.max] : null;
+  out.slow_ctl_text = textOf(getEl("slowctl"));
+  if (process.argv.includes("--sel-all-clear")) {
+    try {
+      const sel = function () {
+        return (sandbox.window && sandbox.window.__MC_SEL)
+          ? sandbox.window.__MC_SEL() : [];
+      };
+      const sa = getEl("selAllBtn");
+      if (sa && sa.onclick) sa.onclick();
+      out.selobjs_all = sel();
+      const sc = getEl("selClearBtn");
+      if (sc && sc.onclick) sc.onclick();
+      out.selobjs_cleared = sel();
+    } catch (e) { errs.push("selall: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--expand-tree")) {
+    try {
+      for (let i = 0; i < 32; i++) {
+        let clicked = false;
+        (function walk(node) {
+          (node.children || []).forEach(function (c) {
+            if (clicked) return;
+            if (String(c.className || "").indexOf("tree-caret") >= 0 &&
+                c.onclick && c._text !== "▾") {
+              c.onclick(); clicked = true;
+            }
+            walk(c);
+          });
+        })(getEl("objTree"));
+        if (!clicked) break;
+      }
+      out.tree_rows_expanded = (getEl("objTree").children || []).map(textOf);
+    } catch (e) { errs.push("expand: " + String(e && e.stack || e)); }
+  }
+  function findBtn(root, text) {
+    let hit = null;
+    (function walk(node) {
+      if (hit || !node) return;
+      if (node._text === text && node.onclick) { hit = node; return; }
+      (node.children || []).forEach(walk);
+    })(root);
+    return hit;
+  }
+  if (process.argv.includes("--role-writer")) {
+    try {
+      const wb = findBtn(getEl("objTree"), "writer");
+      if (wb && wb.onclick) wb.onclick();
+      out.selobjs_after_role = (sandbox.window && sandbox.window.__MC_SEL)
+        ? sandbox.window.__MC_SEL() : [];
+      const qseq = charts.qpschart || [];
+      const qo = qseq.length ? qseq[qseq.length - 1] : null;
+      out.qps_after_role = ((qo && qo.series) || []).map(function (s) {
+        return s.name;
+      });
+    } catch (e) { errs.push("role: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--role-roundtrip")) {
+    try {
+      const sel = function () {
+        return (sandbox.window && sandbox.window.__MC_SEL)
+          ? sandbox.window.__MC_SEL() : [];
+      };
+      sandbox.toggleObj("node:n2:reader");          // reader 视角选中一个节点
+      out.selobjs_reader_selected = sel();
+      const wb = findBtn(getEl("objTree"), "writer");
+      if (wb && wb.onclick) wb.onclick();
+      out.selobjs_writer_view = sel();
+      const rb = findBtn(getEl("objTree"), "reader");
+      if (rb && rb.onclick) rb.onclick();
+      out.selobjs_back_reader = sel();
+    } catch (e) { errs.push("roundtrip: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--slow-writer")) {
+    try {
+      const wb = findBtn(getEl("slowctl"), "writer");
+      if (wb && wb.onclick) wb.onclick();
+      const q1 = charts.slowchart || [];
+      const o1 = q1.length ? q1[q1.length - 1] : null;
+      out.slow_series_writer = ((o1 && o1.series) || []).map(function (s) {
+        return {name: s.name, symbol: s.symbol};
+      });
+      const ab = findBtn(getEl("slowctl"), "全选");
+      if (ab && ab.onclick) ab.onclick();
+      const q2 = charts.slowchart || [];
+      const o2 = q2.length ? q2[q2.length - 1] : null;
+      out.slow_series_all = ((o2 && o2.series) || []).map(function (s) {
+        return {name: s.name, len: (s.data || []).length};
+      });
+    } catch (e) { errs.push("slow: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--total-off")) {
+    try {
+      const tb = findBtn(getEl("objTree"), "总计");
+      if (tb && tb.onclick) tb.onclick();
+      out.selobjs_total_off = (sandbox.window && sandbox.window.__MC_SEL)
+        ? sandbox.window.__MC_SEL() : [];
+    } catch (e) { errs.push("total: " + String(e && e.stack || e)); }
+  }
+  out.perf_kids = kids("perfcards");
+  out.info_kids = kids("infocards");
+  out.unit_kids = kids("unitmeta");
+  out.perf_shown = getEl("perfcards").style.display !== "none";
+  out.rolecards_shown = getEl("rolecards").style.display !== "none";
+  out.rolecards_text = textOf(getEl("rolecards"));
+  out.param_rows = ((getEl("params").children || []).map(function(r){
+    const k = (r.children || []).find(function(c){ return c.className === "pk"; });
+    return k ? textOf(k) : textOf(r);
+  }));
   const hseq = charts.histchart || [];
   const ho = hseq.length ? hseq[hseq.length - 1] : null;
   out.hist_marks = (ho && ho.series && ho.series[0] && ho.series[0].markLine)
@@ -199,6 +350,7 @@ if (!errs.length) {
   out.hist_mark_x = (ho && ho.series && ho.series[0] && ho.series[0].markLine
     && ho.series[0].markLine.data)
     ? ho.series[0].markLine.data.map((d) => d.xAxis) : [];
+  out.hist_grid_top = (ho && ho.grid) ? ho.grid.top : null;
   out.init_len = seriesLen(mainOpt(), "p50");
   out.init_x0 = seriesX0(mainOpt(), "p50");
 
@@ -217,6 +369,18 @@ if (!errs.length) {
     out.min_len = out.init_len;
   }
 
+  if (clickCombo) {
+    try {
+      const btns = (getEl("comboBtns").children || []);
+      out.combo_btns = btns.length;
+      if (btns.length > 1) {
+        btns[btns.length - 1].onclick();
+        out.combo_clicked = true;
+        out.combo_cards = (getEl("infocards").children || []).length;
+      }
+    } catch (e) { errs.push("combo click: " + String(e && e.stack || e)); }
+  }
+
   if (addObjKey) {
     try {
       // 对象树：找到 data-key 匹配的行并点击（等价于用户勾选）
@@ -233,6 +397,9 @@ if (!errs.length) {
       if (!clicked) errs.push("add obj: tree row not found " + addObjKey);
       const opt = mainOpt();
       out.overlay_names = (opt && opt.series || []).map((s) => s.name);
+      out.overlay_colors = (opt && opt.series || []).map((s) => {
+        return {name: s.name, color: (s.lineStyle || {}).color};
+      });
       out.overlay_len = opt && opt.series && opt.series.length
         ? opt.series[0].data.length : null;
     } catch (e) { errs.push("add obj: " + String(e && e.stack || e)); }
@@ -262,15 +429,14 @@ if (!errs.length) {
   const outlierArg = arg("--outlier", null);
   if (outlierArg === "1") {
     try {
+      const names = function () {
+        const opt = mainOpt();
+        return ((opt && opt.series) || []).map(function (s) { return s.name; });
+      };
+      out.outlier_before = names();
       const btn = getEl("outlierBtn");
       btn.onclick();
-      const opt = mainOpt();
-      out.outlier_nulls = ((opt && opt.series) || []).map(function (s) {
-        return (s.data || []).filter(function (d) { return d[1] === null; }).length;
-      });
-      out.outlier_max = Math.max.apply(null, [0].concat.apply([], ((opt && opt.series) || []).map(function (s) {
-        return (s.data || []).map(function (d) { return (d && d[1] != null) ? d[1] : 0; });
-      })));
+      out.outlier_after = names();
       out.outlier_btn = textOf(btn);
     } catch (e) { errs.push("outlier: " + String(e && e.stack || e)); }
   }
@@ -278,13 +444,74 @@ if (!errs.length) {
   const _tc=(charts.tchart||[]); const _tco=_tc.length?_tc[_tc.length-1]:null;
   out.tchart_series=((_tco&&_tco.series)||[]).map(function(s){return s.name;});
   out.tchart_empty=textOf(getEl("tchartEmpty"));
-  out.yscale_hi = textOf(getEl("yscaleHi"));
-  out.yscale_lo = textOf(getEl("yscaleLo"));
+  out.zslider_cap = textOf(getEl("zsliderCap"));
   out.tree_rows = (getEl("objTree").children || []).map(function (r) {
     return textOf(r);
   });
   out.qps_series = (charts.qpschart || []).length;
   out.qps_note = textOf(getEl("qpsNote"));
+  const qseq = charts.qpschart || [];
+  const qo = qseq.length ? qseq[qseq.length - 1] : null;
+  out.qps_legend_mode = (qo && qo.legend) ? qo.legend.selectedMode : null;
+  out.qps_filter_mode = (qo && qo.dataZoom && qo.dataZoom[0])
+    ? qo.dataZoom[0].filterMode : null;
+
+  if (process.argv.includes("--click-client")) {
+    try {
+      const tb = getEl("#ctable tbody");
+      const tr0 = (tb.children || [])[0];
+      const sel = function () {
+        return (sandbox.window && sandbox.window.__MC_SEL)
+          ? sandbox.window.__MC_SEL() : [];
+      };
+      const before = JSON.stringify(sel());
+      const mseq0 = charts.mainchart || [];
+      const mo0 = mseq0.length ? mseq0[mseq0.length - 1] : null;
+      out.main_series_before = (mo0 && mo0.series) ? mo0.series.length : null;
+      out.row_onclick = !!(tr0 && tr0.onclick);
+      if (tr0 && tr0.onclick) tr0.onclick();
+      out.selobjs_before = before;
+      out.selobjs_after = JSON.stringify(sel());
+      out.rows_after = (tb.children || []).length;
+      out.cld_rows = (tb.children || []).filter(function (r) {
+        return String(r.className || "").indexOf("cld-row") >= 0;
+      }).length;
+      const mseq1 = charts.mainchart || [];
+      const mo1 = mseq1.length ? mseq1[mseq1.length - 1] : null;
+      out.main_series_after = (mo1 && mo1.series) ? mo1.series.length : null;
+    } catch (e) { errs.push("clickclient: " + String(e && e.stack || e)); }
+  }
+
+  if (process.argv.includes("--endlabels")) {
+    try {
+      const top = 52, bot = 350;
+      const cases = [
+        {name: "edge-clamp", pys: [-80, 40, 200, 900]},
+        {name: "bottom-cluster+top", pys: [60, 348, 350, 352, 353, 354, 354]},
+        {name: "top+bottom", pys: [52, 52, 52, 353, 354, 354, 354]},
+        {name: "top-cluster", pys: [52, 52, 52, 53, 60, 80, 120]},
+        {name: "all-bottom", pys: [354, 354, 354, 354, 354, 354, 354]},
+      ];
+      out.endlabel_bounds = [top, bot];
+      out.endlabel_cases = cases.map(function (c) {
+        const laid = sandbox.endLabelLayout(c.pys.map(function (py) {
+          return {px: 600, py: py, ly: 0};
+        }), top, bot) || [];
+        const lys = laid.map(function (it) { return it.ly; });
+        let minGap = Infinity;
+        for (let i = 1; i < lys.length; i++) {
+          minGap = Math.min(minGap, lys[i] - lys[i - 1]);
+        }
+        return {name: c.name, pys: laid.map(function (it) { return it.py; }),
+                lys: lys, min_gap: minGap};
+      });
+      out.endlabels = out.endlabel_cases[0].lys.map(function (ly, i) {
+        return {py: out.endlabel_cases[0].pys[i], ly: ly};
+      });
+    } catch (e) {
+      errs.push("endlabels: " + String(e && e.stack || e));
+    }
+  }
 
   const hsizes = data.sizes || {};
   const hsize = Object.keys(hsizes)[0];
@@ -299,6 +526,35 @@ if (!errs.length) {
       if (name && name.onclick) { name.onclick(); clicked = true; }
     });
     out.detail_text = textOf(getEl("tdetail"));
+    out.tcards_kids = kids("tcards");
+    const tseq = charts.tstackchart || [];
+    const topt = tseq.length ? tseq[tseq.length - 1] : null;
+    out.tstack_series = ((topt && topt.series) || []).map(function (s) {
+      return {name: s.name, stack: s.stack,
+              color: (s.itemStyle || {}).color,
+              len: (s.data || []).length};
+    });
+    out.tstack_cats = (topt && topt.xAxis && topt.xAxis.data)
+      ? topt.xAxis.data.length : null;
+    try {
+      const bk = sandbox.stageBreakdownRow(zz.trace.top[0]);
+      out.tbreak_text = bk ? textOf(bk) : "";
+    } catch (e) { errs.push("tbreak: " + String(e && e.stack || e)); }
+    try {
+      out.lvl_line_w = [
+        sandbox.lvlLineW("残差", "1.5 µs  0.0%"),
+        sandbox.lvlLineW("buf_alloc_us", "1.3 µs  0.0%"),
+        sandbox.lvlLineW("query_total_us", "18.8 ms  50.3%")
+      ];
+      out.lvl_zero_px = [
+        sandbox.lvlZeroW("残差", "1.5 µs  0.0%"),
+        sandbox.lvlZeroW("buf_alloc_us", "1.3 µs  0.0%")
+      ];
+    } catch (e) { errs.push("lvlw: " + String(e && e.stack || e)); }
+    try {
+      out.stage_tier_btns = (getEl("stageTierBtns").children || [])
+        .map(function (b) { return b._text; });
+    } catch (e) { errs.push("stier: " + String(e && e.stack || e)); }
   }
 
   if (switchSize) {
@@ -316,10 +572,28 @@ if (!errs.length) {
   }
 }
 if (useReal && !errs.length) {
+  const zoomArg = process.env.VC_ZOOM || null;   /* "30,60" -> dispatch 后再渲染 */
+  if (zoomArg) {
+    const parts = zoomArg.split(",").map(Number);
+    realCharts.forEach((rc) => {
+      if (rc.id === "mainchart" || rc.id === "qpschart") {
+        try {
+          rc.chart.dispatchAction({ type: "dataZoom", dataZoomIndex: 0,
+            start: parts[0], end: parts[1] });
+        } catch (e) { errs.push("zoom " + rc.id + ": " + e.message); }
+      }
+    });
+  }
+  const svgDir = process.env.VC_SVGDIR || null;
   const real = { total: realCharts.length, ok: 0, fail: 0, fails: [] };
   realCharts.forEach((rc) => {
     try {
       const svg = rc.chart.renderToSVGString();
+      if (svgDir) {
+        fs.mkdirSync(svgDir, { recursive: true });
+        fs.writeFileSync(svgDir + "/" + rc.id + "_" +
+                         (process.env.VC_WIDTH || 960) + ".svg", svg);
+      }
       if (!svg || svg.length < 200) throw new Error("empty svg " + (svg || "").length);
       real.ok++;
     } catch (e) {

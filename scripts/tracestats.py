@@ -47,18 +47,30 @@ WRITE_OPS = {"put", "put_batch", "put_from", "upsert", "upsert_from",
              "batch_put"}
 
 READ_TOP = ("query_total_us", "select_us", "buf_alloc_us", "memread_total_us")
+# L2 子阶段：慢请求展开明细要回答「慢的一块里哪个子区间慢」——top 条目
+# 除 L1 外一并保留这些字段（与 report.py 的 TREAD/TWRITE 树一致）。
+READ_SUB = ("query_route_us", "query_rpc_us",
+            "read_submit_us", "read_queue_us", "read_urma_us",
+            "read_teardown_us")
 WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
              "put_start_us", "memwrite_total_us", "put_end_us", "finalize_us",
              "cache_invalidate_us", "revoke_us")
+WRITE_SUB = ("prep_buf_alloc_us", "prep_memcpy_us", "prep_split_us",
+             "memwrite_submit_us", "memwrite_queue_us",
+             "memwrite_urma_us", "memwrite_teardown_us")
 
 # 段3：阶段曲线（图2）采样字段 = L1 顶层 + total + residual。
 # L2 子阶段（query_route/read_urma/...）不再逐时间采样（体积随字段数线性膨胀，
 # 512 客户端不可控）；L2 细粒度分析在阶段树/指标套件里提供全局统计。
 CHART_FIELDS = set(READ_TOP) | set(WRITE_TOP) | {"residual"}
-FIELD_MIN_SECONDS = 60        # 阶段时间桶初档：1 分钟
-FIELD_MAX_BUCKETS = 1440      # 单字段桶数上限（超出自动降档到 10 分钟）
+FIELD_BASE_SECONDS = 1        # 采集粒度：按 1 秒累加
+# 时间尺度收集规则（与 logstats.py / report.py 一致）：
+#   尺度 s 回传 ⇔ 桶数 span/s ∈ [MIN_TIER_BUCKETS, MAX_TIER_BUCKETS]
+TIER_STEPS = (1, 10, 60)
+MIN_TIER_BUCKETS = 59
+MAX_TIER_BUCKETS = 8192
 
-TOP_N = 50
+TOP_N = 100
 
 
 def _num(value):
@@ -168,6 +180,64 @@ def parse_phase_markers(path):
     return marks
 
 
+def _resolve_ep_shift(path, marks):
+    """宿主重算时的 epoch 基准校准（秒）。
+
+    节点钟面串用 mktime（宿主本地时区）解析。map 在节点上跑时两边一致；
+    但 --rebuild-report / 拉原始日志的本地重算跑在宿主上，宿主时区与
+    节点（本项目约定 UTC，见 report._node_ts_epoch）不同时，mktime 会
+    整体偏移整数个时区，导致所有行落不进 MC_PHASE 的 measured 窗口
+    （曾出现 ops=0、trace 段空白）。UTC 宿主（含节点侧）直接返回 0；
+    非 UTC 宿主用 marker 的客户端 epoch 自校准（15 分钟步进 + 跨文件抽样）。
+    """
+    if not marks:
+        return 0.0
+    m0 = marks.get(("measured", "start"))
+    m1 = marks.get(("measured", "end"))
+    if m0 is None:
+        return 0.0
+    if m1 is None:
+        m1 = m0 + 3600.0
+    off = -time.timezone
+    if time.daylight and time.localtime(m0).tm_isdst > 0:
+        off = -time.altzone
+    if off == 0:
+        return 0.0                       # UTC 宿主：无需校准
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    stride = max(1, size // (400 * 300))   # 约 400 个跨文件均匀样本
+    samples = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if stride > 1 and i % stride:
+                    continue
+                pairs = parse_line(line)
+                if not pairs:
+                    continue
+                bd = pairs.get("breakdown", "")
+                if not bd or bd.endswith(".slice"):
+                    continue
+                if _num(pairs.get("total_us", "")) is None:
+                    continue
+                e = _start_epoch(pairs.get("start_time", ""))
+                if e is not None:
+                    samples.append(e)
+                if len(samples) >= 400:
+                    break
+    except OSError:
+        return off
+    best_o, best_hits = off, 0
+    for k in range(-56, 57):              # ±14 小时，15 分钟步进
+        o = k * 900.0
+        hits = sum(1 for e in samples if m0 <= e + o <= m1)
+        if hits > best_hits:
+            best_hits, best_o = hits, o
+    return best_o
+
+
 def _phase_of(t, marks):
     """Classify one trace timestamp into setup / warmup / measured / teardown
     by the marker windows. No markers at all (legacy clients) -> None (the
@@ -224,14 +294,24 @@ def _fmb_add(bmap, field, mkey, value):
             b[2] = value
 
 
-def _fmb_rows(fbuckets):
-    """{min_epoch: [n,sum,max]} -> [[t, n, avg, max], ...] with an automatic
-    coarsening step (10 min) when the bucket count would exceed the cap."""
+def _emit_step(span):
+    """收集规则：最细的、桶数落在 [59, 8192] 的时间尺度；无达标回退 1s。"""
+    span = float(span or 0)
+    for cand in TIER_STEPS:
+        if span > 0 and MIN_TIER_BUCKETS <= span / cand <= MAX_TIER_BUCKETS:
+            return cand
+    return FIELD_BASE_SECONDS
+
+
+def _fmb_rows(fbuckets, step=1):
+    """{epoch_s: [n,sum,max]} -> [[t, n, avg, max], ...] at the emit step.
+
+    采集粒度是 1 秒；按 step（1/10/60）聚合，step 由该 op 的时间跨度按
+    收集规则决定（与 logstats / 端到端曲线同一策略）。"""
     if not fbuckets:
-        return [], FIELD_MIN_SECONDS
-    step = FIELD_MIN_SECONDS
-    if len(fbuckets) > FIELD_MAX_BUCKETS:
-        step = FIELD_MIN_SECONDS * 10
+        return []
+    step = int(step or 1)
+    if step > 1:
         agg = {}
         for t, b in fbuckets.items():
             k = int(t) // step * step
@@ -248,14 +328,38 @@ def _fmb_rows(fbuckets):
         n, ssum, mx = fbuckets[t]
         rows.append([int(t), int(n), round(ssum / n, 3) if n else 0.0,
                      round(mx, 3)])
-    return rows, step
+    return rows
 
 
-def _bucket_rows(bmap, base=1):
-    """bucket rows; t is emitted as epoch-seconds (base=60 for minute keys)."""
+def _bucket_rows(bmap, base=1, step=1):
+    """bucket rows; t is emitted as epoch-seconds (base=60 for minute keys).
+
+    step>1 aggregates consecutive base buckets onto the step grid (收集规则
+    选出最细达标尺度时的产物)。"""
+    src = bmap
+    if int(step or 1) > 1:
+        src = {}
+        for t in sorted(bmap):
+            k = t // step * step
+            b = src.get(k)
+            o = bmap[t]
+            if b is None:
+                b = src[k] = {"n": o["n"], "ok": o["ok"], "fail": o["fail"],
+                              "sum": o["sum"], "max": o["max"],
+                              "neg": o.get("neg", 0),
+                              "h": dict(o.get("h") or {})}
+            else:
+                b["n"] += o["n"]
+                b["ok"] += o["ok"]
+                b["fail"] += o["fail"]
+                b["sum"] += o["sum"]
+                b["max"] = max(b["max"], o["max"])
+                b["neg"] += o.get("neg", 0)
+                for hk, hn in (o.get("h") or {}).items():
+                    b["h"][hk] = b["h"].get(hk, 0) + hn
     out = []
-    for t in sorted(bmap):
-        b = bmap[t]
+    for t in sorted(src):
+        b = src[t]
         out.append([t * base, b["n"], b["ok"], b["fail"], round(b["sum"], 3),
                     round(b["max"], 6), 0.0, 0.0, b["h"], b["neg"]])
     return out
@@ -286,7 +390,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 "group": group, "op": op,
                 "count": 0, "ok": 0, "fail": 0, "status": {},
                 "fields": {},          # field -> {n, sum, sumsq, min, max, neg, hist}
-                "field_minutes": {},   # chart field -> {min_epoch: [n, sum, max]}
+                "field_minutes": {},   # chart field -> {epoch_s: [n, sum, max]}
                 "seconds": {}, "minutes": {},
                 "size_values": {}, "replicas": {}, "slice_count": {},
                 "top": [], "_top_seq": 0,
@@ -296,6 +400,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     # phase markers first (one pass): classification windows for the C++
     # trace rows. Legacy clients (no markers) -> every row is measured.
     marks = parse_phase_markers(path)
+    ep_shift = _resolve_ep_shift(path, marks) if marks else 0.0
     phase_counts = {"setup": 0, "warmup": 0, "measured": 0, "teardown": 0}
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -321,6 +426,8 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             ep = _start_epoch(pairs.get("start_time", ""))
             if ep is None:
                 ep = 0.0
+            else:
+                ep += ep_shift
             phase = _phase_of(ep, marks)
             if phase is None:
                 phase = "measured"      # legacy: no markers in this glog
@@ -336,6 +443,8 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             st["status"][status] = st["status"].get(status, 0) + 1
 
             ep_pre = _start_epoch(pairs.get("start_time", ""))
+            if ep_pre is not None:
+                ep_pre += ep_shift
             # numeric field statistics (histogram + sum/min/max; -1 counts as neg)
             parsed = {}
             for k, v in pairs.items():
@@ -365,7 +474,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             total = parsed.get("total_us")
             # 阶段分钟桶（图2）：L1 顶层 + residual（端到端减去 L1 之和）
             if ep_pre is not None:
-                mkey = int(ep_pre) // FIELD_MIN_SECONDS * FIELD_MIN_SECONDS
+                mkey = int(ep_pre) // FIELD_BASE_SECONDS * FIELD_BASE_SECONDS
                 tops = READ_TOP if group == "read" else (
                     WRITE_TOP if group == "write" else ())
                 stage_sum = 0.0
@@ -400,10 +509,12 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 st["slice_count"][sc] = st["slice_count"].get(sc, 0) + 1
 
             # top-N slow requests (+ dominant stages for the report table);
-            # total_us=-1 (no timestamp) has no duration -> never a "slowest"
+            # total_us=-1 (no timestamp) has no duration -> never a "slowest".
+            # stages 同时保留 L1 与 L2（展开行要下钻到子区间）。
             if total is not None and total >= 0:
                 st["_top_seq"] += 1
-                stage_tree = READ_TOP if group == "read" else WRITE_TOP
+                stage_tree = ((READ_TOP + READ_SUB) if group == "read"
+                              else (WRITE_TOP + WRITE_SUB))
                 stages = {f: parsed[f] for f in stage_tree if f in parsed
                           and parsed[f] > 0}
                 cand = (total, st["_top_seq"])
@@ -438,25 +549,29 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         # second pass — use median-of-fields approximation? No: keep it exact
         # by accumulating during the scan below (second pass over the file).
         g = groups.setdefault(group, {"ops": {}})
+        # 该 op 的采集步长：由 seconds 桶的时间跨度按收集规则决定；
+        # fminutes（阶段字段）与 seconds（端到端）统一使用这一档位。
+        _lo = min(st["seconds"]) if st["seconds"] else None
+        _hi = max(st["seconds"]) if st["seconds"] else None
+        _span = (_hi - _lo + 1) if _lo is not None else 0
+        op_step = _emit_step(_span)
         g["ops"][op] = {
             "count": st["count"], "ok": st["ok"], "fail": st["fail"],
             "status": st["status"], "fields": fields,
-            "seconds": _bucket_rows(st["seconds"]),
-            "minutes": _bucket_rows(st["minutes"], 60),
+            "seconds": _bucket_rows(st["seconds"], 1, op_step),
+            "minutes": _bucket_rows(st["minutes"], 60, op_step),
             "size_values": _value_hist(st["size_values"]),
             "replicas": _value_hist(st["replicas"]),
             "slice_count": _value_hist(st["slice_count"]),
             "top": [e for _t, _s, e in sorted(st["top"], key=lambda x: -x[0])],
         }
-        # 段3：阶段时间桶（图2）；同一 op 内统一档位
+        # 段3：阶段时间桶（图2）；同一 op 内统一档位（= op_step）
         fmin = {}
-        tier = FIELD_MIN_SECONDS
         for fname, fb in (st.get("field_minutes") or {}).items():
-            rows, tier = _fmb_rows(fb)
-            fmin[fname] = rows
+            fmin[fname] = _fmb_rows(fb, op_step)
         if fmin:
             g["ops"][op]["fminutes"] = fmin
-            g["ops"][op]["ftier"] = tier
+            g["ops"][op]["ftier"] = op_step
 
     # second pass: residual histogram per (group, op) — exact, cheap (local
     # disk, sampled lines); only when trace lines exist

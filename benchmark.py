@@ -2213,6 +2213,8 @@ def _is_client_log(name):
         return False
     if any(k in name for k in (".ylt.", ".nohup", ".glog", ".exitrc")):
         return False
+    if name.endswith(".err.log"):    # mem/urma 采样器错误日志（profiling 产物）
+        return False
     if any(k in name for k in (".generate-data.", ".remove-keys",
                                ".prepare-store.")):
         return False
@@ -2224,12 +2226,16 @@ def _collect_local_stats(local_log_dir):
     used as-is; raw-only logs get stats computed locally (small-run auto
     pull / --png / legacy runs). Returns sorted stats paths."""
     stats = []
-    for root, _dirs, files in os.walk(local_log_dir):
+    for root, dirs, files in os.walk(local_log_dir):
+        # 监控产物（profiling/）与报表目录不是客户端日志：剪枝，避免把
+        # mem.err.log 之类当作客户端生成幽灵数据档
+        dirs[:] = [d for d in dirs if d not in ("profiling", "report")]
         for fn in files:
             if fn.endswith(".stats.json"):
                 stats.append(os.path.join(root, fn))
     have = set(stats)
-    for root, _dirs, files in os.walk(local_log_dir):
+    for root, dirs, files in os.walk(local_log_dir):
+        dirs[:] = [d for d in dirs if d not in ("profiling", "report")]
         for fn in sorted(files):
             if not _is_client_log(fn):
                 continue
@@ -2307,6 +2313,14 @@ def _build_report_params(cfg, meta, nodes=0):
         add("数据大小", "、".join(str(x) for x in ds))
     else:
         add("数据大小", ds)
+    # 单元报表（一个 size×combo）：只显示本单元的 size / 并发参数
+    if meta.get("unit_size"):
+        _override_param(out, "数据大小", meta["unit_size"])
+    if cfg.get("scenario") != "pipeline":
+        # pipeline 的 c/t 来自文件名（每客户端进程 c1_t1），不代表并发规模；
+        # 客户端数/写读规模在报表单元行由 client.count_per_node×N 推导
+        _override_param(out, "客户端数", meta.get("unit_clients"))
+        _override_param(out, "线程数", meta.get("unit_threads"))
     if cfg.get("duration"):
         add("采集时长", "{} s".format(cfg.get("duration")))
     warm = cfg.get("warmup") or {}
@@ -2319,8 +2333,23 @@ def _build_report_params(cfg, meta, nodes=0):
     mult = cfg.get("qps_multiple") or 1
     if qps:
         try:
-            add("目标 QPS", "{:g} × {:g} = {:g}".format(
-                float(qps), float(mult), float(qps) * float(mult)))
+            per_node_qps = float(qps) * float(mult)
+            if cfg.get("scenario") == "pipeline":
+                # pipeline 的 base_qps 是「每节点」速率：完整写出集群口径，
+                # 并给出读 QPS（写总量 × notify_count）
+                if nodes:
+                    write_total = per_node_qps * int(nodes)
+                    add("目标写 QPS", "{:g} × {} 节点 = {:g}".format(
+                        per_node_qps, int(nodes), write_total))
+                    notify = int(cfg.get("notify_count") or 0)
+                    if notify:
+                        add("目标读 QPS", "{:g} × {} 读 = {:g}".format(
+                            write_total, notify, write_total * notify))
+                else:
+                    add("目标写 QPS", "{:g}".format(per_node_qps))
+            else:
+                add("目标 QPS", "{:g} × {:g} = {:g}".format(
+                    float(qps), float(mult), per_node_qps))
         except (TypeError, ValueError):
             add("目标 QPS", qps)
     add("notify_count", cfg.get("notify_count"))
@@ -2333,6 +2362,8 @@ def _build_report_params(cfg, meta, nodes=0):
     add("reader.count_per_node", rd.get("count_per_node"))
     add("reader.num_threads", rd.get("num_threads"))
     add("client.count_per_node", (cfg.get("client") or {}).get("count_per_node"))
+    # store 数量（=每节点 store 数 × 节点数，直接配置；仅展示）
+    add("store_count_per_node", cfg.get("store_count_per_node"))
     add("cpu_shard", cfg.get("cpu_shard"))
     add("numa_bind", cfg.get("numa_bind"))
     # 运行上下文
@@ -2346,31 +2377,111 @@ def _build_report_params(cfg, meta, nodes=0):
     add("cluster 配置", meta.get("cluster_cfg"))
     add("global 配置", meta.get("global_cfg"))
     add("profile 配置", meta.get("profile_cfg"))
-    add("开始时间", meta.get("started"))
     return out
 
 
-def _generate_reports(cfg, local_log_dir, args, early_stop=False,
-                      qps_target=0, launch_mode="single", mode="pipeline",
-                      nodes=0):
-    """Reduce the map products and render the scenario report. WARN-only —
-    never fails the benchmark path."""
-    if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
-        return None
-    try:
-        rp = _report_module()
-        stats = _collect_local_stats(local_log_dir)
-        if not stats:
-            log_detail("[report] no client logs under {}; skipped".format(
-                local_log_dir))
-            return None
-        cfg_name = os.path.splitext(os.path.basename(
-            cfg.get("__cfg_path__") or "scenario"))[0]
+_UNIT_COMBO_RE = re.compile(r"benchmark_c(\d+)_t(\d+)")
+
+
+def _unit_of(path, mode):
+    """(key, dir_name, label, c, t, size) for one stats/trace file.
+
+    basic: 单元 = (c, t, data_size) —— 目录 c{c}_t{t}_{size}
+    pipeline: 单元 = data_size（pipeline 的 c1_t{N} 里 t 是 reader_threads，
+    不是 combo，绝不能当 combo 解析）—— 目录 {size}
+    解析失败（旧命名）退化为一个 "all" 单元。
+    """
+    base = os.path.basename(str(path))
+    size = None
+    m = _LOG_SIZE_RE.search(base)
+    if m:
+        size = (m.group(1) + m.group(2)).upper()
+    mc = _UNIT_COMBO_RE.search(base)
+    c = t = None
+    if mc:
+        c, t = int(mc.group(1)), int(mc.group(2))
+    if mode != "basic" or c is None:
+        sz = size or "all"
+        return (("size", sz), sz, sz, c, t, size)
+    sz = size or "all"
+    return (("basic", c, t, sz),
+            "c{}_t{}_{}".format(c, t, sz),
+            "c{}×t{}{}".format(c, t, " · " + sz if size else ""),
+            c, t, size)
+
+
+def _unit_groups(paths, mode):
+    """Group file paths by report unit, preserving discovery order."""
+    out = {}
+    for p in paths:
+        key, name, label, c, t, size = _unit_of(p, mode)
+        u = out.get(key)
+        if u is None:
+            u = out[key] = {"paths": [], "name": name, "label": label,
+                            "c": c, "t": t, "size": size}
+        u["paths"].append(p)
+    return out
+
+
+def _stats_window(loaded):
+    """(t0, t1) epoch seconds covering these stats, or (None, None)."""
+    t0 = t1 = None
+    for st in loaded or []:
+        m = st.get("meta") or {}
+        if m.get("ts_from") is not None:
+            t0 = m["ts_from"] if t0 is None else min(t0, m["ts_from"])
+        if m.get("ts_to") is not None:
+            t1 = m["ts_to"] if t1 is None else max(t1, m["ts_to"])
+    return t0, t1
+
+
+def _override_param(params, label, value):
+    if value is None or value == "":
+        return params
+    for p in params:
+        if p and p[0] == label:
+            p[1] = value
+            return params
+    params.append([label, value])
+    return params
+
+
+def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
+                           qps_target=0, launch_mode="single",
+                           mode="pipeline", nodes=0):
+    """Unit-based report generation: ONE self-contained report.html per
+    (data_size × combo) unit, in <local_log_dir>/report/<unit>/.
+    Returns the list of written report paths (empty on failure)."""
+    rp = _report_module()
+    stats = _collect_local_stats(local_log_dir)
+    if not stats:
+        log_detail("[report] no client logs under {}; skipped".format(
+            local_log_dir))
+        return []
+    traces_all = _collect_local_traces(local_log_dir)
+    cfg_name = os.path.splitext(os.path.basename(
+        cfg.get("__cfg_path__") or "scenario"))[0]
+    echarts = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
+    units = _unit_groups(stats, mode)
+    traces_by_unit = {}
+    for tp in traces_all:
+        key, _n, _l, _c, _t, _s = _unit_of(tp, mode)
+        traces_by_unit.setdefault(key, []).append(tp)
+    written = []
+    for key, u in units.items():
+        loaded = rp.load(u["paths"])
+        if not loaded:
+            continue
+        t0, t1 = _stats_window(loaded)
+        # basic 的合并日志每个 combo 一份，客户端数取自文件名 c{C}；
+        # pipeline 一个单元 = 一个 size，客户端数按实际 stats 计。
+        n_clients = (u["c"] if (mode == "basic" and u["c"])
+                     else len(loaded))
         meta = {
             "config": cfg_name,
             "mode": mode,
             "launch_mode": launch_mode,
-            "clients": len(stats),
+            "clients": n_clients,
             "qps_target": qps_target,
             "protocol": cfg.get("protocol") or "",
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2378,19 +2489,20 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
             "cluster_cfg": os.path.basename(getattr(args, "cluster", "") or ""),
             "global_cfg": os.path.basename(getattr(args, "global_cfg", "") or ""),
             "profile_cfg": os.path.basename(getattr(args, "profile", "") or ""),
+            "unit": u["label"],
+            "unit_size": u["size"],
+            "unit_clients": u["c"],
+            "unit_threads": u["t"],
         }
         meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
-        traces = _collect_local_traces(local_log_dir)
-        data = rp.reduce_scenario(rp.load(stats), meta,
-                                  monitors=rp.reduce_monitors(local_log_dir),
-                                  traces=rp.load(traces))
-        echarts = os.path.join(ROOT, "webui", "web", "vendor",
-                               "echarts.min.js")
-        out_dir = os.path.join(local_log_dir, "report")
+        data = rp.reduce_scenario(
+            loaded, meta,
+            monitors=rp.reduce_monitors(local_log_dir, t0=t0, t1=t1),
+            traces=rp.load(traces_by_unit.get(key, [])))
+        out_dir = os.path.join(local_log_dir, "report", u["name"])
         html, _datajs = rp.render_scenario(
             data, out_dir, echarts,
             rel_base=os.path.relpath(out_dir, ROOT).replace(os.sep, "/"))
-        # persist meta so --rebuild-report can restore params/context
         try:
             os.makedirs(out_dir, exist_ok=True)
             with open(os.path.join(out_dir, "meta.json"), "w",
@@ -2398,10 +2510,26 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
                 json.dump(meta, f, ensure_ascii=False, indent=1)
         except OSError as exc:
             log_detail("[report] meta.json write failed: {}".format(exc))
-        log("[report] {} -> {}".format(
-            cfg_name, os.path.relpath(html, ROOT)))
-        _REPORT_ACC.append({"data": data, "report_html": html})
-        return data
+        log("[report] {} · {} -> {}".format(
+            cfg_name, u["label"], os.path.relpath(html, ROOT)))
+        _REPORT_ACC.append({"data": data, "report_html": html,
+                            "config": cfg_name, "unit": u["label"]})
+        written.append(html)
+    return written
+
+
+def _generate_reports(cfg, local_log_dir, args, early_stop=False,
+                      qps_target=0, launch_mode="single", mode="pipeline",
+                      nodes=0):
+    """WARN-only wrapper around the unit-based report generation."""
+    if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
+        return None
+    try:
+        written = _generate_report_units(
+            cfg, local_log_dir, args, early_stop=early_stop,
+            qps_target=qps_target, launch_mode=launch_mode, mode=mode,
+            nodes=nodes)
+        return written or None
     except Exception as exc:
         log("[WARN] report generation failed: {}".format(exc))
         return None
@@ -2417,7 +2545,9 @@ def _render_run_overview(ts_dir, mode=""):
     scenarios = []
     for acc in _REPORT_ACC:
         rel = os.path.relpath(acc["report_html"], ov_dir)
-        scenarios.append(dict(acc["data"], report_rel=rel.replace(os.sep, "/")))
+        sc = dict(acc["data"], report_rel=rel.replace(os.sep, "/"))
+        sc["unit"] = acc.get("unit") or ""
+        scenarios.append(sc)
     by_node = {}
     for sc in scenarios:
         for n in sc.get("nodes") or []:
@@ -3886,6 +4016,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             plan["writers"] + plan["readers"]
         for entry in pool:
             entry["node"] = node_names[entry["slot"]]
+    # client lifetime cap: the pipeline client exits after
+    # min(--timeout, duration); a hardcoded 300 silently truncated long runs
+    # (duration=600 measured only ~300s). Derive it from the configured
+    # duration + warmup + shutdown margin instead.
+    try:
+        _dur = float(cfg.get("duration") or 0)
+        _warm = float((cfg.get("warmup") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        _dur = _warm = 0.0
+    _client_timeout = int(_dur + _warm + 120) if _dur > 0 else 300
     # record the REAL cluster-wide process counts for the CSV (client_count);
     # write_scenario_csv rebuilds a node_count=1 plan, so it cannot derive N.
     cfg["_writer_count"] = len(plan["writers"])
@@ -4213,12 +4353,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     ccmd = ("MC_READER_LOG={rlog} MC_GLOG_FILE={glog} nohup {p}bash {runner} pipeline "
                             "{log} --client-id {cid} --role both --listen-port {port} "
                             "--writer-operation {wop} --reader-operation {rop} "
-                            "--num-threads {thr} --warmup {wu} --timeout 300{kc}{na} "
+                            "--num-threads {thr} --warmup {wu} --timeout {to}{kc}{na} "
                             "> {nohup} 2>&1 & echo $!").format(
                         rlog=reader_log, glog=glog_file, p=launch_prefix, runner=remote_runner,
                         log=merged_log, cid=c["id"], port=c["port"],
                         wop=writer_op, rop=reader_op, thr=reader_threads,
-                        wu=warmup, kc=kc_arg, na=numa_arg, nohup=nohup_log)
+                        wu=warmup, to=_client_timeout, kc=kc_arg, na=numa_arg,
+                        nohup=nohup_log)
                     pid = ssh_check_output(rn["ip"], rn, ccmd, dry_run=dry)
                     reader_pids.append((c, pid))
                     writer_pids.append((c, pid))
@@ -4355,10 +4496,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         if numactl_ok.get(r["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
                     rcmd = ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
-                            "--role reader --listen-port {} --warmup false --timeout 300 "
+                            "--role reader --listen-port {} --warmup false --timeout {} "
                             "--operation {} {} > {} 2>&1 & echo $!").format(
                         launch_prefix, remote_runner, merged_log, r["index"],
-                        reader_threads, r["port"], reader_op, numa_arg, nohup_log)
+                        reader_threads, r["port"], reader_op, _client_timeout,
+                        numa_arg, nohup_log)
                     pid = ssh_check_output(rn["ip"], rn, rcmd, dry_run=dry)
                     reader_pids.append((r, pid))
                     if not dry and pid:
@@ -5819,11 +5961,11 @@ def rebuild_reports(ts):
         if not stats:
             log("[WARN] {}: no stats/raw logs locally; skipped".format(name))
             continue
-        loaded = rp.load(stats)
-        roles = {(st.get("meta") or {}).get("role") for st in loaded}
+        probe = rp.load(stats[:1])
+        roles = {(st.get("meta") or {}).get("role") for st in probe}
         mode = "pipeline" if roles & {"writer", "reader"} else "basic"
-        traces = _collect_local_traces(d)
-        # restore the params/context captured at run time (段1 参数配置卡)
+        traces_all = _collect_local_traces(d)
+        # legacy merged meta (pre-unit layout) is still honoured as fallback
         saved = {}
         try:
             with open(os.path.join(d, "report", "meta.json"),
@@ -5831,28 +5973,99 @@ def rebuild_reports(ts):
                 saved = json.load(f) or {}
         except (OSError, ValueError):
             saved = {}
-        data = rp.reduce_scenario(loaded, {
-            "config": name, "mode": saved.get("mode") or mode,
-            "launch_mode": saved.get("launch_mode") or "",
-            "clients": len(loaded),
-            "qps_target": saved.get("qps_target") or 0,
-            "protocol": saved.get("protocol") or "",
-            "started": saved.get("started")
-            or time.strftime("%Y-%m-%d %H:%M:%S"),
-            "early_stop": False,          # unknown for historical runs
-            "cluster_cfg": saved.get("cluster_cfg") or "",
-            "global_cfg": saved.get("global_cfg") or "",
-            "profile_cfg": saved.get("profile_cfg") or "",
-            "params": saved.get("params") or [],
-        }, monitors=rp.reduce_monitors(d), traces=rp.load(traces))
-        out_d = os.path.join(d, "report")
-        html, _dj = rp.render_scenario(
-            data, out_d, echarts,
-            rel_base=os.path.relpath(out_d, ROOT).replace(os.sep, "/"))
-        log("[report] rebuilt {} -> {}".format(
-            name, os.path.relpath(html, ROOT)))
-        scenarios.append(dict(data, report_rel=os.path.relpath(
-            html, os.path.join(ts_dir, "report")).replace(os.sep, "/")))
+        if saved.get("mode"):
+            mode = saved["mode"]
+        units = _unit_groups(stats, mode)
+        traces_by_unit = {}
+        for tp in traces_all:
+            key, _n, _l, _c, _t, _s = _unit_of(tp, mode)
+            traces_by_unit.setdefault(key, []).append(tp)
+        for key, u in units.items():
+            loaded = rp.load(u["paths"])
+            if not loaded:
+                continue
+            t0, t1 = _stats_window(loaded)
+            # 单元级 meta.json（新布局）优先，旧合并 meta 兜底
+            usaved = {}
+            try:
+                with open(os.path.join(d, "report", u["name"], "meta.json"),
+                          "r", encoding="utf-8") as f:
+                    usaved = json.load(f) or {}
+            except (OSError, ValueError):
+                usaved = {}
+            base = usaved or saved
+            # 恢复 run 时参数，但把「客户端总数 / 节点数」按本次实际加载的
+            # stats 重算（历史 run 的旧 params 可能含已修复的幽灵客户端）
+            n_nodes = len({(st.get("meta") or {}).get("node")
+                           for st in loaded
+                           if (st.get("meta") or {}).get("node")})
+            n_clients = (u["c"] if (mode == "basic" and u["c"])
+                         else len(loaded))
+            params = []
+            for pr in (base.get("params") or []):
+                if pr and pr[0] == "开始时间":
+                    continue          # 开始时间已在页脚副标题给出
+                if pr and pr[0] == "客户端总数":
+                    params.append(["客户端总数", n_clients])
+                elif pr and pr[0] == "节点数" and n_nodes:
+                    params.append(["节点数", n_nodes])
+                else:
+                    params.append(pr)
+            if params:   # 派生字段缺失时补上（历史 params 可能没有）
+                keys = {p[0] for p in params if p}
+                if "客户端总数" not in keys:
+                    params.append(["客户端总数", n_clients])
+                if n_nodes and "节点数" not in keys:
+                    params.append(["节点数", n_nodes])
+            # 单元只显示自己的 size / combo
+            params = _override_param(params, "数据大小", u["size"])
+            if mode == "basic":
+                params = _override_param(params, "客户端数", u["c"])
+                params = _override_param(params, "线程数", u["t"])
+            n_clients = (u["c"] if (mode == "basic" and u["c"])
+                         else len(loaded))
+            meta = {
+                "config": name, "mode": mode,
+                "launch_mode": base.get("launch_mode") or "",
+                "clients": n_clients,
+                "qps_target": base.get("qps_target") or 0,
+                "protocol": base.get("protocol") or "",
+                "started": base.get("started")
+                or time.strftime("%Y-%m-%d %H:%M:%S"),
+                "early_stop": False,      # unknown for historical runs
+                "cluster_cfg": base.get("cluster_cfg") or "",
+                "global_cfg": base.get("global_cfg") or "",
+                "profile_cfg": base.get("profile_cfg") or "",
+                "unit": u["label"],
+                "unit_size": u["size"],
+                "unit_clients": u["c"],
+                "unit_threads": u["t"],
+                "params": params,
+            }
+            data = rp.reduce_scenario(
+                loaded, meta,
+                monitors=rp.reduce_monitors(d, t0=t0, t1=t1),
+                traces=rp.load(traces_by_unit.get(key, [])))
+            out_d = os.path.join(d, "report", u["name"])
+            # 回写修正后的 meta.json：后续重建/打开读到一致的参数
+            try:
+                os.makedirs(out_d, exist_ok=True)
+                with open(os.path.join(out_d, "meta.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=1)
+            except OSError:
+                pass
+            html, _dj = rp.render_scenario(
+                data, out_d, echarts,
+                rel_base=os.path.relpath(out_d, ROOT).replace(os.sep, "/"))
+            log("[report] rebuilt {} · {} -> {}".format(
+                name, u["label"], os.path.relpath(html, ROOT)))
+            scenarios.append(dict(
+                data, unit=u["label"],
+                report_rel=os.path.relpath(
+                    html, os.path.join(ts_dir, "report")
+                ).replace(os.sep, "/")))
+
     if not scenarios:
         log("[ERROR] rebuild: no local stats or raw logs found under {} — "
             "re-run with --pull-raw-logs, or use --rebuild-report on the "
