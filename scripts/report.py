@@ -62,6 +62,24 @@ def _role_of(st, fallback="all"):
     return (st.get("meta") or {}).get("role") or fallback
 
 
+def _client_name(source):
+    """Display name of a map product: kvtest ones end in .samples.csv."""
+    return os.path.basename(str(source or "")).replace(
+        ".log", "").replace(".samples.csv", "")
+
+
+def _row_ts_epoch(row):
+    """Absolute epoch of a listed request: the map may already know it.
+
+    Node-side map products only carry the node wall-clock ts; kvtest products
+    are mapped on the orchestrator and ship an explicit ts_epoch, which must
+    win (re-deriving it with the UTC assumption would shift it)."""
+    ep = row.get("ts_epoch")
+    if ep is not None:
+        return ep
+    return _node_ts_epoch(row.get("ts"))
+
+
 def _hist_edges(stats):
     """Ladder for these map products (v2 unless any legacy v1 file is mixed in).
 
@@ -383,8 +401,7 @@ def _client_entry(st, role):
     g = st.get("global") or {}
     meta = st.get("meta") or {}
     return {
-        "name": os.path.basename(str(meta.get("source") or "")).replace(
-            ".log", ""),
+        "name": _client_name(meta.get("source")),
         "node": meta.get("node") or "",
         "pod": meta.get("pod") or "",
         "role": role,
@@ -521,8 +538,7 @@ def reduce_size(stats, meta):
         _m = st.get("meta") or {}
         _node = _m.get("node") or ""
         _role = _m.get("role") or ""
-        _client = os.path.basename(str(_m.get("source") or "")).replace(
-            ".log", "")
+        _client = _client_name(_m.get("source"))
         for row in (st.get("slowest") or []):
             row = dict(row)
             row["node"] = _node
@@ -533,7 +549,7 @@ def reduce_size(stats, meta):
             # 本地钟面时间，直接在前端用本地时区解析会整体偏移。这里按
             # 节点写日志时的时区（UTC）换算成 epoch，前端只用 ts_epoch，
             # 与 seconds 桶（同为绝对时刻）口径一致。
-            row["ts_epoch"] = _node_ts_epoch(row.get("ts"))
+            row["ts_epoch"] = _row_ts_epoch(row)
             slowest.append(row)
     slowest.sort(key=lambda r: -float(r.get("lat_ms") or 0))
     slowest = slowest[:100]
@@ -543,16 +559,15 @@ def reduce_size(stats, meta):
         m = st.get("meta") or {}
         node = m.get("node") or ""
         role = m.get("role") or ""
-        client = os.path.basename(str(m.get("source") or "")).replace(
-            ".log", "")
+        client = _client_name(m.get("source"))
         for row in (st.get("outliers") or []):
             r = dict(row)
-            r["ts_epoch"] = _node_ts_epoch(r.get("ts"))
+            r["ts_epoch"] = _row_ts_epoch(r)
             r["node"], r["role"], r["client"] = node, role, client
             outliers.append(r)
         for row in (st.get("abnormal") or []):
             r = dict(row)
-            r["ts_epoch"] = _node_ts_epoch(r.get("ts"))
+            r["ts_epoch"] = _row_ts_epoch(r)
             r["node"], r["role"], r["client"] = node, role, client
             abnormal.append(r)
     outliers.sort(key=lambda r: r.get("ts_epoch") or 0)
@@ -563,8 +578,7 @@ def reduce_size(stats, meta):
         _m = st.get("meta") or {}
         _node = _m.get("node") or ""
         _role = _m.get("role") or ""
-        _cl = os.path.basename(str(_m.get("source") or "")).replace(
-            ".log", "")
+        _cl = _client_name(_m.get("source"))
         for a in st.get("anomalies") or []:
             key = (a.get("t"), a.get("kind"), _node)
             if key in seen:
@@ -624,7 +638,7 @@ def reduce_size(stats, meta):
                          "tiers": tiers}
     # nodes: embed-tier upward only (bounded regardless of node count)
     # pipeline：同一节点的 writer/reader 分开建对象（角色单选下互不混用）
-    is_pipe = (meta.get("mode") == "pipeline")
+    is_pipe = meta.get("mode") in ("pipeline", "kvtest")
     for node, group in sorted(node_stats.items()):
         if is_pipe:
             by_role = {}
@@ -6502,7 +6516,7 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     if meta.get("early_stop"):
         meta_bits.append("⚠ 提前停止/异常，数据不完整")
     subtitle = " · ".join(meta_bits)
-    is_pipe = str(meta.get("mode") or "") == "pipeline"
+    is_pipe = str(meta.get("mode") or "") in ("pipeline", "kvtest")
     body = _BODY_PIPELINE if is_pipe else _BODY_BASIC
     mon = data.get("monitors") or {}
     body = body.replace("<!-- monitor -->",

@@ -145,9 +145,10 @@ Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，�
 ## 结果
 
 成功运行的最终目录按 Python 模式收敛，只保留每实例 `log`/`glog`、请求级
-PNG，以及 run 级 `<cfg>.csv` 和 `benchmark_detail.csv`。`summary.json` 和
-`samples.csv` 仅作为汇总、作图的临时输入，成功后自动删除；失败或绘图失败时
-保留它们用于排障和重画。注意：
+PNG、**HTML 报表（map-reduce 产物，见下节）**，以及 run 级 `<cfg>.csv` 和
+`benchmark_detail.csv`。`summary.json` 和 `samples.csv` 仅作为汇总、作图、
+报表 map 的临时输入，成功后自动删除；失败或绘图失败时保留它们用于排障、
+重画与 `--rebuild-report`。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。每实例 QPS/吞吐使用 summary 中的实际 `elapsed_seconds`。
 延迟统计只使用 `status=OK` 的请求；TOTAL 行会先合并全部实例的成功请求样本，
@@ -166,6 +167,40 @@ kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` �
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
 request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回窗口聚合数据；
 `--no-plot` 可关闭自动绘图。
+
+## HTML 报表（map-reduce）
+
+kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的请求级样本转换成
+标准的 `<log>.stats.json`，reduce 阶段（`scripts/report.py`）渲染与 pipeline 同构的
+单元报表：
+
+1. **map**（编排器本地，场景结束、CSV 汇总后自动执行）：
+   `scripts/logstats.py --kvtest-samples <实例>.samples.csv --start-epoch <该 size 的
+   /start 时刻> --summary <实例>.summary.json --role writer|reader`。
+   `samples.csv` 的 `elapsed_us` 是相对 `/start` 的偏移，编排器把该 size 的 `/start`
+   epoch 传进 map，因此报表时间轴、1s/1min 桶与慢点列表使用绝对时刻；每个实例
+   按 operation 拆成 **writer**（`upsert*`/`remove`）与 **reader**
+   （`get*`/`exist`）两份产物（dual 实例同时有两边，对应 Python dual client 的
+   writer.log/reader.log）。
+2. **reduce**（同一进程内）：`report.py` 按 data_size 汇总这些 stats，生成
+   `logs/<cfg>/report/<size>/report.html` + `data.js` + `meta.json`，并在 run 结束
+   时生成 `report/overview.html`。版式与 pipeline 一致：writer/reader 角色页签、
+   角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口，
+   若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
+3. **重建**：`python benchmark.py --rebuild-report <ts>`。失败 run 保留了
+   `samples.csv` 时，会自动先补跑 map 再重建报表（缺少运行配置时，`/start`
+   时刻用 `summary.json` 的 mtime 减去 `elapsed_seconds` 估算）。
+
+报表参数卡沿用 pipeline 字段（场景/协议/工作模式/QPS/notify/操作/节点数/客户端
+总数/KV 配置名等），并标记「运行模式 = kvtest」。注意：
+
+- `--no-plot` 同时关闭报表（与 pipeline 一致）；
+- 报表生成是 WARN-only，失败不影响压测结论；
+- 成功清理只删除 `summary.json`/`samples.csv`，`*.stats.json` 与
+  `report/` 目录保留；
+- `notify_http` / `notify_queue_wait` 目前只有 summary 聚合值（进入 CSV），
+  请求级 HTML 图表只覆盖 writer/reader 数据接口；
+- STOP（Ctrl+C）路径不生成 kvtest 部分报表：C++ 样本在 `/stop` 时才落盘。
 
 kvtest 实例文件使用紧凑名称
 `kv<配置哈希>.i<instance>_p<port>.kvtest_<size>.*`。K8s Pod 全名不再进入

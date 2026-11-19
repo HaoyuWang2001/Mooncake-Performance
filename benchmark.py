@@ -2553,9 +2553,9 @@ def _build_report_params(cfg, meta, nodes=0):
     # 单元报表（一个 size×combo）：只显示本单元的 size / 并发参数
     if meta.get("unit_size"):
         _override_param(out, "数据大小", meta["unit_size"])
-    if cfg.get("scenario") != "pipeline":
-        # pipeline 的 c/t 来自文件名（每客户端进程 c1_t1），不代表并发规模；
-        # 客户端数/写读规模在报表单元行由 client.count_per_node×N 推导
+    if cfg.get("scenario") not in ("pipeline", "kvtest"):
+        # pipeline/kvtest 的 c/t 来自文件名（每客户端进程 c1_t1），不代表并发
+        # 规模；客户端数/写读规模在报表单元行由 client.count_per_node×N 推导
         _override_param(out, "客户端数", meta.get("unit_clients"))
         _override_param(out, "线程数", meta.get("unit_threads"))
     if cfg.get("duration"):
@@ -5471,12 +5471,12 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
 
 
 def _cleanup_kvtest_success_intermediates(log_dir):
-    """Remove raw kvtest inputs after aggregation and plotting succeed.
+    """Remove raw kvtest inputs after aggregation, reporting and plotting.
 
-    Basic/Python mode leaves logs and figures, not a second set of raw metric
-    files. kvtest needs summary/samples temporarily, but they are not final
-    user-facing artifacts. Failed runs intentionally retain these inputs.
-    """
+    kvtest needs summary.json/samples.csv for the CSV aggregation, the
+    map-reduce HTML report and the request-level plots, but they are not final
+    user-facing artifacts: the map products (*.stats.json) and report/ tree
+    are kept. Failed runs intentionally retain these inputs (rebuild)."""
     patterns = ("*.kvtest_*.summary.json", "*.kvtest_*.samples.csv",
                 "*.kvtest_*.timeseries.csv")
     removed = 0
@@ -5568,6 +5568,159 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
         except Exception as exc:
             log("[WARN] fail-cleanup: {} log pull failed: {}".format(
                 label, exc))
+
+
+# kvtest map/reduce: the C++ binary emits request-level samples, so the same
+# map (stats.json) -> reduce (report.py) chain the Python client uses can run
+# on them. A dual instance emits BOTH roles, hence one CSV -> up to two
+# per-role products (a dual kvtest process is the C++ analogue of the Python
+# client's dual role with its writer/reader logs).
+KVTEST_WRITE_OPS = frozenset(KVTEST_WRITER_OPS.values())
+KVTEST_READ_OPS = frozenset(KVTEST_READER_OPS.values())
+_KVTEST_SAMPLES_RE = re.compile(
+    r"^.*?\.i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_(?P<ds>.+?)"
+    r"\.samples\.csv$")
+
+
+KVTEST_REPORT_META = "kvtest_report_meta.json"
+
+
+def _kvtest_write_report_meta(local_log_dir, cfg):
+    """Persist the run context the report and --rebuild-report need.
+
+    Artifact filenames are deliberately compact (no node/pod names) and the
+    /start epoch only lives in the orchestrator's memory, so a failed run
+    would otherwise lose node attribution and the sample timeline."""
+    payload = {
+        "format": "kvtest_report_meta",
+        "nodes": cfg.get("_kvtest_nodes"),
+        "iid_nodes": cfg.get("_kvtest_iid_nodes") or {},
+        "start_epochs": cfg.get("_kvtest_start_epochs") or {},
+        "writer_operation": _kvtest_writer_operation(cfg),
+        "reader_operation": _kvtest_reader_operation(cfg),
+    }
+    path = os.path.join(local_log_dir, KVTEST_REPORT_META)
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log_detail("[report] kvtest report meta write failed: {}".format(exc))
+
+
+def _kvtest_read_report_meta(local_log_dir):
+    """The sidecar written by _kvtest_write_report_meta ({} when absent)."""
+    try:
+        with open(os.path.join(local_log_dir, KVTEST_REPORT_META),
+                  "r", encoding="utf-8") as f:
+            doc = json.load(f) or {}
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _kvtest_start_epoch(cfg, ds, samples_path, summary_path):
+    """Epoch origin of one instance's samples (the /start trigger).
+
+    A live run records it per data_size; ``--rebuild-report`` and failed-pull
+    artifacts fall back to (summary mtime - elapsed_seconds), which is the
+    /stop write time minus the C++ measurement window."""
+    starts = cfg.get("_kvtest_start_epochs") or {}
+    try:
+        return float(starts[str(ds)])
+    except (KeyError, TypeError, ValueError):
+        pass
+    elapsed = 0.0
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            elapsed = float((json.load(f) or {}).get("elapsed_seconds") or 0)
+    except (OSError, ValueError, TypeError):
+        elapsed = 0.0
+    try:
+        return max(0.0, os.path.getmtime(samples_path) - elapsed)
+    except OSError:
+        return 0.0
+
+
+def _kvtest_map_stats(local_log_dir, cfg):
+    """Map stage for kvtest: samples.csv -> per-role <...>.stats.json.
+
+    Runs on the orchestrator (the samples are already pulled for the CSV and
+    the request-level plot), writes the exact logstats product schema so the
+    unchanged reduce stage renders the standard HTML report.
+    """
+    ls = _logstats_module()
+    side = _kvtest_read_report_meta(local_log_dir)
+    if not cfg.get("_kvtest_start_epochs") and side.get("start_epochs"):
+        cfg = dict(cfg, _kvtest_start_epochs=side["start_epochs"])
+    if not cfg.get("_kvtest_iid_nodes") and side.get("iid_nodes"):
+        cfg = dict(cfg, _kvtest_iid_nodes=side["iid_nodes"])
+    iid_nodes = cfg.get("_kvtest_iid_nodes") or {}
+    written = []
+    for path in sorted(glob.glob(os.path.join(
+            local_log_dir, "*.kvtest_*.samples.csv"))):
+        match = _KVTEST_SAMPLES_RE.match(os.path.basename(path))
+        if not match:
+            continue
+        iid = int(match.group("iid"))
+        ds = match.group("ds")
+        node = iid_nodes.get(str(iid), "i{}".format(iid))
+        base = os.path.basename(path)[:-len(".samples.csv")]
+        summary_path = path[:-len(".samples.csv")] + ".summary.json"
+        start = _kvtest_start_epoch(cfg, ds, path, summary_path)
+        for role, ops in (("writer", KVTEST_WRITE_OPS),
+                          ("reader", KVTEST_READ_OPS)):
+            summaries = []
+            payload = ls.kvtest_summary_payload(summary_path, ops)
+            if payload is not None:
+                summaries.append(("summary", payload))
+            stats = ls.compute_stats(
+                path, top_n=100, context=20, node=node, pod="", role=role,
+                remote_path=path, size=ds,
+                rows_factory=lambda p, _ops=ops, _start=start:
+                    ls.iter_kvtest_rows(p, _start, _ops),
+                summaries=summaries,
+                source_name="{}.{}.samples.csv".format(base, role),
+                extra_meta={"format": "kvtest_samples",
+                            "scenario": "kvtest"})
+            if not stats["meta"]["rows"]:
+                continue
+            out = "{}.{}.stats.json".format(path, role)
+            tmp = out + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False,
+                          separators=(",", ":"))
+            os.replace(tmp, out)
+            written.append(out)
+    return written
+
+
+def _kvtest_generate_reports(cfg, local_log_dir, args):
+    """Inject the map-reduce report chain into a kvtest scenario.
+
+    map:   request samples -> per-role stats.json (see _kvtest_map_stats)
+    reduce: stats.json -> one HTML report per data_size (report.py), plus the
+            run overview accumulated by the caller.
+    WARN-only: a report failure must never fail the benchmark."""
+    if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
+        return None
+    try:
+        mapped = _kvtest_map_stats(local_log_dir, cfg)
+        if mapped:
+            log("[report] kvtest map: {} per-role stats product(s)".format(
+                len(mapped)))
+    except Exception as exc:
+        log("[WARN] kvtest map failed: {}".format(exc))
+    qps_target = 0
+    try:
+        nodes = max(1, int(cfg.get("_kvtest_nodes") or 1))
+        qps_target = kvtest_plan(cfg, node_count=nodes)["total_qps"]
+    except Exception:
+        pass
+    return _generate_reports(
+        cfg, local_log_dir, args, qps_target=qps_target, launch_mode="single",
+        mode="kvtest", nodes=int(cfg.get("_kvtest_nodes") or 0))
 
 
 def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
@@ -5774,6 +5927,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             str(entry["iid"]): entry["node"]
             for entry in plan["writers"] + plan["readers"]
         }
+        # report context: node count drives the params card, and the /start
+        # epoch is the origin of the samples' elapsed_us (map/reduce needs it)
+        cfg["_kvtest_nodes"] = n_nodes
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
         # kvtest.binary_local: push the C++ binary to every node/pod; the
@@ -6026,6 +6182,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             if start_failures:
                 raise RuntimeError("kvtest /start failed: {}".format(
                     "; ".join(start_failures)))
+            if not dry:
+                # samples' elapsed_us is measured from this /start reset
+                cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = time.time()
 
             # ---- measurement window: every C++ collector was reset by
             # /start. Per-instance elapsed_seconds from summary.json is used
@@ -6132,6 +6291,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _groups.append((n, _files,
                                 "kvtest i{}".format(entry["iid"])))
             _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+            if not dry:
+                # keep node mapping + this size's /start epoch local for the
+                # report map and for --rebuild-report after a later failure
+                _kvtest_write_report_meta(local_log_dir, cfg)
             log("logs: {} files / {} instances pulled".format(
                 sum(len(f) for _n, f, _l in _groups), len(_groups)))
             # remove empty .nohup redirect files (non-empty kept for
@@ -7718,12 +7881,27 @@ def rebuild_reports(ts):
         if not os.path.isdir(d) or name == "report":
             continue
         stats = _collect_local_stats(d)
+        if not stats and glob.glob(os.path.join(
+                d, "*.kvtest_*.samples.csv")):
+            # failed kvtest run: rebuild the map products from the request
+            # samples (the run config is gone; the sidecar supplies the node
+            # mapping + /start epochs, the summary mtime is the last resort)
+            try:
+                _kvtest_map_stats(d, {"_kvtest_start_epochs": {}})
+            except Exception as exc:
+                log("[WARN] {}: kvtest map rebuild failed: {}".format(
+                    name, exc))
+            stats = _collect_local_stats(d)
         if not stats:
             log("[WARN] {}: no stats/raw logs locally; skipped".format(name))
             continue
         probe = rp.load(stats[:1])
         roles = {(st.get("meta") or {}).get("role") for st in probe}
-        mode = "pipeline" if roles & {"writer", "reader"} else "basic"
+        if any((st.get("meta") or {}).get("format") == "kvtest_samples"
+               for st in probe):
+            mode = "kvtest"
+        else:
+            mode = "pipeline" if roles & {"writer", "reader"} else "basic"
         traces_all = _collect_local_traces(d)
         # legacy merged meta (pre-unit layout) is still honoured as fallback
         saved = {}
@@ -7777,6 +7955,24 @@ def rebuild_reports(ts):
                     params.append(["客户端总数", n_clients])
                 if n_nodes and "节点数" not in keys:
                     params.append(["节点数", n_nodes])
+            if not params and mode == "kvtest":
+                # no scenario meta.json (failed/best-effort run): rebuild the
+                # params card from what the map products know
+                # prefer the C++ summary wall over the sample span (the
+                # span can be shorter when the last requests land early)
+                wall = max(
+                    [float((p or {}).get("wall_s") or 0)
+                     for st in loaded
+                     for kind, p in (st.get("summaries") or [])
+                     if kind == "summary"]
+                    + [float((st.get("meta") or {}).get("wall_s") or 0)
+                       for st in loaded] + [0.0])
+                params = _build_report_params(
+                    {"scenario": "kvtest", "data_size": [u["size"]],
+                     "duration": int(round(wall)) if wall > 0 else None},
+                    {"unit_size": u["size"], "unit_clients": None,
+                     "unit_threads": None, "clients": n_clients},
+                    nodes=n_nodes)
             # 单元只显示自己的 size / combo
             params = _override_param(params, "数据大小", u["size"])
             if mode == "basic":
@@ -8017,6 +8213,10 @@ def main(args, cfg_paths):
                     categories.add("kvtest")
                     # detail keeps only the aggregated writer/reader TOTAL rows
                     all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
+                    # map-reduce HTML report (same product as pipeline/basic):
+                    # samples -> per-role stats.json -> per-size report.html
+                    _kvtest_generate_reports(
+                        cfg, os.path.join(ts_dir, "logs", name), args)
                 else:
                     categories.add("basic")
                     all_rows.extend(rows)

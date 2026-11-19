@@ -237,8 +237,33 @@ def _scan_summaries(path, cap=128, meta_cap=2):
     return out
 
 
+def _row_epoch(row):
+    """Absolute epoch of a row: explicit field wins, else parse the ts string.
+
+    kvtest map rows carry `epoch` because their ts is synthesized on the
+    ORCHESTRATOR (host timezone), while node-side map products carry node
+    wall-clock ts that must be parsed with the node's timezone."""
+    ep = row.get("epoch")
+    if ep is not None:
+        return ep
+    ts = row.get("ts") or ""
+    return _ts_to_epoch(ts) if ts else None
+
+
 def compute_stats(path, top_n=100, context=20, node=None, pod=None,
-                  role=None, remote_path=None, size=None):
+                  role=None, remote_path=None, size=None, rows_factory=None,
+                  summaries=None, source_name=None, extra_meta=None):
+    """Build one client's stats product (the map stage).
+
+    rows_factory: optional callable(path) -> row iterator; defaults to the
+        RESULT-line reader. The kvtest map passes ``iter_kvtest_rows`` so a
+        request-sample CSV produces the exact same product as a client log.
+    summaries: pre-built SUMMARY/META payload list (kvtest has no such lines;
+        the orchestrator synthesizes them from summary.json).
+    source_name: display/provenance name written to meta.source.
+    extra_meta: additional meta keys (e.g. {"format": "kvtest_samples"}).
+    """
+    row_source = rows_factory or iter_rows
     top_n = max(1, int(top_n or 0))   # a 0-capacity heap indexes slowest[0]
     rows = 0
     total = ok = fail = 0
@@ -261,7 +286,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     seconds = {}                    # epoch-second -> bucket dict
     ts_from = ts_to = None
 
-    for row in iter_rows(path):
+    for row in row_source(path):
         rows += 1
         op = row["op"]
         kc = row["kc"]
@@ -294,7 +319,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         else:
             opd["fail"] += 1
             opd["_keys_fail"] += kc
-        ep = _ts_to_epoch(row["ts"])
+        ep = _row_epoch(row)
         if ep is not None:
             if ts_from is None or ep < ts_from:
                 ts_from = ep
@@ -313,7 +338,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                     "ts": row["ts"], "op": row["op"], "key": row["key"],
                     "lat_ms": (round(row["lat"], 6)
                                if row["lat"] is not None else None),
-                    "status": status})
+                    "status": status, "ts_epoch": row.get("epoch")})
             if row["lat"] is not None:
                 slow_seq += 1
                 if len(slowest) < top_n:
@@ -368,10 +393,10 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     # second pass avoided: errors were few in normal runs; add them now by
     # re-scanning ONLY when errors exist
     if fail:
-        for row in iter_rows(path):
+        for row in row_source(path):
             if row["status"] == "OK" or row["lat"] is None:
                 continue
-            ep = _ts_to_epoch(row["ts"])
+            ep = _row_epoch(row)
             if ep is None:
                 continue
             sec = int(ep)
@@ -389,6 +414,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         top.append({"ts": row["ts"], "op": row["op"], "key": row["key"],
                     "lat_ms": round(row["lat"], 6),
                     "status": row["status"],
+                    "ts_epoch": row.get("epoch"),
                     "qw_ms": (round(row["qw"], 6) if row["qw"] is not None else None)})
 
     # exact or histogram percentiles (min/max stay exact either way)
@@ -439,17 +465,18 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             outlier_thr = _p99 * OUTLIER_FACTOR
             excl = {}       # sec -> [sum_excl, qsum_excl]
             mx = {}         # sec -> [max_non_outlier, qmax_non_outlier]
-            for row in iter_rows(path):
+            for row in row_source(path):
                 if row["status"] != "OK" or row["lat"] is None:
                     continue
                 lat = row["lat"]
-                ep = _ts_to_epoch(row["ts"])
+                ep = _row_epoch(row)
                 if lat > outlier_thr:
                     if len(outliers) < LIST_CAP:
                         outliers.append({
                             "ts": row["ts"], "op": row["op"],
                             "key": row["key"],
-                            "lat_ms": round(lat, 6), "status": "OK"})
+                            "lat_ms": round(lat, 6), "status": "OK",
+                            "ts_epoch": row.get("epoch")})
                     if ep is not None:
                         e = excl.setdefault(int(ep), [0.0, 0.0])
                         e[0] += lat
@@ -556,7 +583,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
 
     stats = {
         "meta": {
-            "source": os.path.basename(path),
+            "source": source_name or os.path.basename(path),
             "bytes": os.path.getsize(path),
             "node": node,
             "pod": pod,
@@ -592,7 +619,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         },
         "histogram": {str(b): n for b, n in sorted(hist.items())},
         "ops": ops_out,
-        "summaries": _scan_summaries(path),
+        "summaries": (summaries if summaries is not None
+                      else _scan_summaries(path)),
         "seconds": buckets_to_list(emit_buckets, 1),
         "errors": errors,
         "error_excerpt": (_read_context(path, first_error_line, context)
@@ -603,15 +631,116 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         "abnormal": abnormal,
         "outliers": outliers,
     }
+    if extra_meta:
+        stats["meta"].update(extra_meta)
     return stats
+
+
+# ---------------------------------------------------------------------------
+# kvtest map: request-sample CSV -> the same stats product as a client log
+# ---------------------------------------------------------------------------
+# Operation names in the kvtest summary/samples are the scenario config's
+# native metric names (benchmark.KVTEST_WRITER_OPS maps the aliases onto them).
+KVTEST_WRITE_OPS = frozenset(
+    ("upsert", "upsert_from", "batch_upsert_from", "remove"))
+KVTEST_READ_OPS = frozenset(
+    ("get", "get_buffer", "batch_get_buffer", "exist"))
+
+
+def _epoch_to_ts(epoch):
+    """Absolute local wall clock as 'YYYY-MM-DD HH:MM:SS.micro' (log format)."""
+    whole = int(epoch)
+    frac = int(round((float(epoch) - whole) * 1e6))
+    if frac >= 1000000:
+        whole += 1
+        frac -= 1000000
+    return "{}.{:06d}".format(
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(whole)), frac)
+
+
+def iter_kvtest_rows(path, start_epoch, ops=None):
+    """Yield RESULT-shaped rows from one kvtest request-sample CSV.
+
+    Columns: elapsed_us,instance_id,operation,request_index,latency_ms,
+    status,bytes. ``elapsed_us`` is relative to the C++ measurement window
+    start (the orchestrator /start), so ``start_epoch`` rebuilds the same
+    absolute timeline the Python client logs carry; time buckets, slowest
+    lists and the report's time axis then share one clock.
+    """
+    import csv
+    with open(path, "r", encoding="utf-8", errors="replace",
+              newline="") as f:
+        reader = csv.DictReader(f)
+        for lineno, row in enumerate(reader, 2):
+            op = (row.get("operation") or "").strip()
+            if not op or (ops is not None and op not in ops):
+                continue
+            status = (row.get("status") or "").strip()
+            try:
+                lat = float(row.get("latency_ms"))
+            except (TypeError, ValueError):
+                lat = None
+            if lat is None and status == "OK":
+                continue        # an OK sample without a latency cannot be binned
+            try:
+                elapsed = float(row.get("elapsed_us") or 0.0) / 1e6
+            except (TypeError, ValueError):
+                elapsed = 0.0
+            epoch = (float(start_epoch) + elapsed) if start_epoch else None
+            ts = _epoch_to_ts(epoch) if epoch is not None else ""
+            yield {"ts": ts, "op": op,
+                   "key": str(row.get("request_index") or ""),
+                   "lat": lat, "status": status, "qw": None,
+                   "kc": 1, "lineno": lineno, "epoch": epoch}
+
+
+def kvtest_summary_payload(summary_path, ops=None):
+    """Synthesize the SUMMARY payload the reduce stage expects, from summary.json.
+
+    Only the consumed fields are kept (wall_s / bytes / max_depth).
+    ``ops`` restricts the byte total to one role, so a dual instance's writer
+    and reader products do not both claim the whole traffic.
+    """
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    operations = doc.get("operations") or {}
+    total_bytes = 0
+    for name, payload in operations.items():
+        if ops is not None and name not in ops:
+            continue
+        try:
+            total_bytes += int((payload or {}).get("bytes", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        wall = float(doc.get("elapsed_seconds") or 0.0)
+    except (TypeError, ValueError):
+        wall = 0.0
+    return {"mode": "kvtest_summary", "wall_s": wall, "bytes": total_bytes,
+            "max_depth": 0,
+            "verify_failures": doc.get("verify_failures"),
+            "operations": sorted(operations)}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Compute compact stats JSON from one client log (map stage)")
-    parser.add_argument("--log", required=True, help="client log file")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--log", help="client log file")
+    src.add_argument("--kvtest-samples",
+                     help="kvtest request-sample CSV (C++ binary map input)")
     parser.add_argument("--out", default=None,
-                        help="output path (default: <log>.stats.json)")
+                        help="output path (default: <input>.stats.json)")
+    parser.add_argument("--start-epoch", type=float, default=None,
+                        help="kvtest: epoch seconds of the /start trigger "
+                             "(origin of elapsed_us)")
+    parser.add_argument("--summary", default=None,
+                        help="kvtest: per-instance summary.json (wall/bytes)")
+    parser.add_argument("--source-name", default=None,
+                        help="meta.source override (default: input basename)")
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--context", type=int, default=20)
     # provenance stamped by the orchestrator's map stage (used by the report's
@@ -622,17 +751,42 @@ def main(argv=None):
     parser.add_argument("--remote-path", default=None)
     parser.add_argument("--size", default=None)
     args = parser.parse_args(argv)
-    out = args.out or (args.log + ".stats.json")
-    stats = compute_stats(args.log, top_n=args.top_n, context=args.context,
-                          node=args.node, pod=args.pod, role=args.role,
-                          remote_path=args.remote_path, size=args.size)
+    if args.kvtest_samples:
+        if args.start_epoch is None:
+            parser.error("--kvtest-samples requires --start-epoch")
+        ops = None
+        if args.role == "writer":
+            ops = KVTEST_WRITE_OPS
+        elif args.role == "reader":
+            ops = KVTEST_READ_OPS
+        summaries = []
+        if args.summary:
+            payload = kvtest_summary_payload(args.summary, ops)
+            if payload is not None:
+                summaries.append(("summary", payload))
+        src_path = args.kvtest_samples
+        stats = compute_stats(
+            src_path, top_n=args.top_n, context=args.context,
+            node=args.node, pod=args.pod, role=args.role,
+            remote_path=args.remote_path, size=args.size,
+            rows_factory=lambda p: iter_kvtest_rows(p, args.start_epoch, ops),
+            summaries=summaries, source_name=args.source_name,
+            extra_meta={"format": "kvtest_samples"})
+    else:
+        src_path = args.log
+        stats = compute_stats(src_path, top_n=args.top_n,
+                              context=args.context, node=args.node,
+                              pod=args.pod, role=args.role,
+                              remote_path=args.remote_path, size=args.size,
+                              source_name=args.source_name)
+    out = args.out or (src_path + ".stats.json")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, out)
     g = stats["global"]
     print("[logstats] {} rows={} ok={} fail={} p99={:.3f}ms -> {}".format(
-        os.path.basename(args.log), stats["meta"]["rows"], g["ok"], g["fail"],
+        os.path.basename(src_path), stats["meta"]["rows"], g["ok"], g["fail"],
         g["p99_ms"], out))
     return 0
 
