@@ -1563,6 +1563,32 @@ text-overflow:ellipsis;min-width:0}
 overflow:hidden;text-overflow:ellipsis;min-width:0}
 .lvl-children{align-self:start;overflow-x:auto;padding-top:5px}
 .lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 6px}
+.tconsole{border:1px solid var(--grid);background:var(--quiet);
+border-radius:4px;padding:8px 10px;margin:0 0 10px}
+.tconsole-top{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;
+overflow-x:auto;margin:0 0 8px}
+.tconsole-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+gap:14px}
+.tconsole-col{min-width:0}
+.tconsole-head{font-size:12px;color:var(--mut);font-weight:700;margin:0 0 4px}
+.objdrop-wrap{position:relative;display:inline-block}
+.objdrop-btn{font-size:12px;padding:2px 10px;border-radius:4px;
+border:1px solid var(--grid);background:transparent;color:var(--ink);
+cursor:pointer;max-width:240px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.objdrop-menu{position:absolute;z-index:30;top:calc(100% + 4px);left:0;
+min-width:240px;max-width:420px;max-height:320px;overflow:auto;
+background:var(--paper);border:1px solid var(--grid);border-radius:4px;
+padding:4px}
+.objdrop-row{display:flex;align-items:center;gap:6px;padding:3px 6px;
+cursor:pointer;font-size:12px;border-radius:3px}
+.objdrop-row:hover{background:var(--quiet)}
+.objdrop-row.on{background:var(--track);font-weight:700}
+.objdrop-row .dot{display:inline-block;width:8px;height:8px;border-radius:99px;
+flex:0 0 auto}
+.objdrop-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+min-width:0;flex:1 1 auto}
+.objdrop-tag{font-size:12px;color:var(--mut)}
 .node-row td{background:var(--quiet);font-weight:700}
 td.logcell{max-width:220px;overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}
@@ -4235,6 +4261,7 @@ let tGroup='',tOp='',tChart=null;
 let tLevelMetric='avg',tStageSel=['total_us'];
 let tCurveMetric='avg';          /* 分级时延曲线指标：avg / max */
 let tObjSel=[];                  /* 曲线对象多选（trace objects，当前 group 作用域） */
+let blockMenuOpen=false, blockMenuBound=false;   /* 块图对象弹层状态 */
 let tBlockObj='';                /* 分级时延块图对象（单选） */
 let tStageTier='cnt';            /* 粒度：1 秒/10 秒/1 分钟/自适应(默认) */
 const T_METRIC_OPTS=[['min','最小'],['avg','平均'],['p50','p50'],['p99','p99'],
@@ -5246,42 +5273,95 @@ function renderStageBtns(cur){
       stb.appendChild(b);
     });
   }
-  const box=document.getElementById('stageBtns'); if(!box) return;
+}
+let tStageOpen={};   /* 阶段树 L2 展开状态 */
+function toggleStageKey(k,cur){
+  const i=tStageSel.indexOf(k);
+  if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
+  if(!tStageSel.length) tStageSel=['total_us'];
+  /* 维度联动：阶段多选 => 对象收敛为单选 */
+  if(tStageSel.length>1&&tObjSel.length>1) tObjSel=[tBlockObj||tRoleKey()];
+  renderStageObjTree(); renderStageTree(cur); buildStageChart(cur);
+}
+function stageSelectableKeys(cur){
+  const g=(cur&&cur.g)||tGroup;
+  const ks=['total_us'];
+  tTree(g).forEach(function(x){
+    if(x[1]===1&&ks.indexOf(x[0])<0)ks.push(x[0]);});
+  return ks;
+}
+function renderStageTree(cur){
+  const box=document.getElementById('stageTree'); if(!box) return;
   box.innerHTML='';
-  const list=tStageKeys();
-  list.forEach(function(k){
-    const on=tStageSel.indexOf(k)>=0;
-    const b=el('button',on?'on':'');
-    const dot=el('span','dot');
-    dot.style.background=stageColor(list.indexOf(k));
-    b.appendChild(dot);
-    b.appendChild(el('span',null,tStageName(k)));
-    b.title='点击加入/移出阶段曲线对比';
-    b.onclick=function(){
-      const i=tStageSel.indexOf(k);
-      if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
-      if(!tStageSel.length) tStageSel=['total_us'];
-      /* 维度联动：阶段多选 => 对象收敛为单选 */
-      if(tStageSel.length>1&&tObjSel.length>1)
-        tObjSel=[tBlockObj||tRoleKey()];
-      renderStageObjTree(); renderStageBtns(cur); buildStageChart(cur);
-    };
-    box.appendChild(b);
-  });
+  const g=(cur&&cur.g)||tGroup;
+  const tree=tTree(g);
+  const order=stageSelectableKeys(cur);
+  const head=el('div','node-group-head');
+  head.appendChild(el('span','tree-group-title','已选 '+tStageSel.length+' 项'));
+  box.appendChild(head);
+  const acts=el('div','node-group-acts');
   const allb=el('button','mini','全选');
-  allb.title='选中全部阶段（阶段多选时对象自动收敛为单选）';
+  allb.title='选中全部可选阶段（total/L1/残差；阶段多选时对象自动收敛为单选）';
   allb.onclick=function(){
-    tStageSel=list.slice();
+    tStageSel=order.slice();
     if(tObjSel.length>1) tObjSel=[tBlockObj||tRoleKey()];
-    renderStageObjTree(); renderStageBtns(cur); buildStageChart(cur);
+    renderStageObjTree(); renderStageTree(cur); buildStageChart(cur);
   };
   const clrb=el('button','mini','清空');
   clrb.title='只保留端到端 total';
   clrb.onclick=function(){
     tStageSel=['total_us'];
-    renderStageBtns(cur); buildStageChart(cur);
+    renderStageTree(cur); buildStageChart(cur);
   };
-  box.appendChild(allb); box.appendChild(clrb);
+  acts.appendChild(allb); acts.appendChild(clrb);
+  box.appendChild(acts);
+  const list=el('div','tree-list');
+  function stageRow(key,level){
+    const on=tStageSel.indexOf(key)>=0;
+    const r=el('div','tree-row'+(on?' on':''));
+    r.style.paddingLeft=(level*18)+'px';
+    const kids=(level===1)?tree.filter(function(x){
+      return x[1]===2&&x[2]===key;}):[];
+    if(kids.length){
+      const caret=el('button','tree-caret',tStageOpen[key]?'▾':'▸');
+      caret.title=tStageOpen[key]?'收起二级子阶段':'展开二级子阶段';
+      caret.onclick=function(){tStageOpen[key]=!tStageOpen[key];
+        renderStageTree(cur);};
+      r.appendChild(caret);
+    }
+    const b=el('button','tree-check');
+    b.setAttribute('data-key',key);
+    if(level===2){
+      /* L2 无时间桶（map 侧只回传 L1+残差），显示但禁用 */
+      b.disabled=true;
+      b.title='L2 子阶段没有时间桶（map 只回传 L1+残差），不能加入曲线；仅用于块图展开';
+    }else{
+      b.onclick=function(){toggleStageKey(key,cur);};
+      b.title=(key==='total_us')?'端到端 total':
+        (key==='residual'?'残差 = total − L1 之和':'点击加入/移出阶段曲线对比');
+    }
+    b.appendChild(el('span','tree-box',on?'✓':''));
+    if(level>0){
+      const dot=el('span','dot');
+      dot.style.background=stageColor(order.indexOf(key));
+      b.appendChild(dot);
+    }
+    b.appendChild(el('span','tree-name',
+      level===0?'total（端到端）':tStageName(key)));
+    r.appendChild(b);
+    if(level===2) r.appendChild(el('span','tree-note','无时间桶'));
+    return r;
+  }
+  tree.forEach(function(x){
+    const level=x[1];
+    if(level===2) return;             /* L2 随父行展开渲染 */
+    list.appendChild(stageRow(x[0],level));
+    if(level===1&&tStageOpen[x[0]]){
+      tree.filter(function(y){return y[1]===2&&y[2]===x[0];})
+        .forEach(function(y){list.appendChild(stageRow(y[0],2));});
+    }
+  });
+  box.appendChild(list);
 }
 function renderCurveMetric(){
   const box=document.getElementById('tCurveMetric'); if(!box) return;
@@ -5633,6 +5713,89 @@ function renderTraceStatus(cur){
   });
   box.appendChild(wrap);
 }
+function renderBlockObjMenu(){
+  /* 分级时延块图对象：树状弹层（总计 / 节点（下挂实例）/ 实例），单选即定并收起 */
+  const btn=document.getElementById('tBlockObj');
+  const menu=document.getElementById('tBlockObjMenu');
+  if(!btn||!menu) return;
+  ensureTraceSel();
+  btn.textContent=traceObjLabel(tBlockObj)+' ▾';
+  btn.title='选择分级时延块图的对象（树状：总计 → 节点 → 实例）';
+  menu.innerHTML='';
+  const keys=tObjKeys();
+  btn.style.display=keys.length>1?'':'none';
+  const all=tObjAll();
+  const clientsByNode={};
+  keys.forEach(function(k){
+    const o=all[k]||{};
+    if(o.kind==='client'){
+      const n=o.node||'';
+      (clientsByNode[n]=clientsByNode[n]||[]).push(k);
+    }
+  });
+  function optRow(key,depth){
+    const o=all[key]||{};
+    const on=(key===tBlockObj);
+    const r=el('div','objdrop-row'+(on?' on':''));
+    r.style.paddingLeft=(8+depth*16)+'px';
+    r.setAttribute('data-key',key);
+    const dot=el('span','dot');
+    dot.style.background=traceObjColor(key);
+    r.appendChild(dot);
+    const nm=el('span','objdrop-name',traceObjLabel(key));
+    nm.title=String(traceObjLabel(key));
+    r.appendChild(nm);
+    if(o.kind==='role') r.appendChild(el('span','objdrop-tag','总计'));
+    r.onclick=function(){
+      tBlockObj=key;
+      blockMenuOpen=false;
+      renderTrace();
+    };
+    return r;
+  }
+  keys.forEach(function(k){
+    const o=all[k]||{};
+    if(o.kind==='client') return;
+    menu.appendChild(optRow(k,0));
+    if(o.kind==='node'){
+      (clientsByNode[o.node||'']||[]).forEach(function(ck){
+        menu.appendChild(optRow(ck,1));
+      });
+    }
+  });
+  menu.style.display=blockMenuOpen?'':'none';
+  btn.onclick=function(){
+    blockMenuOpen=!blockMenuOpen;
+    menu.style.display=blockMenuOpen?'':'none';
+  };
+  if(!blockMenuBound){
+    blockMenuBound=true;
+    try{
+      document.addEventListener('click',function(ev){
+        if(!blockMenuOpen||!ev) return;
+        let inside=false;
+        function walk(n){
+          if(!n||inside) return;
+          if(n===ev.target){inside=true;return;}
+          (n.children||[]).forEach(walk);
+        }
+        walk(menu); walk(btn);
+        if(!inside){
+          blockMenuOpen=false;
+          const m=document.getElementById('tBlockObjMenu');
+          if(m)m.style.display='none';
+        }
+      });
+      document.addEventListener('keydown',function(ev){
+        if(ev&&(ev.key==='Escape'||ev.keyCode===27)){
+          blockMenuOpen=false;
+          const m=document.getElementById('tBlockObjMenu');
+          if(m)m.style.display='none';
+        }
+      });
+    }catch(e){}
+  }
+}
 function renderTrace(){
   const card=document.getElementById('tracecard'); if(!card) return;
   const keys=traceSizes();
@@ -5673,25 +5836,13 @@ function renderTrace(){
   }
   const cur=tPick(); if(!cur) return;
   ensureTraceSel();
-  /* 分级时延块图：对象单选（总计/节点/实例） */
-  const bs=document.getElementById('tBlockObj');
-  if(bs){
-    const keys=tObjKeys();
-    bs.innerHTML='';
-    keys.forEach(function(k){
-      const o=el('option',null,traceObjLabel(k)); o.value=k;
-      bs.appendChild(o);
-    });
-    bs.value=tBlockObj;
-    bs.style.display=keys.length>1?'':'none';
-    bs.onchange=function(){tBlockObj=bs.value;renderTrace();};
-  }
+  renderBlockObjMenu();
   const bcur=tObjPick(tBlockObj)||cur.data;
   safe('trace-levels',function(){
     renderLevelMetric();
     renderLevels({g:cur.g,op:cur.op,data:bcur});});
   safe('trace-stage-chart',function(){renderStageObjTree();renderStageBtns(cur);
-    renderCurveMetric();buildStageChart(cur);});
+    renderStageTree(cur);renderCurveMetric();buildStageChart(cur);});
   safe('trace-tree',function(){renderTree(cur);renderTreeDetail(cur);});
   safe('trace-top',function(){renderTraceTop(cur);});
   safe('trace-stack',function(){renderTraceStack();});
@@ -5877,27 +6028,31 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 <div class="sub" id="tmeta"></div>
 <div class="toolbar"><span id="tgroups" class="toolbar"></span>
 <select id="topSel" style="display:none"></select></div>
-<div class="objtree-strip">
-<div class="objtree-body" id="stageObjTree"></div>
-</div>
 <h3 class="sec" title="块宽 = 占父项百分比；点击块聚焦，下一级在新行展开">分级时延块图（trace）</h3>
 <div class="toolbar"><span class="tl-label">对象</span>
-<select id="tBlockObj"></select>
+<span class="objdrop-wrap"><button id="tBlockObj" class="objdrop-btn" type="button">总计 ▾</button>
+<div id="tBlockObjMenu" class="objdrop-menu" style="display:none"></div></span>
 <span class="tl-label" style="margin-left:16px">指标</span>
 <span id="lvlMetric" class="toolbar"></span></div>
 <div id="levels" class="levels"></div>
-<h3 class="sec" title="阶段 + 指标 + 对象：单对象可多阶段，单阶段可多对象">分级时延曲线（trace）</h3>
-<div class="toolbar" id="tLatToolbar">
+<h3 class="sec" title="阶段 × 指标 × 对象：单对象可多阶段，单阶段可多对象">分级时延曲线（trace）</h3>
+<div class="tconsole">
+<div class="toolbar tconsole-top">
 <span id="stageTierBtns" class="toolbar"></span>
-<button id="tResetBtn" title="恢复初始缩放范围">重置视图</button>
-</div>
-<div class="toolbar">
-<span class="tl-label">阶段</span>
-<span id="stageBtns" class="toolbar"></span>
-</div>
-<div class="toolbar">
-<span class="tl-label">指标</span>
+<span class="tl-label" style="margin-left:16px">指标</span>
 <span id="tCurveMetric" class="toolbar"></span>
+<button id="tResetBtn" title="恢复缩放窗口">重置视图</button>
+</div>
+<div class="tconsole-cols">
+<div class="tconsole-col">
+<div class="tconsole-head">对象（总计 / 节点 / 实例）</div>
+<div class="objtree-body" id="stageObjTree"></div>
+</div>
+<div class="tconsole-col">
+<div class="tconsole-head">阶段（total → L1 → L2）</div>
+<div class="objtree-body" id="stageTree"></div>
+</div>
+</div>
 </div>
 <div id="tchartEmpty" class="empty-tip" style="display:none"></div>
 <div class="chart-frame">

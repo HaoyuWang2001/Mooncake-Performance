@@ -1823,24 +1823,26 @@ def test_stage_tier_policy_by_span(tmp_path):
 
 
 def test_trace_toolbar_stage_rows(tmp_path):
-    """trace 工具栏不再含数据大小选择器/说明文字；组切换保留；
-    阶段曲线工具栏：粒度+重置 一行（无分割线），阶段独立一行。"""
+    """trace 工具栏：顶部仅读写/op；曲线控台=粒度+指标+重置一行、对象树|阶段树两栏。"""
     a = _stats(tmp_path, "a.reader", "reader")
     tr = _trace_stats(tmp_path, "c.glog")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
     html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
     src = open(html, encoding="utf-8").read()
     assert 'id="tsizeSel"' not in src
-    assert "「数据大小」= 本次 trace" not in src
     assert 'id="tgroups"' in src
-    i = src.index('id="tLatToolbar"')
-    head = src[i:src.index("</div>", i)]
-    assert "tb-sep" not in head
-    assert 'id="stageTierBtns"' in head and 'id="tResetBtn"' in head
-    # 阶段行独立：tLatToolbar 之后、tchart 之前含 阶段 label + stageBtns
-    j = src.index('id="stageBtns"')
-    assert i < j
-    assert src.index("</div>", j) > j
+    # 顶部不再有对象树：对象树/阶段树在曲线控台两栏内
+    i_console = src.index('class="tconsole"')
+    i_obj = src.index('id="stageObjTree"')
+    i_stage = src.index('id="stageTree"')
+    assert i_console < i_obj and i_console < i_stage, (i_console, i_obj, i_stage)
+    head = src[i_console:src.index("</div>", i_console)]
+    for cid in ('id="stageTierBtns"', 'id="tCurveMetric"', 'id="tResetBtn"'):
+        assert cid in src[i_console:src.index('id="stageObjTree"')], cid
+    # 块图对象选择：按钮 + 弹层树
+    assert 'id="tBlockObj"' in src and 'id="tBlockObjMenu"' in src
+    # 阶段平铺 chips 已移除
+    assert 'id="stageBtns"' not in src
 
 
 def test_client_site_tree_readonly_rows(tmp_path):
@@ -2465,8 +2467,8 @@ def test_trace_curve_dimension_coupling(tmp_path):
     ob = res.get("dim_obj_series") or []
     assert "总计" in ob and any("n1" in n for n in ob), ob
     assert res.get("dim_tsel_multi") == 2, res.get("dim_tsel_multi")
-    # 块图对象选择器 / 曲线指标按钮
-    assert "总计" in (res.get("block_opts") or []), res.get("block_opts")
+    # 块图对象选择器（树状弹层）/ 曲线指标按钮
+    assert "总计" in (res.get("block_btn_text") or ""), res.get("block_btn_text")
     assert res.get("curve_metrics") == ["均值", "最大"], res.get("curve_metrics")
 
 
@@ -2752,6 +2754,47 @@ def test_combo_hidden_client_falls_back(tmp_path):
     assert any(k.startswith("client:") for k in before), before
     assert not any(k.startswith("client:") for k in after), after
     assert after == ["all"], after
+
+
+def test_block_obj_tree_dropdown(tmp_path):
+    """分级时延块图对象 = 树状弹层：行含总计/节点/实例（缩进），单选即定并收起。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--blockobj-tree")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["bobj_closed"] == "none", res["bobj_closed"]
+    assert res["bobj_open"] != "none", res["bobj_open"]
+    rows = res.get("bobj_rows") or []
+    keys = [r["key"] for r in rows]
+    assert any(k == "role:read" for k in keys), keys
+    assert any(k and k.startswith("node:") for k in keys), keys
+    # 实例行缩进（树状）
+    assert any(r["pad"] for r in rows), rows
+    assert res.get("bobj_picked", "").startswith("node:"), res.get("bobj_picked")
+    assert res["bobj_closed_after"] == "none", res["bobj_closed_after"]
+    assert "n1" in (res.get("bobj_btn_after") or ""), res.get("bobj_btn_after")
+    assert res.get("bobj_levels"), res.get("bobj_levels")
+
+
+def test_stage_tree_l2_disabled(tmp_path):
+    """阶段树：total→L1→L2；L1 可选、L2 显示但禁用（无时间桶）。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--stage-tree")
+    if res is None:
+        return
+    assert res["errors"] == []
+    rows = res.get("stage_tree_rows") or []
+    assert rows, res.get("stage_tree_note")
+    l1 = [r for r in rows if r["pad"] == "18px"]
+    l2 = [r for r in rows if r["pad"] == "36px"]
+    assert l1 and all(not r["disabled"] for r in l1), rows
+    assert l2 and all(r["disabled"] for r in l2), rows
+    assert any(r["key"] == "total_us" for r in rows), rows
 
 
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):

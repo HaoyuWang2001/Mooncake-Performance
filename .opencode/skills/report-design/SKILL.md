@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 207 条 · ✓178 · ◐27 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 209 条 · ✓181 · ◐26 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -336,12 +336,13 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C11.V4 无 trace 产物整卡隐藏 —— R-TRACE-8 〔test_render_without_trace_keeps_card_hidden〕
 - C11.V5 旧产物无阶段标记 → 注明「无阶段标记（旧客户端），样本未分阶段」 —— R-TRACE-1 〔test_legacy_trace_no_marker_note〕
 - C11.I1 写/读互斥，控制该节全部子图（分级块图/曲线/慢点追踪） —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo, test_trace_curve_dimension_coupling〕
+- C11.V6 顶部总控只有 读写/op；**对象树与阶段树位于分级时延曲线控台**（不在顶部独立条） —— R-TRACE-12 〔test_trace_toolbar_stage_rows〕
 - C11.I2 切换读写组时重置 op 选择与阶段/对象选择（对象按组作用域过滤） —— R-TRACE-6 〔◐〕
 - C11.B1 写/读分组曾只作用于部分子图（慢点追踪未跟随） —— DR-29 〔test_slow_tracking_ranked_colors_and_legend_solo〕
 
 ### C12 SDK 全链路 · 对象树
 
-- C12.V1 树 = 总计（当前读写组全实例聚合）+ 节点与实例；**无角色行**（角色在顶部） —— R-TRACE-6 〔test_stage_tree_objects_enabled〕
+- C12.V1 树 = 总计（当前读写组全实例聚合）+ 节点与实例；**无角色行**（角色在顶部）；位于分级时延曲线控台**左栏** —— R-TRACE-6 〔test_stage_tree_objects_enabled, test_trace_toolbar_stage_rows〕
 - C12.V2 组按钮与主图同构：全选节点/全选实例 toggle、全部清空→总计 —— R-TRACE-6 〔test_trace_object_tree_toggle〕
 - C12.I1 节点/实例可选中并驱动分级时延块图与曲线 —— R-TRACE-6/11 〔test_stage_tree_objects_enabled, test_trace_per_object_series〕
 - C12.I2 节点行可展开其下实例；单节点也显示该组（trace 不做「单实例隐藏」优化） —— R-TRACE-6 〔test_stage_tree_objects_enabled〕
@@ -353,7 +354,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### C13 SDK 全链路 · 分级时延块图（trace）
 
 - C13.V1 标题「分级时延块图（trace）」；**已删除指标概览卡**（tcards） —— R-TRACE-11 〔test_trace_cards_stack_and_breakdown_js〕
-- C13.V2 对象**单选**（下拉：总计/节点/实例）+ 指标**单选**（min/avg/p50/p99/p999/p9999/max，按字段可用） —— R-TRACE-11 〔test_trace_curve_dimension_coupling〕
+- C13.V2 对象**单选**= **树状弹层**（总计 / 节点（下挂实例，缩进）/ 实例；点选即定并收起；点外部/Esc 收起）+ 指标**单选**（min/avg/p50/p99/p999/p9999/max，按字段可用） —— R-TRACE-11 〔test_block_obj_tree_dropdown, test_trace_curve_dimension_coupling〕
 - C13.V3 块宽 = 阶段值占父项百分比；0% 块宽 = 该块文字宽 + 标准 padding；残差单独成块 —— R-TRACE-4 〔test_levels_focus_expand_and_residual, test_trace_cards_stack_and_breakdown_js〕
 - C13.V4 块 tooltip 附全局均值与倍率（本次值 vs 全局 avg） —— R-TRACE-4 〔◐〕
 - C13.V5 p9999 仅当样本 ≥ 10000 可选 —— R-TRACE-3 〔test_trace_field_has_p9999〕
@@ -364,15 +365,16 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### C14 SDK 全链路 · 分级时延曲线（trace）
 
-- C14.V1 标题「分级时延曲线（trace）」；工具栏 = 粒度档+重置一行、阶段一行、指标一行 —— R-TRACE-5/12 〔test_trace_toolbar_stage_rows, test_render_trace_section〕
-- C14.V2 阶段按树序列出（total + L1 + 残差），每阶段带稳定颜色点 —— R-TRACE-12 〔◐〕
+- C14.V1 标题「分级时延曲线（trace）」；**控台 = 行1 粒度档+指标+重置，行2 两栏（对象树 | 阶段树）**；图在控台下方 —— R-TRACE-5/12 〔test_trace_toolbar_stage_rows, test_render_trace_section〕
+- C14.V2 阶段按树序列出（total 根行 → L1 → L2 子阶段），L1 带稳定颜色点 —— R-TRACE-12 〔test_stage_tree_l2_disabled〕
+- C14.V8 阶段树 **L2 子阶段显示但禁用**（map 只回传 L1+残差时间桶），行尾注明「无时间桶」，title 说明仅用于块图展开 —— R-TRACE-12 〔test_stage_tree_l2_disabled〕
 - C14.V3 指标单选 = 均值 / 最大（map 阶段桶仅存 avg/max） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.V4 线宽：total 1.0 / 阶段 0.8；hover 强调 +0.2 —— R-TRACE-12/15 〔test_line_widths_avg_thicker_only〕
 - C14.V5 多对象=对象色（总计灰阶/节点色系/实例色阶）；多阶段=阶段调色板 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.V6 分桶策略与端到端一致（span/s∈[59,8192] 且 ≥ftier；自适应默认） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
 - C14.V7 空态：无对象/旧产物/对象未内嵌各有明确文案 —— R-TRACE-12 〔◐〕
 - C14.I1 **维度联动**：单对象可阶段多选；单阶段可对象多选；多选一侧时另一侧自动收敛为单选 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
-- C14.I2 阶段行 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔test_trace_stage_row_all_clear〕
+- C14.I2 阶段**树**头 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔test_trace_stage_row_all_clear〕
 - C14.I3 右侧固定槽位标签（无引线）+ 悬浮压暗聚焦（与端到端同构） —— R-TRACE-12 〔test_trace_curve_fixed_labels_and_focus〕
 - C14.I4 点击绘图区任意位置开框（含空白），内容为格式化时间 + 各序列值 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
 - C14.I5 粒度档/重置/缩放/平移与端到端同构（含 y 滑块） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕

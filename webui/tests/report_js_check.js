@@ -800,6 +800,50 @@ if (!errs.length) {
       out.sel_after_clear_auto_total=sel();
     } catch (e) { errs.push("clear-total-off: " + String(e && e.stack || e)); }
   }
+  function stageTreeL1() {
+    let hit = null;
+    (function walk(n) {
+      if (hit || !n) return;
+      (n.children || []).forEach(function (c) {
+        const k = c.getAttribute && c.getAttribute("data-key");
+        if (k && k !== "total_us" && k !== "residual" && c.onclick) {
+          hit = c; return;
+        }
+        walk(c);
+      });
+    })(getEl("stageTree"));
+    return hit;
+  }
+  if (process.argv.includes("--stage-tree")) {
+    try {
+      // 展开第一个 L1（点 caret）后采集阶段树行
+      let caret = null;
+      (function walk(n) {
+        if (caret || !n) return;
+        (n.children || []).forEach(function (c) {
+          if (String(c.className || "").indexOf("tree-caret") >= 0 &&
+              c.onclick) { caret = c; return; }
+          walk(c);
+        });
+      })(getEl("stageTree"));
+      if (caret && caret.onclick) caret.onclick();
+      const rows = [];
+      (function walk(n) {
+        (n.children || []).forEach(function (c) {
+          if (String(c.className || "").indexOf("tree-check") >= 0) {
+            const parent = c.parentNode;
+            const pad = parent && parent.style && parent.style.paddingLeft;
+            rows.push({key: c.getAttribute && c.getAttribute("data-key"),
+                       disabled: !!c.disabled, text: textOf(c),
+                       pad: String(pad || "")});
+          }
+          walk(c);
+        });
+      })(getEl("stageTree"));
+      out.stage_tree_rows = rows;
+      out.stage_tree_note = textOf(getEl("stageTree"));
+    } catch (e) { errs.push("stage-tree: " + String(e && e.stack || e)); }
+  }
   if (process.argv.includes("--trace-tree")) {
     try {
       const tsel = function () {
@@ -825,12 +869,10 @@ if (!errs.length) {
         const o = a.length ? a[a.length - 1] : null;
         return ((o && o.series) || []).map(function (s) { return s.name; });
       };
-      const chips = (getEl("stageBtns").children || []).filter(function (b) {
-        return b && b.onclick && b.className !== "mini";
-      });
-      out.dim_chips = chips.length;
-      // 单对象多阶段：点第二个阶段 chip
-      if (chips[1] && chips[1].onclick) chips[1].onclick();
+      // 单对象多阶段：点阶段树第一个 L1
+      const l1 = stageTreeL1();
+      out.dim_l1 = l1 ? String(l1.getAttribute("data-key")) : null;
+      if (l1 && l1.onclick) l1.onclick();
       out.dim_stage_series = seriesNames();
       out.dim_tsel_after_stage = (sandbox.window.__MC_TSEL
         ? sandbox.window.__MC_TSEL() : []);
@@ -851,14 +893,37 @@ if (!errs.length) {
         ? "obj-multi" : "?");
       out.dim_tsel_multi = (sandbox.window.__MC_TSEL
         ? sandbox.window.__MC_TSEL().length : 0);
-      // 块图对象选择器
-      const bs = getEl("tBlockObj");
-      out.block_opts = (bs.children || []).map(function (o) { return o._text; });
-      out.block_value = bs.value;
+      // 块图对象选择器（树状弹层）
+      const bbtn = getEl("tBlockObj");
+      out.block_btn_text = String(bbtn._text || "");
+      out.block_menu_rows = (getEl("tBlockObjMenu").children || []).map(
+        function (r) { return r._text; });
       // 曲线指标按钮
       const cm = getEl("tCurveMetric");
       out.curve_metrics = (cm.children || []).map(function (b) { return b._text; });
     } catch (e) { errs.push("trace-dims: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--blockobj-tree")) {
+    try {
+      const bbtn = getEl("tBlockObj");
+      const menu = getEl("tBlockObjMenu");
+      out.bobj_closed = String(menu.style.display || "");
+      if (bbtn.onclick) bbtn.onclick();     // 打开
+      out.bobj_open = String(menu.style.display || "");
+      out.bobj_rows = (menu.children || []).map(function (r) {
+        return {key: r.getAttribute && r.getAttribute("data-key"),
+                text: r._text, pad: r.style.paddingLeft};
+      });
+      // 选一个节点对象（从弹层行里取第一行 node:*）
+      const row = (menu.children || []).find(function (r) {
+        const k = r.getAttribute && r.getAttribute("data-key");
+        return k && k.indexOf("node:") === 0;});
+      out.bobj_picked = row ? row.getAttribute("data-key") : null;
+      if (row && row.onclick) row.onclick();
+      out.bobj_closed_after = String(menu.style.display || "");
+      out.bobj_btn_after = String(bbtn._text || "");
+      out.bobj_levels = textOf(getEl("levels")).slice(0, 40);
+    } catch (e) { errs.push("blockobj-tree: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--slow-tracking")) {
     try {
@@ -947,20 +1012,19 @@ if (!errs.length) {
         return ((o && o.series) || []).map(function (x) { return x.name; });
       };
       out.tstage_before = series();
-      const allb = findBtn(getEl("stageBtns"), "全选");
+      const allb = findBtn(getEl("stageTree"), "全选");
       if (allb && allb.onclick) allb.onclick();
       out.tstage_all = series();
-      const clrb = findBtn(getEl("stageBtns"), "清空");
+      const clrb = findBtn(getEl("stageTree"), "清空");
       if (clrb && clrb.onclick) clrb.onclick();
       out.tstage_clear = series();
     } catch (e) { errs.push("trace-stage-all: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--tchart-labels")) {
     try {
-      // 先点第二个阶段 chip → 两条序列（多阶段模式）
-      const chips = (getEl("stageBtns").children || []).filter(function (b) {
-        return b && b.onclick && b.className !== "mini";});
-      if (chips[1] && chips[1].onclick) chips[1].onclick();
+      // 先点阶段树第一个 L1 → 两条序列（多阶段模式）
+      const l1 = stageTreeL1();
+      if (l1 && l1.onclick) l1.onclick();
       const ov = getEl("tEndlabels");
       const labels = (ov.children || []).filter(function (c) {
         return String(c.className || "").indexOf("endlabel") >= 0;});
