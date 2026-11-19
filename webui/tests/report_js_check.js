@@ -953,10 +953,13 @@ if (!errs.length) {
   }
   if (process.argv.includes("--trace-dims")) {
     try {
-      const seriesNames = function () {
+      const meta = function () {
         const a = charts.tchart || [];
         const o = a.length ? a[a.length - 1] : null;
-        return ((o && o.series) || []).map(function (s) { return s.name; });
+        return ((o && o.series) || []).map(function (s) {
+          return {name: s.name, dash: (s.lineStyle || {}).type,
+                  color: (s.lineStyle || {}).color};
+        });
       };
       const tsel = function () {
         return (sandbox.window && sandbox.window.__MC_TSEL)
@@ -977,58 +980,41 @@ if (!errs.length) {
         })(getEl("stageObjTree"));
         return acc;
       };
-      // 1) 单对象 × 多阶段（checkbox）
-      const l1 = stageTreeL1();
-      if (l1 && l1.onclick) l1.onclick();
-      out.dim_stage_series = seriesNames();
-      out.dim_stage_sel_1 = ssel();
-      out.dim_tsel_after_stage = tsel();
-      // 2) 多阶段下点节点：对象单选切换（阶段保持多选）→ 节点的多阶段曲线
+      const clickL1 = function () {
+        const l1 = stageTreeL1();
+        if (l1 && l1.onclick) l1.onclick();
+      };
+      // 1) 单对象 × 多阶段
+      clickL1();
+      out.dim_series_1 = meta();
+      out.dim_sel_1 = {obj: tsel(), stage: ssel()};
+      // 2) 单阶段选择之上再勾一个节点（不收敛：对象+1，阶段保持）
       const nodes1 = nodeRows();
       if (nodes1[0] && nodes1[0].onclick) nodes1[0].onclick();
-      out.dim_node_series = seriesNames();
-      out.dim_node_tsel = tsel();
-      out.dim_node_stage_sel = ssel();
-      // 3) 取消该阶段 → 回到单阶段（对象保持）
-      const l1b = stageTreeL1();
-      if (l1b && l1b.onclick) l1b.onclick();
-      out.dim_stage_single = seriesNames();
-      out.dim_stage_sel_3 = ssel();
-      // 4) 单阶段下再加一个节点 + 总计 → 多对象（checkbox）
+      out.dim_series_2 = meta();
+      out.dim_sel_2 = {obj: tsel(), stage: ssel()};
+      // 3) 再勾一个节点：3 对象 × 2 阶段 = 6 条
       const nodes2 = nodeRows();
       if (nodes2[1] && nodes2[1].onclick) nodes2[1].onclick();
-      let roleRow = null;
-      (function walk(n) {
-        (n.children || []).forEach(function (c) {
-          const k = c.getAttribute && c.getAttribute("data-key");
-          if (k && k.indexOf("role:") === 0 && c.onclick) { roleRow = c; return; }
-          walk(c);
-        });
-      })(getEl("stageObjTree"));
-      if (roleRow && roleRow.onclick) roleRow.onclick();
-      out.dim_obj_series = seriesNames();
-      out.dim_obj_tsel = tsel();
-      // 5) 多对象下点其它阶段：阶段单选切换（对象保持）
-      const l1c = stageTreeL1();
-      if (l1c && l1c.onclick) l1c.onclick();
-      out.dim_switch_series = seriesNames();
-      out.dim_switch_tsel = tsel();
-      out.dim_switch_stage = ssel();
-      // 6) 清空阶段 → 允许空（空态文案）
+      out.dim_series_3 = meta();
+      out.dim_sel_3 = {obj: tsel(), stage: ssel()};
+      // 4) 取消该阶段（checkbox）：3 对象 × 1 阶段 = 3 条，回到对象名
+      clickL1();
+      out.dim_series_4 = meta();
+      out.dim_sel_4 = {obj: tsel(), stage: ssel()};
+      // 5) 再次加回该阶段（自由组合仍成立）
+      clickL1();
+      out.dim_series_5 = meta();
+      // 6) 清空阶段 → 允许空
       const sc = findBtn(getEl("stageTree"), "清空");
       if (sc && sc.onclick) sc.onclick();
       out.dim_empty_stage = textOf(getEl("tchartEmpty"));
-      // 6b) 对象全空 + 阶段有选 → 不得回退画总计
-      const l1d = stageTreeL1();
-      if (l1d && l1d.onclick) l1d.onclick();
+      // 7) 对象全空 + 阶段有选 → 不得回退画总计
+      clickL1();
       const oc0 = findBtn(getEl("stageObjTree"), "全部清空");
       if (oc0 && oc0.onclick) oc0.onclick();
       out.dim_no_obj = textOf(getEl("tchartEmpty"));
       out.dim_no_obj_sel = tsel();
-      // 7) 再清空对象 → 允许空（空态文案）
-      const oc = findBtn(getEl("stageObjTree"), "全部清空");
-      if (oc && oc.onclick) oc.onclick();
-      out.dim_empty_all = textOf(getEl("tchartEmpty"));
     } catch (e) { errs.push("trace-dims: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--blockobj-tree")) {

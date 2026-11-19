@@ -2504,8 +2504,10 @@ def test_trace_object_tree_toggle(tmp_path):
 
 
 def test_trace_curve_dimension_coupling(tmp_path):
-    """维度联动：单对象×多阶段（含节点/实例）；多对象×单阶段（切阶段保持对象）；
-    允许空选（清空阶段/对象 → 空态）。"""
+    """对象与阶段自由组合（不做互斥收敛）：
+    - 单对象：阶段调色板，多阶段可叠加；
+    - 多对象：颜色=对象，阶段>1 时线型区分（实/虚/点）；
+    - 允许空选；对象为空时不得回退画总计。"""
     trs = [_trace_stats2(tmp_path, "n1.glog", node="n1", pod="p1"),
            _trace_stats2(tmp_path, "n2.glog", node="n2", pod="p2")]
     a = _stats(tmp_path, "a.reader", "reader", node="n1")
@@ -2514,39 +2516,36 @@ def test_trace_curve_dimension_coupling(tmp_path):
     if res is None:
         return
     assert res["errors"] == []
-    # 1) 单对象 × 多阶段：对象不变、两条阶段序列
-    ss = res.get("dim_stage_series") or []
-    assert len(ss) >= 2 and all(" · " not in n for n in ss), ss
-    assert res.get("dim_stage_sel_1") and len(res["dim_stage_sel_1"]) == 2
-    assert res.get("dim_tsel_after_stage") == ["role:read"], \
-        res.get("dim_tsel_after_stage")
-    # 2) 多阶段下点节点：对象切换为单选，阶段保持多选 → 节点的多阶段曲线
-    ns = res.get("dim_node_series") or []
-    assert len(ns) >= 2 and all(" · " not in n for n in ns), ns
-    assert len(res.get("dim_node_tsel") or []) == 1, res.get("dim_node_tsel")
-    assert res.get("dim_node_stage_sel") and \
-        len(res["dim_node_stage_sel"]) == 2, res.get("dim_node_stage_sel")
-    # 3) 取消该阶段 → 单阶段
-    assert len(res.get("dim_stage_sel_3") or []) == 1, res.get("dim_stage_sel_3")
-    # 4) 单阶段下再加节点 → 多对象（系列=对象名）
-    ob = res.get("dim_obj_series") or []
-    assert "总计" in ob and len(ob) >= 3, ob
-    assert len(res.get("dim_obj_tsel") or []) >= 2, res.get("dim_obj_tsel")
-    # 5) 多对象下点其它阶段：阶段切换、对象保持
-    sw = res.get("dim_switch_series") or []
-    assert "总计" in sw and len(sw) == len(ob), (sw, ob)
-    assert len(res.get("dim_switch_tsel") or []) == len(res["dim_obj_tsel"])
-    assert len(res.get("dim_switch_stage") or []) == 1, res.get("dim_switch_stage")
-    assert res["dim_switch_stage"][0] != "total_us", res["dim_switch_stage"]
+    # 1) 单对象 × 多阶段：阶段名、全实线
+    s1 = res.get("dim_series_1") or []
+    assert len(s1) == 2 and all(" · " not in x["name"] for x in s1), s1
+    assert all((x["dash"] or "solid") == "solid" for x in s1), s1
+    assert res["dim_sel_1"]["obj"] == ["role:read"], res["dim_sel_1"]
+    # 2) 勾节点（不收敛）：2 对象 × 2 阶段 = 4 条；颜色=对象，线型=阶段
+    s2 = res.get("dim_series_2") or []
+    assert len(s2) == 4, s2
+    assert all(" · " in x["name"] for x in s2), s2
+    dashes = {x["dash"] for x in s2}
+    assert dashes == {"solid", "dashed"}, dashes
+    assert len(res["dim_sel_2"]["obj"]) == 2 and \
+        len(res["dim_sel_2"]["stage"]) == 2, res["dim_sel_2"]
+    assert len({x["color"] for x in s2}) == 2, s2      # 两种对象色
+    # 3) 再勾一个节点：3 × 2 = 6 条
+    s3 = res.get("dim_series_3") or []
+    assert len(s3) == 6, s3
+    # 4) 取消阶段：3 × 1 = 3 条，回到对象名（全实线）
+    s4 = res.get("dim_series_4") or []
+    assert len(s4) == 3 and all(" · " not in x["name"] for x in s4), s4
+    assert all((x["dash"] or "solid") == "solid" for x in s4), s4
+    # 5) 加回阶段：仍是 6 条（自由组合）
+    assert len(res.get("dim_series_5") or []) == 6, res.get("dim_series_5")
     # 6) 允许空选
     assert "未选择阶段" in (res.get("dim_empty_stage") or ""), \
         res.get("dim_empty_stage")
-    # 6b) 总计被取消 + 阶段有选 → 不得默认回退展示总计
+    # 7) 对象为空 + 阶段有选 → 不回退总计
     assert res.get("dim_no_obj_sel") == [], res.get("dim_no_obj_sel")
     assert "未选择对象" in (res.get("dim_no_obj") or ""), \
         res.get("dim_no_obj")
-    assert "未选择对象" in (res.get("dim_empty_all") or ""), \
-        res.get("dim_empty_all")
 
 
 def test_slow_tracking_ranked_colors_and_legend_solo(tmp_path):

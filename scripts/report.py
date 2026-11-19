@@ -1730,7 +1730,7 @@ background:var(--quiet);border-radius:99px;
 cursor:grab}
 /* ---- 时延曲线选择（对象树下方，统一控制指标显隐） ---- */
 .lat-sel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-margin-bottom:10px}
+margin-bottom:16px}
 .lat-sel-btns{display:flex;gap:6px;flex-wrap:wrap}
 .lat-sel-btns button{font-size:12px;padding:2px 10px;border-radius:99px;
 border:1px solid var(--grid);background:transparent;color:var(--ink);
@@ -4555,8 +4555,7 @@ function ensureTraceSel(){
   if(keys.indexOf(tBlockObj)<0) tBlockObj=keys[0];
   const stages=tStageKeys();
   tStageSel=tStageSel.filter(function(k){return stages.indexOf(k)>=0;});
-  /* 双多选安全收敛：对象保留多选，阶段取第一个 */
-  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=[tStageSel[0]];
+  /* 对象与阶段可自由组合（不再互相收敛） */
 }
 /* 通用：按序列名集合压暗/恢复（用于曲线标签聚焦） */
 function focusSeriesOn(ch,names){
@@ -5147,12 +5146,13 @@ function buildStageChart(cur){
   tier=Math.max(tier,ftierMin);
   const series=[]; let t0=null,t1=null;
   tLabelMeta=[];
-  function addSeries(nm,color,data,wide){
+  function addSeries(nm,color,data,wide,dash){
     if(!data||!data.length) return;
     const w=wide?1.0:0.8;
     tLabelMeta.push({name:nm,color:color,data:data});
     series.push({name:nm,type:'line',showSymbol:false,clip:true,
-      lineStyle:{width:w,color:color},itemStyle:{color:color},z:3,
+      lineStyle:{width:w,color:color,type:dash||'solid'},
+      itemStyle:{color:color},z:3,
       emphasis:{focus:'series',lineStyle:{width:w+EMPHASIS_ADD}},
       data:data});
     data.forEach(function(d){
@@ -5162,29 +5162,37 @@ function buildStageChart(cur){
     });
   }
   const stageOrder=tStageKeys();
-  if(multiObj){
-    /* 单阶段 × 多对象：每个对象一条（总计灰阶/节点色系/实例色阶） */
-    const stage=stages.length?stages[0]:null;
-    if(stage) objs.forEach(function(k){
+  /* 对象与阶段可任意组合（不做互斥收敛）：
+     - 单对象：颜色=阶段调色板（可叠加任意多阶段）
+     - 多对象：颜色=对象；阶段>1 时用线型（实/虚/点）区分阶段 */
+  const DASHES=['solid','dashed','dotted'];
+  function dashFor(i){return DASHES[i%DASHES.length];}
+  if(objs.length&&stages.length){
+    if(objs.length===1){
+      const k=objs[0];
       const op=tObjPick(k);
-      addSeries(traceObjLabel(k), traceObjColor(k),
-        tStageSeriesData(op,stage,tier,tCurveMetric),
-        stage==='total_us');
-    });
-  }else if(objs.length){
-    /* 单对象 × 多阶段（或单阶段单对象）：阶段调色板；空阶段=空态。
-       对象未选择时不得回退到总计（用户明确取消总计后不应再画它）。 */
-    const k=objs[0];
-    const op=tObjPick(k);
-    const list=stages.length?(multiStage?stages:stages.slice(0,1)):[];
-    const isRole=(k===tRoleKey());
-    list.forEach(function(stage){
-      const nm=(multiStage||isRole)?tStageName(stage):
-        (traceObjLabel(k)+' · '+tStageName(stage));
-      addSeries(nm,stageColor(stageOrder.indexOf(stage)),
-        tStageSeriesData(op,stage,tier,tCurveMetric),
-        stage==='total_us');
-    });
+      const isRole=(k===tRoleKey());
+      stages.forEach(function(stage){
+        const nm=(stages.length>1||isRole)?tStageName(stage):
+          (traceObjLabel(k)+' · '+tStageName(stage));
+        addSeries(nm,stageColor(stageOrder.indexOf(stage)),
+          tStageSeriesData(op,stage,tier,tCurveMetric),
+          stage==='total_us');
+      });
+    }else{
+      objs.forEach(function(k){
+        const op=tObjPick(k);
+        stages.forEach(function(stage,si){
+          const nm=stages.length>1
+            ?(traceObjLabel(k)+' · '+tStageName(stage))
+            :traceObjLabel(k);
+          addSeries(nm,traceObjColor(k),
+            tStageSeriesData(op,stage,tier,tCurveMetric),
+            stage==='total_us',
+            stages.length>1?dashFor(si):'solid');
+        });
+      });
+    }
   }
   const hasData=series.length>0;
   if(cap){
@@ -5290,14 +5298,9 @@ function tStageSeriesData(op,stage,tier,metric){
 }
 function stageObjToggle(key){
   if(tObjKeys().indexOf(key)<0) return;
-  if(tStageSel.length>1){
-    /* 模式A（多阶段）：对象=单选切换；点当前项=取消（允许空） */
-    tObjSel=(tObjSel.length===1&&tObjSel[0]===key)?[]:[key];
-  }else{
-    /* 模式B（单阶段）：对象=checkbox 多选（允许空） */
-    const i=tObjSel.indexOf(key);
-    if(i>=0) tObjSel.splice(i,1); else tObjSel.push(key);
-  }
+  /* 对象 = 自由多选 checkbox（与阶段选择互不影响；允许空） */
+  const i=tObjSel.indexOf(key);
+  if(i>=0) tObjSel.splice(i,1); else tObjSel.push(key);
   renderStageObjTree(); renderTrace();
 }
 function stageObjSetMany(keys,on){
@@ -5307,8 +5310,6 @@ function stageObjSetMany(keys,on){
     if(on&&i<0) tObjSel.push(k);
     if(!on&&i>=0) tObjSel.splice(i,1);
   });
-  /* 双多选安全收敛：对象保留多选，阶段取第一个 */
-  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=[tStageSel[0]];
   renderStageObjTree(); renderTrace();
 }
 function stageTreeModel(){
@@ -5371,8 +5372,7 @@ function renderStageObjTree(){
   const g2=el('div','tree-group node-group');
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','节点与实例'));
-  head.appendChild(el('span','objtree-count','已选 '+tObjSel.length+' 项 · '+
-    (tStageSel.length>1?'单选':'多选')));
+  head.appendChild(el('span','objtree-count','已选 '+tObjSel.length+' 项'));
   g2.appendChild(head);
   function kindKeys(kind){
     return m.all?Object.keys(m.all).filter(function(k){
@@ -5454,14 +5454,9 @@ function renderStageBtns(cur){
 }
 let tStageOpen={};   /* 阶段树 L2 展开状态 */
 function toggleStageKey(k,cur){
-  if(tObjSel.length>1){
-    /* 模式B（多对象）：阶段=单选切换；点当前项=取消（允许空） */
-    tStageSel=(tStageSel.length===1&&tStageSel[0]===k)?[]:[k];
-  }else{
-    /* 模式A（单对象）：阶段=checkbox 多选（允许空） */
-    const i=tStageSel.indexOf(k);
-    if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
-  }
+  /* 阶段 = 自由多选 checkbox（与对象选择互不影响；允许空） */
+  const i=tStageSel.indexOf(k);
+  if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
   renderStageObjTree(); renderStageTree(cur); buildStageChart(cur);
 }
 function stageSelectableKeys(cur){
@@ -5479,15 +5474,13 @@ function renderStageTree(cur){
   const order=stageSelectableKeys(cur);
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','阶段'));
-  head.appendChild(el('span','objtree-count','已选 '+tStageSel.length+' 项 · '+
-    (tObjSel.length>1?'单选':'多选')));
+  head.appendChild(el('span','objtree-count','已选 '+tStageSel.length+' 项'));
   box.appendChild(head);
   const acts=el('div','node-group-acts');
   const allb=el('button','mini','全选');
-  allb.title='选中全部可选阶段（total / L1 / 残差）；对象多选时收敛为第一个对象';
+  allb.title='选中全部可选阶段（total / L1 / 残差）';
   allb.onclick=function(){
     tStageSel=order.slice();
-    if(tObjSel.length>1) tObjSel=[tObjSel[0]];
     renderStageObjTree(); renderStageTree(cur); buildStageChart(cur);
   };
   const clrb=el('button','mini','清空');
