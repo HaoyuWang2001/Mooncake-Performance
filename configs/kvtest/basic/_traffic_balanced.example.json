@@ -1,0 +1,8 @@
+{
+  "operation": "get",
+  "traffic_mode": "balanced",
+  "kvtest": {
+    "pacing_catch_up": true,
+    "enable_jitter": true
+  }
+}

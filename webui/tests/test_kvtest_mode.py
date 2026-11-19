@@ -144,6 +144,9 @@ def test_build_kvtest_instance_config_http_master():
     assert inst["notify_count"] == 10 and inst["notify_threads"] == 10
     assert inst["key_pool_size"] == 256
     assert inst["start_paused"] is True
+    assert inst["metrics_interval_ms"] == 0
+    assert inst["notify_transport"] == "http"
+    assert inst["notify_rpc_port"] == entry["port"] + 10000
     # late-bound placeholders (filled by run_kvtest.sh per pod)
     assert inst["store"]["rdma_devices"] == "__UB_DEVICE__"
     assert inst["store"]["local_hostname"] == "__FABRIC_IP__:12345"
@@ -168,6 +171,29 @@ def test_build_kvtest_instance_config_etcd_master():
         plan, entry, "dual", "8MB", 128, [])
     assert inst["store"]["metadata_server"] == "http://10.0.0.10:2379"
     assert inst["store"]["master_server_address"] == "http://10.0.0.10:2379"
+
+
+def test_build_kvtest_instance_config_carries_traffic_and_warmup():
+    cfg = _kv_cfg(traffic_mode="pulse", warmup={"duration": 5})
+    cfg["writer"]["notify_async"] = True
+    plan = bm.kvtest_plan(cfg, node_count=1)
+    entry = plan["clients"][0]
+    entry["_qps"] = 53
+    entry["_out_dir"] = "/remote/kvtest_out/i0"
+    entry["_lhost_port"] = 12345
+    inst = bm.build_kvtest_instance_config(
+        cfg, {"local_buffer_size": "1GB", "tenant_id": "default"},
+        {"SETUP_MASTER_ADDR": "10.0.0.10:50051",
+         "SETUP_METADATA_SERVER": ""},
+        plan, entry, "dual", "8MB", 256, [])
+    assert inst["traffic_mode"] == "pulse"
+    assert inst["warmup_duration"] == 5.0
+    assert inst["duration"] == 30.0
+    assert inst["notify_async"] is True
+    assert inst["notify_overflow"] == "block"
+    assert inst["notify_format"] == "json"
+    assert inst["notify_read_format"] == "both"
+    assert inst["pacing_catch_up"] is True
 
 
 def test_build_kvtest_split_pair_keeps_four_plus_twelve_budget():
@@ -218,7 +244,8 @@ def test_kvtest_operation_maps_cover_documented_native_names():
     assert bm.KVTEST_WRITER_OPS["batch_upsert_from"] == \
         "batch_upsert_from"
     assert bm.KVTEST_WRITER_OPS["remove"] == "remove"
-    assert bm.KVTEST_READER_OPS["batch_get_buffer"] == "batch_get_buffer"
+    assert bm.KVTEST_READER_OPS["batch_get_buffer"] == "get_batch"
+    assert bm.KVTEST_READER_OPS["get_batch"] == "get_batch"
     assert bm.KVTEST_READER_OPS["exist"] == "exist"
 
 
@@ -631,3 +658,203 @@ def test_webui_validate_and_inventory():
     inv = cfg_router.api_configs(None, {})
     assert "kvtest" in inv["categories"]
     assert inv["categories"]["kvtest"]["config_count"] >= 2
+
+
+# ------------------------------------------------------- kvtest_basic scenario
+
+def test_kvtest_basic_split_operation():
+    assert bm.kvtest_basic_split_operation(
+        {"operation": "get_buffer"}) == (None, "get_buffer", False)
+    assert bm.kvtest_basic_split_operation(
+        {"operation": "put_batch"}) == ("put_batch", None, False)
+    assert bm.kvtest_basic_split_operation(
+        {"operation": "put_batch/get_batch"}) == (
+            "put_batch", "get_batch", True)
+
+
+def test_build_kvtest_basic_instance_config():
+    cfg = {
+        "scenario": "kvtest_basic", "protocol": "ub",
+        "operation": "put_batch/get_batch", "key_prefix": "mc_bench",
+        "key_scenario": "basic", "key_count": 1000, "batch_size": 4,
+        "put_ratio": 0.5, "target_qps": 100, "duration": 10,
+        "warmup": {"duration": 2},
+        "kvtest": {"port_base": 9401, "local_port_base": 12345,
+                   "verify_level": "full", "verify_fail_op": True},
+    }
+    entry = {"iid": 1, "port": 9402, "_out_dir": "/remote/out",
+             "_lhost_port": 12346}
+    inst = bm.build_kvtest_basic_instance_config(
+        cfg, {"local_buffer_size": "1GB", "tenant_id": "tenant-x"},
+        "http://master/metadata", "10.0.0.10:50051", entry, "8MB",
+        "put_batch/get_batch", 2, 4, 500, 1000)
+    assert inst["mode"] == "basic" and inst["role"] == "client"
+    assert inst["operation"] == "put_batch/get_batch"
+    assert inst["key_start"] == 500 and inst["key_end"] == 1000
+    assert inst["num_threads"] == 4
+    assert inst["batch_keys_count"] == 4
+    assert inst["target_qps"] == 50.0
+    assert inst["traffic_mode"] == "balanced"
+    assert inst["pulse_window_ms"] == 1000
+    assert inst["pacing_catch_up"] is True
+    assert inst["enable_jitter"] is True
+    assert inst["duration"] == 10.0 and inst["warmup_duration"] == 2.0
+    assert inst["start_paused"] is True
+    assert inst["metrics_interval_ms"] == 0
+    assert inst["verify_level"] == "full" and inst["verify_fail_op"] is True
+    assert inst["store"]["rdma_devices"] == "__UB_DEVICE__"
+    assert inst["store"]["local_hostname"] == "__FABRIC_IP__:12346"
+    assert inst["store"]["tenant_id"] == "tenant-x"
+    assert inst["store"]["metadata_server"] == "http://master/metadata"
+
+
+def test_build_kvtest_basic_instance_config_pulse():
+    cfg = {
+        "scenario": "kvtest_basic", "protocol": "ub",
+        "operation": "get", "target_qps": 10, "duration": 5,
+        "traffic_mode": "pulse",
+        "kvtest": {"pulse_window_ms": 2000, "pacing_catch_up": False,
+                   "enable_jitter": False},
+    }
+    entry = {"iid": 0, "port": 9401, "_out_dir": "/remote/out",
+             "_lhost_port": 12345}
+    inst = bm.build_kvtest_basic_instance_config(
+        cfg, {}, "http://master/metadata", "10.0.0.10:50051", entry,
+        "1MB", "get", 1, 1, 0, 100)
+    assert inst["traffic_mode"] == "pulse"
+    assert inst["pulse_window_ms"] == 2000
+    assert inst["pacing_catch_up"] is False
+    assert inst["enable_jitter"] is False
+
+
+def test_write_kvtest_basic_csv_aggregates_clients(tmp_path):
+    cfg = {
+        "scenario": "kvtest_basic", "work_mode": "basic",
+        "operation": "get_buffer", "protocol": "ub", "key_count": 1000,
+        "batch_size": 1, "duration": 10, "target_qps": 100,
+        "data_size": ["8MB"],
+        "params": [{"num_clients": 2, "num_threads": 1}],
+        "warmup": {"duration": 0},
+        "kvtest": {"port_base": 9401},
+        "_primary_node": "node1",
+        "_kvtest_basic_topology": "remote_node",
+    }
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    cfg_path = str(tmp_path / "get_buffer.json")
+    for client_index, (ok, fail, nbytes, elapsed) in enumerate(
+            ((5, 0, 320, 2.0), (4, 1, 256, 3.0))):
+        base = bm.kvtest_basic_base("get_buffer", "node1", client_index + 1,
+                                    9401 + client_index, "8MB")
+        summary = {
+            "operations": {"get_buffer": {
+                "total": 5, "success": ok, "failure": fail,
+                "bytes": nbytes, "avg_ms": 1.0, "min_ms": 0.5,
+                "max_ms": 2.0, "p99_ms": 1.5, "p999_ms": 1.8,
+                "p9999_ms": 1.9}},
+            "elapsed_seconds": elapsed,
+        }
+        with open(str(logs / (base + ".summary.json")), "w",
+                  encoding="utf-8") as fh:
+            json.dump(summary, fh)
+    rows = bm.write_kvtest_basic_csv(str(logs), cfg, "ts", cfg_path,
+                                     cluster=None, result_dir=str(tmp_path))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["operation"] == "get_buffer"
+    assert row["num_clients"] == 2 and row["num_threads"] == 1
+    assert row["total"] == 10 and row["ok"] == 9 and row["fail"] == 1
+    assert row["total_bytes"] == 576
+    assert row["wall_s"] == 3.0
+    assert row["qps"] == round(10 / 3.0, 2)
+    assert row["fail_rate"] == 10.0
+    assert row["node"] == "node1"
+    with open(str(tmp_path / "get_buffer.csv"), newline="",
+              encoding="utf-8") as fh:
+        got = list(csv.DictReader(fh))
+    assert len(got) == 1 and got[0]["operation"] == "get_buffer"
+
+
+def test_kvtest_basic_config_router_accepts_new_scenario():
+    import importlib
+    cfg_router = importlib.import_module("webui.backend.routers.configs")
+    path = os.path.join(bm.CONFIGS_DIR, "kvtest", "basic", "get_buffer.json")
+    content = open(path, "r", encoding="utf-8").read()
+    assert cfg_router.validate_config_content(path, content) == []
+    merged = bm.load_scenario_config(path)
+    assert merged["scenario"] == "kvtest_basic"
+    assert merged["operation"] == "get_buffer"
+    assert merged["kvtest"]["port_base"] == 9401
+
+
+def test_kvtest_op_maps_only_emit_native_cpp_operations():
+    native = {
+        "put", "put_batch", "put_from", "batch_put_from", "upsert",
+        "upsert_from", "batch_upsert_from", "get", "get_batch", "get_into",
+        "get_buffer", "exist", "batch_exist", "remove", "batch_remove",
+    }
+    for mapping in (bm.KVTEST_WRITER_OPS, bm.KVTEST_READER_OPS):
+        for alias, op in mapping.items():
+            assert op in native, "{} maps to unknown C++ op {}".format(
+                alias, op)
+    # legacy mSet/mGet configs must land on the batch interfaces
+    assert bm.KVTEST_WRITER_OPS["mSet"] == "batch_upsert_from"
+    assert bm.KVTEST_READER_OPS["mGet"] == "get_batch"
+    assert bm.KVTEST_READER_OPS["batch_get_buffer"] == "get_batch"
+
+
+def test_kvtest_csv_prefers_summary_busy_throughput(tmp_path):
+    local_logs = tmp_path / "logs"
+    local_logs.mkdir()
+    throughputs = [1200.5, 1100.5]
+    for iid, throughput in enumerate(throughputs):
+        fn = "kvtest_csv.nodeA_i{}_p{}.kvtest_8MB.summary.json".format(
+            iid, 9301 + iid)
+        summary = _summary(iid, 10, 10, 0)
+        summary["operations"]["upsert_from"]["throughput_mb_s"] = throughput
+        summary["operations"]["get_buffer"]["throughput_mb_s"] = throughput / 2
+        (local_logs / fn).write_text(json.dumps(summary), encoding="utf-8")
+    cfg = _kv_cfg()
+    cfg["_writer_count"] = 2
+    cfg["_reader_count"] = 2
+    rows = bm.write_scenario_csv(
+        str(local_logs), cfg, "ts",
+        os.path.join(str(tmp_path), "kvtest_csv.json"),
+        cluster=None, mooncake_store_nodes=[], result_dir=str(tmp_path))
+    writer = [r for r in rows if r["role"] == "writer"]
+    reader = [r for r in rows if r["role"] == "reader"]
+    assert writer[0]["throughput_mb_s"] == round(1200.5, 2)
+    assert writer[1]["throughput_mb_s"] == round(1100.5, 2)
+    assert writer[2]["throughput_mb_s"] == round(2301.0, 2)
+    assert reader[0]["throughput_mb_s"] == round(600.25, 2)
+
+
+def test_write_kvtest_basic_csv_prefers_busy_throughput(tmp_path):
+    cfg = {
+        "scenario": "kvtest_basic", "work_mode": "basic",
+        "operation": "get_buffer", "protocol": "ub", "key_count": 1000,
+        "batch_size": 1, "duration": 10, "target_qps": 100,
+        "data_size": ["8MB"],
+        "params": [{"num_clients": 1, "num_threads": 1}],
+        "warmup": {"duration": 0}, "kvtest": {"port_base": 9401},
+        "_primary_node": "node1", "_kvtest_basic_topology": "remote_node",
+    }
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = bm.kvtest_basic_base("get_buffer", "node1", 1, 9401, "8MB")
+    summary = {
+        "operations": {"get_buffer": {
+            "total": 2, "success": 2, "failure": 0, "bytes": 2000,
+            "busy_ms": 50.0, "avg_ms": 25.0, "min_ms": 20.0,
+            "max_ms": 30.0, "p99_ms": 30.0, "p999_ms": 30.0,
+            "p9999_ms": 30.0}},
+        "elapsed_seconds": 2.0,
+    }
+    (logs / (base + ".summary.json")).write_text(
+        json.dumps(summary), encoding="utf-8")
+    rows = bm.write_kvtest_basic_csv(
+        str(logs), cfg, "ts", os.path.join(str(tmp_path), "get_buffer.json"),
+        cluster=None, result_dir=str(tmp_path))
+    assert len(rows) == 1
+    expected = 2000 / 0.05 / 1024.0 ** 2
+    assert rows[0]["throughput_mb_s"] == round(expected, 2)
