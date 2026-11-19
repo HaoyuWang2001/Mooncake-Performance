@@ -1564,6 +1564,8 @@ overflow:hidden;text-overflow:ellipsis;min-width:0}
 .lvl-children{align-self:start;overflow-x:auto;padding-top:5px}
 .lvl-note{color:var(--mut);font-size:12.5px;margin:2px 0 6px}
 .node-row td{background:var(--quiet);font-weight:700}
+td.logcell{max-width:220px;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
 .node-row .node-name{color:var(--ink)}
 .client-row td:first-child{padding-left:14px}
 .sbrk{padding:10px 0 4px;width:min(100%,1250px)}
@@ -3537,7 +3539,7 @@ function renderClientSite(){
   function logName(c){
     const p=String(c.remote_path||c.source||'');
     const b=p.split('/').pop()||c.name;
-    return b+'（'+fmtBytes(c.bytes)+'）';
+    return fmtBytes(c.bytes)+' · '+b;
   }
   const nodes={};
   cs.forEach(function(c){
@@ -3590,8 +3592,8 @@ function renderClientSite(){
       tr2.appendChild(el('td','n',String(c.total)));
       tr2.appendChild(el('td','n',String(c.ok)));
       tr2.appendChild(el('td','n',String(c.fail)));
-      const lg=el('td','mono',logName(c));
-      if(c.remote_path) lg.title=String(c.remote_path);
+      const lg=el('td','mono logcell',logName(c));
+      lg.title=String(c.remote_path||c.source||'');
       tr2.appendChild(lg);
       if(hasTrace) tr2.appendChild(el('td','n',String(contribOf(c))));
       tb.appendChild(tr2);
@@ -5012,6 +5014,16 @@ function buildStageChart(cur){
   o.grid=STAGE_GRID;
   o.tooltip=lfTooltip({trigger:'axis'});
   o.tooltip.valueFormatter=function(v){return fmtUs(v);};
+  o.tooltip.formatter=function(ps){
+    if(!ps||!ps.length) return '';
+    const v0=(ps[0].value&&ps[0].value[0]);
+    const t=(v0!=null)?v0/1000:(ps[0].axisValue||0);
+    const rows=ps.map(function(p){
+      const v=(p.value&&p.value[1]!=null)?p.value[1]:null;
+      return (p.marker||'')+p.seriesName+'：'+(v==null?'-':fmtUs(v));
+    });
+    return '<b>'+fullts(t)+'</b><br>'+rows.join('<br>');
+  };
   o.yAxis=[lfAxisValue({name:'µs',scale:true,nameLocation:'end',nameGap:14})];
   o.dataZoom=zoomModel('main');
   if(t0!==null) o.xAxis=lfAxisTime(xExtent(t0,t1,

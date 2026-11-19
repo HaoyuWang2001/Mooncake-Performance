@@ -2361,6 +2361,9 @@ def test_tooltip_click_anywhere_opens(tmp_path):
     assert any(a.get("type") == "hideTip"
                for a in res["tip_outside_actions"]), res["tip_outside_actions"]
     # 分级时延曲线：空白点击同样 showTip（x/y = 点击位置）
+    # 分级时延 tooltip 内容必须格式化时间（不得落回原始毫秒）
+    fmt = res.get("tchart_tip_fmt") or ""
+    assert "2026-" in fmt and "5.35 ms" in fmt, fmt
     tacts = [a for a in (res.get("tchart_tip_actions") or [])
              if a.get("type") == "showTip"]
     assert tacts and tacts[0].get("x") == 500, tacts

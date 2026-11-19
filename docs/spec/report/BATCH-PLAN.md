@@ -100,3 +100,18 @@
 
 验证：393 passed；Edge/CDP 实浏览器核对（标签顺序与截断、悬浮压暗、悬浮指针、点击钉框与格式化 tooltip）。
 
+---
+
+## 后续批次 · SDK 全链路重构与尾部章节（2026-11-19，已完成，见 DR-29 / v1.0）
+
+| 项 | 内容 | 测试 |
+|---|---|---|
+| P0 | 时延曲线选择 全选/清空；tooltip 点击绘图区任意位置（含空白）打开（分级时延同构） | test_latency_metric_select_all_clear / test_tooltip_click_anywhere_opens |
+| P1a | trace 按对象（总计/节点/实例）保留阶段桶 + 嵌入预算抽稀 | test_trace_per_object_series / test_trace_embed_trim_budget_and_coarsen |
+| P1b | SDK 对象树/分级时延块图/分级时延曲线三维联动/删除指标概览卡 | test_stage_tree_objects_enabled / test_trace_curve_dimension_coupling |
+| P1c | 慢点追踪（降序+阶段彩色+图例 solo+无 total 展开） | test_slow_tracking_ranked_colors_and_legend_solo |
+| P2 | 错误按写读/节点客户端；实例与日志现场合并；章节重排+页脚；监控卡前移 | test_errors_split_by_role_and_client / test_client_site_* / test_section_order_and_footer_note |
+| P3 | 设计入册：V-6 时间戳对齐、V-7 数据量预估模型 | 文档 |
+
+验证：400 passed；沙箱重建 + SSR 并发冒烟 + Edge/CDP 截图。
+

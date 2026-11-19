@@ -591,6 +591,12 @@ if (!errs.length) {
 
   const _tc=(charts.tchart||[]); const _tco=_tc.length?_tc[_tc.length-1]:null;
   out.tchart_series=((_tco&&_tco.series)||[]).map(function(s){return s.name;});
+  try{
+    const fmt=(_tco&&_tco.tooltip&&_tco.tooltip.formatter);
+    out.tchart_tip_fmt=(typeof fmt==='function')
+      ? String(fmt([{value:[1795050994000,5350],seriesName:'total（端到端）',marker:''}]))
+      : null;
+  }catch(e){ out.tchart_tip_fmt=null; }
   out.tchart_empty=textOf(getEl("tchartEmpty"));
   out.zslider_cap = textOf(getEl("zsliderCap"));
   out.tree_rows = (getEl("objTree").children || []).map(function (r) {
