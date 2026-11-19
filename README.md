@@ -547,6 +547,15 @@ client 前也会 echo 同样的快照（实时进入编排日志）。
 mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`（git 跟踪，手工编辑），
 与编排器生成的 `env.sh` 分离——调优项可自由增删改而不会在每次运行时被覆盖。
 
+当前面板启用 TENT（`MC_USE_TENT=1`），默认通过 `MC_TENT_CONF` 启用 UB，
+沿用 `SETUP_UB_DEVICE` 选择单个 UB 设备，并设置 1 MiB slice 和 2 个 worker。
+`MC_URMA_BONDING_MODE=BALANCE` / `MC_URMA_BONDING_LEVEL=PORT` 与 TE 共用；
+需使用包含 TENT bonding 支持的 Mooncake 构建。预先设置非空 `MC_TENT_CONF` 可替换默认配置。
+TENT 不使用 setup 的 `device_names` 作为 UB 过滤器，因此自定义 JSON 时应自行设置
+`transports.ub.device_filter`。`MC_UB_NUMA_AFFINITY_ENABLE`、`MC_MAX_WR` 等 classic TE
+参数不等同于 TENT UB 的配置；进程的 numactl CPU/内存绑定仍由编排器独立控制。
+客户端 wheel / kvtest 可执行文件须编入 TENT，且运行时可找到 `libtent_metrics.so` 和 URMA 依赖。
+
 - **内容**：连接与容错（`MC_STORE_CLIENT_SETUP_RETRIES`/`MC_STORE_WARMUP`/
   `MC_STORE_CLIENT_METRIC_BANDWIDTH`）、客户端资源（`MC_GLOBAL_SEGMENT_SIZE`）、
   ylt RPC 连接池（`MC_YLT_RPC_POOL_*`/`MC_OFFLOAD_RPC_THREAD_NUM`）、日志

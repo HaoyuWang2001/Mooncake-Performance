@@ -49,7 +49,9 @@ source "$ENV_FILE"
 # Sourced AFTER env.sh: same-name vars here override the generated env.sh.
 # -f guard keeps the script working without the file (local ad-hoc runs).
 # Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
-[ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
+if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
+  source "$SCRIPT_DIR/env.mooncake.sh" || exit 1
+fi
 
 # Print the inherited transport/env snapshot before each client starts.
 print_client_env() {

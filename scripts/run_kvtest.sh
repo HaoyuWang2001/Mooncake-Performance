@@ -32,7 +32,9 @@ fi
 source "$ENV_FILE"
 # Hand-editable mooncake tuning defaults; sourced AFTER env.sh so same-name
 # vars here override the generated env.sh (same rule as the other runners).
-[ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
+if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
+  source "$SCRIPT_DIR/env.mooncake.sh" || exit 1
+fi
 
 if [ ! -x "$(command -v "$BINARY" 2>/dev/null)" ] && [ ! -x "$BINARY" ]; then
   echo "[FATAL] mooncake_kvtest binary not found or not executable: $BINARY" >&2
