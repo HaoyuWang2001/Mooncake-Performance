@@ -328,6 +328,10 @@ def test_kvtest_rebuild_from_samples_only(tmp_path, monkeypatch):
     base = _write_instance(str(logs), 0, 9301, "8MB", [1.0, 2.0], [3.0],
                            cfg_name="kvtest_rebuild")
     os.utime(str(logs / (base + ".samples.csv")), (START + 10, START + 10))
+    # a real pull also brings the wrapper .log + SDK glog; logstats must not
+    # mistake them for Python client logs (that used to suppress the kvtest map)
+    (logs / (base + ".log")).write_text("no RESULT rows\n", encoding="utf-8")
+    (logs / (base + ".log.glog")).write_text("I2026 log\n", encoding="utf-8")
     # the run sidecar survives a failure: node mapping + /start epoch + nodes
     bm._kvtest_write_report_meta(str(logs), {
         "_kvtest_nodes": 2, "_kvtest_iid_nodes": {"0": "nodeA"},
@@ -338,6 +342,7 @@ def test_kvtest_rebuild_from_samples_only(tmp_path, monkeypatch):
     assert (out / "report.html").is_file()
     stats_files = list(logs.glob("*.stats.json"))
     assert len(stats_files) == 2
+    assert not (logs / (base + ".log.stats.json")).exists()
     writer = json.load(open(
         [p for p in stats_files if ".writer.stats.json" in str(p)][0],
         encoding="utf-8"))
@@ -579,6 +584,21 @@ def test_kvtest_stop_collect_stops_flushes_and_pulls(tmp_path, monkeypatch):
     assert ctx["involved_nodes"] == ["nodeA"]
 
 
+def test_collect_local_stats_ignores_kvtest_raw_logs(tmp_path):
+    """kvtest .log/.glog are C++ wrapper/SDK output, not RESULT logs."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0])
+    (logs / (base + ".log")).write_text("no result rows\n", encoding="utf-8")
+    (logs / (base + ".log.glog")).write_text("I2026 log\n", encoding="utf-8")
+    stats = bm._collect_local_stats(str(logs))
+    assert stats == []                       # nothing derived from raw logs
+    assert not (logs / (base + ".log.stats.json")).exists()
+    assert bm._is_client_log(base + ".log") is False
+    assert bm._is_client_log("cfg.dual_node_c0_p9301.reader.log") is True
+
+
+# --------------------------------------------------------------------- CLI
 # --------------------------------------------------------------------- CLI
 
 def test_logstats_cli_kvtest_mode(tmp_path):

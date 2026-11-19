@@ -2455,6 +2455,10 @@ def _is_client_log(name):
     if any(k in name for k in (".generate-data.", ".remove-keys",
                                ".prepare-store.")):
         return False
+    if ".kvtest_" in name:
+        # C++ kvtest instance logs carry no RESULT rows; the map for that
+        # scenario is built from <...>.samples.csv (see _kvtest_map_stats)
+        return False
     return True
 
 
@@ -8048,8 +8052,11 @@ def rebuild_reports(ts):
         if not os.path.isdir(d) or name == "report":
             continue
         stats = _collect_local_stats(d)
-        if not stats and glob.glob(os.path.join(
-                d, "*.kvtest_*.samples.csv")):
+        _samples = glob.glob(os.path.join(d, "*.kvtest_*.samples.csv"))
+        _have_kvtest_stats = any(
+            os.path.basename(p).endswith(".stats.json") and
+            ".samples.csv." in os.path.basename(p) for p in stats)
+        if _samples and not _have_kvtest_stats:
             # failed kvtest run: rebuild the map products from the request
             # samples (the run config is gone; the sidecar supplies the node
             # mapping + /start epochs, the summary mtime is the last resort)
