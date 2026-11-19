@@ -71,6 +71,9 @@ put 家族先删后写、upsert_from 覆盖写）。**容量解析**：探测恒
 | `count_per_node` | 每节点 writer 进程数 |
 | `operation` | 写接口，可选值见下表 |
 | `notify_threads` | notify 发送线程池大小 |
+| `notify_async` | true 时写入只提交到发送队列，不逐批等待 HTTP 响应；默认 false |
+| `notify_queue_size` | 每个 writer 待发送 HTTP 请求的队列容量，不含正在发送的请求；rank 默认 8192，满额时背压、不丢弃 |
+| `notify_max_inflight` | 旧配置兼容字段：未设置 notify_queue_size 时作为队列容量，默认 256 |
 | `port_base` | writer HTTP `/start` 触发端口段，默认 9101；节点内编号（第 i 个进程用 port_base+i；k8s 全部 pod 同端口） |
 
 **writer.operation 可选值**：

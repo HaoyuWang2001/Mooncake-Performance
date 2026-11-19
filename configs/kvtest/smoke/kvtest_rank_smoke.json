@@ -1,0 +1,30 @@
+{
+  "work_mode": "rank",
+  "base_qps": 105,
+  "qps_multiple": 1,
+  "notify_count": 10,
+  "client": {
+    "count_per_node": 2,
+    "process_mode": "split"
+  },
+  "writer": {
+    "operation": "upsert_from",
+    "num_threads": 4,
+    "notify_threads": 10,
+    "port_base": 9101
+  },
+  "reader": {
+    "operation": "get_buffer",
+    "num_threads": 12,
+    "port_base": 9201
+  },
+  "store_count_per_node": 1,
+  "data_size": [
+    "8MB"
+  ],
+  "duration": 30,
+  "kvtest": {
+    "key_pool_size": 256,
+    "local_port_base": 12345
+  }
+}

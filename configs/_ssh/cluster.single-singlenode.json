@@ -1,0 +1,13 @@
+{
+  "_note": "Single-node diagnostic cluster: launch one writer and one reader on node3 only.",
+  "venv": "/home/w00921547/venvs/mc-w00921547/bin/python",
+  "nodes": {
+    "reader_node3": {
+      "ip": "141.61.84.149",
+      "fabric_ip": "192.168.84.149",
+      "ssh_user": "root",
+      "ssh_port": 22,
+      "ssh_key": ""
+    }
+  }
+}

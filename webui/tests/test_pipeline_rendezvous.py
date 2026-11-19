@@ -81,6 +81,24 @@ def test_pipeline_plan_dual_client_mode():
     assert plan["writers"] is plan["clients"] and plan["readers"] is plan["clients"]
 
 
+def test_pipeline_client_timeout_covers_long_recall_window():
+    cfg = {"duration": 300, "warmup": {"duration": 5}}
+    timeout_s = bm._pipeline_client_timeout(
+        cfg, rendezvous_timeout_s=120, warmup_enabled=True)
+
+    # Two rendezvous budgets + warmup + measurement + shutdown grace.
+    assert timeout_s == 605
+    # The orchestrator's normal shutdown happens after warmup + duration +
+    # ten seconds, so the client must still be alive then.
+    assert timeout_s > 5 + 300 + 10
+
+
+def test_pipeline_client_timeout_respects_no_warmup():
+    cfg = {"duration": 300, "warmup": {"duration": 5}}
+    assert bm._pipeline_client_timeout(
+        cfg, rendezvous_timeout_s=120, warmup_enabled=False) == 600
+
+
 def test_loader_strips_client_nodes(tmp_path, capsys):
     cfg_file = tmp_path / "p.json"
     cfg_file.write_text(json.dumps({
@@ -500,7 +518,7 @@ def test_pipeline_http_parallel_results(monkeypatch):
 
     # all OK
     monkeypatch.setattr(bm, "_pipeline_http_call",
-                        lambda n, p, path, timeout=5, dry=False: True)
+                        lambda n, p, path, timeout=5, dry=False, **kw: True)
     res = bm._pipeline_http_parallel(
         None, [(node, 9301, "", "c0"), (node, 9302, "", "c1")], "/start")
     assert [(w, ok) for w, ok, _ in res] == [("c0", True), ("c1", True)]
@@ -508,7 +526,7 @@ def test_pipeline_http_parallel_results(monkeypatch):
     # one fails on both attempts -> exactly 2 calls, reported
     calls = {"n": 0}
 
-    def flaky(n, p, path, timeout=5, dry=False):
+    def flaky(n, p, path, timeout=5, dry=False, **kw):
         calls["n"] += 1
         if p == 9302:
             raise RuntimeError("boom")

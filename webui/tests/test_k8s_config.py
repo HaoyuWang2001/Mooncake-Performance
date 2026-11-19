@@ -33,6 +33,19 @@ def test_parse_size_bytes():
     assert bm.parse_size_bytes("1GB") == 1024 ** 3
     assert bm.parse_size_bytes("512KB") == 512 * 1024
     assert bm.parse_size_bytes("1.5MB") == int(1.5 * 1024 ** 2)
+
+
+def test_ssh_password_can_come_from_environment(monkeypatch):
+    monkeypatch.setenv("MC_TEST_SSH_PASSWORD", "secret-from-env")
+    assert u.node_passwd({"passwd": "",
+                          "passwd_env": "MC_TEST_SSH_PASSWORD"}) == \
+        "secret-from-env"
+    monkeypatch.delenv("MC_TEST_SSH_PASSWORD")
+    try:
+        u.node_passwd({"passwd_env": "MC_TEST_SSH_PASSWORD"})
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "MC_TEST_SSH_PASSWORD" in str(exc)
     try:
         bm.parse_size_bytes("0")
     except RuntimeError:

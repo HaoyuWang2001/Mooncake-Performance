@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plot_latency.py — 从 benchmark 客户端日志绘制时延统计图。
+"""plot_latency.py — 从 benchmark 日志/kvtest 时序 CSV 绘制时延统计图。
 
 RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟时间戳）：
   basic/mixed : RESULT  <ts>  <op>  <key>  <lat_ms>  <status>                       (6 字段)
@@ -11,19 +11,26 @@ RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟�
 存在离群值时每个统计量出两幅图：原名图（包含离群值，红 x 标注）+ .trimmed.png
 （剔除离群值，分位线按剔除后数据重算）。
 
+kvtest C++ 客户端把逐请求样本批量落到 ``*.kvtest_*.samples.csv``，脚本按
+operation 绘制一请求一点的 ``.latency.png`` / ``.queuewait.png``。
+
 用法：
   python plot_latency.py --log <日志文件|目录> [--out DIR] [--outlier MS] [--type both]
-    --log      单个日志文件，或目录（递归扫描其中含 RESULT 行的 *.log，逐文件出图）
+    --log      单个日志/kvtest CSV，或目录（递归扫描 *.log 与
+               *.samples.csv，逐文件出图）
     --out      输出目录，缺省 = 日志所在目录（即 outputs/<ts>/logs/<配置名>/）
     --outlier  离群阈值 ms；缺省自动 = p99 × 10 取整（p99 不会被尾部离群值自身抬高）
     --type     both（缺省）| latency | queue-wait
 
 输出：<日志主干>.latency.png[.trimmed] / <日志主干>.queuewait.png[.trimmed]（dpi 150）。
+pipeline 日志主干中的 Pod 名不写入图片文件名，仅保留全局唯一的 client/role
+标识，避免 Windows MAX_PATH 导致出图失败。
 横轴：有时间戳 → 下轴时间线（HH:MM:SS）+ 顶轴 request#i；无时间戳 → request#i。
 benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用本脚本
 （--no-plot 关闭）。依赖：matplotlib（pip install matplotlib）。
 """
 import argparse
+import csv
 import os
 import re
 import sys
@@ -56,12 +63,36 @@ REF_LINES = [(1.0, "1ms"), (2.0, "2ms")]
 # new "YYYY-MM-DD HH:MM:SS.micro" (dated, multi-day safe) or legacy
 # "HH:MM:SS.micro" — one regex detects both
 TS_PREFIX = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}")
+_PIPELINE_POD_STEM_PATTERNS = (
+    # dual:   ...dual_<pod>_c0_p9301.reader
+    re.compile(r"^(?P<prefix>.*\.dual)_.+(?P<suffix>_c\d+_p\d+\.(?:reader|writer))$"),
+    # split reader: ...reader_<pod>_r0_p9201
+    re.compile(r"^(?P<prefix>.*\.reader)_.+(?P<suffix>_r\d+_p\d+)$"),
+    # split writer: ...writer_<pod>_w0
+    re.compile(r"^(?P<prefix>.*\.writer)_.+(?P<suffix>_w\d+)$"),
+)
+KVTEST_SAMPLES_SUFFIX = ".samples.csv"
 
 
 def percentile(sorted_vals, q):
     if not sorted_vals:
         return 0.0
     return sorted_vals[int(round(q * (len(sorted_vals) - 1)))]
+
+
+def _plot_file_stem(log_stem):
+    """Drop the pipeline Pod/node segment from generated image names.
+
+    Client/reader/writer ids are global within one scenario, so keeping the
+    suffix (cN/rN/wN, port and role) preserves uniqueness without carrying a
+    potentially very long Kubernetes Pod name into the Windows output path.
+    Non-pipeline/basic log names are returned unchanged.
+    """
+    for pattern in _PIPELINE_POD_STEM_PATTERNS:
+        match = pattern.match(log_stem)
+        if match:
+            return match.group("prefix") + match.group("suffix")
+    return log_stem
 
 
 def ts_to_seconds(ts):
@@ -158,7 +189,7 @@ def _fmt_hms(seconds, base):
 
 
 def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
-                ylabel="Latency (ms)"):
+                ylabel="Latency (ms)", time_axis="wall"):
     """Dot-line plot with stat hlines, absolute reference lines and outliers.
 
     times: wall-clock seconds per sample (None -> request#i axis). When
@@ -170,9 +201,12 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
         times = None
     n = len(vals)
     fig, ax = plt.subplots(figsize=(12, 6))
-    if times:
+    if times and time_axis == "wall":
         t0 = times[0]
         xs = [t - t0 for t in times]  # 相对秒（底部刻度再渲染回绝对 HH:MM:SS）
+    elif times:
+        t0 = 0.0
+        xs = list(times)  # kvtest: already seconds elapsed since /start
     else:
         t0 = None
         xs = list(range(n))
@@ -197,14 +231,16 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                 "p9999": percentile(stat_vals, 0.9999)}
     for name, color in STAT_HLINES_ALWAYS:
         v = computed[name]
-        ax.axhline(v, linestyle="--", linewidth=1.2, color=color)
+        ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
+                   label=f"{name}={v:.4f}ms")
         ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
                     ha="right", va="bottom", fontsize=9, color=color)
     for name, color, min_n in STAT_HLINES_GATED:
         if n < min_n:
             continue  # 样本量不达标：分位数无意义，不加线
         v = computed[name]
-        ax.axhline(v, linestyle="--", linewidth=1.2, color=color)
+        ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
+                   label=f"{name}={v:.4f}ms")
         ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
                     ha="right", va="bottom", fontsize=9, color=color)
     for v, label in REF_LINES:
@@ -215,7 +251,7 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend(loc="upper left", fontsize=9)
-    if times:
+    if times and time_axis == "wall":
         ax.set_xlabel("time (HH:MM:SS)")
         ax.xaxis.set_major_formatter(
             plt.FuncFormatter(lambda x, _: _fmt_hms(x, t0)))
@@ -227,15 +263,28 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                 lambda i, _xt=np.array(xs), _xi=np.arange(len(vals)):
                 np.interp(i, _xi, _xt)))
         sec.set_xlabel("request #i")
+    elif times:
+        ax.set_xlabel("elapsed time (s)")
+        sec = ax.secondary_xaxis(
+            "top", functions=(
+                lambda t, _xt=np.array(xs), _xi=np.arange(len(vals)):
+                np.interp(t, _xt, _xi),
+                lambda i, _xt=np.array(xs), _xi=np.arange(len(vals)):
+                np.interp(i, _xi, _xt)))
+        sec.set_xlabel("request #i")
     else:
         ax.set_xlabel("request #i")
-    ax.set_xlim(min(xs) if times else 0, max(xs))
+    if len(xs) == 1:
+        ax.set_xlim(xs[0] - 0.5, xs[0] + 0.5)
+    else:
+        ax.set_xlim(min(xs) if times else 0, max(xs))
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
 
 
-def _emit_plots(stem, kind, vals, times, out_dir, outlier_ms, note):
+def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note,
+                time_axis="wall"):
     """Write the latency/queue-wait figure(s): full view always; trimmed view
     additionally when outliers exist (stats recomputed on trimmed data)."""
     suffix = "latency" if kind == "latency" else "queuewait"
@@ -243,16 +292,20 @@ def _emit_plots(stem, kind, vals, times, out_dir, outlier_ms, note):
     base_title = f"{stem}  ({note})"
     trimmed = [v for v in vals if v <= outlier_ms]
     has_out = len(trimmed) != len(vals)
-    png = os.path.join(out_dir, f"{stem}.{suffix}.png")
+    png = os.path.join(out_dir, f"{file_stem}.{suffix}.png")
     plot_series(vals, times, base_title, png, outlier_ms, include_outliers=True,
-                ylabel=ylabel)
+                ylabel=ylabel, time_axis=time_axis)
+    outputs = [png]
     print(f"  -> {png}")
     if has_out:
-        png = os.path.join(out_dir, f"{stem}.{suffix}.trimmed.png")
+        png = os.path.join(out_dir, f"{file_stem}.{suffix}.trimmed.png")
         plot_series(trimmed, _trim_times(times, vals, outlier_ms),
                     f"{stem}  ({note}, outliers removed)", png, outlier_ms,
-                    include_outliers=False, ylabel=ylabel)
+                    include_outliers=False, ylabel=ylabel,
+                    time_axis=time_axis)
         print(f"  -> {png}  (trimmed, {len(vals) - len(trimmed)} outliers excluded)")
+        outputs.append(png)
+    return outputs
 
 
 def _trim_times(times, vals, threshold):
@@ -265,6 +318,7 @@ def process_file(path, args):
     lats, qws, times, counts, qw_times = parse_result_file(path)
     out_dir = args.out or os.path.dirname(os.path.abspath(path))
     stem = os.path.splitext(os.path.basename(path))[0]
+    file_stem = _plot_file_stem(stem)
     status_note = "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "no RESULT"
     print(f"[{os.path.basename(path)}] RESULT status: {status_note}, OK-samples: {len(lats)}"
           + (f", queue_wait: {len(qws)}" if qws else "")
@@ -281,7 +335,7 @@ def process_file(path, args):
     print(f"  outlier threshold: {threshold}ms "
           f"({'auto = p99 x 10' if not args.outlier else 'explicit'})")
     if args.type in ("both", "latency"):
-        _emit_plots(stem, "latency", lats, times, out_dir, threshold,
+        _emit_plots(stem, file_stem, "latency", lats, times, out_dir, threshold,
                     f"{len(lats)} OK samples")
     if qws and args.type in ("both", "queue-wait"):
         # queue_wait 阈值独立按自身分布计算，避免被时延离群值牵连；
@@ -289,25 +343,105 @@ def process_file(path, args):
         # times 长度不同）
         qw_threshold = threshold if args.outlier else \
             max(round(percentile(sorted(qws), 0.99) * 10), 1)
-        _emit_plots(stem, "queue-wait", qws, qw_times, out_dir, qw_threshold,
+        _emit_plots(stem, file_stem, "queue-wait", qws, qw_times, out_dir, qw_threshold,
                     f"{len(qws)} samples")
 
 
-def collect_logs(path):
+def parse_kvtest_samples(path):
+    """Return one row per kvtest operation call, grouped by operation."""
+    groups = {}
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"elapsed_us", "instance_id", "operation", "request_index",
+                    "latency_ms", "status", "bytes"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            return groups
+        for row in reader:
+            operation = (row.get("operation") or "").strip()
+            if not operation:
+                continue
+            try:
+                point = {
+                    "elapsed_us": int(row["elapsed_us"]),
+                    "request_index": int(row["request_index"]),
+                    "latency_ms": float(row["latency_ms"]),
+                    "status": (row["status"] or "").strip(),
+                    "bytes": int(row["bytes"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            groups.setdefault(operation, []).append(point)
+    for points in groups.values():
+        points.sort(key=lambda p: (p["elapsed_us"], p["request_index"]))
+    return groups
+
+
+def process_kvtest_samples(path, args):
+    groups = parse_kvtest_samples(path)
+    if not groups:
+        print("[{}] skip (no valid kvtest request samples)".format(
+            os.path.basename(path)))
+        return []
+    outputs = []
+    name = os.path.basename(path)
+    base = name[:-len(KVTEST_SAMPLES_SUFFIX)] \
+        if name.endswith(KVTEST_SAMPLES_SUFFIX) else os.path.splitext(name)[0]
+    out_dir = args.out or os.path.dirname(os.path.abspath(path))
+    os.makedirs(out_dir, exist_ok=True)
+    for operation in sorted(groups):
+        is_queue_wait = _kvtest_is_queue_wait(operation)
+        if args.type == "latency" and is_queue_wait:
+            continue
+        if args.type == "queue-wait" and not is_queue_wait:
+            continue
+        points = groups[operation]
+        successful = [p for p in points if p["status"] == "OK"]
+        vals = [p["latency_ms"] for p in successful]
+        times = [p["elapsed_us"] / 1_000_000.0 for p in successful]
+        failed = len(points) - len(successful)
+        if not vals:
+            print("[{}] {} skip (no OK request samples)".format(
+                name, operation))
+            continue
+        threshold = args.outlier or max(
+            round(percentile(sorted(vals), 0.99) * 10), 1)
+        print("[{}] {}: OK={}, failed={}, outlier threshold={}ms".format(
+            name, operation, len(vals), failed, threshold))
+        kind = "queue-wait" if is_queue_wait else "latency"
+        file_stem = "{}.{}".format(base, _safe_plot_component(operation))
+        title = "{} — {}".format(base, operation)
+        outputs.extend(_emit_plots(
+            title, file_stem, kind, vals, times, out_dir, threshold,
+            "{} OK samples  ERR:{}".format(len(vals), failed),
+            time_axis="elapsed"))
+    return outputs
+
+
+def _safe_plot_component(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "operation"
+
+
+def _kvtest_is_queue_wait(operation):
+    return operation == "notify_queue_wait" or operation.endswith("queue_wait")
+
+
+def collect_inputs(path):
     if os.path.isfile(path):
         return [path]
     found = []
     for root, _dirs, files in os.walk(path):
         for f in sorted(files):
-            if f.endswith(".log"):
+            if f.endswith(".log") or f.endswith(KVTEST_SAMPLES_SUFFIX):
                 found.append(os.path.join(root, f))
     return found
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Plot latency stats from RESULT log lines")
+    parser = argparse.ArgumentParser(
+        description="Plot latency stats from RESULT logs or kvtest samples CSV")
     parser.add_argument("--log", required=True,
-                        help="log file or directory (recursive *.log scan)")
+                        help="file or directory (recursive *.log and "
+                             "*.samples.csv scan)")
     parser.add_argument("--out", default=None,
                         help="output dir; default = each log's own directory")
     parser.add_argument("--outlier", type=float, default=None,
@@ -317,11 +451,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not os.path.exists(args.log):
         sys.exit(f"[ERROR] log path not found: {args.log}")
-    logs = collect_logs(args.log)
-    if not logs:
-        sys.exit(f"[ERROR] no *.log under {args.log}")
-    for path in logs:
-        process_file(path, args)
+    inputs = collect_inputs(args.log)
+    if not inputs:
+        sys.exit(f"[ERROR] no *.log or *.samples.csv under {args.log}")
+    for path in inputs:
+        if path.endswith(KVTEST_SAMPLES_SUFFIX):
+            process_kvtest_samples(path, args)
+        else:
+            process_file(path, args)
     print("done")
 
 

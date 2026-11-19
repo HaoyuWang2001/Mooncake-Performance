@@ -12,6 +12,7 @@ configs/*
 !configs/global.example.json
 !configs/basic
 !configs/pipeline
+!configs/kvtest
 !configs/_spdiag_trees
 !configs/_ssh
 !configs/_k8s
@@ -32,3 +33,6 @@ configs/_ssh/profile.json
 configs/_k8s/cluster.json
 configs/_k8s/global.json
 configs/_k8s/profile.json
+
+# Stray benchmark output dumps (never tracked)
+*.text

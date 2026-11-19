@@ -2,7 +2,7 @@
   "_note": "k8s十六节点环境",
   "venvs": {},
   "controller": {
-    "ip": "141.62.32.7",
+    "ip": "141.62.32.3",
     "ssh_user": "root",
     "ssh_port": 22,
     "ssh_key": "",
