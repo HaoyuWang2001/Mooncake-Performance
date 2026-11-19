@@ -1271,11 +1271,21 @@ def _lieflat_tokens_js():
 _PAGE_CSS = """
 :root{color-scheme:light dark;
 --paper:#F0F0EE;--ink:#1F1E1C;--mut:rgba(31,30,28,.60);--lab:rgba(31,30,28,.72);
---faint:rgba(31,30,28,.32);--grid:rgba(31,30,28,.16);--quiet:rgba(31,30,28,.15);
+--faint:rgba(31,30,28,.72);--grid:rgba(31,30,28,.16);--quiet:rgba(31,30,28,.15);
 --track:rgba(31,30,28,.12);--hero:#F5572F;--term-bg:#1C1C1A;--term-fg:#F0EFEB}
-@media (prefers-color-scheme:dark){:root{--paper:#1C1C1A;--ink:#F0EFEB;
---mut:rgba(240,240,238,.55);--lab:rgba(240,240,238,.72);--faint:#55554F;
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--paper:#1C1C1A;--ink:#F0EFEB;
+--mut:rgba(240,240,238,.55);--lab:rgba(240,240,238,.72);--faint:rgba(240,240,238,.72);
 --grid:#2E2D29;--quiet:rgba(240,240,238,.15);--track:rgba(240,240,238,.12)}}
+:root[data-theme="dark"]{--paper:#1C1C1A;--ink:#F0EFEB;
+--mut:rgba(240,240,238,.55);--lab:rgba(240,240,238,.72);--faint:rgba(240,240,238,.72);
+--grid:#2E2D29;--quiet:rgba(240,240,238,.15);--track:rgba(240,240,238,.12)}
+:root[data-theme="light"]{--paper:#F0F0EE;--ink:#1F1E1C;
+--mut:rgba(31,30,28,.60);--lab:rgba(31,30,28,.72);--faint:rgba(31,30,28,.72);
+--grid:rgba(31,30,28,.16);--quiet:rgba(31,30,28,.15);--track:rgba(31,30,28,.12)}
+.theme-btn{position:absolute;top:36px;right:28px;border:1px solid var(--grid);
+  background:transparent;color:var(--ink);border-radius:99px;padding:2px 10px;
+  font:inherit;font-size:12.5px;cursor:pointer;line-height:1.5}
+.theme-btn:hover{border-color:var(--faint)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--paper);color:var(--ink);
 font:14px/1.62 'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC',
@@ -1284,7 +1294,7 @@ font:14px/1.62 'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC',
 h1{font-size:19px;font-weight:700;letter-spacing:-.02em;margin:0 0 3px}
 h2{font-size:16.5px;font-weight:700;letter-spacing:-.02em;margin:0 0 2px}
 .sub{color:var(--mut);font-size:13px;margin-bottom:14px}
-.card{background:var(--paper);border-radius:24px;padding:26px 26px 20px;
+.card{background:var(--paper);border:1px solid var(--grid);border-radius:24px;padding:26px 26px 20px;
 margin:0}
 .card + .card,.wrap > .card:not(:first-child){margin-top:14px}
 .note{color:var(--mut);font-size:13px;line-height:1.75;margin-top:8px}
@@ -1339,7 +1349,7 @@ text-overflow:ellipsis;white-space:nowrap}
 .chip .chip-x{border:none;background:transparent;color:var(--mut);
 cursor:pointer;font-size:12px;padding:0 5px}
 .chip .chip-x:hover{color:var(--hero)}
-.tb-sep{width:1px;height:16px;background:var(--grid);display:inline-block}
+
 #latToolbar,#tLatToolbar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
 #latToolbar::-webkit-scrollbar,#tLatToolbar::-webkit-scrollbar{display:none}
 #latToolbar>*,#tLatToolbar>*{flex:0 0 auto;margin:0}   /* 清掉嵌套 .toolbar 的 margin-bottom（否则内容整体上移、与前两个按钮错行） */
@@ -1429,13 +1439,6 @@ overflow:hidden}
 .sbfill{display:block;height:8px;border-radius:99px;min-width:2px}
 .sbval{flex:0 0 auto;font-size:12.5px;font-weight:700;
 font-variant-numeric:tabular-nums}
-/* QPS 达成率（F11 刻度） */
-.gkv .gtrack{position:relative;height:6px;border-radius:99px;margin-top:8px;
-background:var(--track);overflow:visible}
-.gkv .gfill{display:block;height:6px;border-radius:99px;background:var(--ink)}
-.gkv .gtick{position:absolute;top:-3px;width:2px;height:12px;
-background:var(--hero);border-radius:1px}
-.gkv .gsub{font-size:12px;color:var(--faint);margin-top:5px;letter-spacing:.02em}
 /* RSS 增幅正负条（G10 diverging） */
 .grow{display:flex;flex-direction:column;gap:4px;margin:14px 0 2px}
 .grow-row{display:flex;align-items:center;gap:10px}
@@ -1616,8 +1619,36 @@ function colQps(col,tier){
   return col.c.map(function(c,i){
     return Math.round(c/((col.span&&col.span[i])||step)*100)/100;});}
 /* ---- lieflat Wire 主题（token 来自 vendored mono-tokens/color-presets） ---- */
-const LF_DARK = !!(window.matchMedia &&
-  window.matchMedia('(prefers-color-scheme: dark)').matches);
+/* R-SHELL-4：主题三态（自动/亮/暗）。'auto' 跟随系统 prefers-color-scheme；
+   手动选择持久化到 localStorage（file:// 下不可用时退化为会话内生效），
+   并通过 <html data-theme> 让 CSS token 翻转——图表 token（LF_DARK）在
+   切换时整体重算并整页重渲染。 */
+const _THEME_KEY = 'mc_report_theme';
+function _sysDark(){
+  return !!(window.matchMedia &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+function _storedTheme(){
+  try{ return window.localStorage.getItem(_THEME_KEY)||''; }catch(e){ return ''; }
+}
+function themePref(){ return _storedTheme()||'auto'; }
+function applyTheme(pref, silent){
+  const dark = (pref==='auto') ? _sysDark() : (pref==='dark');
+  try{
+    const root=document.documentElement;
+    root.setAttribute('data-theme', dark?'dark':'light');
+  }catch(e){}
+  if(!silent){
+    try{ window.localStorage.setItem(_THEME_KEY, pref); }catch(e){}
+  }
+  const btn=document.getElementById('themeToggle');
+  if(btn){ btn.setAttribute('aria-pressed', pref==='auto'?'false':'true');
+    btn.title='当前：'+(pref==='auto'?'自动（跟随系统）':(pref==='dark'?'暗色':'亮色'))+'，点击切换';
+    const t=btn.querySelector('.theme-icon'); if(t)t.textContent=dark?'◐':'◑'; }
+  return dark;
+}
+const LF_DARK = applyTheme(themePref(), true);
+window.__MC_THEME__ = { pref: themePref(), dark: LF_DARK };
 const LF_W = (window.PRESETS && window.PRESETS.WIRE) || null;
 const LF_M = window.MONO || null;
 const LF_LADDER_L = (LF_W && LF_W.SER) || ['#22211F','#8F8E86','#C0BFB7',
@@ -1833,8 +1864,8 @@ function objLineColor(key){
   if(o.kind==='node') return nodeHue(o.node||o.label);
   return instanceColor(o.node,key);
 }
-/* ---- 离群值剔除（阀值 = 10 x 整体 p99，与 plot_latency.py 的 PNG 版一致）
-   语义：命中桶**不丢弃**，而是把该桶的取值截顶到阀值 —— 这样 y 轴不再被
+/* ---- 离群值剔除（阈值 = 10 x 整体 p99，与 plot_latency.py 的 PNG 版一致）
+   语义：命中桶**不丢弃**，而是把该桶的取值截顶到阈值 —— 这样 y 轴不再被
    偶发离群值抬到天上，同时数据点不消失（早前版本整桶置空，一个 1s 桶
    里有 100 个样本时命中概率极高，曲线会缺一大半 = 明显 bug）。        */
 /* 离群体系（S5）：离群值 = 单请求 > 客户端 p99×10，由 map 阶段判定并落盘；
@@ -3111,7 +3142,9 @@ function renderSlowStrip(){
   o.tooltip=lfTooltip({trigger:'item',formatter:function(p){
     const r=p.data&&p.data[2];
     if(!r) return '';
-    return fullts(r.t)+'<br>'+String(r.key||'')+
+    /* R-SLOW-2：时刻走归一 epoch（rowEpoch 优先 ts_epoch），不得读行上
+       不存在的 r.t（曾致 tooltip 时刻显示 undefined） */
+    return fullts(rowEpoch(r))+'<br>'+String(r.key||'')+
       '<br>'+(r.role?('角色 '+r.role+' · 节点 '+(r.node||'-')+'<br>'):'')+
       '时延 '+Number(r.lat).toFixed(2)+' ms · '+(r.status||'');
   }});
@@ -3435,6 +3468,15 @@ function renderControls(){
     ob.disabled=!hasOut;
   }
 }
+function renderThemeToggle(){
+  const btn=document.getElementById('themeToggle'); if(!btn) return;
+  btn.onclick=function(){
+    const cur=themePref();
+    const next=cur==='auto'?'dark':(cur==='dark'?'light':'auto');
+    applyTheme(next);
+    renderAll();               /* token 翻转后整页重渲染 */
+  };
+}
 function renderAll(){
   const z=Z(); if(!z) return;
   const ss=document.getElementById('sizeSel');
@@ -3462,6 +3504,7 @@ function renderAll(){
   safe('trace',renderTrace);
   safe('sources',function(){
     if(!window.__srcDone){renderSources();window.__srcDone=true;}});
+  safe('theme-toggle',renderThemeToggle);
 }
 let monCharts={};
 function _monChart(id, series, yname){
@@ -3495,6 +3538,18 @@ function renderMonitors(){
   card.style.display='';
   const g=document.getElementById('moncards'); g.innerHTML='';
   const sm=M.summary||{};
+  /* R-MON-4 部分缺失：只有 mem 无 urma（或反之）时，标题/图注同步去掉
+     对应分句、空图占位隐藏——不留下对不存在内容的说明与空洞。 */
+  const hasUrma=!!(M.urma&&M.urma.length);
+  const hasMem=!!((M.mem_host&&M.mem_host.length)||
+    (M.mem_proc&&M.mem_proc.length));
+  const suf=document.getElementById('monTitleSuffix');
+  if(suf) suf.textContent=hasMem&&hasUrma?'（内存 / URMA 端口）':
+    (hasUrma?'（URMA 端口）':(hasMem?'（内存）':''));
+  const unote=document.getElementById('monUrmaNote');
+  if(unote&&!hasUrma) unote.textContent='';
+  const ubox=document.getElementById('urmachart');
+  if(ubox) ubox.style.display=hasUrma?'':'none';
   if(sm.peak_mem_mb) Object.keys(sm.peak_mem_mb).forEach(function(n){
     g.appendChild(kv('峰值内存 · '+n, sm.peak_mem_mb[n], 'MB'));});
   if(sm.worst_proc){
@@ -5040,7 +5095,11 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>{css}</style></head><body>
 <div class="wrap">
-<h1>{title}</h1><div class="sub">{subtitle}</div>
+<h1>{title}</h1>
+<button id="themeToggle" class="theme-btn" type="button"
+  aria-pressed="false" title="当前：自动（跟随系统），点击切换"><span
+  class="theme-icon">◑</span></button>
+<div class="sub">{subtitle}</div>
 {body}
 </div>
 <script>{echarts}</script>
@@ -5066,6 +5125,7 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
 # ---------------------------------------------------------------------------
 _SEC_SUMMARY = """
 <div class="card">
+<h2>测试概览</h2>
 <div class="toolbar">
 <label class="tl-label" id="sizeSelLabel" for="sizeSel">数据大小</label>
 <select id="sizeSel"></select>
@@ -5113,14 +5173,14 @@ _SEC_LATENCY = """<div class="card"><h2>端到端时延曲线</h2>
 </div>
 </div>
 <div class="chart-canvas">
-<div id="mainchart" class="chart"></div>
+<div id="mainchart" class="chart" role="img" aria-label="端到端时延曲线图"></div>
 <div id="endlabels" class="endlabels"></div>
 <div id="xpan" class="xpan" title="拖动平移时间轴（缩放请用滚轮）">
 <div id="xpanWin" class="xpan-win" title="拖动平移时间轴"></div>
 </div>
 </div>
 </div>
-<div id="qpschart" class="chart qps"></div>
+<div id="qpschart" class="chart qps" role="img" aria-label="QPS 与失败副图"></div>
 <div class="note" id="qpsNote"></div>
 <div class="note">浅色竖带 = 无数据窗口（仅首处标注时长，其余同色带同样含义）</div>
 <div class="chart-hint">滚轮 = 缩放时间轴 · 左右拖动 = 平移x · 上下拖动 = 平移y ·
@@ -5129,14 +5189,14 @@ _SEC_LATENCY = """<div class="card"><h2>端到端时延曲线</h2>
 """
 _SEC_HIST = """<div class="card" id="histcard" style="display:none"><h2>时延分布</h2>
 <div class="sub">p9999 需样本 ≥ 10000</div>
-<div id="histchart" class="chart sm"></div></div>
+<div id="histchart" class="chart sm" role="img" aria-label="时延分布直方图"></div></div>
 """
 _SEC_SLOW = """<div class="card" id="slowcard" style="display:none"><h2>慢点捕捉</h2>
 <div class="sub">每条 = 一次慢操作（Top-100）；总计 = 该角色全部慢点（灰），
 勾选节点/实例后高亮叠加</div>
 <div id="slowctl" class="slow-ctl"></div>
 <div id="slowsum" class="slow-sum"></div>
-<div id="slowchart" class="chart sm"></div>
+<div id="slowchart" class="chart sm" role="img" aria-label="慢点捕捉条带图"></div>
 <div class="note">时间轴与端到端时延曲线同窗口（缩放独立）；摘要条 = 各节点慢点次数
 与该节点自身 p99</div></div>
 """
@@ -5151,9 +5211,9 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 </div>
 <div class="toolbar"><span class="tl-label">指标</span>
 <span id="lvlMetric" class="toolbar"></span></div>
-<h3 class="sec">分级时延（块宽 = 占父项百分比；点击块聚焦，下一级在新行展开）</h3>
+<h3 class="sec" title="块宽 = 占父项百分比；点击块聚焦，下一级在新行展开">分级时延</h3>
 <div id="levels" class="levels"></div>
-<h3 class="sec">阶段曲线（粒度 + 阶段，与分级时延共享对象与指标）</h3>
+<h3 class="sec" title="粒度 + 阶段，与分级时延共享对象与指标">阶段曲线</h3>
 <div class="toolbar" id="tLatToolbar">
 <span id="stageTierBtns" class="toolbar"></span>
 <button id="tResetBtn" title="恢复初始缩放范围">重置视图</button>
@@ -5177,7 +5237,7 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 </div>
 </div>
 <div class="chart-canvas">
-<div id="tchart" class="chart"></div>
+<div id="tchart" class="chart" role="img" aria-label="阶段曲线图"></div>
 <div id="tEndlabels" class="endlabels"></div>
 <div id="tXpan" class="xpan" title="拖动平移时间轴（缩放请用滚轮）">
 <div id="tXpanWin" class="xpan-win" title="拖动平移时间轴"></div>
@@ -5187,15 +5247,15 @@ _SEC_TRACE = """<div class="card" id="tracecard" style="display:none">
 <div class="note">阶段曲线的时间桶按跨度提供：档位 s 仅当 span/s ≥ 8 时可选
 （30s run 只有 1 秒与自适应；默认自适应按 30~120 桶自动选档）；
 平均/最大值来自 SDK 字段统计；端到端曲线由 1s 桶聚合到同一档位。</div>
-<h3 class="sec" style="display:none">阶段树（点击节点，右侧显示该阶段指标套件）</h3>
+<h3 class="sec" style="display:none" title="点击节点，右侧显示该阶段指标套件">阶段树</h3>
 <div class="stage-split" style="display:none">
 <div class="ttree" id="ttree"></div>
 <div class="tdetail" id="tdetail"></div>
 </div>
-<h3 class="sec">最慢请求（Top-100，点击行展开全链路时延及占比）</h3>
+<h3 class="sec" title="Top-100，点击行展开全链路时延及占比">最慢请求</h3>
 <div class="sub">慢请求阶段构成：柱高 = 端到端时延，自下而上 = 一级阶段；
 灰阶 = 各阶段平均占比越大越深</div>
-<div id="tstackchart" class="chart" style="height:210px"></div>
+<div id="tstackchart" class="chart" style="height:210px" role="img" aria-label="慢请求阶段构成堆叠直方图"></div>
 <div class="wrapx"><table id="ttop"><thead><tr>
 <th>start_time</th><th>trace_id</th><th>key</th><th>op</th><th>状态</th>
 <th>节点</th><th>实例</th>
@@ -5210,8 +5270,8 @@ memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total
 _SEC_CLIENTS = """<div class="card"><h2>实例详情</h2><div class="wrapx">
 <table id="ctable"><thead><tr>
 <th>客户端</th><th>角色</th><th>节点</th><th class="n">总数</th><th class="n">成功</th>
-<th class="n">失败</th><th class="n">平均</th><th class="n">p50</th><th class="n">p99</th>
-<th class="n">p999</th><th class="n">最大</th><th class="n">队列等待均</th><th class="n">日志</th>
+<th class="n">失败</th><th class="n">avg</th><th class="n">p50</th><th class="n">p99</th>
+<th class="n">p999</th><th class="n">max</th><th class="n">队列等待均值</th><th class="n">日志</th>
 </tr></thead><tbody></tbody></table></div>
 <div class="note" id="datanote" style="display:none">全量数据 data.js 未加载（例如通过
 WebUI/HTTP 直接打开）：客户端表按 p99 显示前 20 名。
@@ -5226,15 +5286,15 @@ _SEC_FOOTER = """<div class="note">数据文件：report.html（自包含）+ da
 由 logstats（map）+ report.py（reduce）生成。</div>
 """
 _MONITOR_CARD = """
-<div class="card" id="monitorcard"><h2>节点监控（内存 / URMA 端口）</h2>
+<div class="card" id="monitorcard"><h2>节点监控<span id="monTitleSuffix">（内存 / URMA 端口）</span></h2>
 <div id="moncards" class="grid"></div>
-<h3 class="sec">进程 RSS 增幅（正/负）</h3>
+<h3 class="sec">进程 RSS 增幅</h3>
 <div id="growth" class="grow" style="display:none"></div>
-<div id="memchart" class="chart"></div>
-<div id="procchart" class="chart"></div>
-<div id="urmachart" class="chart"></div>
-<div class="note">整机内存来自 numastat（NUMA 分列），进程内存来自
-/proc/&lt;pid&gt;/smaps_rollup；URMA 端口为 mdcli flit 计数器差分（GiB/s，1024 进制）。
+<div id="memchart" class="chart" role="img" aria-label="节点宿主内存图"></div>
+<div id="procchart" class="chart" role="img" aria-label="进程 RSS 内存图"></div>
+<div id="urmachart" class="chart" role="img" aria-label="URMA 端口流量图"></div>
+<div class="note" id="monNote">整机内存来自 numastat（NUMA 分列），进程内存来自
+/proc/&lt;pid&gt;/smaps_rollup；<span id="monUrmaNote">URMA 端口为 mdcli flit 计数器差分（GiB/s，1024 进制）。</span>
 时间轴与上方延迟图同源，可对照异常窗口；进程 RSS 持续增长会被标记「疑似泄露」。</div></div>
 """
 
@@ -5316,8 +5376,14 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     mon = data.get("monitors") or {}
     if mon.get("mem_host") or mon.get("mem_proc") or mon.get("urma"):
         body += _MONITOR_CARD
-    page_title = ("Pipeline 场景报表" if is_pipe else "场景报表") + \
-        " · " + time.strftime("%H:%M:%S")
+    # R-SHELL-11：title/h1 携带场景名与单元身份（meta.unit，如「c4×t8 · 128KB」）；
+    # 报告生成时间已由副标题承载，不再占据页面最高层级（多标签页对照时
+    # 同名不可区分的问题由此修复——pipeline 单元目录仅 size 一级时尤甚）。
+    _ident = " · ".join(x for x in (
+        str(meta.get("config") or ""),
+        str(meta.get("unit") or "")) if x)
+    _base_name = "Pipeline 场景报表" if is_pipe else "场景报表"
+    page_title = (_base_name + " · " + _ident) if _ident else _base_name
     echarts_js = _read_echarts(echarts_path)
     html = _page_html(page_title,
                       subtitle, body, embedded, echarts_js,

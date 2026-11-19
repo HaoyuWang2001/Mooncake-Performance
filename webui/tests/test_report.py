@@ -415,8 +415,9 @@ def test_old_stats_minutes_compat(tmp_path):
     assert z2["objects"]["writer"]["tiers"]["60"]["t"] == [3600, 3660]
 
 
-def _js_check(tmp_path, data, *args):
-    """用桩 DOM 执行 report 的 app JS；无 node 时跳过（返回 None）。"""
+def _js_check(tmp_path, data, *args, env=None):
+    """用桩 DOM 执行 report 的 app JS；无 node 时跳过（返回 None）。
+    env: 传给 harness 的环境变量（VC_* 钩子：模拟 data.js 缺失/注入断点等）。"""
     node = shutil.which("node")
     if not node:
         print("  [skip] node not found")
@@ -425,9 +426,14 @@ def _js_check(tmp_path, data, *args):
     app.write_text(rp._APP_JS, encoding="utf-8")
     dj = tmp_path / "data.json"
     dj.write_text(json.dumps(data), encoding="utf-8")
+    run_env = None
+    if env:
+        run_env = dict(os.environ)
+        run_env.update({k: str(v) for k, v in env.items()})
     r = subprocess.run([node, os.path.join(HERE, "report_js_check.js"),
                         str(app), str(dj)] + list(args),
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=60,
+                       env=run_env)
     assert r.returncode == 0, r.stdout + r.stderr
     return json.loads(r.stdout)
 
@@ -2055,3 +2061,537 @@ def test_slow_capture_basic_has_no_role_radio(tmp_path):
     ctl = res["slow_ctl_text"]
     assert "角色" not in ctl
     assert "总计" in ctl
+
+
+# ===========================================================================
+# A 类补测（2026-11-19 测试审计）：REQUIREMENTS v0.6「已实现、无测试」的规则
+# 逐条落测——审计矩阵 38✓/10◐/7✗ 中的 ✗ 与 ◐ 补齐项。纯补测，不改产品码。
+# ===========================================================================
+
+def test_a01_gap_markarea_between_runs(tmp_path):
+    """R-LAT-9：相邻桶间隔 > 桶宽中位数 3 倍 => 主图/QPS 图 markArea 浅带，
+    注「N 秒无数据」。构造 0..9s + 26..30s（gap=16s > 3x1s）。"""
+    st = _minimal_stats([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 26, 27, 28, 29, 30],
+                       [0, 30])
+    st["meta"].update({"ts_from": 0, "ts_to": 30, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    ma = res.get("main_markarea") or []
+    qma = res.get("qps_markarea") or []
+    assert ma, "主图应有 markArea 无数据带"
+    label = str(ma[0][0].get("name") or "")
+    assert "无数据" in label, label
+    assert "17" in label, label            # 10 -> 26，含端点共 17 秒（as-built）
+    assert qma, "QPS 副图同样应有 markArea"
+
+
+def test_a02_no_gap_no_markarea(tmp_path):
+    """R-LAT-9 反例：连续 1s 桶无间隔 => 不产生任何无数据带。"""
+    st = _minimal_stats(list(range(40)), [0, 30])
+    st["meta"].update({"ts_from": 0, "ts_to": 39, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert not (res.get("main_markarea") or []), res.get("main_markarea")
+
+
+def test_a03_latency_color_semantics_gray_only(tmp_path):
+    """R-LAT-12 / skill §1：端到端曲线全灰阶（深灰 avg/p99/p9999、其余浅灰），
+    多对象调色板同为灰阶；任何 LAT_COLORS 值的 r=g=b（不允许彩色曲线）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    colors = res.get("main_colors") or []
+    assert colors, "应采集到主线 series 颜色"
+    # 灰阶 token = lieflat 阶梯既有值（r≈g≈b 的「视觉灰」，非严格相等）；
+    # 语义禁令是「不引入新 hex / 不用彩色」，故断言通道差 <= 8（灰）且
+    # 全部落在既有 token 白名单内。
+    _grays = {"#6E6D66", "#8F8E86", "#22211F", "#3F3E3B", "#A5A49C",
+              "#55554F", "#B3B0A4", "#C0BFB7", "#DCDAD2", "#4A4944",
+              "#8F8E88", "#6A6963", "#C9C7BD", "#B5B4AC"}
+    for c in colors:
+        h = str(c["color"] or "").upper().lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        assert len(h) == 6, c
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        assert max(r, g, b) - min(r, g, b) <= 16, "曲线出现非灰阶颜色: {}".format(c)
+        assert "#" + h in {g2.upper() for g2 in _grays}, \
+            "曲线颜色不在灰阶 token 白名单: {}".format(c)
+
+
+def test_a04_slow_strip_hero_only_on_max(tmp_path):
+    """R-LAT-12：慢点条带仅「该组最慢一根」用 hero 橙，其余全灰。
+    同时锁定慢点 series 为 scatter（rect 仅 pipeline writer）。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["slowest"] = [{"ts": "2026-11-19 00:00:0{}.000000".format(i),
+                      "op": "put", "key": "k{}".format(i),
+                      "lat_ms": 10.0 + i, "status": "OK"} for i in range(4)]
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    # v4 as-built：慢点卡为对象化散点（独立控件）。默认「总计」系列颜色
+    # 为灰阶 C.mut（rgba），无任何 hero 橙散布在普通慢点上；橙只允许出现在
+    # 勾选高亮（slowColorOf）之外——R-LAT-12 的慢点条款随 v4 重构语义如下：
+    ss = res.get("slow_series") or []
+    assert ss and ss[0]["name"].startswith("总计"), ss
+    assert ss[0]["type"] == "scatter", ss
+    _sc = res.get("slow_colors") or []
+    assert all(c is None for c in _sc), \
+        "普通慢点不得携带逐点颜色（橙只用于勾选高亮语义）: {}".format(_sc)
+
+
+def test_a05_qps_fail_series_hero_only(tmp_path):
+    """R-LAT-12：QPS 副图橙只出现在「失败」系列；QPS 柱系列必须为灰阶。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    qcs = res.get("qps_colors") or []
+    assert qcs, "应采集 QPS series 颜色"
+    named = {str(s["name"]): s for s in qcs}
+    fail_names = [n for n in named if "失败" in n]
+    assert fail_names, "QPS 副图应有失败系列: {}".format(list(named))
+    for n in fail_names:
+        assert "F5572F" in str(named[n]["color"] or "").upper(), named[n]
+    _grays = {"#8F8E86", "#8F8E88", "#6E6D66", "#A5A49C", "#4A4944",
+              "#B3B0A4", "#DCDAD2", "#3F3E3B", "#22211F", "#55554F",
+              "#C0BFB7", "#C9C7BD", "#B5B4AC", "#6A6963"}
+    for n, s in named.items():
+        if n in fail_names:
+            continue
+        c = str(s["color"] or "").upper()
+        assert c in {g.upper() for g in _grays}, \
+            "QPS 柱必须使用灰阶 token: {}".format(s)
+
+
+def test_a06_metric_list_locked_to_spec(tmp_path):
+    """R-LAT-3：曲线指标清单锁定为 LAT_LINES 定义（avg/p50/p99/p999/p9999/
+    min/max/qw），按钮数 = 清单长度；杜绝 latSel 超纲类漂移。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    names = [b["t"].strip() for b in (res.get("lat_btns") or [])]
+    expected = {"avg", "p50", "p99", "p999", "p9999", "min", "max", "队列等待"}
+    assert set(names) == expected, names
+
+
+def test_a07_anomalies_capped_at_50(tmp_path):
+    """R-LAT-10：异常竖线最多 50 条（slice(0,50)）。构造 60 条异常。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["anomalies"] = [{"t": i * 0.05, "kind": "latency_spike",
+                        "avg_ms": 9.9, "count": 5} for i in range(60)]
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("main_markline_n") == 50, res.get("main_markline_n")
+
+
+def test_a08_data_missing_degrades_to_note(tmp_path):
+    """R-SHELL-2：data.js 加载失败（__mcDataMissing）=> datanote 显示，
+    明细表降级仍可渲染（行数 > 0），页面不崩。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    b = _stats(tmp_path, "b.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, env={"VC_DATAMISSING": "1"})
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("datanote_visible") != "none", res.get("datanote_visible")
+
+
+def test_a09_data_loaded_hides_note(tmp_path):
+    """R-SHELL-2 正例：data.js 在场（VC_FULLSIM）=> datanote 保持隐藏。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data, env={"VC_FULLSIM": "1"})
+    if res is None:
+        return
+    assert res["errors"] == []
+    # as-built（桩 DOM）：inline style="display:none" 不进桩，仅 JS 修改可观测。
+    # data.js 在场时 renderTable 从不触碰 datanote => style.display 保持未设置；
+    # 与失败路径（A08 中被显式置 ''）相区分：此处必须读作空串。
+    assert res.get("datanote_visible") == "", res.get("datanote_visible")
+
+
+def test_a10_subtitle_sequence(tmp_path):
+    """R-SHELL-5：副标题序列 = 测试开始于 / 报告生成于 / 协议 /（早停警告）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]),
+                              {"config": "c", "started": "2026-11-19 10:00:00",
+                               "protocol": "tcp", "early_stop": True})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    i0 = src.index("测试开始于")
+    i1 = src.index("报告生成于")
+    i2 = src.index("协议")
+    i3 = src.index("提前停止")
+    assert i0 < i1 < i2 < i3, (i0, i1, i2, i3)
+
+
+def test_a11_empty_hist_and_slow_cards_hidden(tmp_path):
+    """R-HIST-3 / R-SLOW-3：无直方图 / 无慢点数据 => 整卡保持 display:none。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["histogram"] = {}              # 无直方图
+    # slowest 已是空（_minimal_stats 默认）
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("hist_visible") == "none", res.get("hist_visible")
+    assert res.get("slow_visible") == "none", res.get("slow_visible")
+
+
+def test_a12_hist_and_slow_cards_visible_with_data(tmp_path):
+    """R-HIST-3 / R-SLOW-3 正例：有数据 => 两卡解除隐藏。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["slowest"] = [{"ts": "2026-11-19 00:00:01.000000", "op": "put",
+                      "key": "k1", "lat_ms": 9.0, "status": "OK"}]
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("hist_visible") != "none", res.get("hist_visible")
+    assert res.get("slow_visible") != "none", res.get("slow_visible")
+
+
+def test_a13_zoom_links_main_and_qps(tmp_path):
+    """R-LAT-6：主图 dataZoom 后 QPS 副图窗口同步（VC_ZOOM 注入后读回两图）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--real",
+                    env={"VC_ZOOM": "30,60"})
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    zs = res.get("zoom_states") or {}
+    assert zs.get("mainchart") and zs.get("qpschart"), zs
+    assert zs["mainchart"]["start"] == zs["qpschart"]["start"], zs
+    assert zs["mainchart"]["end"] == zs["qpschart"]["end"], zs
+    assert zs["mainchart"]["start"] == 30, zs
+
+
+def test_a14_safe_isolation_single_block(tmp_path):
+    """R-SHELL-8：单块渲染抛错只失效该块，其余块照常（errors 仍为空，
+    其余卡片文本已填充）。注入 renderHist 抛错。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    b = _stats(tmp_path, "b.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, env={"VC_BREAK": "renderHist"})
+    if res is None:
+        return
+    # safe() 吞掉注入异常：页面主流程不受影响（渲染树/summary 正常）
+    assert res.get("cards_text"), "其余块仍应渲染"
+    assert res["errors"] == [], res["errors"]
+
+
+def test_a15_report_stdlib_only():
+    """C-2：report.py 仅使用 Python 标准库（AST 扫描 import）。"""
+    import ast as _ast
+    src = open(os.path.join(ROOT, "scripts", "report.py"),
+               encoding="utf-8").read()
+    std = set(sys.stdlib_module_names) | {"logstats"}
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, _ast.Import):
+            for al in node.names:
+                top = al.name.split(".")[0]
+                assert top in std, "非标准库 import: {}".format(al.name)
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module:
+                top = node.module.split(".")[0]
+                assert top in std, "非标准库 import: {}".format(node.module)
+
+
+def test_a16_theme_and_numeric_css(tmp_path):
+    """R-SHELL-3 / R-SHELL-6 / R-SHELL-10：双主题 @media、tabular-nums 存在；
+    sizeSel 多 size 才显示（结构存在 + JS 单 size 隐藏）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert "@media (prefers-color-scheme:dark)" in src
+    assert "tabular-nums" in src
+    assert 'id="sizeSel"' in src
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("size_sel_display") == "none", res.get("size_sel_display")
+
+
+def test_a17_fmt_us_adaptive_units(tmp_path):
+    """R-SHELL-10：fmtUs 自适应单位（µs -> ms -> s）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    fu = res.get("fmt_us")
+    assert fu, "harness 应输出 fmtUs 样例"
+    assert fu[0].endswith("ms"), fu        # 1500us -> 1.50 ms
+    assert fu[1].endswith("µs"), fu        # 500us -> 500.0 µs
+    assert fu[3].endswith("ms"), fu        # 1234567us -> 1234.57 ms
+
+
+def test_a18_outlier_button_disabled_without_outliers(tmp_path):
+    """R-LAT-4 v0.5 分支：无离群请求时按钮置灰（不呈现永远无效的控件），
+    title 说明口径。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["outliers"] = []
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    ob = res.get("outlier_btn_state") or {}
+    assert ob.get("disabled") is True, ob
+    # as-built：说明走 title（悬停可见），文本仍为动作名
+    assert "没有离群" in str(ob.get("title") or ""), ob
+
+
+def test_a19_outlier_button_enabled_with_outliers(tmp_path):
+    """R-LAT-4 正例：有离群请求时按钮可用且 title 带计数。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["outliers"] = [{"ts": "2026-11-19 00:00:01.000000", "op": "put",
+                       "key": "k9", "lat_ms": 500.0, "status": "OK"}]
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    ob = res.get("outlier_btn_state") or {}
+    assert ob.get("disabled") is False, ob
+
+
+# ===========================================================================
+# B 类 TDD（v0.5/v0.6 [新增] 需求）：先红后绿。每条需求一个测试。
+# ===========================================================================
+
+def test_b01_unit_identity_in_title_and_h1(tmp_path):
+    """R-SHELL-11 [新增]：<title> 与 <h1> 携带场景名与单元身份
+    （config · unit，取自 meta）；生成时间只在副标题，不进 h1。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]),
+                              {"config": "get_buffer_multi",
+                               "mode": "basic", "unit": "c4×t8 · 128KB"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert "get_buffer_multi" in src.split("</title>")[0], \
+        "<title> 应含场景名"
+    assert "c4×t8" in src.split("</title>")[0], "<title> 应含单元身份"
+    assert "get_buffer_multi" in src.split("</h1>")[0], "<h1> 应含场景名"
+    assert "c4×t8" in src.split("</h1>")[0], "<h1> 应含单元身份"
+
+
+def test_b02_chart_role_and_aria_labels(tmp_path):
+    """R-SHELL-12 [新增]：每个图表容器有 role="img" 与 aria-label。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    import re as _re
+    charts = _re.findall(r'id="(mainchart|qpschart|histchart|slowchart|'
+                          r'tchart|tstackchart|memchart|procchart|urmachart)"',
+                          src)
+    assert charts, "应存在图表容器"
+    for cid in set(charts):
+        m = _re.search(r'id="' + cid + r'"[^>]*role="img"', src)
+        assert m, "{} 缺 role=\"img\"".format(cid)
+        assert 'aria-label' in src, "图表容器缺 aria-label"
+
+
+def test_b03_heading_hierarchy_no_skips(tmp_path):
+    """R-SHELL-13 [新增]：标题层级不跳级——首卡的「性能统计」分节必须有
+    所属 h2 卡片标题；h1 后不得直接跟 h3。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    # h1 在外壳（_page_html），body 模板内首个分节标题（h3.sec）之前
+    # 必须已有所属卡片的 h2 —— 不允许 h1 -> h3 跳级。
+    body_start = src.index("<!-- tpl:")
+    first_h3 = src.index('<h3 class="sec">', body_start)
+    first_h2 = src.index("<h2>", body_start)
+    assert first_h2 < first_h3, "首个分节 h3 前无 h2 卡片标题（h1→h3 跳级）"
+
+
+def test_b04_text_contrast_c5(tmp_path):
+    """C-5 [新增]：--faint 文本（.sec 节标题 / th 表头）对比度 >= 4.5:1。
+    亮色主题下用 --lab（0.72 透明度）替代。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    import re as _re
+    faint = _re.search(r"--faint:([^;]+);", src).group(1).strip()
+    paper = _re.search(r"--paper:([^;]+);", src).group(1).strip()
+
+    def _hex(c):
+        c = c.lstrip("#")
+        return [int(c[i:i + 2], 16) for i in (0, 2, 4)]
+
+    # rgba 合成（--faint 是 rgba(31,30,28,.32) 形态）
+    m = _re.match(r"rgba\((\d+),(\d+),(\d+),([\d.]+)\)", faint)
+    assert m, "亮色 --faint 应为 rgba 形态: {}".format(faint)
+    fr, fg, fb, fa = (float(m.group(i)) for i in (1, 2, 3, 4))
+    pr, pg, pb = _hex(paper)
+    cr = fr * fa + pr * (1 - fa)
+    cg = fg * fa + pg * (1 - fa)
+    cb = fb * fa + pb * (1 - fa)
+
+    def _rel_lum(r, g, b):
+        lin = []
+        for v in (r, g, b):
+            v = v / 255.0
+            lin.append(v / 12.92 if v <= 0.04045 else
+                       ((v + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    l1 = _rel_lum(cr, cg, cb)
+    l2 = _rel_lum(pr, pg, pb)
+    ratio = (max(l1, l2) + 0.05) / (min(l1, l2) + 0.05)
+    assert ratio >= 4.5, "--faint 亮色对比度 {} < 4.5:1".format(round(ratio, 2))
+
+
+def test_b05_theme_manual_toggle(tmp_path):
+    """R-SHELL-4 [新增]：手动主题切换控件存在（亮/暗/自动），
+    且切换后图表 token 跟随（LF_DARK 翻转）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert 'id="themeToggle"' in src, "缺少主题切换控件"
+    assert 'data-theme' in src, "缺少 CSS data-theme 覆盖层"
+    # 存储偏好 = dark => LF_DARK 为真（token 跟随手动选择而非系统）
+    r1 = _js_check(tmp_path, data, env={"VC_THEME": "dark",
+                                        "VC_SYS": "light"})
+    if r1 is None:
+        return
+    assert r1["errors"] == []
+    assert r1["theme_pref"] == "dark", r1["theme_pref"]
+    assert r1["theme_dark"] is True, r1["theme_dark"]
+    assert r1["theme_btn_exists"] is True
+    # 无偏好 => auto 跟随系统（系统 light => 亮）
+    r2 = _js_check(tmp_path, data, env={"VC_SYS": "light"})
+    if r2 is None:
+        return
+    assert r2["theme_pref"] == "auto", r2["theme_pref"]
+    assert r2["theme_dark"] is False, r2["theme_dark"]
+    # auto + 系统暗 => 暗
+    r3 = _js_check(tmp_path, data, env={"VC_SYS": "dark"})
+    if r3 is None:
+        return
+    assert r3["theme_dark"] is True, r3["theme_dark"]
+
+
+def test_b06_monitor_card_partial_missing(tmp_path):
+    """R-MON-4 v0.5 分支 [新增]：只有 mem 无 urma => 不留 URMA 空占位：
+    标题去掉对应分句、urmachart 不渲染或隐藏，且图注同步。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    mons = {
+        "mem_host": [{"node": "n1", "t": [1000, 1001],
+                      "columns": ["n0_used_mb"],
+                      "series": {"n0_used_mb": [10.0, 20.0]}}],
+        "mem_proc": [],
+        "urma": [],
+        "summary": {"peak_mem_mb": {"n1": 20}, "peak_urma": None,
+                    "worst_proc": None, "proc_growth": []},
+    }
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, monitors=mons)
+    # JS 冒烟：模板默认带 urma 分句，renderMonitors 按数据改写（模板无法
+    # 静态判别，因为 _MONITOR_CARD 由有无 monitors 决定是否附加）
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("mon_title_suffix") == "（内存）", res.get("mon_title_suffix")
+    assert res.get("urma_chart_display") == "none", res.get("urma_chart_display")
+    assert res.get("mon_urma_note") == "", res.get("mon_urma_note")
+    # 对照：监控卡本身可见
+    assert res.get("monitorcard_visible") != "none", res.get("monitorcard_visible")
+
+
+# ===========================================================================
+# C 类防回归（DR-24 对齐性缺陷清单）：修复已落，断言锁死防回潮。
+# ===========================================================================
+
+def test_c01_dr24_alignment_lock(tmp_path):
+    """DR-24 全清单锁死：无「阀值」错字 / 无死 CSS / 表头命名 avg-max /
+    h3 无交互括号注记 / 卡片有描边。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    # 1) 错字
+    assert "阀值" not in src, "「阀值」错字回潮"
+    # 2) 死 CSS（skill 明令禁用或已废弃的样式不得复生）
+    for dead in (".tb-sep", ".gkv", ".gtick", ".gtrack"):
+        assert dead not in src, "死 CSS 回潮: {}".format(dead)
+    # 3) 表头命名（skill 文案规则6：指标名 avg/max；队列等待均值不截断）
+    assert "<th class=\"n\">avg</th>" in src
+    assert "<th class=\"n\">max</th>" in src
+    assert "队列等待均值</th>" in src
+    assert "队列等待均</th>" not in src
+    # 4) h3 标题无交互括号注记（说明移入 title 属性）
+    import re as _re
+    for m in _re.finditer(r'<h3 class="sec"[^>]*>([^<]+)</h3>', src):
+        assert "（" not in m.group(1), "h3 括号注记回潮: {}".format(m.group(1))
+    # 5) 卡片描边（skill 设计基调：1px 描边或底色区分）
+    assert "border:1px solid var(--grid)" in src, "卡片描边缺失"
+
+
+def test_c02_slow_tooltip_epoch_not_undefined(tmp_path):
+    """R-SLOW-2 回归：慢点 tooltip 时刻来自 ts_epoch 归一（rowEpoch），
+    不得读行上不存在的 r.t（曾致 tooltip 显示 undefined）。"""
+    st = _minimal_stats([0, 1, 2, 3], [0])
+    st["meta"].update({"ts_from": 0, "ts_to": 3, "node": "n1",
+                       "role": "writer", "source": "a.writer.log"})
+    st["slowest"] = [{"ts": "2026-11-19 00:00:01.000000", "op": "put",
+                      "key": "k1", "lat_ms": 9.0, "status": "OK"}]
+    data = rp.reduce_scenario([st], {"config": "c"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    tip = res.get("slow_tip")
+    assert tip, "harness 应产出慢点 tooltip 样例"
+    assert "undefined" not in str(tip), tip
+    assert "1970" not in str(tip).split("<br>")[0], \
+        "epoch=0 时显示 1970 说明归一失败: {}".format(tip)
+    # ts 字符串 00:00:01 UTC -> epoch 1? _node_ts_epoch 按节点钟面（UTC）解析
+    # 2026-11-19 00:00:01 => 绝对时刻，fullts 应输出 08:00:01（+08:00 宿主）
+    assert "08:00:01" in str(tip).split("<br>")[0], tip

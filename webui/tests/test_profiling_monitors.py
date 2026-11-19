@@ -139,7 +139,8 @@ def test_render_scenario_has_monitor_card(tmp_path):
                               monitors=mon)
     html, dj = rp.render_scenario(data, str(tmp_path / "report"), ECHARTS)
     src = open(html, encoding="utf-8").read()
-    assert "节点监控（内存 / URMA 端口）" in src
+    # 标题带可变后缀 span（R-MON-4 部分缺失分支），静态默认为全分句
+    assert "节点监控" in src and "（内存 / URMA 端口）" in src
     assert 'id="monitorcard"' in src and 'id="memchart"' in src
     assert 'id="growth"' in src          # G10 RSS 增幅正负条容器
     assert "renderMonitors" in src

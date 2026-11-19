@@ -200,10 +200,23 @@ def test_dry_run_via_api():
     prof = "configs/zz-webui-test-profile.json"
     with open(prof, "w", encoding="utf-8") as f:
         json.dump({"tools": {"spdiag": {"enabled": False}}}, f)
+    # dry-run 用 mock 集群专属 global（venv=mock），不依赖
+    # configs/_ssh/global.json 的环境默认值——该文件在本地 lab 沙箱里是
+    # 适配过的（venv=mooncake-bench），依赖它会让本测试因环境而失败。
+    gpath = "mock/zz-global-test.json"
+    with open(gpath, "w", encoding="utf-8") as f:
+        json.dump({"venv": "mock", "master_type": "http",
+                   "etcd_endpoints": "", "master_addr": "127.0.0.1:50051",
+                   "metadata_server": "http://127.0.0.1:9999/metadata",
+                   "mooncake_store_nodes": ["store1"],
+                   "remote_dir": "/tmp/mc_mock",
+                   "remote_data_dir": "/tmp/mc_mock/data",
+                   "remote_results_dir": "/tmp/mc_mock/results"}, f)
     try:
         code, d = _req("POST", "/api/run", {
             "selector": {"files": ["mock/smoke/put.json"]},
             "flags": {"cluster": "mock/cluster.json",
+                      "global": gpath,
                       "profile": prof, "dry_run": True}})
         assert code == 200, d
         rid = d["run"]["id"]

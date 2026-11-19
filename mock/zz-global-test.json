@@ -1,0 +1,1 @@
+{"venv": "mock", "master_type": "http", "etcd_endpoints": "", "master_addr": "127.0.0.1:50051", "metadata_server": "http://127.0.0.1:9999/metadata", "mooncake_store_nodes": ["store1"], "remote_dir": "/tmp/mc_mock", "remote_data_dir": "/tmp/mc_mock/data", "remote_results_dir": "/tmp/mc_mock/results"}

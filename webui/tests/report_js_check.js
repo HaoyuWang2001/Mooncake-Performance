@@ -101,6 +101,12 @@ function echartsInit(el) {
 
 let domReady = null;
 const windowStub = {};
+/* R-SHELL-4 主题桩：VC_THEME 控制 stored preference；matchMedia 跟随 */
+windowStub.localStorage = { _v: process.env.VC_THEME || "",
+  getItem(k){ return this._v; },
+  setItem(k,v){ this._v = String(v); } };
+windowStub.matchMedia = (q) => ({ matches:
+  q.indexOf("dark") >= 0 && process.env.VC_SYS === "dark" });
 const documentStub = {
   getElementById: (id) => getEl(id),
   querySelector: (sel) => getEl(sel),
@@ -175,12 +181,24 @@ const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
 windowStub.__MC_REPORT__ = data;
 windowStub.__MC_FULL__ = null;       // data.js 不在本次桩内加载
 windowStub.addEventListener = () => {};
+/* VC_DATAMISSING=1：模拟 data.js 加载失败（降级路径 R-SHELL-2） */
+if (process.env.VC_DATAMISSING === "1") windowStub.__mcDataMissing = 1;
+/* VC_FULLSIM=1：把同一份数据当作 __MC_FULL__（模拟 data.js 已加载） */
+if (process.env.VC_FULLSIM === "1") windowStub.__MC_FULL__ = data;
 
 const errs = [];
 try {
   vm.runInContext(fs.readFileSync(appPath, "utf-8"), sandbox,
                   { filename: "app.js" });
   if (!domReady) throw new Error("DOMContentLoaded handler not registered");
+  /* VC_BREAK=<函数名>：把指定渲染函数替换为抛错，验证 safe() 单块隔离
+     （R-SHELL-8）——其余块必须照常渲染 */
+  const brk = process.env.VC_BREAK || null;
+  if (brk) {
+    try {
+      sandbox[brk] = function () { throw new Error("injected:" + brk); };
+    } catch (e) { errs.push("break setup: " + String(e && e.message || e)); }
+  }
   domReady();
 } catch (e) {
   errs.push(String(e && e.stack || e));
@@ -233,6 +251,17 @@ if (!errs.length) {
   });
   out.slow_x = (so && so.xAxis) ? [so.xAxis.min, so.xAxis.max] : null;
   out.slow_ctl_text = textOf(getEl("slowctl"));
+  // R-SLOW-2：慢点 tooltip 时刻必须来自 ts_epoch（不得出现 undefined）
+  const _slowOpt = sseq.length ? sseq[sseq.length - 1] : null;
+  const _fmt = (_slowOpt && _slowOpt.tooltip && _slowOpt.tooltip.formatter)
+    ? _slowOpt.tooltip.formatter : null;
+  if (typeof _fmt === "function") {
+    try {
+      const _row = ((so && so.series && so.series[0] &&
+        so.series[0].data) || [])[0];
+      out.slow_tip = _fmt({ data: _row });
+    } catch (e) { out.slow_tip = "ERR:" + e.message; }
+  }
   if (process.argv.includes("--sel-all-clear")) {
     try {
       const sel = function () {
@@ -353,6 +382,65 @@ if (!errs.length) {
   out.hist_grid_top = (ho && ho.grid) ? ho.grid.top : null;
   out.init_len = seriesLen(mainOpt(), "p50");
   out.init_x0 = seriesX0(mainOpt(), "p50");
+
+  /* ---- A 类补测的机械输出键（语义断言在 pytest 侧） ---- */
+  // 无数据窗口带（R-LAT-9）与异常竖线上限（R-LAT-10）
+  const _s0 = (mainOpt() && mainOpt().series) ? mainOpt().series[0] : null;
+  out.main_markarea = (_s0 && _s0.markArea && _s0.markArea.data) || null;
+  out.main_markline_n = (_s0 && _s0.markLine && _s0.markLine.data)
+    ? _s0.markLine.data.length : 0;
+  const _qseq = charts.qpschart || [];
+  const _qo = _qseq.length ? _qseq[_qseq.length - 1] : null;
+  out.qps_markarea = (_qo && _qo.series && _qo.series[0] &&
+    _qo.series[0].markArea && _qo.series[0].markArea.data) || null;
+  out.qps_colors = ((_qo && _qo.series) || []).map(function (s) {
+    return { name: s.name, color: (s.itemStyle || {}).color };
+  });
+  // 慢点条带逐条颜色（R-LAT-12：仅最慢一根 hero）
+  out.slow_colors = ((so && so.series && so.series[0] &&
+    so.series[0].data) || []).map(function (d) {
+    return (d && d.itemStyle && d.itemStyle.color) || null;
+  });
+  // 整卡可见性（R-HIST-3 / R-SLOW-3：无数据保持 display:none）
+  out.hist_visible = getEl("histcard")
+    ? String(getEl("histcard").style.display || "") : "missing";
+  out.slow_visible = getEl("slowcard")
+    ? String(getEl("slowcard").style.display || "") : "missing";
+  // data.js 降级（R-SHELL-2）
+  out.datanote_visible = getEl("datanote")
+    ? String(getEl("datanote").style.display || "") : "missing";
+  out.size_sel_display = getEl("sizeSel")
+    ? String(getEl("sizeSel").style.display || "") : null;
+  // R-SHELL-4 主题状态
+  const _th = windowStub.__MC_THEME__ || null;
+  out.theme_pref = _th ? String(_th.pref) : null;
+  out.theme_dark = _th ? !!_th.dark : null;
+  const _tg = getEl("themeToggle");
+  out.theme_btn_exists = !!_tg;
+  // R-MON-4 部分缺失：标题后缀 / urma 图占位 / 图注分句
+  const _suf = getEl("monTitleSuffix");
+  out.mon_title_suffix = _suf ? String(_suf._text || "") : null;
+  const _ub2 = getEl("urmachart");
+  out.urma_chart_display = _ub2
+    ? String(_ub2.style.display || "") : null;
+  const _un2 = getEl("monUrmaNote");
+  out.mon_urma_note = _un2 ? String(_un2._text || "") : null;
+  const _mc = getEl("monitorcard");
+  out.monitorcard_visible = _mc
+    ? String(_mc.style.display || "") : "missing";
+  // fmtUs 自适应单位（R-SHELL-10）
+  out.fmt_us = (typeof sandbox.fmtUs === "function")
+    ? [String(sandbox.fmtUs(1500)), String(sandbox.fmtUs(500)),
+       String(sandbox.fmtUs(0)), String(sandbox.fmtUs(1234567))]
+    : null;
+  // 离群按钮状态（R-LAT-4：无可命中对象时不得呈现无效控件）
+  const _ob = getEl("outlierBtn");
+  out.outlier_btn_state = _ob
+    ? { display: String(_ob.style.display || ""),
+        disabled: !!_ob.disabled,
+        text: textOf(_ob),
+        title: String(_ob.title || "") }
+    : null;
 
   // 点击一个比默认更粗的粒度按钮（时间分桶阶梯），验证切档
   const stepBox = getEl("tierBtns");
@@ -583,6 +671,17 @@ if (useReal && !errs.length) {
         } catch (e) { errs.push("zoom " + rc.id + ": " + e.message); }
       }
     });
+    /* 缩放联动断言（R-LAT-6）：dispatch 后读取两图的 dataZoom 窗口 */
+    try {
+      const zs = {};
+      realCharts.forEach((rc) => {
+        if (rc.id !== "mainchart" && rc.id !== "qpschart") return;
+        const o = rc.chart.getOption();
+        const dz = (o.dataZoom || [])[0] || {};
+        zs[rc.id] = { start: dz.start, end: dz.end };
+      });
+      out.zoom_states = zs;
+    } catch (e) { errs.push("zoom states: " + e.message); }
   }
   const svgDir = process.env.VC_SVGDIR || null;
   const real = { total: realCharts.length, ok: 0, fail: 0, fails: [] };
