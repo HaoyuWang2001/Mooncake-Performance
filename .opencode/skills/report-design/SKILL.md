@@ -301,6 +301,94 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C8.B1 zslider 把手由描边改填充后回潮（黑边） —— DR-13 〔test_sliders_have_no_border〕
 - C8.B2 平移窗口越界（start/end 未夹紧） —— R-LAT-6 〔◐〕
 
+### C9 时延分布（直方图）
+
+- C9.V1 对数分箱直方图（跨客户端合并），x 轴为分箱区间标签 —— R-HIST-1 〔test_hist_chart_units_and_marklines〕
+- C9.V2 标注 avg/p50/p99/p999/p9999（p9999 仅样本≥10000）；全部为 p50 灰、细虚线；标签按像素错层 —— R-HIST-2 〔test_hist_chart_units_and_marklines, test_hist_labels_dynamic_top_margin, test_hist_labels_no_extra_margin_when_separate〕
+- C9.V3 卡内说明仅保留「p9999 需样本 ≥ 10000」 —— R-HIST-2 〔◐ 由 test_c01_dr24_alignment_lock 类审计覆盖〕
+- C9.V4 无直方图数据整卡隐藏 —— R-HIST-3 〔test_a11_empty_hist_and_slow_cards_hidden, test_a12_hist_and_slow_cards_visible_with_data〕
+- C9.D1 直方图为全量样本（离群值计入），与 QPS/计数口径一致 —— R-LAT-4 〔◐ 由离群合并测试间接覆盖〕
+- C9.B1 标注挤压/越界（顶部 margin 需随是否错层动态计算） —— R-HIST-2 〔test_hist_labels_dynamic_top_margin, test_hist_labels_no_extra_margin_when_separate〕
+
+### C10 慢点捕捉（独立控件）
+
+- C10.V1 独立控件：角色单选（pipeline 默认 reader）/ 总计（默认开）/ 节点与实例 —— R-SLOW-1 〔test_slow_capture_independent_controls〕
+- C10.V2 叠加语义：总计=该角色全部慢点（灰背景点），勾选节点/实例以对象色高亮 —— R-SLOW-1 〔test_slow_capture_independent_controls〕
+- C10.V3 摘要条（不受勾选影响）：每节点慢点次数 + 该节点自身 p99 —— R-SLOW-1 〔test_slow_capture_independent_controls〕
+- C10.V4 x 轴与端到端曲线同窗口、缩放独立；writer=方点 / reader=圆点 —— R-SLOW-1 〔test_slow_capture_independent_controls〕
+- C10.V5 该组最慢一根用强调色（图注说明） —— R-SLOW-1 〔test_a04_slow_strip_hero_only_on_max〕
+- C10.V6 basic 无角色 radio（单组） —— R-SLOW-1 〔test_slow_capture_basic_has_no_role_radio〕
+- C10.V7 无慢点数据整卡隐藏 —— R-SLOW-3 〔test_a11_empty_hist_and_slow_cards_hidden〕
+- C10.I1 全选节点/全选实例 toggle（全选后变清空*）；全部清空**自动显示总计** —— R-LAT-17 〔test_slow_capture_independent_controls〕
+- C10.D1 慢点时刻用归一化 `ts_epoch`，与主图同口径（不受查看者时区影响） —— R-SLOW-2 〔test_c02_slow_tooltip_epoch_not_undefined, test_slowest_ts_epoch_matches_buckets〕
+- C10.D2 慢点清单两级截断：map 每客户端 Top-N → reduce 合并后整体 Top-N —— R-SLOW-1 〔◐〕
+- C10.B1 tooltip 读行上不存在的 `r.t` → 显示 undefined —— DR-26 〔test_c02_slow_tooltip_epoch_not_undefined〕
+- C10.B2 隐藏已选客户端后高亮残留（选中集未回落） —— R-INST-2 〔◐〕
+
+### C11 SDK 全链路 · 顶部总控与元信息
+
+- C11.V1 标题「SDK 全链路（C++ trace）」；元信息行 = trace 文件数/解析行/slice 行/解析失败/采样率/阶段剔除统计 —— R-TRACE-1 〔test_render_trace_section〕
+- C11.V2 写路径/读路径/其它分组按钮（basic 与 pipeline 均保留）；op 选择器仅在可选项 >1 时显示 —— R-TRACE-2 〔test_trace_toolbar_stage_rows〕
+- C11.V3 卡内不再有独立「数据大小」选择器（跟随页面主选择器） —— R-TRACE-2 〔test_render_trace_section〕
+- C11.V4 无 trace 产物整卡隐藏 —— R-TRACE-8 〔test_render_without_trace_keeps_card_hidden〕
+- C11.V5 旧产物无阶段标记 → 注明「无阶段标记（旧客户端），样本未分阶段」 —— R-TRACE-1 〔test_legacy_trace_no_marker_note〕
+- C11.I1 写/读互斥，控制该节全部子图（分级块图/曲线/慢点追踪） —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo, test_trace_curve_dimension_coupling〕
+- C11.I2 切换读写组时重置 op 选择与阶段/对象选择（对象按组作用域过滤） —— R-TRACE-6 〔◐〕
+- C11.B1 写/读分组曾只作用于部分子图（慢点追踪未跟随） —— DR-29 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+
+### C12 SDK 全链路 · 对象树
+
+- C12.V1 树 = 总计（当前读写组全实例聚合）+ 节点与实例；**无角色行**（角色在顶部） —— R-TRACE-6 〔test_stage_tree_objects_enabled〕
+- C12.V2 组按钮与主图同构：全选节点/全选实例 toggle、全部清空→总计 —— R-TRACE-6 〔test_trace_object_tree_toggle〕
+- C12.I1 节点/实例可选中并驱动分级时延块图与曲线 —— R-TRACE-6/11 〔test_stage_tree_objects_enabled, test_trace_per_object_series〕
+- C12.I2 节点行可展开其下实例；单节点也显示该组（trace 不做「单实例隐藏」优化） —— R-TRACE-6 〔test_stage_tree_objects_enabled〕
+- C12.D1 reduce 按 `meta.node/pod` 保留阶段桶；总计全嵌、节点/实例 192 点抽稀 + 6 万行预算；data.js 全量 —— R-TRACE-6 〔test_trace_embed_trim_budget_and_coarsen, test_render_embeds_trimmed_trace_full_in_datajs〕
+- C12.D2 每对象计数 = 该对象各文件请求数之和；总计 = 全部之和 —— R-TRACE-6 〔test_trace_per_object_series〕
+- C12.B1 节点/实例曾被禁用（R-TRACE-9 欠账）→ 数据补齐后开放 —— DR-29 〔test_stage_tree_objects_enabled〕
+- C12.B2 角色化对象模型导致同名节点重复行 —— DR-29 〔test_stage_tree_objects_enabled〕
+
+### C13 SDK 全链路 · 分级时延块图（trace）
+
+- C13.V1 标题「分级时延块图（trace）」；**已删除指标概览卡**（tcards） —— R-TRACE-11 〔test_trace_cards_stack_and_breakdown_js〕
+- C13.V2 对象**单选**（下拉：总计/节点/实例）+ 指标**单选**（min/avg/p50/p99/p999/p9999/max，按字段可用） —— R-TRACE-11 〔test_trace_curve_dimension_coupling〕
+- C13.V3 块宽 = 阶段值占父项百分比；0% 块宽 = 该块文字宽 + 标准 padding；残差单独成块 —— R-TRACE-4 〔test_levels_focus_expand_and_residual, test_trace_cards_stack_and_breakdown_js〕
+- C13.V4 块 tooltip 附全局均值与倍率（本次值 vs 全局 avg） —— R-TRACE-4 〔◐〕
+- C13.V5 p9999 仅当样本 ≥ 10000 可选 —— R-TRACE-3 〔test_trace_field_has_p9999〕
+- C13.I1 点击块聚焦、下一级在新行展开；展开全部/收起全部/取消聚焦 —— R-TRACE-4 〔test_levels_focus_expand_and_residual〕
+- C13.I2 切换对象/指标后块图即时重算（同一 focus 状态不串） —— R-TRACE-11 〔◐〕
+- C13.B1 块宽把两行文字拼成一串测宽 → 整行溢出、行尾残差被裁 —— DR-24 〔test_trace_cards_stack_and_breakdown_js〕
+- C13.B2 0% 块文字被截断 —— R-TRACE-4 〔test_trace_cards_stack_and_breakdown_js〕
+
+### C14 SDK 全链路 · 分级时延曲线（trace）
+
+- C14.V1 标题「分级时延曲线（trace）」；工具栏 = 粒度档+重置一行、阶段一行、指标一行 —— R-TRACE-5/12 〔test_trace_toolbar_stage_rows, test_render_trace_section〕
+- C14.V2 阶段按树序列出（total + L1 + 残差），每阶段带稳定颜色点 —— R-TRACE-12 〔◐〕
+- C14.V3 指标单选 = 均值 / 最大（map 阶段桶仅存 avg/max） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.V4 线宽：total 1.0 / 阶段 0.8；hover 强调 +0.2 —— R-TRACE-12/15 〔test_line_widths_avg_thicker_only〕
+- C14.V5 多对象=对象色（总计灰阶/节点色系/实例色阶）；多阶段=阶段调色板 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.V6 分桶策略与端到端一致（span/s∈[59,8192] 且 ≥ftier；自适应默认） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
+- C14.V7 空态：无对象/旧产物/对象未内嵌各有明确文案 —— R-TRACE-12 〔◐〕
+- C14.I1 **维度联动**：单对象可阶段多选；单阶段可对象多选；多选一侧时另一侧自动收敛为单选 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.I2 阶段行 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔✗〕
+- C14.I3 右侧固定槽位标签（无引线）+ 悬浮压暗聚焦（与端到端同构） —— R-TRACE-12 〔✗〕
+- C14.I4 点击绘图区任意位置开框（含空白），内容为格式化时间 + 各序列值 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
+- C14.I5 粒度档/重置/缩放/平移与端到端同构（含 y 滑块） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
+- C14.B1 tooltip 落回原始毫秒时间戳（无 formatter） —— DR-29 〔test_tooltip_click_anywhere_opens〕
+- C14.B2 三重维度无收敛 → 曲线灾难（阶段×对象×指标全开） —— DR-29 〔test_trace_curve_dimension_coupling〕
+- C14.B3 阶段曲线对象树在角色行/节点禁用状态间的历史漂移 —— DR-27/29 〔test_stage_tree_objects_enabled〕
+
+### C15 SDK 全链路 · 慢点追踪（trace）
+
+- C15.V1 标题「慢点追踪（trace）」；柱按端到端时延**降序**排列，轴标签=时延值（可读出聚集簇） —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.V2 柱高=端到端时延，自下而上=一级阶段（含残差）；**每阶段不同颜色** —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo, test_trace_cards_stack_and_breakdown_js〕
+- C15.V3 表格 Top-N（当前 100，参数化）；行点击展开该请求阶段构成的块图：**无 total 行**、单行压缩、横向滚动 —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.V4 tooltip：时刻 + op + 端到端 + 节点/实例 + 各阶段分项 —— R-TRACE-7/13 〔◐〕
+- C15.V5 说明文字：采样门控 / memwrite 副本口径 / -1 哨兵 / slice 仅计数 —— R-TRACE-7 〔◐〕
+- C15.I1 图例点击 = **solo**：点某阶段只保留它；再点同一图例恢复全部；点其它图例切换 solo 对象 —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.D1 图/表共用 reduce 合并后的 Top-N（按 total_us 降序，跨节点跨 op） —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.B1 图例 solo 依赖事件回传状态会误判（点击已 solo 项被当成「全隐」）；用自身 solo 状态机 + 防重入锁 —— DR-29 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.B2 灰阶阶段色导致相邻阶段无法区分 —— DR-29 〔test_trace_cards_stack_and_breakdown_js〕
+
 ## 模板架构规范
 
 - 共享：`_PAGE_CSS`、`_APP_JS`、`_PAGE_ADAPTER_JS`、外壳 `_page_html()`、以及各区块片段常量（`_SEC_*`）。
