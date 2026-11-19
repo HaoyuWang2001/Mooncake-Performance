@@ -316,6 +316,80 @@ def _trace_stats(tmp_path, name, size="8MB"):
                                sample_rate=1.0)
 
 
+def _trace_stats2(tmp_path, name, *, node, pod, role=""):
+    from tracestats import compute_trace_stats
+    p = tmp_path / name
+    p.write_text(TRACE_READ + "\n" + TRACE_WRITE + "\n", encoding="utf-8")
+    return compute_trace_stats(str(p), node=node, role=role, size="8MB",
+                               sample_rate=1.0, pod=pod)
+
+
+def test_trace_per_object_series(tmp_path):
+    """SDK 全链路数据侧：按对象（总计/节点/实例）保留阶段桶。"""
+    a = _trace_stats2(tmp_path, "n1.glog", node="n1", pod="pod1")
+    b = _trace_stats2(tmp_path, "n2.glog", node="n2", pod="pod2")
+    out = rp.reduce_trace_size([a, b])
+    objs = out["objects"]
+    assert objs["role:read"]["kind"] == "role"
+    assert objs["role:write"]["kind"] == "role"
+    assert objs["node:n1:read"]["kind"] == "node"
+    assert objs["node:n2:write"]["kind"] == "node"
+    assert objs["client:pod1:read"]["kind"] == "client"
+    assert objs["client:pod1:read"]["node"] == "n1"
+    # 节点对象计数 = 该节点各文件之和；总计 = 全部之和
+    n1 = objs["node:n1:read"]["groups"]["read"]["ops"]["get_buffer"]
+    assert n1["count"] == 1
+    tot = objs["role:read"]["groups"]["read"]["ops"]["get_buffer"]
+    assert tot["count"] == 2
+    # 每个对象都有阶段秒桶（曲线数据源）
+    assert n1["seconds"] and n1["fminutes"]
+
+
+def test_trace_embed_trim_budget_and_coarsen(tmp_path):
+    """嵌入裁剪：总计全嵌、节点/实例抽稀并受行预算约束；data.js 保留全量。"""
+    trs = [_trace_stats2(tmp_path, "n%d.glog" % i, node="n%d" % i,
+                         pod="p%d" % i) for i in range(12)]
+    tr = rp.reduce_trace_size(trs)
+    full_total = tr["object_total"]
+    assert full_total == 2 + 12 * 2 + 12 * 2   # role×2 + node×2组×12 + client×2组×12
+    trimmed = rp._trim_trace_embed(tr, max_points=1, budget=10)
+    assert "role:read" in trimmed["objects"]   # 总计始终嵌入
+    assert trimmed["embed_objects"] < full_total
+    assert trimmed["object_total"] == full_total
+    # 抽稀后 ftier 提高（1s -> k 秒），总样本数保持
+    key = [k for k in trimmed["objects"] if k.startswith("node:")][0]
+    g = list(trimmed["objects"][key]["groups"])[0]
+    op = list(trimmed["objects"][key]["groups"][g]["ops"])[0]
+    assert op
+    # 全量数据未被裁剪污染（data.js 用原始 tr）
+    raws = [len(op2.get("fminutes", {}).get("total_us", []))
+            for t in tr["objects"].values()
+            for g2 in t["groups"].values()
+            for op2 in g2["ops"].values()]
+    trims = [len(op2.get("fminutes", {}).get("total_us", []))
+             for t in trimmed["objects"].values()
+             for g2 in t["groups"].values()
+             for op2 in g2["ops"].values()]
+    assert max(raws) >= max(trims)
+
+
+def test_render_embeds_trimmed_trace_full_in_datajs(tmp_path):
+    """HTML 内嵌 trace.objects 受预算裁剪；data.js 仍含全部对象。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    trs = [_trace_stats2(tmp_path, "n%d.glog" % i, node="n%d" % i,
+                         pod="p%d" % i) for i in range(6)]
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=trs)
+    html, dj = rp.render_scenario(data, str(tmp_path / "o"), ECHARTS)
+    import re as _re
+    emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
+                                open(html, encoding="utf-8").read(), _re.S
+                                ).group(1))
+    etr = list(emb["sizes"].values())[0]["trace"]
+    assert etr["object_total"] >= etr["embed_objects"]
+    full = open(dj, encoding="utf-8").read()
+    assert "client:p0:read" in full or "client:p0:write" in full
+
+
 def test_reduce_trace_block_and_sources(tmp_path):
     a = _stats(tmp_path, "a.writer", "writer")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"},

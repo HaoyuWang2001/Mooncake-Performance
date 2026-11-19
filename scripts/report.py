@@ -34,6 +34,8 @@ import logstats as ls   # noqa: E402  (histogram ladder + percentile shared)
 EMBED_SECONDS_MAX = 86400        # ≤1 天：1s 桶内嵌；否则内嵌 1min
 SCATTER_MAX_POINTS = 200000      # per-client raw scatter cap (small runs)
 TOPK_DEFAULT = 20
+TRACE_EMBED_POINTS = 192     # 节点/实例阶段桶嵌入抽稀点数（总计不抽稀）
+TRACE_EMBED_ROWS = 60000     # 节点/实例阶段行嵌入预算（超出留 data.js）
 
 
 # ---------------------------------------------------------------------------
@@ -811,9 +813,207 @@ def _merge_bucket_rows(dst, rows):
     return dst
 
 
+
+def _merge_trace_stat(groups, st, tops=None):
+    """Merge one trace stats file into `groups` (aggregate or per-object).
+
+    tops=None 时不收集慢请求明细（按对象合并时不需要，节省内存）。"""
+    m = st.get("meta") or {}
+    for gname, g in (st.get("groups") or {}).items():
+        gg = groups.setdefault(gname, {"ops": {}})
+        for op, o in (g.get("ops") or {}).items():
+            dst = gg["ops"].setdefault(op, {
+                "count": 0, "ok": 0, "fail": 0, "status": {},
+                "fields": {}, "_buckets": {"seconds": {}, "minutes": {}},
+                "_fmin": {}, "ftier": 0,
+                "size_values": {}, "replicas": {}, "slice_count": {},
+                "residual": None, "top": []})
+            dst["count"] += o.get("count") or 0
+            dst["ok"] += o.get("ok") or 0
+            dst["fail"] += o.get("fail") or 0
+            for k, n in (o.get("status") or {}).items():
+                dst["status"][k] = dst["status"].get(k, 0) + int(n)
+            for fk, fd in (o.get("fields") or {}).items():
+                dst["fields"][fk] = _merge_field(dst["fields"].get(fk), fd)
+            _merge_bucket_rows(dst["_buckets"]["seconds"], o.get("seconds"))
+            _merge_bucket_rows(dst["_buckets"]["minutes"], o.get("minutes"))
+            for vk in ("size_values", "replicas", "slice_count"):
+                dst[vk] = _merge_value_counts(dst[vk], o.get(vk))
+            if o.get("residual"):
+                dst["residual"] = _merge_field(dst["residual"], o["residual"])
+            for fname, frows in (o.get("fminutes") or {}).items():
+                fb = dst["_fmin"].setdefault(fname, {})
+                for r in frows or []:
+                    t = int(r[0])
+                    cur = fb.get(t)
+                    if cur is None:
+                        fb[t] = [int(r[1]), float(r[2]) * int(r[1]),
+                                 float(r[3])]
+                    else:
+                        cur[0] += int(r[1])
+                        cur[1] += float(r[2]) * int(r[1])
+                        cur[2] = max(cur[2], float(r[3]))
+            _ft = int(o.get("ftier") or 60)
+            dst["ftier"] = min(dst.get("ftier") or _ft, _ft)
+            if tops is not None:
+                for _e in (o.get("top") or []):
+                    _e = dict(_e)
+                    _e["node"] = m.get("node") or ""
+                    _e["pod"] = m.get("pod") or ""
+                    _e["client"] = m.get("source") or ""
+                    tops.append(_e)
+
+
+def _finalize_trace_groups(groups, edges, hist_ok):
+    """Convert merged groups' internals to the on-disk/JS payload shape."""
+    for _gname, g in groups.items():
+        for _op, o in g["ops"].items():
+            o["fields"] = {k: _field_pcts(fd, edges, hist_ok)
+                           for k, fd in o["fields"].items()}
+            o["residual"] = (_field_pcts(o["residual"], edges, hist_ok)
+                             if o.get("residual") else None)
+            fmin = {}
+            for fname, fb in (o.pop("_fmin") or {}).items():
+                rows = []
+                for t in sorted(fb):
+                    n, ssum, mx = fb[t]
+                    rows.append([int(t), int(n),
+                                 round(ssum / n, 3) if n else 0.0,
+                                 round(mx, 3)])
+                fmin[fname] = rows
+            o["fminutes"] = fmin
+            o["ftier"] = int(o.get("ftier") or 60)
+            buckets = o.pop("_buckets")
+            for bk in ("seconds", "minutes"):
+                bmap = buckets[bk]
+                rows = []
+                for t, b in sorted(bmap.items()):
+                    n, okc, failc, ssum, mx = b[0], b[1], b[2], b[3], b[4]
+                    hb = b[7]
+                    valid = n - (b[8] if len(b) > 8 else 0)
+                    rows.append([int(t), n, okc, failc,
+                                 round(ssum / valid, 3) if valid > 0 else 0.0,
+                                 round(mx, 6),
+                                 (round(ls.hist_percentile(hb, 0.50, edges), 4)
+                                  if hist_ok and hb else None),
+                                 (round(ls.hist_percentile(hb, 0.99, edges), 4)
+                                  if hist_ok and hb else None)])
+                o[bk] = rows
+
+def _coarsen_fmin(rows, max_points):
+    """[t,n,avg,max] 抽稀：按 k 合并桶（n 加权平均，max 取最大）。"""
+    n = len(rows or [])
+    if n <= max_points:
+        return rows, 1
+    k = (n + max_points - 1) // max_points
+    agg = {}
+    for r in rows:
+        tk = int(r[0]) // k * k
+        w = int(r[1])
+        a = agg.get(tk)
+        if a is None:
+            agg[tk] = [tk, w, float(r[2]) * w, float(r[3])]
+        else:
+            a[1] += w
+            a[2] += float(r[2]) * w
+            a[3] = max(a[3], float(r[3]))
+    out = []
+    for tk in sorted(agg):
+        a = agg[tk]
+        out.append([tk, a[1], round(a[2] / a[1], 3) if a[1] else 0.0,
+                    round(a[3], 3)])
+    return out, k
+
+
+def _coarsen_sec(rows, max_points):
+    """[t,n,ok,fail,avg,max,p50,p99] 抽稀（avg 按 n 加权，max 取最大，
+    p50/p99 取简单平均——仅提示用途）。"""
+    n = len(rows or [])
+    if n <= max_points:
+        return rows, 1
+    k = (n + max_points - 1) // max_points
+    agg = {}
+    for r in rows:
+        tk = int(r[0]) // k * k
+        w = int(r[1])
+        a = agg.get(tk)
+        if a is None:
+            agg[tk] = [tk, w, int(r[2]), int(r[3]), float(r[4]) * w,
+                       float(r[5]), r[6], r[7]]
+        else:
+            a[1] += w
+            a[2] += int(r[2])
+            a[3] += int(r[3])
+            a[4] += float(r[4]) * w
+            a[5] = max(a[5], float(r[5]))
+            if r[6] is not None:
+                a[6] = r[6] if a[6] is None else (a[6] + r[6]) / 2.0
+            if r[7] is not None:
+                a[7] = r[7] if a[7] is None else (a[7] + r[7]) / 2.0
+    out = []
+    for tk in sorted(agg):
+        a = agg[tk]
+        out.append([tk, a[1], a[2], a[3],
+                    round(a[4] / a[1], 3) if a[1] else 0.0,
+                    round(a[5], 6), a[6], a[7]])
+    return out, k
+
+
+def _copy_trace_obj(obj):
+    """浅拷贝对象的两层结构（groups -> ops），供嵌入裁剪后安全修改。"""
+    new = dict(obj)
+    groups = {}
+    for gname, g in (obj.get("groups") or {}).items():
+        groups[gname] = {"ops": {op: dict(p)
+                                 for op, p in (g.get("ops") or {}).items()}}
+    new["groups"] = groups
+    return new
+
+
+def _trim_trace_embed(tr, max_points=TRACE_EMBED_POINTS,
+                      budget=TRACE_EMBED_ROWS):
+    """HTML 内嵌裁剪：总计对象全嵌；节点/实例抽稀到 max_points 并按行预算
+    裁剪（超出的对象只留在 data.js，前端在 Full 模式合并）。"""
+    objs = tr.get("objects") or {}
+    order = sorted(objs, key=lambda k: (
+        0 if objs[k].get("kind") == "role" else
+        (1 if objs[k].get("kind") == "node" else 2),
+        -int(objs[k].get("count") or 0)))
+    out = {}
+    used = 0
+    for k in order:
+        c = _copy_trace_obj(objs[k])
+        if c.get("kind") != "role":
+            rows = 0
+            for g in c["groups"].values():
+                for op in g["ops"].values():
+                    fm = {}
+                    for fn, rs in (op.get("fminutes") or {}).items():
+                        rs2, kk = _coarsen_fmin(rs, max_points)
+                        fm[fn] = rs2
+                        if kk > 1:
+                            op["ftier"] = int(op.get("ftier") or 1) * kk
+                        rows += len(rs2)
+                    op["fminutes"] = fm
+                    if op.get("seconds"):
+                        rs2, kk = _coarsen_sec(op["seconds"], max_points)
+                        op["seconds"] = rs2
+                        rows += len(rs2)
+            if used + rows > budget:
+                continue
+            used += rows
+        out[k] = c
+    new = dict(tr)
+    new["objects"] = out
+    new["embed_objects"] = len(out)
+    new["object_total"] = len(objs)
+    return new
+
+
 def reduce_trace_size(trace_list):
     """Merge per-client trace stats into one data-size block."""
     groups = {}
+    objects = {}
     clients = []
     tops = []
     metad = {"files": 0, "lines": 0, "trace_lines": 0, "slice_lines": 0,
@@ -838,99 +1038,45 @@ def reduce_trace_size(trace_list):
         cl = {"name": m.get("source") or "", "node": m.get("node") or "",
               "pod": m.get("pod") or "", "role": m.get("role") or "",
               "ops": {}}
-        for gname, g in (st.get("groups") or {}).items():
-            gg = groups.setdefault(gname, {"ops": {}})
+        for g in (st.get("groups") or {}).values():
             for op, o in (g.get("ops") or {}).items():
                 cl["ops"][op] = cl["ops"].get(op, 0) + (o.get("count") or 0)
-                dst = gg["ops"].setdefault(op, {
-                    "count": 0, "ok": 0, "fail": 0, "status": {},
-                    "fields": {}, "_buckets": {"seconds": {}, "minutes": {}},
-                    "_fmin": {}, "ftier": 0,
-                    "size_values": {}, "replicas": {}, "slice_count": {},
-                    "residual": None, "top": []})
-                dst["count"] += o.get("count") or 0
-                dst["ok"] += o.get("ok") or 0
-                dst["fail"] += o.get("fail") or 0
-                for k, n in (o.get("status") or {}).items():
-                    dst["status"][k] = dst["status"].get(k, 0) + int(n)
-                for fk, fd in (o.get("fields") or {}).items():
-                    dst["fields"][fk] = _merge_field(dst["fields"].get(fk), fd)
-                _merge_bucket_rows(dst["_buckets"]["seconds"],
-                                   o.get("seconds"))
-                _merge_bucket_rows(dst["_buckets"]["minutes"],
-                                   o.get("minutes"))
-                for vk in ("size_values", "replicas", "slice_count"):
-                    dst[vk] = _merge_value_counts(dst[vk], o.get(vk))
-                if o.get("residual"):
-                    dst["residual"] = _merge_field(dst["residual"],
-                                                   o["residual"])
-                for fname, frows in (o.get("fminutes") or {}).items():
-                    fb = dst["_fmin"].setdefault(fname, {})
-                    for r in frows or []:
-                        t = int(r[0])
-                        cur = fb.get(t)
-                        if cur is None:
-                            fb[t] = [int(r[1]), float(r[2]) * int(r[1]),
-                                     float(r[3])]
-                        else:
-                            cur[0] += int(r[1])
-                            cur[1] += float(r[2]) * int(r[1])
-                            cur[2] = max(cur[2], float(r[3]))
-                # 阶段时间桶步长：多份产物合并时取**最细**步长（越细越能
-                # 支撑前端多档切换）；旧产物 ftier=60，新产物 ftier=1。
-                _ft = int(o.get("ftier") or 60)
-                dst["ftier"] = min(dst.get("ftier") or _ft, _ft)
-                for _e in (o.get("top") or []):
-                    _e = dict(_e)
-                    _e["node"] = m.get("node") or ""
-                    _e["pod"] = m.get("pod") or ""
-                    _e["client"] = m.get("source") or ""
-                    tops.append(_e)
+        _merge_trace_stat(groups, st, tops)
+        # ---- 按对象（总计/节点/实例）保留阶段桶：SDK 全链路的对象树用 ----
+        node = m.get("node") or ""
+        pod = m.get("pod") or m.get("source") or ""
+        for gname, g in (st.get("groups") or {}).items():
+            cnt = sum(int((oo or {}).get("count") or 0)
+                      for oo in (g.get("ops") or {}).values())
+            tgts = [("role:" + gname, "role", "总计", "", gname)]
+            if node:
+                tgts.append(("node:%s:%s" % (node, gname), "node",
+                             node, node, gname))
+            if pod:
+                tgts.append(("client:%s:%s" % (pod, gname), "client",
+                             pod, node, gname))
+            for key, kind, label, nd, role in tgts:
+                tobj = objects.get(key)
+                if tobj is None:
+                    tobj = objects[key] = {
+                        "kind": kind, "label": label, "node": nd,
+                        "role": role, "groups": {}, "count": 0}
+                tobj["count"] += cnt
+                _merge_trace_stat(tobj["groups"],
+                                  {"meta": m, "groups": {gname: g}}, None)
         clients.append(cl)
     trace_edges = ls.BIN_EDGES_US if metad["bins"] == "us-v1" else None
     trace_hist_ok = metad["bins"] == "us-v1"
-    for _gname, g in groups.items():
-        for _op, o in g["ops"].items():
-            o["fields"] = {k: _field_pcts(fd, trace_edges, trace_hist_ok)
-                           for k, fd in o["fields"].items()}
-            o["residual"] = (_field_pcts(o["residual"], trace_edges,
-                                         trace_hist_ok)
-                             if o.get("residual") else None)
-            fmin = {}
-            for fname, fb in (o.pop("_fmin") or {}).items():
-                rows = []
-                for t in sorted(fb):
-                    n, ssum, mx = fb[t]
-                    rows.append([int(t), int(n),
-                                 round(ssum / n, 3) if n else 0.0,
-                                 round(mx, 3)])
-                fmin[fname] = rows
-            o["fminutes"] = fmin
-            # ftier=0 表示没有任何产物给出步长（空 op），回退 60 兼容旧报表
-            o["ftier"] = int(o.get("ftier") or 60)
-            buckets = o.pop("_buckets")
-            for bk in ("seconds", "minutes"):
-                bmap = buckets[bk]
-                rows = []
-                for t, b in sorted(bmap.items()):
-                    n, okc, failc, ssum, mx = b[0], b[1], b[2], b[3], b[4]
-                    hb = b[7]
-                    valid = n - (b[8] if len(b) > 8 else 0)
-                    rows.append([
-                        int(t), n, okc, failc,
-                        round(ssum / valid, 3) if valid > 0 else 0.0,
-                        round(mx, 6),
-                        (round(ls.hist_percentile(hb, 0.50, trace_edges), 4)
-                         if trace_hist_ok and hb else None),
-                        (round(ls.hist_percentile(hb, 0.99, trace_edges), 4)
-                         if trace_hist_ok and hb else None)])
-                o[bk] = rows
+    _finalize_trace_groups(groups, trace_edges, trace_hist_ok)
+    for tobj in objects.values():
+        _finalize_trace_groups(tobj["groups"], trace_edges, trace_hist_ok)
     # 慢请求时刻归一：start_time 是节点本地钟面时间 -> epoch（前端时间轴用）
     for _e in tops:
         _e["ts_epoch"] = _node_ts_epoch(_e.get("start_time"))
     tops.sort(key=lambda e: -float(e.get("total_us") or 0))
     return {"meta": metad, "groups": groups, "top": tops[:100],
-            "clients": clients}
+            "clients": clients, "objects": objects,
+            "object_total": len(objects)}
 
 
 def reduce_scenario(stats, meta, monitors=None, traces=None):
@@ -5492,6 +5638,9 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
                          key=lambda c: -float(c.get("p99_ms") or 0))
         keep = clients[:topk]
         slim = dict(z)
+        if z.get("trace"):
+            # SDK 区的按对象阶段数据：总计全嵌，节点/实例抽稀+预算
+            slim["trace"] = _trim_trace_embed(z["trace"])
         slim["clients"] = keep
         # 段2：对象预算裁剪（角色全嵌 -> 节点按日志量 -> Top 客户端），
         # 单点行预算 EMBED_ROW_BUDGET；其余对象留在 data.js
