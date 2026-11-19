@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 211 条 · ✓183 · ◐26 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 213 条 · ✓185 · ◐26 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -260,8 +260,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.V6 无数据窗口浅带，**仅第一处**标注时长；判定用真实缺失桶 —— R-LAT-9 〔test_a01_gap_markarea_between_runs, test_a02_no_gap_no_markarea, test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C5.I1 点击绘图区任意位置（含空白）按竖线时间点开框；点击其它处换钉位；区外/Esc/缩放收起 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
 - C5.I2 悬浮只显示竖线+交点（showContent:false），不弹框 —— R-SHELL-14 〔test_all_charts_tooltip_hover_pointer_click_box〕
-- C5.I3 多对象标签 = 对象名固定槽位：总计最上、树序平铺、无引线、不绑曲线端点；超长截断+title —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_multilabel_tree_order_and_truncation〕
-- C5.I4 标签悬浮压暗其他对象整簇（setOption opacity 0.15），移出复原 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus〕
+- C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断+title；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve〕
+- C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；指针移入画布或离开标签立即恢复全部。**不做点击锁定**（锁定在分级图 `finished` 重渲下易失联，已放弃）。画布 mousemove 兜底清除预览（防标签重建丢 mouseleave 卡死） —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
 - C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠 —— R-LAT-7/14 〔test_end_label_layout_stays_inside_plot〕
 - C5.I6 离群开关：无可命中桶时置灰/隐藏，不呈现无效控件 —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge〕
 - C5.D1 离群 = 单请求 > 客户端 p99×10（样本≥1000）；从桶标量剔除、计数/直方图全量 —— R-LAT-4 〔test_outlier_scatter_toggle_and_merge〕
@@ -272,6 +272,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.B3 点击必须命中曲线才开框（命中精度过高）→ 任意位置按竖线时间 —— DR-29 〔test_tooltip_click_anywhere_opens〕
 - C5.B4 markLine `xAxis=undefined` 曾杀整页 —— DR-18 〔test_real_echarts_render_smoke〕
 - C5.B5 单区块异常外溢（opt/series 空）→ `safe()` 隔离 —— R-SHELL-8 〔test_a14_safe_isolation_single_block〕
+- C5.B6 标签曾按树序均分槽位，与曲线位置错位（query 在下、标签居中）；且聚焦靠标签 mouseleave 恢复，分级图 `finished` 每次 setOption 重渲标签导致元素销毁、mouseleave 丢失 → 聚焦卡死无法取消。改为锚定排布 + 画布 mousemove 兜底恢复（放弃点击锁定） —— DR-33 〔test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 
 ### C6 端到端时延曲线 · 工具行
 
@@ -366,7 +367,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### C14 SDK 全链路 · 分级时延曲线（trace）
 
 - C14.V1 标题「分级时延曲线（trace）」；控件与**端到端同构**：一行 plain `.toolbar`（粒度档+指标+重置）+ **两个标准 `.objtree-strip` 并排**（对象树 | 阶段树，`.trace-cols` 仅做 grid 布局、无底色/描边）；禁止自定义控台盒 —— R-TRACE-5/12 〔test_trace_toolbar_stage_rows, test_control_style_consistency, test_render_trace_section〕
-- C14.V2 阶段按树序列出（total 根行 → L1 → L2 子阶段），L1 带稳定颜色点 —— R-TRACE-12 〔test_stage_tree_l2_disabled〕
+- C14.V2 阶段按树序列出（total 根行 → L1 → L2 子阶段），L1 带稳定颜色点；**命名 `total`（不用 total（端到端））**，与 avg/p99 技术词风格一致，阶段树/序列/标签/块图根行统一 —— R-TRACE-12 〔test_stage_tree_l2_disabled, test_trace_stage_row_all_clear〕
 - C14.V8 阶段树 **L2 子阶段显示但禁用**（map 只回传 L1+残差时间桶），行尾注明「无时间桶」，title 说明仅用于块图展开 —— R-TRACE-12 〔test_stage_tree_l2_disabled〕
 - C14.V3 指标单选 = 均值 / 最大（map 阶段桶仅存 avg/max） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.V4 线宽：total 1.0 / 阶段 0.8；hover 强调 +0.2 —— R-TRACE-12/15 〔test_line_widths_avg_thicker_only〕
@@ -375,7 +376,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C14.V7 空态：无对象/旧产物/对象未内嵌各有明确文案 —— R-TRACE-12 〔◐〕
 - C14.I1 **维度联动**：单对象可阶段多选；单阶段可对象多选；多选一侧时另一侧自动收敛为单选 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.I2 阶段**树**头 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔test_trace_stage_row_all_clear〕
-- C14.I3 右侧固定槽位标签（无引线）+ 悬浮压暗聚焦（与端到端同构） —— R-TRACE-12 〔test_trace_curve_fixed_labels_and_focus〕
+- C14.I3 右侧标签与端到端同构：**锚定各序列曲线末端**（endLabelLayout 防重叠，无引线）；单序列不出标签；聚焦=悬浮预览（移入画布/离开标签即恢复） —— R-TRACE-12 〔test_trace_curve_fixed_labels_and_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 - C14.I4 点击绘图区任意位置开框（含空白），内容为格式化时间 + 各序列值 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
 - C14.I5 粒度档/重置/缩放/平移与端到端同构（含 y 滑块） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
 - C14.B1 tooltip 落回原始毫秒时间戳（无 formatter） —— DR-29 〔test_tooltip_click_anywhere_opens〕
@@ -460,6 +461,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C20.B3 SSR 冒烟兜底：桩环境测不出的真实渲染异常（markLine undefined 杀整页） —— DR-18 〔test_real_echarts_render_smoke〕
 - C20.B4 大范围删改前必须 grep 引用（曾两次误删相邻函数/测试基建） —— 工程流程 〔n/a〕
 - C20.B5 测试改名/删除必须同步本规则册（由完整性检查拦截） —— 工程流程 〔test_skill_rulebook_integrity〕
+- C20.B7 桩环境把 `el.children` 模拟成数组，掩盖了真实浏览器 HTMLCollection 无 `forEach/map/filter` 的问题（标签聚焦标记、对象弹层「点外部关闭」在浏览器里抛错静默失效）→ 一律用 `Array.prototype.slice.call(...)`/`Array.from(...)`；新增静态审计锁 —— DR-33 〔test_no_htmlcollection_foreach〕
 - C20.B6 曾给 SDK 曲线控台引入「灰底+描边的 tconsole 盒」，凭空造出第三种容器形态（与端到端 plain toolbar + objtree-strip 不一致）→ 删除该样式，用测试锁死（CSS 不得含 tconsole；trace-cols 规则不得含 background/border） —— DR-32 〔test_control_style_consistency〕
 
 ## 模板架构规范

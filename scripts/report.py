@@ -1978,13 +1978,18 @@ function bindClickTip(ch){
     }
     if(!docKey){
       docKey=function(e){
-        if(e&&(e.key==='Escape'||e.keyCode===27)) hide();
+        if(e&&(e.key==='Escape'||e.keyCode===27)){ hide(); mcClearFocus(ch); }
       };
       try{ document.addEventListener('keydown',docKey); }catch(e){}
     }
   }
   const zr=ch.getZr();
+  zr.on('mousemove',function(){
+    /* 指针移到画布上：结束悬浮预览聚焦（防止标签重建导致 mouseleave 丢失） */
+    mcClearFocus(ch);
+  });
   zr.on('click',function(e){
+    mcClearFocus(ch);
     if(!e) { hide(); return; }
     const pr=plotRect();
     const x=e.offsetX, y=e.offsetY;
@@ -2631,6 +2636,105 @@ function fixedLabelOrder(){
   selObjs.forEach(function(k){ if(out.indexOf(k)<0) out.push(k); });
   return out;
 }
+/* ---- 标签聚焦（两图共用）：悬浮预览，指针移入画布或离开标签即恢复全部。
+   注意：分级图每次 setOption 会触发 'finished' 重建标签，hover 中的元素被
+   销毁导致 mouseleave 丢失（曾表现为「聚焦卡死」）——因此画布 mousemove
+   也会清除预览，保证一定能恢复。 */
+function mcFocusInfo(ch){ return (ch&&ch.__mcFocus)||null; }
+function mcSeriesHit(nm,f){
+  if(!f||!f.prefixes||!f.prefixes.length) return true;
+  for(let i=0;i<f.prefixes.length;i++){
+    const p=f.prefixes[i];
+    if(!p) continue;
+    if(nm===p||nm.indexOf(p+' ')===0||nm.indexOf(p+'（')===0) return true;
+  }
+  return false;
+}
+function mcApplyFocus(ch){
+  let sers=[];
+  try{ sers=(ch.getOption().series)||[]; }catch(e){ return; }
+  const f=mcFocusInfo(ch);
+  const partials=sers.map(function(sr){
+    const v=mcSeriesHit(String(sr.name||''),f)?1:0.15;
+    return {lineStyle:{opacity:v},itemStyle:{opacity:v}};
+  });
+  try{ ch.setOption({series:partials}); }catch(e){}
+  ch.__mcDimActive=!!f;
+}
+function mcMarkLabels(ch){
+  const box=ch&&ch.__mcLabelBox; if(!box) return;
+  Array.prototype.slice.call(box.children||[]).forEach(function(c){
+    if(String(c.className||'').indexOf('endlabel')<0) return;
+    const nm=c.getAttribute&&c.getAttribute('data-name');
+    if(nm) c.title=nm+'：悬浮聚焦该曲线';
+    c.className=String(c.className||'').replace(/\s*locked/g,'');
+  });
+}
+function mcFocus(ch,prefixes){
+  if(!ch) return;
+  if(!prefixes||!prefixes.length) ch.__mcFocus=null;
+  else ch.__mcFocus={prefixes:prefixes.slice()};
+  mcApplyFocus(ch); mcMarkLabels(ch);
+}
+function mcClearFocus(ch){
+  if(!ch) return;
+  if(!ch.__mcFocus&&!ch.__mcDimActive) return;
+  ch.__mcFocus=null;
+  mcApplyFocus(ch); mcMarkLabels(ch);
+}
+function mcBindLabel(ch,lab,prefix){
+  lab.setAttribute('data-prefix',prefix);
+  lab.onmouseenter=function(){ mcFocus(ch,[prefix]); };
+  lab.onmouseleave=function(){ mcClearFocus(ch); };
+}
+function mcAnchorY(ch,srIndex,last){
+  let py=null;
+  try{
+    const p=ch.convertToPixel({seriesIndex:srIndex},[last[0],last[1]]);
+    if(p&&isFinite(p[1])) py=p[1];
+  }catch(e){}
+  return py;
+}
+function mcLastVisible(data,w){
+  let last=null;
+  for(let i=(data||[]).length-1;i>=0;i--){
+    const d=data[i];
+    if(!d||d[1]==null) continue;
+    if(w&&(d[0]<w[0]||d[0]>w[1])) continue;
+    last=d; break;
+  }
+  if(!last){
+    for(let i=(data||[]).length-1;i>=0;i--){
+      const d=data[i];
+      if(d&&d[1]!=null){ last=d; break; }
+    }
+  }
+  return last;
+}
+/* 锚定排布：标签贴近各自曲线在当前窗口内的末端；endLabelLayout 防重叠；
+   单序列不出标签；prefixOf 决定聚焦前缀（对象标签按对象名前缀匹配序列）。 */
+function mcRenderLabels(ch,ov,items,grid){
+  if(!ov) return;
+  ov.innerHTML='';
+  ch.__mcLabelBox=ov; ch.__mcGrid=grid;
+  const H=(ch&&ch.getHeight)?ch.getHeight():400;
+  const top=grid.top+8, bot=H-grid.bottom-8;
+  if(items.length<2){
+    if(ch.__mcFocus||ch.__mcDimActive) mcClearFocus(ch);
+    return;
+  }
+  endLabelLayout(items,top,bot);
+  items.forEach(function(it){
+    const lab=el('div','endlabel fixed',it.name);
+    lab.setAttribute('data-name',it.name);
+    lab.style.left=(ch.getWidth()-grid.right+8)+'px';
+    lab.style.top=it.ly+'px';
+    lab.style.color=it.color;
+    mcBindLabel(ch,lab,it.prefix||it.name);
+    ov.appendChild(lab);
+  });
+  mcMarkLabels(ch);
+}
 function focusObjectSeries(prefix){
   let sers=[];
   try{ sers=(chart.getOption().series)||[]; }catch(e){ return; }
@@ -2643,27 +2747,37 @@ function focusObjectSeries(prefix){
   try{ chart.setOption({series:partials}); }catch(e){}
 }
 function layoutFixedLabels(ch,ov){
+  if(!ch||!ov) return;
+  const meta=(mainLabelMeta||[]).slice();
   const keys=fixedLabelOrder();
-  if(!keys.length) return;
-  const W=(ch&&ch.getWidth)?ch.getWidth():0;
-  const H=(ch&&ch.getHeight)?ch.getHeight():0;
-  if(!W) return;
+  const w=xWindowMs(ch,'main');
+  const H=ch.getHeight?ch.getHeight():400;
   const top=MAIN_GRID.top+8, bot=H-MAIN_GRID.bottom-8;
-  const n=keys.length;
-  keys.forEach(function(k,i){
-    const name=fixedLabelText(k);
-    const color=objLineColor(k)||latColor('p99');
-    const y=(n===1)?(top+bot)/2:top+i*(bot-top)/(n-1);
-    const lab=el('div','endlabel fixed',name);
-    lab.style.left=(W-MAIN_GRID.right+8)+'px';
-    lab.style.top=y+'px';
-    lab.style.color=color;
-    lab.title=name+'：悬浮聚焦该对象全部指标曲线';
-    const pref=String(objLabel(k));
-    lab.onmouseenter=function(){focusObjectSeries(pref);};
-    lab.onmouseleave=function(){focusObjectSeries(null);};
-    ov.appendChild(lab);
+  let mx=-Infinity,mn=Infinity;
+  meta.forEach(function(m){
+    (m.data||[]).forEach(function(d){
+      if(d&&d[1]!=null){ if(d[1]>mx)mx=d[1]; if(d[1]<mn)mn=d[1]; }
+    });
   });
+  if(!isFinite(mx)){mx=1;mn=0;}
+  if(mx===mn)mx=mn+1;
+  const items=[];
+  keys.forEach(function(k){
+    const pref=String(objLabel(k));
+    let m=null;
+    for(let q=0;q<meta.length;q++){
+      const mn=String(meta[q].name||'');
+      if(mn===pref||mn.indexOf(pref+'（')===0){m=meta[q];break;}
+    }
+    if(!m) return;
+    const last=mcLastVisible(m.data||[],w);
+    if(!last) return;
+    let py=mcAnchorY(ch,(m.seriesIndex!=null?m.seriesIndex:0),last);
+    if(py==null) py=top+((mx-last[1])/(mx-mn))*(bot-top);
+    items.push({py:py,name:fixedLabelText(k),
+      color:m.color||objLineColor(k)||latColor('p99'),prefix:pref});
+  });
+  mcRenderLabels(ch,ov,items,MAIN_GRID);
 }
 
 /* ---- 时延轴：左侧缩放滑块（倍率 1x..Y_ZOOM_MAX）+ 细刻度轨（窗口平移） ---- */
@@ -4370,7 +4484,7 @@ function tObjPick(key){
   return (g.ops||{})[tOp]||null;
 }
 function tStageName(k){
-  return k==='total_us'?'total（端到端）':(k==='residual'?'残差':k);
+  return k==='total_us'?'total':(k==='residual'?'残差':k);
 }
 function tStageKeys(){
   const cur=tPick(); if(!cur) return ['total_us'];
@@ -4801,32 +4915,31 @@ function tXWindowMs(){
   return [zs.min+ext*s/100, zs.min+ext*e/100];
 }
 function tLayoutEndLabels(ch){
-  /* 固定槽位标签（与端到端曲线多对象同构）：不画引线、不绑端点；
-     悬浮压暗其他曲线。 */
   const ov=document.getElementById('tEndlabels');
   if(!ov) return;
-  ov.innerHTML='';
   let sers=[];
   try{ sers=(ch.getOption().series)||[]; }catch(e){ sers=[]; }
-  if(!sers.length) return;
-  const W=ch.getWidth?ch.getWidth():0;
+  const w=tXWindowMs();
   const H=ch.getHeight?ch.getHeight():400;
-  if(!W) return;
   const top=STAGE_GRID.top+8, bot=H-STAGE_GRID.bottom-8;
-  const n=sers.length;
-  sers.forEach(function(sr,i){
-    const nm=String(sr.name||'');
-    const color=((sr.lineStyle||{}).color)||C.fg;
-    const y=(n===1)?(top+bot)/2:top+i*(bot-top)/(n-1);
-    const lab=el('div','endlabel fixed',nm);
-    lab.style.left=(W-STAGE_GRID.right+8)+'px';
-    lab.style.top=y+'px';
-    lab.style.color=color;
-    lab.title=nm+'：悬浮聚焦该曲线';
-    lab.onmouseenter=function(){focusSeriesOn(ch,[nm]);};
-    lab.onmouseleave=function(){focusSeriesOn(ch,null);};
-    ov.appendChild(lab);
+  let mx=-Infinity,mn=Infinity;
+  sers.forEach(function(sr){
+    (sr.data||[]).forEach(function(d){
+      if(d&&d[1]!=null){ if(d[1]>mx)mx=d[1]; if(d[1]<mn)mn=d[1]; }
+    });
   });
+  if(!isFinite(mx)){mx=1;mn=0;}
+  if(mx===mn)mx=mn+1;
+  const items=[];
+  sers.forEach(function(sr,i){
+    const last=mcLastVisible(sr.data||[],w);
+    if(!last) return;
+    let py=mcAnchorY(ch,i,last);
+    if(py==null) py=top+((mx-last[1])/(mx-mn))*(bot-top);
+    items.push({py:py,name:String(sr.name||''),
+      color:((sr.lineStyle||{}).color)||C.fg});
+  });
+  mcRenderLabels(ch,ov,items,STAGE_GRID);
 }
 /* 底部平移条（仅平移 x） */
 function tSyncXPan(){
@@ -4881,7 +4994,7 @@ function tBindXPan(){
 }
 /* tooltip 延迟 + 邻域触发 */
 function totalSeriesData(cur,tier,metric){
-  /* total（端到端）曲线：优先用 1s 秒桶现算目标档位（短 run 在 1s/10s
+  /* total 曲线：优先用 1s 秒桶现算目标档位（短 run 在 1s/10s
      档才有足够点数）；旧产物只有 minutes（1 分钟桶）时退回分桶聚合，
      此时低于 60s 的档位与 60s 档等价，不会出现空图。 */
   const src=(cur.data.seconds&&cur.data.seconds.length)?
@@ -5350,7 +5463,7 @@ function renderStageTree(cur){
       b.appendChild(dot);
     }
     b.appendChild(el('span','tree-name',
-      level===0?'total（端到端）':tStageName(key)));
+      level===0?'total':tStageName(key)));
     r.appendChild(b);
     if(level===2) r.appendChild(el('span','tree-note','无时间桶'));
     return r;
@@ -5408,7 +5521,7 @@ function renderTree(cur){
       (Number(st.avg)||0).toFixed(1)+' µs ('+effN+')':'—'));
     box.appendChild(row);
   }
-  addRow('total_us',0,tStat('total_us',cur),'total（端到端）');
+  addRow('total_us',0,tStat('total_us',cur),'total');
   tree.filter(function(x){return x[1]===1;}).forEach(function(it){
     addRow(it[0],1,tStat(it[0],cur),
       it[0]==='residual'?'残差（total − 阶段和）':it[0]);
@@ -5780,7 +5893,7 @@ function renderBlockObjMenu(){
         function walk(n){
           if(!n||inside) return;
           if(n===ev.target){inside=true;return;}
-          (n.children||[]).forEach(walk);
+          Array.prototype.slice.call(n.children||[]).forEach(walk);
         }
         walk(menu); walk(btn);
         if(!inside){

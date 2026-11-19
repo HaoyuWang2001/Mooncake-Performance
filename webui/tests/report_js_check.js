@@ -97,7 +97,18 @@ function echartsInit(el) {
     setOption(opt, notMerge) {
       const a = charts[id];
       const base = a.length ? a[a.length - 1] : null;
-      a.push(notMerge || !base ? opt : Object.assign({}, base, opt));
+      if (notMerge || !base) { a.push(opt); return; }
+      const merged = Object.assign({}, base, opt);
+      // 与 ECharts 一致：series 数组按索引合并（保留 name/data 等未覆盖字段）
+      if (Array.isArray(base.series) && Array.isArray(opt.series)) {
+        const n = Math.max(base.series.length, opt.series.length);
+        merged.series = [];
+        for (let i = 0; i < n; i++) {
+          merged.series.push(Object.assign({}, base.series[i] || {},
+                                            opt.series[i] || {}));
+        }
+      }
+      a.push(merged);
     },
     getOption() { const a = charts[id]; return a.length ? a[a.length - 1] : {}; },
     dispatchAction(a) { (c.__acts = c.__acts || []).push(a); },
@@ -594,7 +605,7 @@ if (!errs.length) {
   try{
     const fmt=(_tco&&_tco.tooltip&&_tco.tooltip.formatter);
     out.tchart_tip_fmt=(typeof fmt==='function')
-      ? String(fmt([{value:[1795050994000,5350],seriesName:'total（端到端）',marker:''}]))
+      ? String(fmt([{value:[1795050994000,5350],seriesName:'total',marker:''}]))
       : null;
   }catch(e){ out.tchart_tip_fmt=null; }
   out.tchart_empty=textOf(getEl("tchartEmpty"));
@@ -813,6 +824,72 @@ if (!errs.length) {
       });
     })(getEl("stageTree"));
     return hit;
+  }
+  if (process.argv.includes("--label-anchor")) {
+    try {
+      // 主图：自选一个节点对象（多对象才有固定标签）
+      let nk = null;
+      (function walk(n) {
+        if (nk || !n) return;
+        (n.children || []).forEach(function (c) {
+          const k = c.getAttribute && c.getAttribute("data-key");
+          if (k && k.indexOf("node:") === 0) { nk = k; return; }
+          walk(c);
+        });
+      })(getEl("objTree"));
+      if (nk && sandbox.toggleObj) sandbox.toggleObj(nk);
+      const labelsOf = function (id) {
+        return ((getEl(id).children || []).filter(function (c) {
+          return String(c.className || "").indexOf("endlabel") >= 0;
+        })).map(function (c) {
+          return {
+            name: String((c.getAttribute && c.getAttribute("data-name")) ||
+                        textOf(c)),
+            top: parseFloat(String(c.style.top || "0").replace("px", "")),
+          };
+        });
+      };
+      out.main_labels = labelsOf("endlabels");
+      // 阶段图：点一个 L1 形成两序列后取标签顺序
+      const l1 = stageTreeL1();
+      if (l1 && l1.onclick) l1.onclick();
+      out.stage_labels = labelsOf("tEndlabels");
+      const to = (charts.tchart || []).slice(-1)[0] || {};
+      out.stage_last = {};
+      ((to && to.series) || []).forEach(function (x) {
+        const d = x.data || [];
+        out.stage_last[x.name] = d.length ? d[d.length - 1][1] : null;
+      });
+    } catch (e) { errs.push("label-anchor: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--label-focus")) {
+    try {
+      const c = chartRefs.tchart;
+      const opac = function () {
+        const a = charts.tchart || [];
+        const o = a.length ? a[a.length - 1] : null;
+        return ((o && o.series) || []).map(function (x) {
+          return (x.lineStyle || {}).opacity;});
+      };
+      const labels = function () {
+        return ((getEl("tEndlabels").children || []).filter(function (x) {
+          return String(x.className || "").indexOf("endlabel") >= 0;}));
+      };
+      const l1 = stageTreeL1();
+      if (l1 && l1.onclick) l1.onclick();
+      const lab = labels()[0];
+      out.lf_count = labels().length;
+      if (lab && lab.onmouseenter) {
+        lab.onmouseenter();
+        out.lf_hover = opac();
+        c.getZr().fire("mousemove", {offsetX: 500, offsetY: 300});
+        out.lf_after_move = opac();
+        lab.onmouseenter();
+        if (lab.onmouseleave) lab.onmouseleave();
+        out.lf_after_leave = opac();
+        out.lf_cls = String(lab.className || "");
+      }
+    } catch (e) { errs.push("label-focus: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--stage-tree")) {
     try {

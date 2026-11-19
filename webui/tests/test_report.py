@@ -962,7 +962,7 @@ def test_trace_three_charts_js(tmp_path):
     lv = res.get("levels_text") or ""
     assert "total" in lv and "memread_total_us" in lv and "残差" in lv
     tree = res.get("tree_text") or ""
-    assert "total（端到端）" in tree and "memread_total_us" in tree
+    assert "total" in tree and "memread_total_us" in tree
     # 细节在右半部分（不再是弹窗）
     assert res.get("modal_visible") is None
     mt = res.get("detail_text") or ""
@@ -1848,6 +1848,26 @@ def test_trace_toolbar_stage_rows(tmp_path):
     assert src.count('class="objtree-strip"') >= 3
 
 
+def test_no_htmlcollection_foreach():
+    """真实浏览器回归锁：`el.children` 是 HTMLCollection（无 forEach/map/filter），
+    只有桩环境把它模拟成数组。代码中禁止 `(x.children||[]).forEach(...)` 这类写法
+    （曾导致标签聚焦/菜单外点关闭在浏览器里抛错、功能静默失效）。"""
+    import re as _re
+    src = rp._APP_JS
+    bad = []
+    for ln in src.split("\n"):
+        if ".children" not in ln:
+            continue
+        if not _re.search(r"\.(?:forEach|map|filter)\(", ln):
+            continue
+        if "slice.call(" in ln or "Array.from(" in ln:
+            continue
+        bad.append(ln.strip()[:120])
+    assert not bad, "HTMLCollection 迭代写法回潮: {}".format(bad)
+    assert "Array.prototype.slice.call(box.children" in src or \
+        "Array.from(box.children" in src
+
+
 def test_control_style_consistency():
     """控件风格锁：新控件必须复用既有形态，不得引入新的带底色/描边的控件容器。
     （事故：SDK 曲线曾用灰底描边 tconsole 盒，与端到端风格不一致 —— DR-32）"""
@@ -2270,11 +2290,11 @@ def test_line_widths_avg_thicker_only(tmp_path):
             assert lw[k]["width"] == 0.8, (k, lw[k])
             assert lw[k]["emphasis"] == 1.0, (k, lw[k])
     tc = {x["name"]: x for x in res["tchart_line_w"]}
-    total = tc.get("total（端到端）")
+    total = tc.get("total")
     assert total and total["width"] == 1.0, tc
     # 阶段序列（若本次产物带阶段秒桶）同样 0.8 / 1.0
     for nm, x in tc.items():
-        if nm != "total（端到端）":
+        if nm != "total":
             assert x["width"] == 0.8 and x["emphasis"] == 1.0, (nm, x)
 
 
@@ -2725,7 +2745,7 @@ def test_trace_stage_row_all_clear(tmp_path):
         return
     assert res["errors"] == []
     assert len(res.get("tstage_all") or []) >= 2, res.get("tstage_all")
-    assert res.get("tstage_clear") == ["total（端到端）"], res.get(
+    assert res.get("tstage_clear") == ["total"], res.get(
         "tstage_clear")
 
 
@@ -2810,6 +2830,51 @@ def test_stage_tree_l2_disabled(tmp_path):
     assert l1 and all(not r["disabled"] for r in l1), rows
     assert l2 and all(r["disabled"] for r in l2), rows
     assert any(r["key"] == "total_us" for r in rows), rows
+
+
+def test_label_anchor_follows_curve(tmp_path):
+    """标签锚定：标签上下顺序跟随对应曲线（不再按树序均分槽位）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1", lat=10.0)
+    b = _stats(tmp_path, "b.writer", "writer", node="n2", lat=1.0)
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"},
+                              traces=[tr])
+    res = _js_check(tmp_path, data, "--label-anchor")
+    if res is None:
+        return
+    assert res["errors"] == []
+    # 主图：node:n1（10ms）在总计（~5.5ms）之上 → top 更小且排在前
+    ml = res.get("main_labels") or []
+    assert len(ml) == 2, ml
+    assert ml[0]["name"] == "n1" and ml[0]["top"] < ml[1]["top"], ml
+    # 阶段图：total(266µs) 高于 query_total_us(50µs)
+    sl = res.get("stage_labels") or []
+    last = res.get("stage_last") or {}
+    assert len(sl) >= 2, sl
+    vals = [last.get(x["name"]) for x in sl]
+    assert all(v is not None for v in vals), (sl, last)
+    tops = [x["top"] for x in sl]
+    assert tops == sorted(tops), (sl, vals)      # 上→下
+    assert vals == sorted(vals, reverse=True), (sl, vals)  # 值大在上
+
+
+def test_label_focus_hover_restores(tmp_path):
+    """聚焦=悬浮预览：悬浮压暗其他曲线；指针移入画布或离开标签即恢复全部。"""
+    a = _stats(tmp_path, "a.reader", "reader", node="n1")
+    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--label-focus")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res.get("lf_count", 0) >= 2, res.get("lf_count")
+    hv = res.get("lf_hover") or []
+    assert any(x == 0.15 for x in hv) and any(x == 1 for x in hv), hv
+    assert all(x == 1 for x in (res.get("lf_after_move") or [])), \
+        res.get("lf_after_move")
+    assert all(x == 1 for x in (res.get("lf_after_leave") or [])), \
+        res.get("lf_after_leave")
+    assert "locked" not in (res.get("lf_cls") or "")
 
 
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
