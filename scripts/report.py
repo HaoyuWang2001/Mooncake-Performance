@@ -3015,16 +3015,19 @@ function qpsOpt(tier){
   });
   if(!stepMs) stepMs=1000;
   const n=entries.length;
-  /* 槽位宽度按像素自适应：桶间距(px) 的 80% 均分给 n 个对象。
-     全览时桶密（<1px/槽）必然重叠；放大后自然分开。 */
+  /* 同一时间点的多条线**紧贴成一小簇**：每对象 1px 线 + 1px 间隙（定宽像素），
+     不随桶宽铺开；偏移按当前窗口跨度换算成毫秒，缩放时由
+     refreshQpsSlots() 重算（保证任何缩放级别下簇都保持紧凑）。 */
   const plotW=plotWidthOf(qpsChart,QPS_GRID);
-  const spanMs=Math.max(1000,(maxT===null?0:(maxT-minT)*1000));
-  const stepPx=plotW*stepMs/spanMs;
-  /* 槽内留 1px 间隙：barW = floor(槽宽)-1，clamp 1..3 */
-  const barW=n>1?Math.max(1,Math.min(3,Math.floor(stepPx*0.8/n)-1)):7;
-  const slot=n>1?stepMs*0.8/n:0;
+  const w0=xWindowMs(qpsChart,'main');
+  const spanWin=Math.max(1000,(w0&&w0.length===2)?(w0[1]-w0[0]):0);
+  const barW=n>1?1:7;
+  const slotPx=n>1?2:0;                 /* 线宽 1 + 间隙 1 */
+  const slot=n>1?slotPx*spanWin/plotW:0;
   const failW=n>1?barW:3;
   const rad=n>1?0:[99,99,0,0];
+  qpsEntries=entries.map(function(e){return {nm:e.nm,qps:e.qps,
+    fail:(e.col.fail||[]),t:e.col.t};});
   entries.forEach(function(e,i){
     const x=e.col.t.map(function(v){return v*1000;});
     const off=n>1?((i-(n-1)/2)*slot):0;
@@ -3055,6 +3058,25 @@ function qpsOpt(tier){
   }
   return o;
 }
+let qpsEntries=[];      /* 最近一次 QPS 渲染的对象数据（缩放重算槽位用） */
+function refreshQpsSlots(){
+  /* 缩放/平移后按当前窗口重算簇内偏移（1px 线 + 1px 间隙），merge 更新
+     序列数据，不重置 dataZoom。 */
+  if(!qpsChart||!qpsEntries.length) return;
+  const n=qpsEntries.length;
+  const plotW=plotWidthOf(qpsChart,QPS_GRID);
+  const w=xWindowMs(qpsChart,'main');
+  const spanWin=Math.max(1000,(w&&w.length===2)?(w[1]-w[0]):0);
+  const slot=n>1?2*spanWin/plotW:0;
+  const partials=[];
+  qpsEntries.forEach(function(e,i){
+    const off=n>1?((i-(n-1)/2)*slot):0;
+    const x=e.t.map(function(v){return v*1000+off;});
+    partials.push({data:x.map(function(v,j){return [v,e.qps[j]];})});
+    partials.push({data:x.map(function(v,j){return [v,e.fail[j]||0];})});
+  });
+  try{ qpsChart.setOption({series:partials}); }catch(err){}
+}
 function totalFails(tier){
   let sum=0;
   const keys=selObjs.length?selObjs:(isPipeMode()?[]:['all']);
@@ -3070,6 +3092,10 @@ function buildQpsChart(){
   const box=document.getElementById('qpschart'); if(!box) return;
   if(!qpsChart) qpsChart=echarts.init(box);
   bindClickTip(qpsChart);
+  if(!qpsChart.__slotBound){
+    qpsChart.__slotBound=true;
+    try{ qpsChart.on('dataZoom',refreshQpsSlots); }catch(e){}
+  }
   const z=Z(); if(!z){qpsChart.clear();return;}
   const tier=currentTier();
   qpsChart.setOption(qpsOpt(tier),true);
@@ -5145,9 +5171,10 @@ function buildStageChart(cur){
         tStageSeriesData(op,stage,tier,tCurveMetric),
         stage==='total_us');
     });
-  }else{
-    /* 单对象 × 多阶段（或单阶段单对象）：阶段调色板；空阶段=空态 */
-    const k=objs[0]||tRoleKey();
+  }else if(objs.length){
+    /* 单对象 × 多阶段（或单阶段单对象）：阶段调色板；空阶段=空态。
+       对象未选择时不得回退到总计（用户明确取消总计后不应再画它）。 */
+    const k=objs[0];
     const op=tObjPick(k);
     const list=stages.length?(multiStage?stages:stages.slice(0,1)):[];
     const isRole=(k===tRoleKey());

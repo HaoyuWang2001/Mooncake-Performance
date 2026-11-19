@@ -1018,6 +1018,13 @@ if (!errs.length) {
       const sc = findBtn(getEl("stageTree"), "清空");
       if (sc && sc.onclick) sc.onclick();
       out.dim_empty_stage = textOf(getEl("tchartEmpty"));
+      // 6b) 对象全空 + 阶段有选 → 不得回退画总计
+      const l1d = stageTreeL1();
+      if (l1d && l1d.onclick) l1d.onclick();
+      const oc0 = findBtn(getEl("stageObjTree"), "全部清空");
+      if (oc0 && oc0.onclick) oc0.onclick();
+      out.dim_no_obj = textOf(getEl("tchartEmpty"));
+      out.dim_no_obj_sel = tsel();
       // 7) 再清空对象 → 允许空（空态文案）
       const oc = findBtn(getEl("stageObjTree"), "全部清空");
       if (oc && oc.onclick) oc.onclick();

@@ -2541,6 +2541,10 @@ def test_trace_curve_dimension_coupling(tmp_path):
     # 6) 允许空选
     assert "未选择阶段" in (res.get("dim_empty_stage") or ""), \
         res.get("dim_empty_stage")
+    # 6b) 总计被取消 + 阶段有选 → 不得默认回退展示总计
+    assert res.get("dim_no_obj_sel") == [], res.get("dim_no_obj_sel")
+    assert "未选择对象" in (res.get("dim_no_obj") or ""), \
+        res.get("dim_no_obj")
     assert "未选择对象" in (res.get("dim_empty_all") or ""), \
         res.get("dim_empty_all")
 
@@ -2928,9 +2932,13 @@ def test_qps_grouped_thin_bars(tmp_path):
     qps = [m for m in meta if m["name"].endswith(" QPS")]
     fails = [m for m in meta if m["name"].endswith(" 失败")]
     assert len(qps) >= 2 and len(fails) >= 2, meta
-    assert all(1 <= m["width"] <= 3 for m in qps), qps     # 细线（1–3px 自适应）
+    assert all(m["width"] == 1 for m in qps), qps          # 1px 细线
     xs = [m["x0"] for m in qps]
     assert len(set(xs)) == len(xs), xs                     # 槽位错开
+    # 同一时间点的线紧贴：相邻对象偏移相等且远小于桶距（1px 线 + 1px 间隙）
+    deltas = [abs(xs[i + 1] - xs[i]) for i in range(len(xs) - 1)]
+    assert deltas and max(deltas) - min(deltas) < 1e-6, deltas
+    assert deltas[0] <= 100, deltas                        # 远小于 1000ms 桶距
     by_name = {m["name"]: m for m in qps}
     for f in fails:
         base = f["name"][:-3]

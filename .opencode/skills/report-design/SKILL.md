@@ -375,7 +375,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C14.V4 线宽：total 1.0 / 阶段 0.8；hover 强调 +0.2 —— R-TRACE-12/15 〔test_line_widths_avg_thicker_only〕
 - C14.V5 多对象=对象色（总计灰阶/节点色系/实例色阶）；多阶段=阶段调色板 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.V6 分桶策略与端到端一致（span/s∈[59,8192] 且 ≥ftier；自适应默认） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
-- C14.V7 空态文案：**未选择对象（总计 / 节点 / 实例）** / **未选择阶段** / 旧产物 / 对象未内嵌，各有明确提示 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.V7 空态文案：**未选择对象（总计 / 节点 / 实例）** / **未选择阶段** / 旧产物 / 对象未内嵌，各有明确提示；**对象为空时不得回退画总计**（即使阶段仍有勾选） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.V9 名词统一：总计/节点/实例统称「**对象**」（树头、空态、按钮 title、文档一致）；树头显示「已选 N 项 · 单选/多选」徽记（按另一维度是否多选） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.I1 **维度联动（radio/checkbox 随维度）**：单对象时阶段=多选 checkbox；多对象时阶段=**单选切换**（点其它阶段=切换并保持对象）；多阶段时对象=**单选切换**（点其它对象=切换并保持阶段）；单阶段时对象=多选 checkbox。**允许空选**（点当前唯一项=取消；清空后显示空态，不回填）；每组首次进入默认 `总计 + total` —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.I2 阶段**树**头 全选/清空：全选=全部可选阶段（total/L1/残差；对象多选时收敛为第一个对象）；**清空=允许空**（图表空态，不回填 total） —— R-TRACE-12 〔test_trace_stage_row_all_clear, test_trace_curve_dimension_coupling〕
