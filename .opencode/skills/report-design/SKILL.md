@@ -101,10 +101,10 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### 4f. 交互（tooltip / 端点标签 / 时间）
 
-- **tooltip 悬浮与点击分离**：悬浮只显示轴指针（竖线 + 各曲线交点，`showContent:false`），**不弹框**；**点击**才显示并钉住内容框（`showContent:true` + `triggerOn:'none'` + `showTip`），框内可滚动（`max-height:46vh`）；鼠标在框内或点击处 16px 内保持，两者都离开 250ms 收起；点击空白、离开图表、缩放时收起。`bindClickTip` 统一挂到所有图表。
+- **tooltip 悬浮与点击分离**：悬浮只显示轴指针（竖线 + 各曲线交点，`showContent:false`），**不弹框**；**点击绘图区内任意位置（含空白）**即按点击 x 对应的竖线时间点显示并钉住内容框（`showContent:true` + `triggerOn:'none'` + `showTip`），框内可滚动（`max-height:46vh`）；鼠标在框内或图表内保持，离开两者 250ms 收起；点击绘图区外、Esc、缩放时收起。`bindClickTip` 统一挂到所有图表，绘图区由 `option.grid` 推导。
 - **端点标签聚焦**：多对象标签 hover = 该对象整簇保持原色、其他对象压暗（`opacity:0.15`，用 `setOption` 局部更新，**不用 highlight/focus blur**——多条 highlight 的 blur 会互相覆盖导致只亮一条）；单对象标签 hover = 高亮该指标序列。多对象图例 `selectedMode:false`（只说明颜色，不可点击隐藏）。
 - **多对象 tooltip** 显示时间 + 各对象各指标（带颜色圆点与单位），不得落回 ECharts 默认的原始毫秒时间戳。
-- **阶段曲线对象树只开放总体/角色**（radio/多选角色）；节点/实例行**禁用**并注明「暂只支持总体/角色（欠账 R-TRACE-9）」，不做静默丢弃。
+- **SDK 对象树 = 总计 + 节点与实例**（角色由 section 顶部写/读总控决定，树里不再有角色行）；节点/实例行可用（阶段桶按 node/pod 保留）。
 - **页头「测试开始于」= 数据最早采样时刻**（`meta.ts_from` 转本地时间），不是报表生成时刻；生成时刻只在「报告生成」位置。
 
 ### 4g. QPS 副图
@@ -154,8 +154,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### 6. 交互边界
 
 - **曲线叠加只由对象树勾选控制**；其他位置（实例明细表等）不得改变曲线/选中集。
-- 实例详情表**只读**：不点击、不展开、不嵌小图。
-- 展开交互只允许出现在「最慢请求」：点击行展开该请求的完整分级时延（树序全部 L1 + 残差；所有有二级子区间且值>0 的 L1 同时展开二级，含「未归因」）。
+- 实例与日志现场：**客户端行只读**（不点击、不嵌小图）；仅**节点行**可展开/收起。
+- 允许的展开交互：慢点追踪表行（展开该请求的块图）、实例节点行、分级时延块图聚焦（下一级展开）。分级时延块展开：树序全部 L1 + 残差；所有有二级子区间且值>0 的 L1 同时展开二级（含「未归因」）。
 - QPS 副图图例可看不可点（`selectedMode:false`，固定显示）；副图上方无小标题。
 - 平移/缩放滑块窗口不加描边；zslider 把手为填充色（不是描边）。
 - 端点标识：标签与引线**两端**都钳制在绘图区内；标签聚集时依次分散、绝不重叠（顶部/底部/贴底同时成立）。
@@ -163,7 +163,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### 7. 文案
 
-- 卡片标题不加括号注记（例：「实例详情」，不写「（点击行…）」）。
+- 卡片标题不加**交互**括号注记（例：「实例与日志现场」）；仅 SDK 三段命名允许带技术标识：`分级时延块图（trace）`、`分级时延曲线（trace）`、`慢点追踪（trace）`。
 - 指标名统一 avg / p50 / p95 / p99 / p999 / p9999 / min / max；不要用「平均」「最大」作为曲线名（段1 的「平均时延」卡片除外）。
 - 说明文字极简：直方图仅保留「p9999 需样本 ≥ 10000」；不写教程式长段落。
 - 图注必须与实际行为一致（颜色/交互变化时同步更新，例：「橙色为该组最慢」）。
@@ -174,6 +174,132 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - 对象树：basic = 顶部单行「总览」+「节点与实例」；pipeline = **角色单选**（`角色 [reader] [writer]`，互斥必选，默认 reader，独立一行）+ **总计**（独立一行，默认开；切换角色时保持开关状态）+「节点与实例」（按当前角色过滤；**切换角色不丢弃节点/实例选择**——按角色记忆，切回自动恢复）。pipeline **没有「总体（全部）」概念**（写入/读取数据不可合并展示）。
 - trace 卡的读/写/其它分组按钮两种模式均保留；trace 卡内**没有**独立数据大小选择器（跟随页面最上方主选择器）。
 - basic 与 pipeline 使用**两套独立 body 模板**（见下）；功能差异在模板/JS 分支中表达，不做隐式行为。
+
+## 组件规则册（逐组件契约）
+
+> **与速查层的关系**：速查层是浓缩，本规则册是**实现契约**（精确到行为/数值/根因）；
+> 两者冲突时以本规则册为准，并反手修正速查层。
+> **条目格式**：`- C<组件>.<类型><序号> <规则> —— <需求/决策> 〔<测试/状态>〕`
+> 类型：**V** 展示 · **I** 交互 · **D** 数据口径 · **B** bug 锁（含根因，防回归）。
+> 状态：`〔test_<name>〕` 已锁 · `〔◐ 说明〕` 部分/桩局限 · `〔✗〕` 无测试 · `〔n/a〕` 静态/流程。
+> **维护闭环**：任何 UI 批次 = 代码 + 本册条目 + 测试 三件套；删改测试必须先改条目；
+> 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
+
+### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
+
+- C0.V1 `<title>` 与 `<h1>` 携带场景名+单元身份；生成时间只在副标题 —— R-SHELL-11 〔test_b01_unit_identity_in_title_and_h1〕
+- C0.V2 副标题按序：测试开始于 / 报告生成于 / 协议 /（提前停止追加警示） —— R-SHELL-5 〔test_a10_subtitle_sequence〕
+- C0.V3 「测试开始于」= 数据最早 `ts_from` 转本地时间，不是生成时刻 —— R-SHELL-5 〔test_report_started_time_uses_data_timestamp〕
+- C0.V4 主题三态 auto/亮/暗，localStorage 记忆；图表色板是加载时常量（切换只翻 CSS，已知局限） —— R-SHELL-4 〔test_b05_theme_manual_toggle, test_a16_theme_and_numeric_css〕
+- C0.V5 数据大小选择器：单 size 隐藏、多 size 切换整页 —— R-SHELL-6 〔◐ harness 捕获 size_sel_display〕
+- C0.V6 每个图表容器 `role="img"` + `aria-label` —— R-SHELL-12 〔test_b02_chart_role_and_aria_labels〕
+- C0.V7 页脚最底部：数据文件（report.html 自包含 + data.js）、map→reduce 流程、正确性口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕
+- C0.I1 主题按钮三态循环 auto→light→dark，写入 localStorage —— R-SHELL-4 〔test_b05_theme_manual_toggle〕
+- C0.I2 data.js 缺失降级：明细表按 p99 前 20 名 + `datanote` 提示；加载后自动隐藏并渲染全量 —— R-SHELL-2 〔test_a08_data_missing_degrades_to_note, test_a09_data_loaded_hides_note, test_data_js_loader_points_to_real_file〕
+- C0.I3 WebUI raw 模式适配：相对链接改写为 `/api/file?path=…&mode=raw`（`..` 逐级解析） —— R-SHELL-2 〔test_render_report_has_rel_base_and_adapter, test_adapter_resolves_parent_relative_links〕
+- C0.D1 单文件自包含：CSS/ECharts/主题内联，零外部请求；生成器纯标准库 —— R-SHELL-1 〔test_render_self_contained_and_data_js, test_a15_report_stdlib_only〕
+- C0.D2 注入 HTML 的用户可控字符串一律转义 —— R-SHELL-9 〔test_html_meta_is_escaped〕
+- C0.B1 标题层级不跳级 h1→h2→h3；h3 无交互括号注记 —— DR-24 〔test_b03_heading_hierarchy_no_skips, test_c01_dr24_alignment_lock〕
+- C0.B2 字号 <12px 微字幕回潮 —— DR-24 〔test_report_has_no_micro_captions_and_tiny_fonts〕
+- C0.B3 弱化文本对比度不足（--faint .32 → .72） —— C-5 〔test_b04_text_contrast_c5〕
+- C0.B4 「阀值」错字 / 死 CSS / 卡片无描边回潮 —— DR-24 〔test_c01_dr24_alignment_lock〕
+
+### C1 段1 · 性能统计
+
+- C1.V1 两行制：第一行粗体 吞吐/avg/p99/p9999；第二行 p50/p95/p999/min/max —— R-PERF-1 〔test_summary_three_sections_and_params, test_summary_layout_rows_and_dedup〕
+- C1.V2 字号层级：强调值 24px/800、其余 18px/500；视觉重心只在第一行 —— R-PERF-3 〔◐ 仅下限 12px 被自动检查〕
+- C1.V3 指标名统一小写 avg/p50/p99/p999/p9999/min/max —— R-PERF-1 〔test_c01_dr24_alignment_lock〕
+- C1.V4 pipeline 按角色分块（写路径/读路径各一套），合并卡隐藏 —— R-PERF-5 〔test_pipeline_summary_splits_roles〕
+- C1.V5 basic 保持合并卡，不受分角色逻辑影响 —— R-PERF-5 〔test_basic_summary_unchanged_by_role_split〕
+- C1.V6 吞吐用 MB/s（bytes/wall）；QPS 不在性能卡 —— R-PERF-2/4 〔test_summary_throughput_uses_bytes〕
+- C1.I1 多 combo：性能统计为合并口径并在信息展示注明；单 combo 仍列 —— R-PERF-4 〔test_summary_reports_multiple_combos, test_summary_single_combo_still_listed〕
+- C1.D1 分位数口径与 CSV 一致（直方图归并） —— R-PERF-1 〔test_summary_percentiles_consistent_with_csv〕
+- C1.D2 wall_s=0 不产生 Infinity/NaN —— R-PERF-1 〔test_zero_wall_has_no_infinity〕
+- C1.B1 combo 回调引用未定义函数（renderMain/renderQps/renderTable）曾致图表空白 —— DR-29 〔test_combo_switch_click_works〕
+- C1.B2 表头截断「队列等待均」、曲线名「平均/最大」回潮 —— DR-24 〔test_c01_dr24_alignment_lock〕
+
+### C2 段1 · 信息展示与队列行
+
+- C2.V1 第一行：总数 / 成功 / 失败 / 失败率 / QPS —— R-INFO-1 〔test_summary_three_sections_and_params〕
+- C2.V2 队列等待均/峰、最大队列深度独占一行，位于信息展示下方 —— R-INFO-2 〔test_summary_three_sections_and_params〕
+- C2.D1 队列等待均值只按成功行数平均（ok 行） —— R-INFO-2 〔test_qw_average_divides_by_ok_rows〕
+- C2.I1 降级（data.js 缺失）不改变本卡数值 —— R-SHELL-2 〔◐〕
+
+### C3 段1 · 参数配置与单元信息行
+
+- C3.V1 参数表过滤已展示值（数据大小/客户端数/线程数/客户端总数/采集时长/开始时间；pipeline 另滤 count_per_node 等） —— R-PARAM-1 〔test_summary_layout_rows_and_dedup〕
+- C3.V2 pipeline 单元行顺序：数据大小 | 部署模式 `xwyr` | 客户端数 `x×N nodes` | store 数量 | 时长 —— R-PARAM-2 〔test_pipeline_summary_splits_roles〕
+- C3.V3 目标写 QPS 全口径（`25 × 4 节点 = 100`）、读 QPS（`100 × 4 读 = 400`） —— R-PARAM-2 〔test_build_report_params_pipeline_and_basic, test_build_report_params_pipeline_qps_total〕
+- C3.V4 basic 单元行保留线程数；不写「= 总数」 —— R-PARAM-2 〔test_basic_summary_unchanged_by_role_split〕
+- C3.D1 单元拆分：basic `c{C}_t{T}_{size}`，pipeline `{size}` —— R-OV-1 〔test_generate_reports_unit_split_basic, test_unit_of_basic_and_pipeline〕
+- C3.B1 参数配置重复信息展示值（pipeline 幽灵值） —— DR-13 〔test_summary_layout_rows_and_dedup〕
+
+### C4 端到端时延曲线 · 对象树
+
+- C4.V1 basic = 单行「总览」+ 节点与实例；pipeline = 角色 radio（默认 reader、互斥）+ 总计（默认开、独立行）+ 节点与实例；无「总体（全部）」 —— R-LAT-1 〔test_basic_tree_keeps_single_overview_selection, test_pipeline_tree_role_radio_total_and_scoped_nodes〕
+- C4.V2 单实例单元隐藏「节点与实例」组（避免与总览三重冗余） —— R-LAT-1 〔test_single_instance_tree_hides_duplicate_groups〕
+- C4.V3 组头显示「已选 N 项」 —— R-LAT-17 〔◐〕
+- C4.I1 切换角色互斥；按角色记忆节点/实例选择，切回自动恢复 —— R-LAT-1 〔test_pipeline_tree_role_radio_total_and_scoped_nodes〕
+- C4.I2 全选节点/全选实例为 toggle：未全选显示「全选*」，全选后变「清空*」 —— R-LAT-17 〔test_tree_toggle_buttons〕
+- C4.I3 全部清空：清节点与实例并**自动开启总计/总览** —— R-LAT-17 〔test_clear_all_auto_enables_total, test_tree_group_select_buttons〕
+- C4.I4 参数组筛选隐藏不在该 combo 的实例；被隐藏实例处于选中态时选中集回落「总体」 —— R-INST-2 〔◐ 仅 combo 点击被覆盖〕
+- C4.I5 对象条横向滚动位置从顶部开始（切换 size/renderAll 后不残留旧滚动） —— R-LAT-1 〔test_objtree_strip_scrolls_from_top〕
+- C4.B1 树行点击失效（onclick 绑错元素/重渲染丢事件） —— DR-27 〔test_tree_group_select_buttons〕
+- C4.B2 角色行残留/节点重复行（角色化 key 未去重） —— DR-29 〔test_pipeline_tree_role_radio_total_and_scoped_nodes〕
+
+### C5 端到端时延曲线 · 主图
+
+- C5.V1 指标清单锁定 `LAT_LINES`（avg/p50/p99/p999/p9999/min/max/qw），无超纲 —— R-LAT-3 〔test_a06_metric_list_locked_to_spec〕
+- C5.V2 色语义：总览/总计灰阶、节点色系（按名排序固定）、实例=节点色阶 —— R-LAT-12 〔test_a03_latency_color_semantics_gray_only, test_multi_object_node_hues_and_metric_buttons_removed〕
+- C5.V3 线宽 avg 1.0 / 其余 0.8；hover +0.2；无「首对象加粗」 —— R-LAT-15 〔test_line_widths_avg_thicker_only〕
+- C5.V4 单对象无图例；多对象图例 `selectedMode:false`（只说明颜色） —— R-LAT-1/19 〔test_multi_object_node_hues_and_metric_buttons_removed, test_multilabel_tree_order_and_truncation〕
+- C5.V5 异常窗口竖线（强调色，≤50 条） —— R-LAT-10 〔test_a07_anomalies_capped_at_50〕
+- C5.V6 无数据窗口浅带，**仅第一处**标注时长；判定用真实缺失桶 —— R-LAT-9 〔test_a01_gap_markarea_between_runs, test_a02_no_gap_no_markarea, test_qps_zoom_keeps_y_and_gap_labels_once〕
+- C5.I1 点击绘图区任意位置（含空白）按竖线时间点开框；点击其它处换钉位；区外/Esc/缩放收起 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
+- C5.I2 悬浮只显示竖线+交点（showContent:false），不弹框 —— R-SHELL-14 〔test_all_charts_tooltip_hover_pointer_click_box〕
+- C5.I3 多对象标签 = 对象名固定槽位：总计最上、树序平铺、无引线、不绑曲线端点；超长截断+title —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_multilabel_tree_order_and_truncation〕
+- C5.I4 标签悬浮压暗其他对象整簇（setOption opacity 0.15），移出复原 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus〕
+- C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠 —— R-LAT-7/14 〔test_end_label_layout_stays_inside_plot〕
+- C5.I6 离群开关：无可命中桶时置灰/隐藏，不呈现无效控件 —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge〕
+- C5.D1 离群 = 单请求 > 客户端 p99×10（样本≥1000）；从桶标量剔除、计数/直方图全量 —— R-LAT-4 〔test_outlier_scatter_toggle_and_merge〕
+- C5.D2 总计 = 同桶按请求数加权平均，max 取最大 —— R-SHELL-15 〔◐ 页脚文字被 test_section_order_and_footer_note 覆盖〕
+- C5.D3 时间口径统一 `ts_epoch`（节点 UTC vs 宿主 CST 的时区归一） —— R-SLOW-2 〔test_slowest_ts_epoch_matches_buckets, test_c02_slow_tooltip_epoch_not_undefined〕
+- C5.B1 逐条 highlight 与 `emphasis.focus` blur 互撞 → 只剩一条；聚焦一律 setOption 压暗 —— DR-28 〔test_endlabel_fixed_slots_and_cluster_focus〕
+- C5.B2 标签绑 p99 端点 → p99 隐藏/无可见点时标签消失或堆顶；改固定槽位 —— DR-27 〔test_endlabel_fixed_slots_and_cluster_focus〕
+- C5.B3 点击必须命中曲线才开框（命中精度过高）→ 任意位置按竖线时间 —— DR-29 〔test_tooltip_click_anywhere_opens〕
+- C5.B4 markLine `xAxis=undefined` 曾杀整页 —— DR-18 〔test_real_echarts_render_smoke〕
+- C5.B5 单区块异常外溢（opt/series 空）→ `safe()` 隔离 —— R-SHELL-8 〔test_a14_safe_isolation_single_block〕
+
+### C6 端到端时延曲线 · 工具行
+
+- C6.V1 工具栏单行 `nowrap`+横向滚动、无竖向分割线、子项垂直居中 —— R-LAT-13 〔◐〕
+- C6.V2 粒度档：自适应固定最左、不可用档隐藏、tooltip 标注折叠方案；当前档失效回落自适应 —— R-LAT-2 〔test_tier_buttons_and_ladder, test_tier_policy_by_span〕
+- C6.I1 时延曲线选择 = 指标 toggle + 全选/清空（清空保底 avg，防空图） —— R-LAT-3 〔test_latency_metric_select_all_clear〕
+- C6.I2 「队列等待」默认不展示 —— R-LAT-3 〔test_a06_metric_list_locked_to_spec〕
+- C6.I3 重置视图：恢复默认档位与缩放窗口 —— R-LAT-2 〔✗〕
+- C6.D1 分桶常量前后端一致：59 / 8192 / 2048 / 4096 —— R-LAT-2 〔test_tier_policy_by_span, test_adaptive_tier_folds_time_buckets〕
+- C6.B1 等样本桶已删除（只有时间片桶 + 自适应折叠） —— DR-? 〔test_tier_policy_by_span〕
+- C6.B2 嵌套 `.toolbar` margin 未清 → 按钮整体上移/错行 —— R-LAT-13 〔◐〕
+- C6.B3 「阀值」错字回潮 —— DR-24 〔test_c01_dr24_alignment_lock〕
+
+### C7 QPS 副图
+
+- C7.V1 双轴：QPS 柱（左）+ 失败柱（右，独立计数）；失败柱强调色 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only〕
+- C7.V2 柱色随对象：总计灰阶 / 节点色系 / 实例色阶 —— R-LAT-8 〔test_qps_bars_follow_object_colors〕
+- C7.V3 图例固定不可点；无失败显示「本次测试无失败」；副图上方无小标题 —— R-LAT-8 〔test_qps_legend_fixed_and_caption_removed〕
+- C7.I1 x 缩放时 y 不重算（`filterMode:'none'`） —— R-LAT-8 〔test_qps_zoom_keeps_y_and_gap_labels_once〕
+- C7.I2 主图与 QPS 缩放联动（zoomState 同步） —— R-LAT-6 〔test_a13_zoom_links_main_and_qps〕
+- C7.D1 QPS 分母 = 实测 wall_s（writer elapsed / reader notify 跨度），不是数据 span —— DR-25 〔test_measured_wall_prefers_notify_span〕
+- C7.B1 失败柱误用曲线色 / 图例点击隐藏柱 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only, test_qps_legend_fixed_and_caption_removed〕
+
+### C8 缩放滑块（y 轨 / x pan）
+
+- C8.V1 y 缩放滑轨 1x..10x + 窗口指示轨可拖；滑块无描边（填充色） —— R-LAT-5 〔test_sliders_have_no_border〕
+- C8.V2 缩放/平移后端点标签随窗口重算，不跑出绘图区 —— R-LAT-14 〔test_end_label_layout_stays_inside_plot〕
+- C8.I1 拖 y 轨 = 缩放（锚点下缘）；拖窗口 = 平移时延轴 —— R-LAT-5 〔test_y_zoom_slider_factor_valid〕
+- C8.I2 时间轴：滚轮缩放、左右拖平移；上下拖 = 时延轴平移（互斥，一次只作用一轴） —— R-LAT-6 〔test_a13_zoom_links_main_and_qps〕
+- C8.B1 zslider 把手由描边改填充后回潮（黑边） —— DR-13 〔test_sliders_have_no_border〕
+- C8.B2 平移窗口越界（start/end 未夹紧） —— R-LAT-6 〔◐〕
 
 ## 模板架构规范
 

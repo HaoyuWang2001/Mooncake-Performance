@@ -2561,6 +2561,77 @@ def test_section_order_and_footer_note(tmp_path):
         assert kw in src, kw
 
 
+def test_tree_toggle_buttons(tmp_path):
+    """#2：全选节点/实例按钮是 toggle——全选后变「清空节点/清空实例」。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c", "mode": "basic"})
+    res = _js_check(tmp_path, data, "--tree-toggle")
+    if res is None:
+        return
+    assert res["errors"] == []
+    before = res.get("btn_labels_before") or []
+    assert "全选节点" in before and "全选实例" in before, before
+    after_nodes = res.get("btn_labels_after_nodes") or []
+    assert "清空节点" in after_nodes, after_nodes
+    assert any(k.startswith("node:") for k in res["sel_after_nodes"])
+    # 再点「清空节点」→ 节点全部取消
+    assert not any(k.startswith("node:") for k in res["sel_after_clear_nodes"])
+    after_ins = res.get("btn_labels_after_instances") or []
+    assert "全选节点" in after_ins and "清空实例" in after_ins, after_ins
+    assert any(k.startswith("client:") for k in res["sel_after_instances"])
+    assert not any(k.startswith("client:")
+                   for k in res["sel_after_clear_instances"])
+    labels = res.get("btn_labels_after_clear_instances") or []
+    assert "全选实例" in labels, labels
+
+
+def test_clear_all_auto_enables_total(tmp_path):
+    """#1：总计关掉后点「全部清空」→ 自动开启总计（不再是空图）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    b2 = _stats(tmp_path, "b2.reader", "reader", node="n1")
+    data = rp.reduce_scenario(rp.load([a, b, b2]),
+                              {"config": "cfg", "mode": "pipeline"})
+    res = _js_check(tmp_path, data, "--clear-total-off")
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["sel_total_off"] == [], res["sel_total_off"]
+    assert res["sel_after_clear_auto_total"] == ["reader"], \
+        res["sel_after_clear_auto_total"]
+
+
+def test_qps_bars_follow_object_colors(tmp_path):
+    """#5：QPS 柱与端到端同配色（总计灰阶、节点色系）；失败柱保持强调色。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--add-obj", "node:n1", "--qps-colors")
+    if res is None:
+        return
+    assert res["errors"] == []
+    cols = res.get("qps_obj_colors") or []
+    assert cols, cols
+
+    def rgb(h):
+        h = (h or "").lstrip("#")
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+
+    qps = [c for c in cols if c["name"].endswith("QPS")]
+    fails = [c for c in cols if c["name"].endswith("失败")]
+    assert len(qps) >= 2 and fails, cols
+    total = [c for c in qps if "总" in c["name"]]
+    node = [c for c in qps if c["name"].startswith("n1")]
+    assert total and node, qps
+    r = rgb(total[0]["color"])
+    assert max(r) - min(r) <= 16, total[0]            # 总计灰阶
+    r = rgb(node[0]["color"])
+    assert max(r) - min(r) > 20, node[0]              # 节点=色系
+    hero = {c["color"] for c in fails}
+    assert len(hero) == 1, fails                      # 失败柱配色一致
+
+
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
     """S6：QPS 副图 x 缩放不重算 y（filterMode none）；无数据窗口仅首处标注。"""
     a = _stats(tmp_path, "a.writer", "writer")
