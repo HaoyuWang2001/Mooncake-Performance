@@ -373,6 +373,24 @@ def test_trace_embed_trim_budget_and_coarsen(tmp_path):
     assert max(raws) >= max(trims)
 
 
+def test_trace_embed_ftier_multiplied_once():
+    """嵌入抽稀的 ftier 必须每个 op 只乘一次（曾在逐字段循环里乘 → k^字段数，
+    600s run 的 5 字段 = 4^5 = 1024s → 只剩 1 桶 → 曲线空白）。"""
+    rows = [[1000 + i, 1, 1.0, 1.0] for i in range(600)]
+    secs = [[1000 + i, 1, 1, 0, 1.0, 1.0, None, None] for i in range(600)]
+    obj = {"kind": "node", "label": "n1", "node": "n1", "role": "read",
+           "count": 1, "groups": {"read": {"ops": {"get_buffer": {
+               "ftier": 1,
+               "fminutes": {f: list(rows) for f in
+                            ("a", "b", "c", "d", "e")},
+               "seconds": list(secs)}}}}}
+    tr = {"objects": {"node:n1:read": obj}}
+    trim = rp._trim_trace_embed(tr, max_points=192, budget=10 ** 9)
+    op = trim["objects"]["node:n1:read"]["groups"]["read"]["ops"]["get_buffer"]
+    assert op["ftier"] == 4, op["ftier"]          # 600→k=4，只乘一次
+    assert len(op["fminutes"]["a"]) <= 192
+
+
 def test_render_embeds_trimmed_trace_full_in_datajs(tmp_path):
     """HTML 内嵌 trace.objects 受预算裁剪；data.js 仍含全部对象。"""
     a = _stats(tmp_path, "a.reader", "reader")
@@ -2482,29 +2500,49 @@ def test_trace_object_tree_toggle(tmp_path):
         res["tsel_nodes"]
     assert "清空节点" in (res.get("tree_btn_after_nodes") or []), \
         res.get("tree_btn_after_nodes")
-    assert res["tsel_clear"] == ["role:read"], res["tsel_clear"]
+    assert res["tsel_clear"] == [], res["tsel_clear"]      # 允许空
 
 
 def test_trace_curve_dimension_coupling(tmp_path):
-    """分级时延曲线：单对象可多阶段；一旦对象多选，阶段自动收敛为 total。"""
+    """维度联动：单对象×多阶段（含节点/实例）；多对象×单阶段（切阶段保持对象）；
+    允许空选（清空阶段/对象 → 空态）。"""
+    trs = [_trace_stats2(tmp_path, "n1.glog", node="n1", pod="p1"),
+           _trace_stats2(tmp_path, "n2.glog", node="n2", pod="p2")]
     a = _stats(tmp_path, "a.reader", "reader", node="n1")
-    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
-    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=trs)
     res = _js_check(tmp_path, data, "--trace-dims")
     if res is None:
         return
     assert res["errors"] == []
-    # 单对象多阶段：series = 阶段名（无「对象 · 阶段」拼接）
-    st = res.get("dim_stage_series") or []
-    assert len(st) >= 2, st
-    assert all(" · " not in n for n in st), st
-    # 再选节点：阶段收敛为 total，series 变为对象名
+    # 1) 单对象 × 多阶段：对象不变、两条阶段序列
+    ss = res.get("dim_stage_series") or []
+    assert len(ss) >= 2 and all(" · " not in n for n in ss), ss
+    assert res.get("dim_stage_sel_1") and len(res["dim_stage_sel_1"]) == 2
+    assert res.get("dim_tsel_after_stage") == ["role:read"], \
+        res.get("dim_tsel_after_stage")
+    # 2) 多阶段下点节点：对象切换为单选，阶段保持多选 → 节点的多阶段曲线
+    ns = res.get("dim_node_series") or []
+    assert len(ns) >= 2 and all(" · " not in n for n in ns), ns
+    assert len(res.get("dim_node_tsel") or []) == 1, res.get("dim_node_tsel")
+    assert res.get("dim_node_stage_sel") and \
+        len(res["dim_node_stage_sel"]) == 2, res.get("dim_node_stage_sel")
+    # 3) 取消该阶段 → 单阶段
+    assert len(res.get("dim_stage_sel_3") or []) == 1, res.get("dim_stage_sel_3")
+    # 4) 单阶段下再加节点 → 多对象（系列=对象名）
     ob = res.get("dim_obj_series") or []
-    assert "总计" in ob and any("n1" in n for n in ob), ob
-    assert res.get("dim_tsel_multi") == 2, res.get("dim_tsel_multi")
-    # 块图对象选择器（树状弹层）/ 曲线指标按钮
-    assert "总计" in (res.get("block_btn_text") or ""), res.get("block_btn_text")
-    assert res.get("curve_metrics") == ["均值", "最大"], res.get("curve_metrics")
+    assert "总计" in ob and len(ob) >= 3, ob
+    assert len(res.get("dim_obj_tsel") or []) >= 2, res.get("dim_obj_tsel")
+    # 5) 多对象下点其它阶段：阶段切换、对象保持
+    sw = res.get("dim_switch_series") or []
+    assert "总计" in sw and len(sw) == len(ob), (sw, ob)
+    assert len(res.get("dim_switch_tsel") or []) == len(res["dim_obj_tsel"])
+    assert len(res.get("dim_switch_stage") or []) == 1, res.get("dim_switch_stage")
+    assert res["dim_switch_stage"][0] != "total_us", res["dim_switch_stage"]
+    # 6) 允许空选
+    assert "未选择阶段" in (res.get("dim_empty_stage") or ""), \
+        res.get("dim_empty_stage")
+    assert "未选择对象" in (res.get("dim_empty_all") or ""), \
+        res.get("dim_empty_all")
 
 
 def test_slow_tracking_ranked_colors_and_legend_solo(tmp_path):
@@ -2745,8 +2783,7 @@ def test_trace_stage_row_all_clear(tmp_path):
         return
     assert res["errors"] == []
     assert len(res.get("tstage_all") or []) >= 2, res.get("tstage_all")
-    assert res.get("tstage_clear") == ["total"], res.get(
-        "tstage_clear")
+    assert res.get("tstage_clear_sel") == [], res.get("tstage_clear_sel")
 
 
 def test_trace_curve_fixed_labels_and_focus(tmp_path):

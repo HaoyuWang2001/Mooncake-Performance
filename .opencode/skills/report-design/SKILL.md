@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 213 条 · ✓185 · ◐26 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 215 条 · ✓188 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -344,10 +344,11 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### C12 SDK 全链路 · 对象树
 
 - C12.V1 树 = 总计（当前读写组全实例聚合）+ 节点与实例；**无角色行**（角色在顶部）；位于分级时延曲线控台**左栏** —— R-TRACE-6 〔test_stage_tree_objects_enabled, test_trace_toolbar_stage_rows〕
-- C12.V2 组按钮与主图同构：全选节点/全选实例 toggle、全部清空→总计 —— R-TRACE-6 〔test_trace_object_tree_toggle〕
+- C12.V2 组按钮：全选节点/全选实例 toggle；**全部清空 = 真清空（允许空选，不回填总计）**（与主图不同：主图清空自动回总计，trace 允许空态） —— R-TRACE-6 〔test_trace_object_tree_toggle, test_trace_curve_dimension_coupling〕
 - C12.I1 节点/实例可选中并驱动分级时延块图与曲线 —— R-TRACE-6/11 〔test_stage_tree_objects_enabled, test_trace_per_object_series〕
 - C12.I2 节点行可展开其下实例；单节点也显示该组（trace 不做「单实例隐藏」优化） —— R-TRACE-6 〔test_stage_tree_objects_enabled〕
-- C12.D1 reduce 按 `meta.node/pod` 保留阶段桶；总计全嵌、节点/实例 192 点抽稀 + 6 万行预算；data.js 全量 —— R-TRACE-6 〔test_trace_embed_trim_budget_and_coarsen, test_render_embeds_trimmed_trace_full_in_datajs〕
+- C12.D1 reduce 按 `meta.node/pod` 保留阶段桶；总计全嵌、节点/实例 192 点抽稀 + 6 万行预算；data.js 全量；**抽稀后 `ftier` 每 op 只乘一次**（k，不是 k^字段数） —— R-TRACE-6 〔test_trace_embed_trim_budget_and_coarsen, test_trace_embed_ftier_multiplied_once, test_render_embeds_trimmed_trace_full_in_datajs〕
+- C12.B3 嵌入抽稀曾把 `ftier` 更新写在逐字段循环内 → ftier = k^字段数（600s run、5 字段 → 4^5=1024s）→ 档位强制 ≥1024 → 只剩 1 桶 → 节点/实例曲线空白（总计不抽稀所以正常） —— DR-35 〔test_trace_embed_ftier_multiplied_once, test_trace_curve_dimension_coupling〕
 - C12.D2 每对象计数 = 该对象各文件请求数之和；总计 = 全部之和 —— R-TRACE-6 〔test_trace_per_object_series〕
 - C12.B1 节点/实例曾被禁用（R-TRACE-9 欠账）→ 数据补齐后开放 —— DR-29 〔test_stage_tree_objects_enabled〕
 - C12.B2 角色化对象模型导致同名节点重复行 —— DR-29 〔test_stage_tree_objects_enabled〕
@@ -373,9 +374,10 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C14.V4 线宽：total 1.0 / 阶段 0.8；hover 强调 +0.2 —— R-TRACE-12/15 〔test_line_widths_avg_thicker_only〕
 - C14.V5 多对象=对象色（总计灰阶/节点色系/实例色阶）；多阶段=阶段调色板 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.V6 分桶策略与端到端一致（span/s∈[59,8192] 且 ≥ftier；自适应默认） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
-- C14.V7 空态：无对象/旧产物/对象未内嵌各有明确文案 —— R-TRACE-12 〔◐〕
-- C14.I1 **维度联动**：单对象可阶段多选；单阶段可对象多选；多选一侧时另一侧自动收敛为单选 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
-- C14.I2 阶段**树**头 全选/清空：全选进入阶段多选（对象自动收敛）；清空只留 total —— R-TRACE-12 〔test_trace_stage_row_all_clear〕
+- C14.V7 空态文案：**未选择对象（总计 / 节点 / 实例）** / **未选择阶段** / 旧产物 / 对象未内嵌，各有明确提示 —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.V9 名词统一：总计/节点/实例统称「**对象**」（树头、空态、按钮 title、文档一致）；树头显示「已选 N 项 · 单选/多选」徽记（按另一维度是否多选） —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.I1 **维度联动（radio/checkbox 随维度）**：单对象时阶段=多选 checkbox；多对象时阶段=**单选切换**（点其它阶段=切换并保持对象）；多阶段时对象=**单选切换**（点其它对象=切换并保持阶段）；单阶段时对象=多选 checkbox。**允许空选**（点当前唯一项=取消；清空后显示空态，不回填）；每组首次进入默认 `总计 + total` —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
+- C14.I2 阶段**树**头 全选/清空：全选=全部可选阶段（total/L1/残差；对象多选时收敛为第一个对象）；**清空=允许空**（图表空态，不回填 total） —— R-TRACE-12 〔test_trace_stage_row_all_clear, test_trace_curve_dimension_coupling〕
 - C14.I3 右侧标签与端到端同构：**锚定各序列曲线末端**（endLabelLayout 防重叠，无引线）；单序列不出标签；聚焦=悬浮预览（移入画布/离开标签即恢复） —— R-TRACE-12 〔test_trace_curve_fixed_labels_and_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 - C14.I4 点击绘图区任意位置开框（含空白），内容为格式化时间 + 各序列值 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
 - C14.I5 粒度档/重置/缩放/平移与端到端同构（含 y 滑块） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕

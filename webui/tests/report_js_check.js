@@ -927,6 +927,10 @@ if (!errs.length) {
         return (sandbox.window && sandbox.window.__MC_TSEL)
           ? sandbox.window.__MC_TSEL() : [];
       };
+      const ssel = function () {
+        return (sandbox.window && sandbox.window.__MC_SSEL)
+          ? sandbox.window.__MC_SSEL() : [];
+      };
       out.tsel_before = tsel();
       const nb = findBtn(getEl("stageObjTree"), "全选节点");
       if (nb && nb.onclick) nb.onclick();
@@ -946,38 +950,70 @@ if (!errs.length) {
         const o = a.length ? a[a.length - 1] : null;
         return ((o && o.series) || []).map(function (s) { return s.name; });
       };
-      // 单对象多阶段：点阶段树第一个 L1
+      const tsel = function () {
+        return (sandbox.window && sandbox.window.__MC_TSEL)
+          ? sandbox.window.__MC_TSEL() : [];
+      };
+      const ssel = function () {
+        return (sandbox.window && sandbox.window.__MC_SSEL)
+          ? sandbox.window.__MC_SSEL() : [];
+      };
+      const nodeRows = function () {
+        const acc = [];
+        (function walk(n) {
+          (n.children || []).forEach(function (c) {
+            const k = c.getAttribute && c.getAttribute("data-key");
+            if (k && k.indexOf("node:") === 0 && c.onclick) acc.push(c);
+            walk(c);
+          });
+        })(getEl("stageObjTree"));
+        return acc;
+      };
+      // 1) 单对象 × 多阶段（checkbox）
       const l1 = stageTreeL1();
-      out.dim_l1 = l1 ? String(l1.getAttribute("data-key")) : null;
       if (l1 && l1.onclick) l1.onclick();
       out.dim_stage_series = seriesNames();
-      out.dim_tsel_after_stage = (sandbox.window.__MC_TSEL
-        ? sandbox.window.__MC_TSEL() : []);
-      // 再选一个节点：阶段应收敛为单选、series 变为对象名
-      let clicked = false;
+      out.dim_stage_sel_1 = ssel();
+      out.dim_tsel_after_stage = tsel();
+      // 2) 多阶段下点节点：对象单选切换（阶段保持多选）→ 节点的多阶段曲线
+      const nodes1 = nodeRows();
+      if (nodes1[0] && nodes1[0].onclick) nodes1[0].onclick();
+      out.dim_node_series = seriesNames();
+      out.dim_node_tsel = tsel();
+      out.dim_node_stage_sel = ssel();
+      // 3) 取消该阶段 → 回到单阶段（对象保持）
+      const l1b = stageTreeL1();
+      if (l1b && l1b.onclick) l1b.onclick();
+      out.dim_stage_single = seriesNames();
+      out.dim_stage_sel_3 = ssel();
+      // 4) 单阶段下再加一个节点 + 总计 → 多对象（checkbox）
+      const nodes2 = nodeRows();
+      if (nodes2[1] && nodes2[1].onclick) nodes2[1].onclick();
+      let roleRow = null;
       (function walk(n) {
-        if (clicked || !n) return;
         (n.children || []).forEach(function (c) {
           const k = c.getAttribute && c.getAttribute("data-key");
-          if (k && k.indexOf("node:") === 0 && c.onclick) {
-            c.onclick(); clicked = true; return;
-          }
+          if (k && k.indexOf("role:") === 0 && c.onclick) { roleRow = c; return; }
           walk(c);
         });
       })(getEl("stageObjTree"));
+      if (roleRow && roleRow.onclick) roleRow.onclick();
       out.dim_obj_series = seriesNames();
-      out.dim_stage_sel = (sandbox.window.__MC_TSEL
-        ? "obj-multi" : "?");
-      out.dim_tsel_multi = (sandbox.window.__MC_TSEL
-        ? sandbox.window.__MC_TSEL().length : 0);
-      // 块图对象选择器（树状弹层）
-      const bbtn = getEl("tBlockObj");
-      out.block_btn_text = String(bbtn._text || "");
-      out.block_menu_rows = (getEl("tBlockObjMenu").children || []).map(
-        function (r) { return r._text; });
-      // 曲线指标按钮
-      const cm = getEl("tCurveMetric");
-      out.curve_metrics = (cm.children || []).map(function (b) { return b._text; });
+      out.dim_obj_tsel = tsel();
+      // 5) 多对象下点其它阶段：阶段单选切换（对象保持）
+      const l1c = stageTreeL1();
+      if (l1c && l1c.onclick) l1c.onclick();
+      out.dim_switch_series = seriesNames();
+      out.dim_switch_tsel = tsel();
+      out.dim_switch_stage = ssel();
+      // 6) 清空阶段 → 允许空（空态文案）
+      const sc = findBtn(getEl("stageTree"), "清空");
+      if (sc && sc.onclick) sc.onclick();
+      out.dim_empty_stage = textOf(getEl("tchartEmpty"));
+      // 7) 再清空对象 → 允许空（空态文案）
+      const oc = findBtn(getEl("stageObjTree"), "全部清空");
+      if (oc && oc.onclick) oc.onclick();
+      out.dim_empty_all = textOf(getEl("tchartEmpty"));
     } catch (e) { errs.push("trace-dims: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--blockobj-tree")) {
@@ -1094,7 +1130,8 @@ if (!errs.length) {
       out.tstage_all = series();
       const clrb = findBtn(getEl("stageTree"), "清空");
       if (clrb && clrb.onclick) clrb.onclick();
-      out.tstage_clear = series();
+      out.tstage_clear_sel = (sandbox.window && sandbox.window.__MC_SSEL)
+        ? sandbox.window.__MC_SSEL() : null;
     } catch (e) { errs.push("trace-stage-all: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--tchart-labels")) {

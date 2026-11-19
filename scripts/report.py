@@ -998,17 +998,22 @@ def _trim_trace_embed(tr, max_points=TRACE_EMBED_POINTS,
             for g in c["groups"].values():
                 for op in g["ops"].values():
                     fm = {}
+                    k_once = 1
                     for fn, rs in (op.get("fminutes") or {}).items():
                         rs2, kk = _coarsen_fmin(rs, max_points)
                         fm[fn] = rs2
-                        if kk > 1:
-                            op["ftier"] = int(op.get("ftier") or 1) * kk
+                        k_once = max(k_once, kk)
                         rows += len(rs2)
                     op["fminutes"] = fm
                     if op.get("seconds"):
                         rs2, kk = _coarsen_sec(op["seconds"], max_points)
                         op["seconds"] = rs2
+                        k_once = max(k_once, kk)
                         rows += len(rs2)
+                    # ftier 必须每个 op 只乘一次（曾写在逐字段循环里 → k^字段数，
+                    # 600s run 的 5 字段 = 4^5 = 1024s → 只剩 1 桶 → 曲线空白）
+                    if k_once > 1:
+                        op["ftier"] = int(op.get("ftier") or 1) * k_once
             if used + rows > budget:
                 continue
             used += rows
@@ -4378,6 +4383,7 @@ let tLevelMetric='avg',tStageSel=['total_us'];
 let tCurveMetric='avg';          /* 分级时延曲线指标：avg / max */
 let tObjSel=[];                  /* 曲线对象多选（trace objects，当前 group 作用域） */
 let blockMenuOpen=false, blockMenuBound=false;   /* 块图对象弹层状态 */
+let tObjInit=null;               /* 当前读写组是否已初始化默认选择 */
 let tBlockObj='';                /* 分级时延块图对象（单选） */
 let tStageTier='cnt';            /* 粒度：1 秒/10 秒/1 分钟/自适应(默认) */
 const T_METRIC_OPTS=[['min','最小'],['avg','平均'],['p50','p50'],['p99','p99'],
@@ -4495,16 +4501,20 @@ function tStageKeys(){
   return keys;
 }
 function ensureTraceSel(){
+  /* 每组首次进入给默认选择（总计 + total）；此后允许空选（清空不再回填） */
+  if(tGroup&&tObjInit!==tGroup){
+    tObjInit=tGroup;
+    tObjSel=[tRoleKey()];
+    tStageSel=['total_us'];
+  }
   const keys=tObjKeys();
   if(!keys.length) return;
   tObjSel=tObjSel.filter(function(k){return keys.indexOf(k)>=0;});
-  if(!tObjSel.length) tObjSel=[tRoleKey()];
-  if(keys.indexOf(tBlockObj)<0) tBlockObj=tRoleKey();
+  if(keys.indexOf(tBlockObj)<0) tBlockObj=keys[0];
   const stages=tStageKeys();
   tStageSel=tStageSel.filter(function(k){return stages.indexOf(k)>=0;});
-  if(!tStageSel.length) tStageSel=['total_us'];
-  /* 维度联动：对象多选 => 阶段单选（阶段多选时的反向收敛在交互处做） */
-  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=['total_us'];
+  /* 双多选安全收敛：对象保留多选，阶段取第一个 */
+  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=[tStageSel[0]];
 }
 /* 通用：按序列名集合压暗/恢复（用于曲线标签聚焦） */
 function focusSeriesOn(ch,names){
@@ -5112,18 +5122,18 @@ function buildStageChart(cur){
   const stageOrder=tStageKeys();
   if(multiObj){
     /* 单阶段 × 多对象：每个对象一条（总计灰阶/节点色系/实例色阶） */
-    const stage=stages[0]||'total_us';
-    objs.forEach(function(k){
+    const stage=stages.length?stages[0]:null;
+    if(stage) objs.forEach(function(k){
       const op=tObjPick(k);
       addSeries(traceObjLabel(k), traceObjColor(k),
         tStageSeriesData(op,stage,tier,tCurveMetric),
         stage==='total_us');
     });
   }else{
-    /* 单对象 × 多阶段（或单阶段单对象）：阶段调色板 */
+    /* 单对象 × 多阶段（或单阶段单对象）：阶段调色板；空阶段=空态 */
     const k=objs[0]||tRoleKey();
     const op=tObjPick(k);
-    const list=multiStage?stages:['total_us'];
+    const list=stages.length?(multiStage?stages:stages.slice(0,1)):[];
     const isRole=(k===tRoleKey());
     list.forEach(function(stage){
       const nm=(multiStage||isRole)?tStageName(stage):
@@ -5137,8 +5147,12 @@ function buildStageChart(cur){
   if(cap){
     cap.style.display=hasData?'none':'';
     if(!hasData){
-      if(!objs.length)
-        cap.textContent='请选择总计/节点/实例任一对象后查看分级时延曲线。';
+      if(!objs.length&&!stages.length)
+        cap.textContent='未选择对象（总计 / 节点 / 实例）与阶段：在下方控台勾选后查看。';
+      else if(!objs.length)
+        cap.textContent='未选择对象（总计 / 节点 / 实例）：在左侧对象树勾选后查看。';
+      else if(!stages.length)
+        cap.textContent='未选择阶段：在右侧阶段树勾选（或点「全选」）后查看。';
       else if(!tObjKeys().length)
         cap.textContent='该数据大小没有 trace 对象数据（节点/实例阶段桶）。';
       else
@@ -5233,11 +5247,14 @@ function tStageSeriesData(op,stage,tier,metric){
 }
 function stageObjToggle(key){
   if(tObjKeys().indexOf(key)<0) return;
-  const i=tObjSel.indexOf(key);
-  if(i>=0) tObjSel.splice(i,1); else tObjSel.push(key);
-  if(!tObjSel.length) tObjSel=[tRoleKey()];
-  /* 维度联动：对象多选 => 阶段收敛为单选 */
-  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=['total_us'];
+  if(tStageSel.length>1){
+    /* 模式A（多阶段）：对象=单选切换；点当前项=取消（允许空） */
+    tObjSel=(tObjSel.length===1&&tObjSel[0]===key)?[]:[key];
+  }else{
+    /* 模式B（单阶段）：对象=checkbox 多选（允许空） */
+    const i=tObjSel.indexOf(key);
+    if(i>=0) tObjSel.splice(i,1); else tObjSel.push(key);
+  }
   renderStageObjTree(); renderTrace();
 }
 function stageObjSetMany(keys,on){
@@ -5247,8 +5264,8 @@ function stageObjSetMany(keys,on){
     if(on&&i<0) tObjSel.push(k);
     if(!on&&i>=0) tObjSel.splice(i,1);
   });
-  if(!tObjSel.length) tObjSel=[tRoleKey()];
-  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=['total_us'];
+  /* 双多选安全收敛：对象保留多选，阶段取第一个 */
+  if(tObjSel.length>1&&tStageSel.length>1) tStageSel=[tStageSel[0]];
   renderStageObjTree(); renderTrace();
 }
 function stageTreeModel(){
@@ -5311,7 +5328,8 @@ function renderStageObjTree(){
   const g2=el('div','tree-group node-group');
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','节点与实例'));
-  head.appendChild(el('span','objtree-count','已选 '+tObjSel.length+' 项'));
+  head.appendChild(el('span','objtree-count','已选 '+tObjSel.length+' 项 · '+
+    (tStageSel.length>1?'单选':'多选')));
   g2.appendChild(head);
   function kindKeys(kind){
     return m.all?Object.keys(m.all).filter(function(k){
@@ -5324,7 +5342,8 @@ function renderStageObjTree(){
       return tObjSel.indexOf(k)>=0;});
   }
   function clearAll(){
-    tObjSel=[tRoleKey()];
+    /* 允许空选：真正的全部清空（图表显示空态，不回填总计） */
+    tObjSel=[];
     renderStageObjTree(); renderTrace();
   }
   function actBtn(label,title,fn){
@@ -5339,7 +5358,8 @@ function renderStageObjTree(){
   acts.appendChild(actBtn(clAll?'清空实例':'全选实例',
     clAll?'取消全部实例选择':'选中当前范围内全部实例',
     function(){stageObjSetMany(kindKeys('client'),!clAll);}));
-  acts.appendChild(actBtn('全部清空','清空节点与实例，并只保留总计',
+  acts.appendChild(actBtn('全部清空',
+    '清空全部对象（总计 / 节点 / 实例；允许空选，图表显示空态）',
     clearAll));
   g2.appendChild(acts);
   const list=el('div','tree-list');
@@ -5391,11 +5411,14 @@ function renderStageBtns(cur){
 }
 let tStageOpen={};   /* 阶段树 L2 展开状态 */
 function toggleStageKey(k,cur){
-  const i=tStageSel.indexOf(k);
-  if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
-  if(!tStageSel.length) tStageSel=['total_us'];
-  /* 维度联动：阶段多选 => 对象收敛为单选 */
-  if(tStageSel.length>1&&tObjSel.length>1) tObjSel=[tBlockObj||tRoleKey()];
+  if(tObjSel.length>1){
+    /* 模式B（多对象）：阶段=单选切换；点当前项=取消（允许空） */
+    tStageSel=(tStageSel.length===1&&tStageSel[0]===k)?[]:[k];
+  }else{
+    /* 模式A（单对象）：阶段=checkbox 多选（允许空） */
+    const i=tStageSel.indexOf(k);
+    if(i>=0) tStageSel.splice(i,1); else tStageSel.push(k);
+  }
   renderStageObjTree(); renderStageTree(cur); buildStageChart(cur);
 }
 function stageSelectableKeys(cur){
@@ -5413,20 +5436,21 @@ function renderStageTree(cur){
   const order=stageSelectableKeys(cur);
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','阶段'));
-  head.appendChild(el('span','objtree-count','已选 '+tStageSel.length+' 项'));
+  head.appendChild(el('span','objtree-count','已选 '+tStageSel.length+' 项 · '+
+    (tObjSel.length>1?'单选':'多选')));
   box.appendChild(head);
   const acts=el('div','node-group-acts');
   const allb=el('button','mini','全选');
-  allb.title='选中全部可选阶段（total/L1/残差；阶段多选时对象自动收敛为单选）';
+  allb.title='选中全部可选阶段（total / L1 / 残差）；对象多选时收敛为第一个对象';
   allb.onclick=function(){
     tStageSel=order.slice();
-    if(tObjSel.length>1) tObjSel=[tBlockObj||tRoleKey()];
+    if(tObjSel.length>1) tObjSel=[tObjSel[0]];
     renderStageObjTree(); renderStageTree(cur); buildStageChart(cur);
   };
   const clrb=el('button','mini','清空');
-  clrb.title='只保留端到端 total';
+  clrb.title='清空全部阶段（允许空选，图表显示空态）';
   clrb.onclick=function(){
-    tStageSel=['total_us'];
+    tStageSel=[];
     renderStageTree(cur); buildStageChart(cur);
   };
   acts.appendChild(allb); acts.appendChild(clrb);
@@ -5967,6 +5991,7 @@ function renderTrace(){
 
 window.__MC_SEL=function(){return selObjs.slice();};
 window.__MC_TSEL=function(){return tObjSel.slice();};
+window.__MC_SSEL=function(){return tStageSel.slice();};
 window.__MC_FULL_READY__=function(){renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """
