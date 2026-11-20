@@ -288,6 +288,7 @@ if (!errs.length) {
     const o = a.length ? a[a.length - 1] : null;
     if (o && o.tooltip) out.tooltips[id] = {triggerOn: o.tooltip.triggerOn,
                                             showContent: o.tooltip.showContent,
+                                            showDelay: o.tooltip.showDelay,
                                             enterable: o.tooltip.enterable};
   });
   // P2-E：阶段对象树行（角色可用；节点/实例禁用）
@@ -459,6 +460,16 @@ if (!errs.length) {
   out.main_markarea = (_s0 && _s0.markArea && _s0.markArea.data) || null;
   out.main_markline_n = (_s0 && _s0.markLine && _s0.markLine.data)
     ? _s0.markLine.data.length : 0;
+  out.anom_line_style = (_s0 && _s0.markLine && _s0.markLine.data &&
+    _s0.markLine.data[0] && _s0.markLine.data[0].lineStyle) || null;
+  out.outlier_series = (((mainOpt() || {}).series) || []).filter(function (x) {
+    return String(x.name || "").indexOf("离群点") >= 0;
+  }).map(function (x) {
+    return {name: x.name,
+            marks: (x.markLine && (x.markLine.data || []).length) || 0,
+            mark0: (x.markLine && x.markLine.data && x.markLine.data[0]) || null,
+            style: (x.markLine && x.markLine.lineStyle) || null};
+  });
   const _qseq = charts.qpschart || [];
   const _qo = _qseq.length ? _qseq[_qseq.length - 1] : null;
   out.qps_markarea = (_qo && _qo.series && _qo.series[0] &&
@@ -892,6 +903,15 @@ if (!errs.length) {
         out.lf_cls = String(lab.className || "");
       }
     } catch (e) { errs.push("label-focus: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--globalout-tip")) {
+    try {
+      const c = chartRefs.mainchart;
+      const n0 = ((c && c.__acts) || []).length;
+      c.getZr().fire("globalout", {});
+      out.go_actions = ((c && c.__acts) || []).slice(n0)
+        .map(function (a) { return a.type; });
+    } catch (e) { errs.push("globalout-tip: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--stage-tree")) {
     try {

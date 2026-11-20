@@ -101,7 +101,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### 4f. 交互（tooltip / 端点标签 / 时间）
 
-- **tooltip 一律原生悬浮**：竖线 + 各曲线交点 + 内容框由 ECharts 同时渲染/消失（`triggerOn:'mousemove'`、`showContent:true`、`showDelay:150`、`hideDelay:250`、`enterable:true`，框内滚动 `max-height:46vh`）。**拒绝点击钉住**（自定义 showContent/triggerOn 切换 + showTip + document 保活的状态机导致交点消失、虚线残留、左右关闭不对称，见 DR-42）。所有图统一由 `lfTooltip` 提供。
+- **tooltip 一律原生悬浮**：竖线 + 各曲线交点 + 内容框由 ECharts 同时渲染/消失（`triggerOn:'mousemove'`、`showContent:true`、`hideDelay:250`、`enterable:true`，框内滚动 `max-height:46vh`）；**不得设置 `showDelay`**（显示定时器与 globalout 竞态 → 快速扫过后框永久残留并挡住右侧标签，见 DR-44）；`bindHoverGuards` 在 `globalout` 时**主动 hideTip** 兜底。**拒绝点击钉住**（DR-42）。所有图统一由 `lfTooltip` 提供。
 - **端点标签聚焦**：多对象标签 hover = 该对象整簇保持原色、其他对象压暗（`opacity:0.15`，用 `setOption` 局部更新，**不用 highlight/focus blur**——多条 highlight 的 blur 会互相覆盖导致只亮一条）；单对象标签 hover = 高亮该指标序列。多对象图例 `selectedMode:false`（只说明颜色，不可点击隐藏）。
 - **多对象 tooltip** 显示时间 + 各对象各指标（带颜色圆点与单位），不得落回 ECharts 默认的原始毫秒时间戳。
 - **SDK 对象树 = 总计 + 节点与实例**（角色由 section 顶部写/读总控决定，树里不再有角色行）；节点/实例行可用（阶段桶按 node/pod 保留）。
@@ -256,14 +256,14 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.V2 色语义：总览/总计灰阶、节点色系（按名排序固定）、实例=节点色阶 —— R-LAT-12 〔test_a03_latency_color_semantics_gray_only, test_multi_object_node_hues_and_metric_buttons_removed〕
 - C5.V3 线宽恒定：avg 1.0 / 其余 0.8；**无 hover 加粗、无「首对象加粗」**（鼠标扫过曲线不产生聚焦/变粗；强调只由右侧标签触发） —— R-LAT-15 〔test_line_widths_avg_thicker_only〕
 - C5.V4 单对象无图例；多对象图例 `selectedMode:false`（只说明颜色） —— R-LAT-1/19 〔test_multi_object_node_hues_and_metric_buttons_removed, test_multilabel_tree_order_and_truncation〕
-- C5.V5 异常窗口竖线（强调色，≤50 条） —— R-LAT-10 〔test_a07_anomalies_capped_at_50〕
+- C5.V5 异常窗口竖线：强调色 **25% 透明度**、宽度 1、≤50 条（低权重，不抢离群点视觉）；图注明确「红色竖线 = 异常窗口（错误突发/时延突增），非离群点」 —— R-LAT-10 〔test_a07_anomalies_capped_at_50, test_anomaly_lines_low_weight_and_outlier_flagpole〕
 - C5.V6 无数据窗口浅带，**仅第一处**标注时长；判定用真实缺失桶 —— R-LAT-9 〔test_a01_gap_markarea_between_runs, test_a02_no_gap_no_markarea, test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C5.I1 tooltip 原生悬浮：鼠标在绘图区任意位置（含空白）即按竖线时间点显示竖线+交点+内容框；移出/离开即收起 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip〕
-- C5.I2 内容框 `showDelay:150`（快速扫过不弹）、`enterable:true`（移入框保持并滚动）；不做点击钉住 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip〕
+- C5.I2 内容框 `enterable:true`（移入框保持并滚动）；**不设 showDelay**；移出画布（globalout）主动 hideTip 兜底；不做点击钉住 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip, test_anomaly_lines_low_weight_and_outlier_flagpole〕
 - C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断，**悬浮时用详情框展示全名**（`data-full` + `.mc-label-tip`，不用原生 title）；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 - C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；**离开标签/移入画布/移出图表（globalout）都必须恢复**；不做点击锁定。清除机制三重兜底：标签 mouseleave + 画布 mousemove + **document mousemove（指针不在标签上即清）+ globalout**——修复长截断标签向右移出后事件不再命中而聚焦残留 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
 - C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠 —— R-LAT-7/14 〔test_end_label_layout_stays_inside_plot〕
-- C5.I6 离群开关：无可命中桶时置灰/隐藏，不呈现无效控件 —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge〕
+- C5.I6 离群点 = 散点 + **从底部到该点的旗杆虚线**（上端止于离群点，便于定位其位置）；「剔除离群点」开关在无可命中离群时置灰（title 说明判定条件，不隐藏） —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge, test_anomaly_lines_low_weight_and_outlier_flagpole〕
 - C5.D1 离群 = 单请求 > 客户端 p99×10（样本≥1000）；从桶标量剔除、计数/直方图全量 —— R-LAT-4 〔test_outlier_scatter_toggle_and_merge〕
 - C5.D2 总计 = 同桶按请求数加权平均，max 取最大 —— R-SHELL-15 〔◐ 页脚文字被 test_section_order_and_footer_note 覆盖〕
 - C5.D3 时间口径统一 `ts_epoch`（节点 UTC vs 宿主 CST 的时区归一） —— R-SLOW-2 〔test_slowest_ts_epoch_matches_buckets, test_c02_slow_tooltip_epoch_not_undefined〕

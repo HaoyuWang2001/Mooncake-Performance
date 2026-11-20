@@ -1595,7 +1595,16 @@ def test_overview_groups_units_per_config(tmp_path):
     ], str(tmp_path))
     html = open(ov, encoding="utf-8").read()
     assert html.count('<div class="card">') == 1
-    assert "2 个单元" in html and "1MB, 8MB" in html
+    assert "1MB, 8MB" in html
+    # 指标行只保留 成功/失败/失败率（QPS/分位数不再上 overview）
+    for k in ("成功", "失败", "失败率"):
+        assert '<div class="k">' + k + "</div>" in html, k
+    for k in ("QPS", "p50", "p99", "p999"):
+        assert '<div class="k">' + k + "</div>" not in html, k
+    # 小字：场景/协议/数据量/时长（无「个单元/客户端/目标 QPS」）
+    assert "个单元" not in html and "目标 QPS" not in html
+    # 底部合并口径说明行已删除
+    assert "分位数取最差单元" not in html
     assert 'href="logs/cfg/report/c1_t1_8MB/report.html"' in html
     assert 'href="logs/cfg/report/c1_t1_1MB/report.html"' in html
 
@@ -2402,6 +2411,7 @@ def test_all_charts_native_hover_tooltip(tmp_path):
         assert tips[cid]["triggerOn"] == "mousemove", (cid, tips[cid])
         assert tips[cid]["showContent"] is True, (cid, tips[cid])
         assert tips[cid]["enterable"] is True, (cid, tips[cid])
+        assert not tips[cid].get("showDelay"), (cid, tips[cid])
     # 分级时延 tooltip 内容必须格式化时间（不得落回原始毫秒）
     fmt = res.get("tchart_tip_fmt") or ""
     assert "2026-" in fmt and "5.35 ms" in fmt, fmt
@@ -3042,6 +3052,38 @@ def test_volume_card_estimates(tmp_path):
     assert "map 后" in vt and "stats.json" in vt and "trace.json" in vt, vt
     assert "回传统计总量" in vt, vt
     assert "行/s" in vt, vt
+
+
+def test_anomaly_lines_low_weight_and_outlier_flagpole(tmp_path):
+    """异常窗口竖线降到 25% 透明度（不抢离群点视觉）+ 图注说明；
+    离群点散点带 0→点 的旗杆虚线（上端止于离群点）；globalout 必隐藏 tooltip。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    z = list(data["sizes"].values())[0]
+    t0 = int((z.get("summary") or {}).get("ts_from") or 0) + 60
+    # 注入一条异常窗口 + 一个离群点
+    z["anomalies"] = [{"t": t0, "kind": "error_burst", "fail": 3, "count": 5}]
+    z["outliers"] = [{"ts_epoch": t0, "lat_ms": 50.0, "role": "reader",
+                      "client": "a.reader", "node": "n1"}]
+    res = _js_check(tmp_path, data, "--globalout-tip")
+    if res is None:
+        return
+    assert res["errors"] == []
+    st = res.get("anom_line_style") or {}
+    assert st.get("opacity") == 0.25, st
+    os_ = res.get("outlier_series") or []
+    assert os_, res.get("outlier_series")
+    assert os_[0]["marks"] == 1, os_[0]
+    m0 = os_[0]["mark0"]
+    assert m0 and m0[0]["coord"][1] == 0 and m0[1]["coord"][1] == 50.0, m0
+    assert os_[0]["style"].get("type") == "dashed", os_[0]
+    # 移出画布（globalout）必须主动隐藏 tooltip
+    assert "hideTip" in (res.get("go_actions") or []), res.get("go_actions")
+    # 图注：红竖线=异常窗口（非离群点）
+    html, _dj = rp.render_scenario(data, str(tmp_path / "o"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert "红色竖线 = 异常窗口" in src and "非离群点" in src
+    assert "离群点为散点" in src
 
 
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):

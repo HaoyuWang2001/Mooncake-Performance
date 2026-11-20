@@ -196,7 +196,16 @@ def test_overview_shows_monitor_summary(tmp_path):
         str(tmp_path / "ov"))
     src = open(ov, encoding="utf-8").read()
     assert "RSS 疑似泄露" in src
-    assert "端口峰值" in src and "峰值内存" in src
+    assert "端口峰值" in src
+    # 峰值内存逐 pod 名单过长，overview 的监控摘要行不再展示（DR-43）
+    import re as _re
+    mline = _re.search(r'<div class="note">监控：(.*?)</div>', src,
+                       _re.S)
+    assert mline, "缺少 overview 监控摘要行"
+    assert "峰值内存" not in mline.group(1), mline.group(1)
+    # 不再出现「pod=NNN MB」形式的逐 pod 峰值名单
+    assert not _re.search(r"[A-Za-z0-9_.-]+=[\d.]+ MB", mline.group(1)), \
+        mline.group(1)
 
 
 

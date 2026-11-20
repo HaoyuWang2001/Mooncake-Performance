@@ -2008,7 +2008,7 @@ function lfTooltip(extra){
      enterable 允许鼠标移入框内滚动/复制。 */
   const o={trigger:'axis',confine:true,
     triggerOn:'mousemove',showContent:true,
-    showDelay:150,hideDelay:250,enterable:true,className:'mc-tip',
+    hideDelay:250,enterable:true,className:'mc-tip',
     extraCssText:'max-height:46vh;overflow-y:auto',
     backgroundColor:LFTIP.backgroundColor,borderWidth:0,
     padding:LFTIP.padding,
@@ -2024,7 +2024,11 @@ function bindHoverGuards(ch){
   ch.__mcGuardsBound=true;
   const zr=ch.getZr();
   zr.on('mousemove',function(){ mcClearFocus(ch); });
-  zr.on('globalout',function(){ mcClearFocus(ch); });
+  zr.on('globalout',function(){
+    mcClearFocus(ch);
+    /* 移出画布必隐藏 tooltip（showDelay 竞态曾导致框残留、并挡住右侧标签） */
+    try{ ch.dispatchAction({type:'hideTip'}); }catch(e){}
+  });
   /* 兜底：指针移动到任何「标签之外」的元素即结束悬浮聚焦
      （修复长截断标签向右移出后鼠标事件不再命中导致聚焦残留） */
   try{
@@ -2241,6 +2245,13 @@ function outlierScatter(key,name,color){
   return {name:name,type:'scatter',symbolSize:6,clip:true,z:9,
     itemStyle:{color:color||C.hero},
     emphasis:{itemStyle:{borderColor:C.ink,borderWidth:1}},
+    /* 旗杆：从底部到离群点画细虚线，上端正好停在点上（否则全高竖线
+       看不出离群值的位置） */
+    markLine:{silent:true,symbol:'none',
+      lineStyle:{color:color||C.hero,width:1,type:'dashed',opacity:0.5},
+      label:{show:false},
+      data:pts.map(function(p){
+        return [{coord:[p[0],0]},{coord:[p[0],p[1]]}];})},
     data:pts};
 }
 function latLineSeries(col,x,meta,key){
@@ -2261,7 +2272,8 @@ function markLines(){
   if(z&&z.anomalies&&z.anomalies.length)
     z.anomalies.slice(0,50).forEach(function(a){
       data.push({xAxis:a.t*1000,
-        lineStyle:{color:C.hero,width:1},label:{show:false}});});
+        lineStyle:{color:C.hero,width:1,opacity:0.25},
+        label:{show:false}});});
   return data.length?{symbol:'none',silent:true,data:data}:null;
 }
 /* 无数据窗口（两次运行/两次参数组之间）：单参数 run 与多 combo sweep 都会
@@ -6361,7 +6373,8 @@ _SEC_LATENCY = """<div class="card"><h2>端到端时延曲线</h2>
 </div>
 <div id="qpschart" class="chart qps" role="img" aria-label="QPS 与失败副图"></div>
 <div class="note" id="qpsNote"></div>
-<div class="note">浅色竖带 = 无数据窗口（仅首处标注时长，其余同色带同样含义）</div>
+<div class="note">浅色竖带 = 无数据窗口（仅首处标注时长，其余同色带同样含义）；
+红色竖线 = 异常窗口（错误突发/时延突增，非离群点）；离群点为散点 + 旗杆虚线（无可命中离群时按钮置灰）</div>
 <div class="chart-hint">滚轮 = 缩放时间轴 · 左右拖动 = 平移x · 上下拖动 = 平移y ·
 左侧刻度轨：拖动调倍率（最下 1x）</div>
 </div>
@@ -6650,24 +6663,15 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
                 "total": sum(int(b.get("total") or 0) for b in blocks),
                 "bytes": sum(int(b.get("bytes") or 0) for b in blocks),
                 "wall_s": sum(float(b.get("wall_s") or 0) for b in blocks),
-                "p50_ms": max((b.get("p50_ms") or 0) for b in blocks),
-                "p99_ms": max((b.get("p99_ms") or 0) for b in blocks),
-                "p999_ms": max((b.get("p999_ms") or 0) for b in blocks),
-                "clients": len({c.get("name") for u in units
-                                for z in (u.get("sizes") or {}).values()
-                                for c in (z.get("clients") or [])}),
             }
-            s["qps"] = (round(s["total"] / s["wall_s"], 2)
-                        if s["wall_s"] > 0 else 0.0)
             s["fail_rate"] = (s["fail"] / s["total"]) if s["total"] else 0.0
         else:
             s = {}
-        # 监控摘要跨单元聚合（每个单元只带自己时间窗的数据）
-        peak_mem, worst_proc, peak_urma = {}, None, None
+        # 监控摘要跨单元聚合（每个单元只带自己时间窗的数据）；
+        # 峰值内存逐 pod 名单过长，不写入 overview（见 DR-43）
+        worst_proc, peak_urma = None, None
         for u in units:
             ms = (u.get("monitors") or {}).get("summary") or {}
-            for n, v in (ms.get("peak_mem_mb") or {}).items():
-                peak_mem[n] = max(peak_mem.get(n, 0), v or 0)
             wp = ms.get("worst_proc")
             if wp and (worst_proc is None or
                        (wp.get("growth_mb") or 0) >
@@ -6678,9 +6682,6 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
                     peak_urma is None or pu["value"] > peak_urma["value"]):
                 peak_urma = pu
         bits = []
-        if peak_mem:
-            bits.append("峰值内存 " + ", ".join(
-                "{}={} MB".format(k, v) for k, v in peak_mem.items()))
         if worst_proc and worst_proc.get("leak_suspect"):
             bits.append('<span class="tag warn">RSS 疑似泄露 {} ({} MB / {}%)'
                         "</span>".format(worst_proc.get("label") or "",
@@ -6708,33 +6709,22 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
         mode = html.escape(str(m.get("mode") or ""))
         cards.append("""
 <div class="card"><h2>{name}</h2>
-<div class="sub">{mode} · {proto} · {sizes} · {nunits} 个单元 · {clients} 客户端 · 时长 {dur} · 目标 QPS {qt} {early}</div>
+<div class="sub">{mode} · {proto} · {sizes} · 时长 {dur} {early}</div>
 <div class="grid">
 <div class="kv"><div class="k">成功</div><div class="v">{ok}</div></div>
 <div class="kv"><div class="k">失败</div><div class="v">{fail}</div></div>
-<div class="kv"><div class="k">QPS</div><div class="v">{qps}</div></div>
-<div class="kv"><div class="k">p50</div><div class="v">{p50}<span class="u"> ms</span></div></div>
-<div class="kv"><div class="k">p99</div><div class="v">{p99}<span class="u"> ms</span></div></div>
-<div class="kv"><div class="k">p999</div><div class="v">{p999}<span class="u"> ms</span></div></div>
 <div class="kv"><div class="k">失败率</div><div class="v">{fr}<span class="u"> %</span></div></div>
 </div>
 {monline}
 {linkblock}
-<div class="note">数值为全部 {nunits} 个单元（size×combo）的合并口径；
-分位数取最差单元。逐单元明细请打开下方报表。</div>
 </div>""".format(
             name=name, mode=mode,
             proto=html.escape(str(m.get("protocol") or "-")),
             sizes=html.escape(", ".join(sizes) or "-", quote=True),
-            nunits=len(units),
-            qt=m.get("qps_target") or "-",
-            clients=m.get("clients") or "-",
             dur=_fmt_dur(s.get("wall_s") or 0),
             early='<span class="tag warn">提前停止/异常</span>'
             if m.get("early_stop") else "",
             ok=s.get("ok", "-"), fail=s.get("fail", "-"),
-            qps=s.get("qps", "-"), p50=s.get("p50_ms", "-"),
-            p99=s.get("p99_ms", "-"), p999=s.get("p999_ms", "-"),
             fr=round((s.get("fail_rate") or 0) * 100, 2),
             linkblock=link_block, monline=monline))
     nodes = run_meta.get("nodes") or []
