@@ -31,8 +31,13 @@ const NodesView = {
           </el-button>
         </el-tooltip>
         <el-button size="small" @click="openPortQuery">端口查询</el-button>
-        <el-button size="small" type="primary" :loading="testing"
-                   :disabled="!nodes.length" @click="testAll">全部测试连接</el-button>
+        <el-tooltip :disabled="nodes.length > 0" placement="top"
+                    content="当前配置没有可探测的 SSH 节点：先选择真机 cluster 配置">
+          <span>
+            <el-button size="small" type="primary" :loading="testing"
+                       :disabled="!nodes.length" @click="testAll">全部测试连接</el-button>
+          </span>
+        </el-tooltip>
       </div>
     </div>
 
