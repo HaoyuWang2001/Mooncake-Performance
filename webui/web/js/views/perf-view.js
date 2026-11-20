@@ -129,7 +129,18 @@ const PerfView = {
       </div>
     </div>
     <el-card shadow="never" class="runbox">
-      <template #header><b>实例模板</b></template>
+      <template #header>
+        <div class="mc-toolbar">
+          <b>实例模板</b>
+          <span class="spacer"></span>
+          <el-tooltip content="刷新配置（重新拉取 cluster / global / profile 候选与配置树）" placement="top">
+            <el-button size="small" circle :loading="cfgLoading"
+                       aria-label="刷新配置" @click="loadConfigs">
+              <el-icon><component is="Refresh"/></el-icon>
+            </el-button>
+          </el-tooltip>
+        </div>
+      </template>
       <div class="rb-row">
         <el-radio-group v-model="mode" size="small" @change="onModeChange">
           <el-radio-button value="ssh">真机</el-radio-button>
@@ -389,6 +400,7 @@ const PerfView = {
     const cfgDialog = Vue.ref(false);
     const treeRoots = Vue.ref([]);
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
+    const cfgLoading = Vue.ref(false);
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
                                  verbose: false, protocol: "", cluster: "",
                                  global: "", profile: "", rankCluster: "",
@@ -479,6 +491,7 @@ const PerfView = {
     Vue.watch([() => flags.cluster, () => mode.value], loadClusterImage);
 
     async function loadConfigs() {
+      cfgLoading.value = true;
       try {
         const checked = _perfCheckedPaths(treeRoots.value);
         const cfg = await api("GET", "/api/configs");
@@ -500,6 +513,8 @@ const PerfView = {
         }
       } catch (e) {
         ElementPlus.ElMessage.error("加载配置失败: " + e.message);
+      } finally {
+        cfgLoading.value = false;
       }
     }
 
@@ -723,7 +738,7 @@ const PerfView = {
 
     return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection,
              modeCandidates, onModeChange, flags, warnings, creating, cleaning,
-             clusterImage, clearSel, runHint, cleanupHint, schedulerBusy,
+             clusterImage, clearSel, loadConfigs, cfgLoading, runHint, cleanupHint, schedulerBusy,
              statusType, statusText, fmtTimeRel, fmtTimeAbs,
              instanceRunHint, scrollToForm,
              instances, instLoading, busy, loadInstances, createInstance, runInstance,
