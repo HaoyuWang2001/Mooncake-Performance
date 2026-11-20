@@ -178,6 +178,12 @@ def _generate_openapi():
         "description": "Running or shared resource conflict"}
     paths["/api/instances/{iid}/stop"] = _post("Stop this instance's active run")
     paths["/api/instances/{iid}/rename"] = _post("Rename instance")
+    paths["/api/nodes"] = _p("Cluster nodes from cluster.json + roles from global.json")
+    paths["/api/nodes"]["get"]["parameters"] = [_q("cluster"), _q("global")]
+    paths["/api/nodes/{name}/test"] = _p("SSH probe: connectivity, env, mooncake processes, expected ports")
+    paths["/api/nodes/{name}/test"]["get"]["parameters"] = [_q("cluster"), _q("global")]
+    paths["/api/nodes/{name}/ports"] = _p("Listening ports on one node (ss -tlnp)")
+    paths["/api/nodes/{name}/ports"]["get"]["parameters"] = [_q("cluster")]
     paths["/api/outputs"] = _p("List output runs")
     paths["/api/outputs/{ts}/tree"] = _p("File tree of one output run")
     paths["/api/outputs/{ts}"] = _delete("Delete run result (moved to trash)")

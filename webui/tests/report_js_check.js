@@ -431,7 +431,6 @@ if (!errs.length) {
     } catch (e) { errs.push("total: " + String(e && e.stack || e)); }
   }
   out.perf_kids = kids("perfcards");
-  out.info_kids = kids("infocards");
   out.unit_kids = kids("unitmeta");
   out.perf_shown = getEl("perfcards").style.display !== "none";
   out.rolecards_shown = getEl("rolecards").style.display !== "none";

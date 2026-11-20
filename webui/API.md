@@ -205,6 +205,46 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 
 ---
 
+## 集群节点（nodes）
+
+探测端点共用参数：`cluster`（默认 `configs/cluster.json`）、`global`（默认 `configs/global.json`，
+仅用于角色/端口推导）。SSH 传输复用编排器 `utils.py`（paramiko，连接缓存），只执行只读命令
+（uname / ss / ps）；`{name}` 必须是所选 cluster 配置中的节点名，否则 404。
+
+### GET /api/nodes?cluster=configs/cluster.json&global=configs/global.json
+```json
+{"cluster":"configs/cluster.json","global":"configs/global.json","mode":"ssh",
+ "venv":"/home/haoyu/venvs/mooncake-benchmark/bin/python",
+ "nodes":[{"name":"store1","ip":"192.168.137.11","fabric_ip":"...","ssh_user":"haoyu",
+           "ssh_port":22,"ssh_key":"","roles":["store"],
+           "expected_ports":[{"purpose":"master RPC","port":50051}]}]}
+```
+- `roles`：`store`（global `mooncake_store_nodes`）、`master`（`master_addr` 的 host 匹配 ip/fabric_ip）、
+  `metadata`（`metadata_server` host）、`etcd`（`etcd_endpoints` host）；都没有则 `client`
+- `mode`：有 nodes → `ssh`；k8s 型 cluster（`controller`/`k8s`）→ `k8s` 且 nodes 为空
+- `expected_ports`：该节点按 global.json 应有暴露的端口（master RPC / 元数据 HTTP / etcd）
+
+### GET /api/nodes/{name}/test?cluster=...&global=...
+一次 SSH 探测：连通性、环境、mooncake 进程、应有端口监听核对。
+```json
+{"ok":true,"detail":"","kernel":"Linux 6.8.0","arch":"x86_64",
+ "processes":[{"pid":1234,"cmd":".../mooncake_master ...","kind":"master"}],
+ "ports":[{"purpose":"master RPC","port":50051,"listening":true}]}
+```
+`kind`：`master | store | benchmark | other`；SSH 失败 → `{"ok":false,"detail":"...","processes":[],"ports":[]}`（200）；
+paramiko 不可用 → 503。
+
+### GET /api/nodes/{name}/ports?cluster=...
+节点监听端口（`sudo -n ss -tlnp` → `ss -tlnp` → `ss -tln` 降级链，netstat 兜底）：
+```json
+{"ok":true,"ports":[{"proto":"tcp","state":"LISTEN","local_addr":"0.0.0.0","port":22,
+                     "processes":[{"pid":1234,"process":"sshd","user":"root"}]}],
+ "warning":null}
+```
+无权限读进程信息时 `warning` 给出说明；SSH 失败 → `{"ok":false,"detail":"...","ports":[]}`（200）。
+
+---
+
 ## 结果浏览
 
 ### GET /api/outputs

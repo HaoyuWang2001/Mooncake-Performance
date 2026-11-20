@@ -210,7 +210,8 @@ def test_rebuild_reports_local(tmp_path, monkeypatch):
 
 
 def test_summary_three_sections_and_params(tmp_path):
-    """段1：总体统计=性能统计/信息展示/参数配置 三子区；无返回链接。"""
+    """段1：性能统计（含第三行 总数/成功/失败/失败率/QPS）+ 参数配置；
+    「信息展示」子区已删除；无返回链接。"""
     a = _stats(tmp_path, "a.writer", "writer")
     params = [["场景", "pipeline"], ["协议", "tcp"],
               ["writer.operation", "put_batch"], ["节点数", 2],
@@ -221,10 +222,12 @@ def test_summary_three_sections_and_params(tmp_path):
     out = str(tmp_path / "report")
     html, _dj = rp.render_scenario(data, out, ECHARTS)
     src = open(html, encoding="utf-8").read()
-    # 三子区标题与容器
-    for sec in ("性能统计", "信息展示", "参数配置"):
+    # 子区：性能统计 / 参数配置（信息展示并入性能统计第三行）
+    for sec in ("性能统计", "参数配置"):
         assert sec in src, "missing section {}".format(sec)
-    assert 'id="perfcards"' in src and 'id="infocards"' in src
+    assert "信息展示" not in src
+    assert 'id="infocards"' not in src
+    assert 'id="perfcards"' in src
     assert 'id="params"' in src and 'id="unitmeta"' in src
     # 顺序：参数配置标题 -> 单元信息行 -> 参数表格
     assert (src.index("参数配置") < src.index('id="unitmeta"')
@@ -1619,9 +1622,9 @@ def test_single_instance_tree_hides_duplicate_groups(tmp_path):
 
 
 def test_summary_layout_rows_and_dedup(tmp_path):
-    """段1 新版：性能统计第一行（吞吐/avg/p99/p9999）强调、第二行含 min/max；无 QPS；
-    信息展示两行（总数/成功/失败/失败率/QPS + 数据大小/客户端数/线程数/时长）；
-    参数配置不重复信息展示已给出的值。"""
+    """段1 新版：性能统计第一行（吞吐/avg/p99/p9999）强调、第二行含 min/max；
+    第三行 = 总数/成功/失败/失败率/QPS（原信息展示并入）；
+    数据大小/客户端数/线程数/时长 在参数配置标题下；参数配置不重复段1 已给出的值。"""
     a = _stats(tmp_path, "a.writer", "writer")
     params = [["场景", "basic"], ["数据大小", "8MB"], ["客户端数", 4],
               ["线程数", 8], ["客户端总数", 4],
@@ -1644,23 +1647,27 @@ def test_summary_layout_rows_and_dedup(tmp_path):
     assert all("strong" in k["cls"] for k in perf[:4])
     # 其后是换行；第二行不含 QPS，且含 min/max、不加粗
     assert "gridbreak" in perf[4]["cls"]
-    assert not any("QPS" in k["text"] for k in perf)
-    assert any(k["text"].startswith("p50") for k in perf[5:])
-    assert any(k["text"].startswith("min") for k in perf[5:])
-    assert any(k["text"].startswith("max") for k in perf[5:])
-    assert all("strong" not in k["cls"] for k in perf[5:])
-    # 信息展示第一行
-    info = res["info_kids"]
+    brk = [i for i, k in enumerate(perf) if "gridbreak" in k["cls"]]
+    assert len(brk) >= 2, brk
+    row2 = perf[brk[0] + 1:brk[1]]
+    assert row2, perf
+    assert not any("QPS" in k["text"] for k in row2), row2
+    assert any(k["text"].startswith("p50") for k in row2)
+    assert any(k["text"].startswith("min") for k in row2)
+    assert any(k["text"].startswith("max") for k in row2)
+    assert all("strong" not in k["cls"] for k in row2)
+    # 第三行（原信息展示）：总数/成功/失败/失败率/QPS，字号非强调
+    info = perf[brk[1] + 1:]
     first = [k["text"] for k in info[:5]]
     for lab in ("总数", "成功", "失败", "失败率", "QPS"):
         assert any(t.startswith(lab) for t in first), (lab, first)
-    # 信息展示只有第一行
-    assert len(info) == 5
+    assert len(info) == 5, info
+    assert all("strong" not in k["cls"] for k in info)
     # 数据大小/客户端数/线程数/时长 移到参数配置标题下、参数表格上方
     unit = [k["text"] for k in res["unit_kids"]]
     for lab in ("数据大小", "客户端数", "线程数", "时长"):
         assert any(t.startswith(lab) for t in unit), (lab, unit)
-    # 参数配置去重（信息展示已给出的字段不再出现）
+    # 参数配置去重（段1 已给出的字段不再出现）
     labels = res["param_rows"]
     assert any(l.startswith("writer.operation") for l in labels)
     for lab in ("数据大小", "客户端数", "线程数", "客户端总数", "采集时长",
@@ -1946,7 +1953,7 @@ def test_pipeline_and_basic_templates_split(tmp_path):
     assert "<!-- tpl:pipeline -->" in sp
     assert "<!-- tpl:basic -->" not in sp
     assert "Pipeline 场景报表" in sp.split("<title>")[1]
-    for sec in ("性能统计", "信息展示", "参数配置", "端到端时延曲线",
+    for sec in ("性能统计", "参数配置", "端到端时延曲线",
                 "时延分布", "慢点捕捉", "SDK 全链路",
                 "错误与异常", "实例与日志现场"):
         assert sec in sb, (sec, "basic")

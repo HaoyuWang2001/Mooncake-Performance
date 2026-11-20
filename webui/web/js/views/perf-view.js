@@ -332,14 +332,14 @@ const PerfView = {
             <el-tooltip :disabled="!instanceRunHint(it)" :content="instanceRunHint(it)" placement="top">
               <span>
                 <el-button size="small" link type="primary"
-                           :loading="!!it._running"
+                           :loading="busy[it.id] === 'run'"
                            :disabled="it.status === 'running' || schedulerBusy"
                            @click="runInstance(it)">运行</el-button>
               </span>
             </el-tooltip>
             <el-button size="small" link type="warning" v-if="it.status === 'running'"
-                       :loading="!!it._stopping"
-                       :disabled="!!it._stopping"
+                       :loading="busy[it.id] === 'stop'"
+                       :disabled="busy[it.id] === 'stop'"
                        @click="stopInstance(it)">停止</el-button>
             <el-button size="small" link type="danger"
                        :disabled="it.status === 'running'"
@@ -398,9 +398,10 @@ const PerfView = {
     const creating = Vue.ref(false);
     const cleaning = Vue.ref(false);
     const clusterImage = Vue.ref("");
-    const instances = Vue.ref([]);
+    const instances = Vue.computed(() => store.instances || []);
     const instLoading = Vue.ref(false);
-    const runs = Vue.ref([]);          // 历史抽屉（/api/runs）
+    const busy = Vue.reactive({});     // 卡片按钮忙态（id -> "run" | "stop"）
+    const runs = Vue.computed(() => store.runs || []);   // 历史抽屉（/api/runs）
     const drawerOpen = Vue.ref(false);
 
     // 配置树手风琴约束：同一时刻仅保留「根→当前展开目录」一条展开链。
@@ -564,8 +565,7 @@ const PerfView = {
     async function loadInstances() {
       instLoading.value = true;
       try {
-        const r = await api("GET", "/api/instances");
-        instances.value = r.instances || [];
+        await refreshInstances();
       } catch (e) {
         ElementPlus.ElMessage.error("加载实例失败: " + e.message);
       } finally {
@@ -606,7 +606,7 @@ const PerfView = {
     }
 
     async function runInstance(it) {
-      it._running = true;
+      busy[it.id] = "run";
       warnings.value = [];
       try {
         const r = await api("POST", "/api/instances/" + it.id + "/run");
@@ -615,18 +615,18 @@ const PerfView = {
         await loadInstances();
       } catch (e) {
         ElementPlus.ElMessage.error("启动失败: " + e.message);
-      } finally { it._running = false; }
+      } finally { delete busy[it.id]; }
     }
 
     async function stopInstance(it) {
-      it._stopping = true;
+      busy[it.id] = "stop";
       try {
         await api("POST", "/api/instances/" + it.id + "/stop");
         ElementPlus.ElMessage.success("已请求停止");
         await loadInstances();
       } catch (e) {
         ElementPlus.ElMessage.error("停止失败: " + e.message);
-      } finally { it._stopping = false; }
+      } finally { delete busy[it.id]; }
     }
 
     async function deleteInstance(it) {
@@ -659,8 +659,8 @@ const PerfView = {
       store.view = "results";
     }
 
-    async function refreshRuns() {
-      try { runs.value = (await api("GET", "/api/runs")).runs; }
+    async function reloadRuns() {
+      try { await refreshRuns(); }
       catch (e) { /* ignore */ }
     }
 
@@ -701,7 +701,7 @@ const PerfView = {
                    global: flags.global },
         });
         warnings.value = r.warnings || [];
-        refreshRuns();
+        reloadRuns();
         ElementPlus.ElMessage.success("清理完成（远端残留已删除）");
       } catch (e) {
         ElementPlus.ElMessage.error("清理失败: " + e.message);
@@ -710,27 +710,23 @@ const PerfView = {
       }
     }
 
-    let instTimer = null, histTimer = null;
     Vue.onMounted(() => {
       loadConfigs().then(loadClusterImage);
-      refreshRuns();
+      reloadRuns();
       loadInstances();
     });
     Vue.onActivated(() => {
       loadConfigs();
-      refreshRuns();
+      reloadRuns();
       loadInstances();
-      instTimer = setInterval(loadInstances, 3000);
-      histTimer = setInterval(refreshRuns, 8000);
     });
-    Vue.onDeactivated(() => { clearInterval(instTimer); clearInterval(histTimer); });
 
     return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection,
              modeCandidates, onModeChange, flags, warnings, creating, cleaning,
              clusterImage, clearSel, runHint, cleanupHint, schedulerBusy,
              statusType, statusText, fmtTimeRel, fmtTimeAbs,
              instanceRunHint, scrollToForm,
-             instances, instLoading, loadInstances, createInstance, runInstance,
+             instances, instLoading, busy, loadInstances, createInstance, runInstance,
              stopInstance, deleteInstance, openInstance, openResults,
              runs, drawerOpen, onHistoryClick, cleanup };
   },

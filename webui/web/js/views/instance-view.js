@@ -315,6 +315,13 @@ const InstanceView = {
         </el-empty>
       </el-card>
     </template>
+
+    <el-card v-else-if="missing" shadow="never">
+      <el-empty description="实例不存在或已被删除（可能是 API 操作）" :image-size="72">
+        <el-button size="small" type="primary" @click="closeMissingTab">关闭页签</el-button>
+        <el-button size="small" @click="goPerf">回性能测试页查看实例列表</el-button>
+      </el-empty>
+    </el-card>
   </div>`,
   setup() {
     const loading = Vue.ref(false);
@@ -323,7 +330,7 @@ const InstanceView = {
     const busyStop = Vue.ref(false);
     const merged = Vue.ref(false);
     const ticket = Vue.ref(0);
-    const instIndex = Vue.ref({});
+    const missing = Vue.ref(false);   // 实例已被删除（API 操作后仍开着页签）
     let timer = null;
 
     const tabs = Vue.computed(() => store.instancesOpen || []);
@@ -335,14 +342,17 @@ const InstanceView = {
                                JSON.stringify(store.instancesOpen || []));
       } catch (e) { /* ignore */ }
     }
+    function _instOf(iid) {
+      return (store.instances || []).find(x => x.id === iid) || null;
+    }
     function nameOf(iid) {
       if (detail.value && detail.value.instance.id === iid)
         return detail.value.instance.name;
-      const it = instIndex.value[iid];
+      const it = _instOf(iid);
       return (it && it.name) || iid;
     }
     function tabDot(iid) {
-      const it = instIndex.value[iid];
+      const it = _instOf(iid);
       const st = it && it.status;
       if (st === "running") return "on";
       if (st === "stopping") return "exec";
@@ -350,15 +360,10 @@ const InstanceView = {
       if (st === "failed" || st === "failed_spawn") return "err";
       return "";
     }
-    async function loadNames() {
-      try {
-        const r = await api("GET", "/api/instances");
-        const idx = {};
-        for (const it of r.instances || []) idx[it.id] = it;
-        instIndex.value = idx;
-      } catch (e) { /* ignore */ }
-    }
     function goPerf() { store.view = "perf"; }
+    function closeMissingTab() {
+      if (active.value) closeTab(active.value);
+    }
 
     const runHint = Vue.computed(() => {
       if (!detail.value) return "";
@@ -387,15 +392,23 @@ const InstanceView = {
         if (active.value !== iid) return;
         const prevRun = latestRun.value && latestRun.value.id;
         detail.value = r;
+        missing.value = false;
         const nowRun = r.runs && r.runs.length ? r.runs[0] : null;
         if (nowRun && nowRun.id !== prevRun) ticket.value++;
       } catch (e) {
-        ElementPlus.ElMessage.error(e.message);
+        if (/no such instance/i.test(e.message)) {
+          // 实例被 agent 经 API 删除：停止展示旧详情，给出明确状态
+          detail.value = null;
+          missing.value = true;
+        } else {
+          ElementPlus.ElMessage.error(e.message);
+        }
       } finally { loading.value = false; }
     }
     function activate(iid) {
       store.instancesTarget = iid;
       detail.value = null;
+      missing.value = false;
       load();
     }
     function closeTab(iid) {
@@ -506,15 +519,14 @@ const InstanceView = {
 
     Vue.watch(active, () => { merged.value = false; });
     Vue.onActivated(() => {
-      loadNames();
       load();
       timer = setInterval(load, 2000);
     });
     Vue.onDeactivated(() => { clearInterval(timer); });
 
-    return { tabs, active, detail, loading, busyRun, busyStop, merged, ticket,
+    return { tabs, active, detail, loading, busyRun, busyStop, merged, ticket, missing,
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
-             pairGlobal, nameOf, tabDot, goPerf, activate, closeTab,
+             pairGlobal, nameOf, tabDot, goPerf, closeMissingTab, activate, closeTab,
              statusType, statusText, run, stop, remove, rename,
              gotoResults, openReport };
   },

@@ -133,6 +133,44 @@ def test_shared_status_module():
     assert "confirmButtonClass: \"el-button--danger\"" in src
 
 
+def test_nodes_view_registered_and_has_sd_form():
+    """集群节点页：菜单项 + 视图注册 + SD 集群节点页的关键交互。"""
+    app = open(os.path.join(JS_DIR, "app.js"), encoding="utf-8").read()
+    assert 'index="nodes"' in app and "<span>集群节点</span>" in app
+    assert 'nodes: "nodes-view"' in app
+    assert 'app.component("nodes-view", NodesView)' in app
+    assert '"nodes"' in app            # VIEW_KEYS 持久化
+    html = open(os.path.join(os.path.dirname(JS_DIR), "index.html"),
+                encoding="utf-8").read()
+    assert "views/nodes-view.js" in html
+
+    src = open(os.path.join(JS_DIR, "views", "nodes-view.js"),
+               encoding="utf-8").read()
+    # 与 Services-Deployment 集群节点页同形的交互
+    assert "全部测试连接" in src and "端口查询" in src
+    assert "监听端口" in src and "多节点占用对照" in src
+    assert "/api/nodes" in src and "/test" in src and "/ports" in src
+    # 服务探测展示（master / SP 进程与应有端口）
+    assert "mooncake 服务" in src and "应有端口" in src
+    assert "el-empty" in src
+
+
+def test_global_polling_and_sidebar_badges():
+    """统一 API 操作显示：全局轮询实例/运行 + 侧边栏徽标。"""
+    app = open(os.path.join(JS_DIR, "app.js"), encoding="utf-8").read()
+    assert "store.instances" in app and "store.runs" in app
+    assert "refreshInstances" in app and "refreshRuns" in app
+    assert "setInterval(tick, 3000)" in app
+    assert 'class="menu-badge"' in app
+    assert "instTotal" in app and "instRunning" in app and "schedState" in app
+    # 性能测试页不再自行轮询实例（共享 store 接替）
+    perf = open(os.path.join(JS_DIR, "views", "perf-view.js"),
+                encoding="utf-8").read()
+    assert "store.instances" in perf and "store.runs" in perf
+    assert "setInterval(loadInstances" not in perf
+    assert "busy[it.id]" in perf
+
+
 if __name__ == "__main__":
     test_component_identifiers_declared()
     test_frontend_boot_check()

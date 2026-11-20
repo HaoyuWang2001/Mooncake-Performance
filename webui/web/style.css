@@ -64,6 +64,8 @@ html, body, #app {
 .mc-label { color: var(--el-text-color-secondary); font-size: 13px; }
 .mc-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mc-space-2); }
 .mc-ml-3 { margin-left: var(--mc-space-3); }
+/* 并排小标签间距（集群节点页的角色/服务/端口 tag） */
+.tag-gap { margin-right: var(--mc-space-1); margin-bottom: 2px; }
 /* token 间距工具类（替代视图内 inline margin/padding 布局） */
 .mt-2 { margin-top: var(--mc-space-2); }
 .mb-2 { margin-bottom: var(--mc-space-2); }
@@ -144,6 +146,17 @@ html, body, #app {
 .badge-dot.err { background: var(--el-color-danger); }
 
 .menu { border-right: none; flex: 1; overflow-y: auto; }
+/* 侧边栏徽标：全局可见的 API 操作观察点（实例数/运行中、调度状态） */
+.menu-badge {
+  margin-left: auto; padding: 0 var(--mc-space-2);
+  font-size: 12px; line-height: 18px; border-radius: 9px;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; flex-shrink: 0;
+}
+.menu-badge.on { color: var(--el-color-primary); background: var(--el-color-primary-light-9); }
+.menu-badge.warn { color: var(--el-color-warning); background: var(--el-color-warning-light-9); }
 .aside-footer {
   border-top: 1px solid var(--el-border-color-light);
   padding: var(--mc-space-3) var(--mc-space-4);

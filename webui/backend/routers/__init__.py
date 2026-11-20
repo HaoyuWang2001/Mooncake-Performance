@@ -4,7 +4,8 @@
 每个子模块暴露 ROUTES = [(method, pattern, fn), ...]；main.py 的 dispatch
 按序匹配。fn 签名：fn(handler, query, **match.groupdict())。
 """
-from . import configs, instances, outputs, runs, schedule, system
+from . import configs, instances, nodes, outputs, runs, schedule, system
 
 ROUTES = (system.ROUTES + configs.ROUTES + runs.ROUTES
-          + instances.ROUTES + outputs.ROUTES + schedule.ROUTES)
+          + instances.ROUTES + nodes.ROUTES + outputs.ROUTES
+          + schedule.ROUTES)

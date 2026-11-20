@@ -1,7 +1,10 @@
 "use strict";
 /* Mooncake-Performance WebUI — 根应用（Vue3 global build + Element Plus，无构建步骤）
-   各视图组件在 views/*.js 中定义为全局常量（ConfigView / RunView / ResultsView /
-   ScheduleView / ApiView），由本文件注册并按侧边栏菜单切换（KeepAlive 保状态）。 */
+   各视图组件在 views/*.js 中定义为全局常量（PerfView / InstanceView /
+   NodesView / ResultsView / ConfigView / ScheduleView），由本文件注册并按
+   侧边栏菜单切换（KeepAlive 保状态）。
+   全局轮询 /api/status、/api/instances（3s）与 /api/runs（8s）：任意页签下
+   agent 经 API 创建实例 / 改变实例状态都能立刻在共享 store 与侧边栏徽标看到。 */
 
 const { createApp, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated,
         watch, nextTick } = Vue;
@@ -17,9 +20,21 @@ async function api(method, url, body) {
   return data;
 }
 
+/* ---------------- 全局共享数据刷新（API 操作的统一观察窗口） ---------------- */
+/* 任何视图（无论当前激活与否）都读 store.instances / store.runs；
+   视图在变更操作后调用这两个函数做即时刷新。 */
+async function refreshInstances() {
+  store.instances = (await api("GET", "/api/instances")).instances || [];
+  return store.instances;
+}
+async function refreshRuns() {
+  store.runs = (await api("GET", "/api/runs")).runs || [];
+  return store.runs;
+}
+
 /* ---------------- 全局共享状态 ---------------- */
 /* ---------------- 视图页签持久化（浏览器刷新后停留在当前页签） ---------------- */
-const VIEW_KEYS = ["perf", "instances", "results", "config", "schedule"];
+const VIEW_KEYS = ["perf", "instances", "nodes", "results", "config", "schedule"];
 function loadInitialView() {
   try {
     const v = localStorage.getItem("mcweb-view");
@@ -37,8 +52,10 @@ function _loadInstanceTabs() {
 }
 
 const store = reactive({
-  view: loadInitialView(),       // 当前视图：perf | instances | results | config | schedule
+  view: loadInitialView(),       // 当前视图：perf | instances | nodes | results | config | schedule
   status: { active_run: null, active_runs: [], scheduler: null },  // /api/status 轮询结果
+  instances: [],                // /api/instances 全局轮询结果（统一 API 操作显示）
+  runs: [],                     // /api/runs 全局轮询结果（历史运行）
   resultsTarget: null,          // 跳转 results 时聚焦的 outputs/<ts>
   instancesOpen: _loadInstanceTabs(),   // 实例详情页已打开的实例（浏览器式页签）
   instancesTarget: null,        // 当前激活的实例详情
@@ -155,9 +172,16 @@ const App = {
       <el-menu :default-active="store.view" class="menu" @select="go">
         <el-menu-item index="perf">
           <el-icon><component is="Monitor"/></el-icon><span>性能测试</span>
+          <span v-if="instTotal" class="menu-badge" :class="{ on: instRunning > 0 }"
+                :title="'实例 ' + instTotal + ' 个，其中运行中 ' + instRunning + ' 个'">
+            {{ instTotal }}<template v-if="instRunning"> · 运行 {{ instRunning }}</template>
+          </span>
         </el-menu-item>
         <el-menu-item index="instances">
           <el-icon><component is="List"/></el-icon><span>实例详情</span>
+        </el-menu-item>
+        <el-menu-item index="nodes">
+          <el-icon><component is="Odometer"/></el-icon><span>集群节点</span>
         </el-menu-item>
         <el-menu-item index="results">
           <el-icon><component is="DataAnalysis"/></el-icon><span>统计结果</span>
@@ -167,6 +191,8 @@ const App = {
         </el-menu-item>
         <el-menu-item index="schedule">
           <el-icon><component is="Clock"/></el-icon><span>定时任务</span>
+          <span v-if="schedState" class="menu-badge" :class="schedBadgeClass"
+                :title="'调度状态：' + schedulerText(schedState)">{{ schedulerText(schedState) }}</span>
         </el-menu-item>
       </el-menu>
       <div class="aside-footer">
@@ -186,7 +212,7 @@ const App = {
   </el-container>`,
   setup() {
     const VIEWS = { perf: "perf-view", instances: "instance-view",
-                    results: "results-view",
+                    nodes: "nodes-view", results: "results-view",
                     config: "config-view", schedule: "schedule-view" };
     const viewComp = computed(() => VIEWS[store.view] || "config-view");
     function go(v) {
@@ -197,15 +223,38 @@ const App = {
       });
     }
 
-    let timer = null;
     async function pollStatus() {
       try { Object.assign(store.status, await api("GET", "/api/status")); }
       catch (e) { /* server down */ }
     }
-    onMounted(() => { pollStatus(); timer = setInterval(pollStatus, 3000); });
+
+    /* 实例/运行状态全局轮询（与 status 同拍，runs 每 3 拍 ~9s 一次）：
+       任意页签都能实时反映 agent 经 API 创建实例 / 启动 / 停止 / 结束。 */
+    let timer = null;
+    let runsTick = 0;
+    function tick() {
+      pollStatus();
+      refreshInstances().catch(() => { /* server down */ });
+      if (runsTick++ % 3 === 0) refreshRuns().catch(() => { /* ignore */ });
+    }
+
+    /* 侧边栏徽标（全局可见的 API 操作观察点） */
+    const instTotal = computed(() => (store.instances || []).length);
+    const instRunning = computed(() =>
+      (store.instances || []).filter(it => it.status === "running").length);
+    const ACTIVE_SCHED = ["waiting", "waiting_slot", "executing", "stopping"];
+    const schedState = computed(() => {
+      const sch = store.status.scheduler;
+      return (sch && ACTIVE_SCHED.includes(sch.state)) ? sch.state : "";
+    });
+    const schedBadgeClass = computed(() =>
+      (schedState.value === "executing" || schedState.value === "stopping") ? "warn" : "on");
+
+    onMounted(() => { tick(); timer = setInterval(tick, 3000); });
     onUnmounted(() => clearInterval(timer));
 
-    return { store, theme, toggleDark, go, viewComp };
+    return { store, theme, toggleDark, go, viewComp,
+             instTotal, instRunning, schedState, schedBadgeClass, schedulerText };
   },
 };
 
@@ -219,6 +268,7 @@ app.component("perf-view", PerfView);
 app.component("sel-node", SelNode);
 app.component("instance-view", InstanceView);
 app.component("instance-log-pane", InstanceLogPane);
+app.component("nodes-view", NodesView);
 app.component("config-view", ConfigView);
 app.component("cfg-node", CfgNode);
 app.component("results-view", ResultsView);

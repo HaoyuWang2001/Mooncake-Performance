@@ -44,14 +44,14 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - 强调色（品牌橙）**只允许出现在语义注解**：离群标注/阈值线、异常窗口竖线、QPS 失败柱、慢点最慢一根、泄露警示。禁止用于常规曲线或纯装饰。
 - 新增颜色必须复用既有 token、既有灰阶阶梯或 `NODE_HUES_L/D`，不引入新的 hex 色。
 
-### 2. 段1（性能统计 / 信息展示 / 参数配置）
+### 2. 段1（性能统计 / 参数配置）
 
 - 性能统计两行：**仅第一行强调（加粗）**：吞吐 / avg / p99 / p9999；第二行 = p50 / p95 / p999 / min / max，常规字重。
-- **队列相关项（队列等待均/峰、最大队列深度）不放在性能统计里**：独占一行，位于信息展示「总数/成功/失败/失败率/QPS」行下方。
-- 字号层级：强调值 24px/800；非强调值（性能第二行、信息展示、队列行）18px/500。视觉重心只在第一行。
+- **队列相关项（队列等待均/峰、最大队列深度）不放在性能统计两行里**：独占一行，位于性能统计**第三行**下方。
+- 字号层级：强调值 24px/800；非强调值（性能第二行、第三行、队列行）18px/500。视觉重心只在第一行。
 - 指标名统一小写 avg / p99 / p9999 / min / max（曲线与段1 一致），不套大写。
-- 信息展示两行：第一行 = 总数 / 成功 / 失败 / 失败率 / QPS；第二行（参数配置标题下、参数表格上方）= 数据大小 / 客户端数 / 线程数 / 时长。
-- 参数配置**不得重复**信息展示已给出的值：渲染层过滤 数据大小 / 客户端数 / 线程数 / 客户端总数 / 采集时长 / 开始时间（pipeline 另过滤 client.count_per_node / store_count_per_node / notify_count）。
+- **基础场景取消「信息展示」子区**：总数 / 成功 / 失败 / 失败率 / QPS 直接作为**性能统计第三行**（basic 与 pipeline 的段1 都不再出现「信息展示」标题）。数据大小 / 客户端数 / 线程数 / 时长 仍在参数配置标题下、参数表格上方。
+- 参数配置**不得重复**段1 已给出的值：渲染层过滤 数据大小 / 客户端数 / 线程数 / 客户端总数 / 采集时长 / 开始时间（pipeline 另过滤 client.count_per_node / store_count_per_node / notify_count）。
 - pipeline 单元行（顺序固定）：`数据大小 | 部署模式 xwyr | 客户端数 x×N nodes | store 数量 s×N nodes | 时长`（部署模式固定在左起第二；英文 nodes 说明 x×N；**不写「= 总数」**；部署模式用 `2w4r` 形式）。
 - QPS 不属于性能统计卡；未提供「QPS 达成率」刻度卡。
 
@@ -215,16 +215,16 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C1.V4 pipeline 按角色分块（写路径/读路径各一套），合并卡隐藏 —— R-PERF-5 〔test_pipeline_summary_splits_roles〕
 - C1.V5 basic 保持合并卡，不受分角色逻辑影响 —— R-PERF-5 〔test_basic_summary_unchanged_by_role_split〕
 - C1.V6 吞吐用 MB/s（bytes/wall）；QPS 不在性能卡 —— R-PERF-2/4 〔test_summary_throughput_uses_bytes〕
-- C1.I1 多 combo：性能统计为合并口径并在信息展示注明；单 combo 仍列 —— R-PERF-4 〔test_summary_reports_multiple_combos, test_summary_single_combo_still_listed〕
+- C1.I1 多 combo：性能统计为合并口径并在第三行下方注明；单 combo 仍列 —— R-PERF-4 〔test_summary_reports_multiple_combos, test_summary_single_combo_still_listed〕
 - C1.D1 分位数口径与 CSV 一致（直方图归并） —— R-PERF-1 〔test_summary_percentiles_consistent_with_csv〕
 - C1.D2 wall_s=0 不产生 Infinity/NaN —— R-PERF-1 〔test_zero_wall_has_no_infinity〕
 - C1.B1 combo 回调引用未定义函数（renderMain/renderQps/renderTable）曾致图表空白 —— DR-29 〔test_combo_switch_click_works〕
 - C1.B2 表头截断「队列等待均」、曲线名「平均/最大」回潮 —— DR-24 〔test_c01_dr24_alignment_lock〕
 
-### C2 段1 · 信息展示与队列行
+### C2 段1 · 第三行与队列行
 
-- C2.V1 第一行：总数 / 成功 / 失败 / 失败率 / QPS —— R-INFO-1 〔test_summary_three_sections_and_params〕
-- C2.V2 队列等待均/峰、最大队列深度独占一行，位于信息展示下方 —— R-INFO-2 〔test_summary_three_sections_and_params〕
+- C2.V1 **性能统计第三行**（原「信息展示」子区已删除）：总数 / 成功 / 失败 / 失败率 / QPS；basic 与 pipeline 均不再有「信息展示」标题与 `#infocards` 容器 —— R-INFO-1 〔test_summary_three_sections_and_params, test_summary_layout_rows_and_dedup〕
+- C2.V2 队列等待均/峰、最大队列深度独占一行，位于第三行下方 —— R-INFO-2 〔test_summary_three_sections_and_params〕
 - C2.D1 队列等待均值只按成功行数平均（ok 行） —— R-INFO-2 〔test_qw_average_divides_by_ok_rows〕
 - C2.I1 降级（data.js 缺失）不改变本卡数值 —— R-SHELL-2 〔◐〕
 

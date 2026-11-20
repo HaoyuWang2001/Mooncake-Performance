@@ -1583,11 +1583,9 @@ text-transform:uppercase;margin-bottom:2px}
 font-variant-numeric:tabular-nums;line-height:1.25}
 .kv .u{font-size:12px;font-weight:500;letter-spacing:.02em;color:var(--mut)}
 .kv.fail .v{color:var(--hero)}
-#perfcards .kv .v,#tcards .kv .v,#infocards .kv .v,
-#rolecards .kv .v{font-weight:500;font-size:18px}
+#perfcards .kv .v,#tcards .kv .v,#rolecards .kv .v{font-weight:500;font-size:18px}
 /* 指标名按小写显示（avg/p99/min/max…，与曲线一致），不套大写 */
-#perfcards .kv .k,#tcards .kv .k,#infocards .kv .k,
-#rolecards .kv .k{text-transform:none}
+#perfcards .kv .k,#tcards .kv .k,#rolecards .kv .k{text-transform:none}
 #perfcards .kv.strong .k,#tcards .kv.strong .k,
 #rolecards .kv.strong .k{color:var(--ink)}
 #perfcards .kv.strong .v,#tcards .kv.strong .v,
@@ -3493,28 +3491,23 @@ function renderSummary(){
   const z=Z(); if(!z) return;
   const s=z.summary;
   const pg=document.getElementById('perfcards');
-  const ig=document.getElementById('infocards');
   const ug=document.getElementById('unitmeta');
   const rc=document.getElementById('rolecards');
   const pbox=document.getElementById('params');
   const secP=document.getElementById('secPerf');
-  const secI=document.getElementById('secInfo');
-  if(!pg||!ig||!pbox) return;
-  pg.innerHTML=''; ig.innerHTML=''; pbox.innerHTML='';
+  if(!pg||!pbox) return;
+  pg.innerHTML=''; pbox.innerHTML='';
   if(ug) ug.innerHTML='';
   if(rc){rc.innerHTML=''; rc.style.display='none';}
   renderParams(pbox);
   if(!s){
     if(secP)secP.style.display='';
-    if(secI)secI.style.display='';
-    pg.style.display=''; ig.style.display='';
+    pg.style.display='';
     pg.appendChild(el('div','note',
       '该 data_size 只有 C++ trace 统计（无 logstats 数据），下方仍可查看全链路区。'));
-    ig.style.display='none';
     if(ug) ug.style.display='none';
     return;
   }
-  ig.style.display='';
   if(ug) ug.style.display='';
   const pmeta={};
   ((D.meta&&D.meta.params)||[]).forEach(function(p){
@@ -3534,10 +3527,9 @@ function renderSummary(){
   const rs=(z.role_summaries)||{};
   const roles=Object.keys(rs);
   if(isPipe&&roles.length){
-    /* pipeline：writer/reader 各自完整一套（性能统计两行 + 信息展示一行） */
+    /* pipeline：writer/reader 各自完整一套（性能统计两行 + 第三行统计项） */
     if(secP)secP.style.display='none';
-    if(secI)secI.style.display='none';
-    pg.style.display='none'; ig.style.display='none';
+    pg.style.display='none';
     if(rc){
       rc.style.display='';
       [['writer','写路径（writer）'],['reader','读路径（reader）']]
@@ -3552,10 +3544,11 @@ function renderSummary(){
     }
   }else{
     if(secP)secP.style.display='';
-    if(secI)secI.style.display='';
-    pg.style.display=''; ig.style.display='';
+    pg.style.display='';
     perfCardsInto(pg,s);
-    infoCardsInto(ig,s);
+    /* 第三行：总数/成功/失败/失败率/QPS（+ 队列行/校验） */
+    pg.appendChild(gridBreak());
+    infoCardsInto(pg,s);
     /* 多参数组（sweep）时顶部为合并口径，明确标注 */
     const cs=(s.combos||[]);
     if(cs.length>1){
@@ -3563,7 +3556,7 @@ function renderSummary(){
       note.textContent='本次为多参数组 sweep：性能统计为 '+cs.length+
         ' 组合并口径（'+cs.map(function(x){return 'c'+x.c+'×t'+x.t;}).join('、')+
         '），单组数值见下方明细表与各对象曲线。';
-      ig.appendChild(note);
+      pg.appendChild(note);
     }
   }
   /* 单元信息行：紧随参数配置标题、位于参数表格上方 */
@@ -3590,7 +3583,7 @@ function renderParams(box){
     box.appendChild(el('div','note','无参数信息（旧报表或未注入）'));
     return;
   }
-  /* 信息展示已给出的值不在参数配置里重复 */
+  /* 段1 已给出的值不在参数配置里重复 */
   const HIDE={'数据大小':1,'客户端数':1,'线程数':1,'客户端总数':1,
               '采集时长':1,'开始时间':1,
               /* pipeline：这些值已在单元信息行/分角色区块给出 */
@@ -6449,8 +6442,6 @@ _SEC_SUMMARY = """
 </div>
 <h3 class="sec" id="secPerf">性能统计</h3>
 <div id="perfcards" class="grid"></div>
-<h3 class="sec" id="secInfo">信息展示</h3>
-<div id="infocards" class="grid"></div>
 <div id="rolecards" style="display:none"></div>
 <h3 class="sec">参数配置</h3>
 <div id="unitmeta" class="grid"></div>

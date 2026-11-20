@@ -15,6 +15,7 @@ const files = [
   "views/config-view.js",
   "views/perf-view.js",
   "views/instance-view.js",
+  "views/nodes-view.js",
   "views/results-view.js",
   "views/schedule-view.js",
   "views/spdiag-tree.js",
