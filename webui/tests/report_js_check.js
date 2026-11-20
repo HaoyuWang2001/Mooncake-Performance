@@ -913,6 +913,39 @@ if (!errs.length) {
         .map(function (a) { return a.type; });
     } catch (e) { errs.push("globalout-tip: " + String(e && e.stack || e)); }
   }
+  if (process.argv.includes("--endlabels-focus")) {
+    try {
+      const acts = [];
+      const fake = {
+        convertToPixel: function () { return [600, 120]; },
+        getWidth: function () { return 960; },
+        getHeight: function () { return 420; },
+        getOption: function () { return mainOpt() || {series: []}; },
+        setOption: function (o) { acts.push(o); },
+        dispatchAction: function () {},
+        getDom: function () { return makeEl("chartdom"); },
+        on: function () {},
+        getZr: function () { return {on: function () {}}; },
+      };
+      sandbox.layoutEndLabels(fake);
+      const labels = ((getEl("endlabels").children || []).filter(function (c) {
+        return String(c.className || "").indexOf("endlabel") >= 0;}));
+      out.el_labels = labels.map(function (c) { return textOf(c); });
+      out.el_box_set = !!fake.__mcLabelBox;
+      const lab = labels[0];
+      if (lab && lab.onmouseenter) {
+        lab.onmouseenter();
+        const l1 = acts.length ? acts[acts.length - 1] : {};
+        out.el_focus = ((l1.series) || []).map(function (x) {
+          return (x.lineStyle || {}).opacity;});
+        if (lab.onmouseleave) lab.onmouseleave();
+        const l2 = acts.length ? acts[acts.length - 1] : {};
+        out.el_restored = ((l2.series) || []).map(function (x) {
+          return (x.lineStyle || {}).opacity;});
+        out.el_title = String(lab.title || "");
+      }
+    } catch (e) { errs.push("endlabels-focus: " + String(e && e.stack || e)); }
+  }
   if (process.argv.includes("--stage-tree")) {
     try {
       // 展开第一个 L1（点 caret）后采集阶段树行

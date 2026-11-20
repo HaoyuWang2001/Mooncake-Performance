@@ -256,13 +256,13 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.V2 色语义：总览/总计灰阶、节点色系（按名排序固定）、实例=节点色阶 —— R-LAT-12 〔test_a03_latency_color_semantics_gray_only, test_multi_object_node_hues_and_metric_buttons_removed〕
 - C5.V3 线宽恒定：avg 1.0 / 其余 0.8；**无 hover 加粗、无「首对象加粗」**（鼠标扫过曲线不产生聚焦/变粗；强调只由右侧标签触发） —— R-LAT-15 〔test_line_widths_avg_thicker_only〕
 - C5.V4 单对象无图例；多对象图例 `selectedMode:false`（只说明颜色） —— R-LAT-1/19 〔test_multi_object_node_hues_and_metric_buttons_removed, test_multilabel_tree_order_and_truncation〕
-- C5.V5 异常窗口竖线：强调色 **25% 透明度**、宽度 1、≤50 条（低权重，不抢离群点视觉）；图注明确「红色竖线 = 异常窗口（错误突发/时延突增），非离群点」 —— R-LAT-10 〔test_a07_anomalies_capped_at_50, test_anomaly_lines_low_weight_and_outlier_flagpole〕
+- C5.V5 异常窗口竖线：强调色 **15% 透明度**、宽度 1、≤50 条（低权重，不抢离群点视觉）；图注明确「红色竖线 = 异常窗口（错误突发/时延突增），非离群点」 —— R-LAT-10 〔test_a07_anomalies_capped_at_50, test_anomaly_lines_low_weight_and_outlier_flagpole〕
 - C5.V6 无数据窗口浅带，**仅第一处**标注时长；判定用真实缺失桶 —— R-LAT-9 〔test_a01_gap_markarea_between_runs, test_a02_no_gap_no_markarea, test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C5.I1 tooltip 原生悬浮：鼠标在绘图区任意位置（含空白）即按竖线时间点显示竖线+交点+内容框；移出/离开即收起 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip〕
 - C5.I2 内容框 `enterable:true`（移入框保持并滚动）；**不设 showDelay**；移出画布（globalout）主动 hideTip 兜底；不做点击钉住 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip, test_anomaly_lines_low_weight_and_outlier_flagpole〕
 - C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断，**悬浮时用详情框展示全名**（`data-full` + `.mc-label-tip`，不用原生 title）；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 - C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；**离开标签/移入画布/移出图表（globalout）都必须恢复**；不做点击锁定。清除机制三重兜底：标签 mouseleave + 画布 mousemove + **document mousemove（指针不在标签上即清）+ globalout**——修复长截断标签向右移出后事件不再命中而聚焦残留 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
-- C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠 —— R-LAT-7/14 〔test_end_label_layout_stays_inside_plot〕
+- C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠；**hover 用 mcFocus 压暗其他指标**（与多对象/分级同一机制，不依赖 emphasis） —— R-LAT-7/14/16 〔test_end_label_layout_stays_inside_plot, test_endlabel_focus_single_object〕
 - C5.I6 离群点 = 散点 + **从底部到该点的旗杆虚线**（上端止于离群点，便于定位其位置）；「剔除离群点」开关在无可命中离群时置灰（title 说明判定条件，不隐藏） —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge, test_anomaly_lines_low_weight_and_outlier_flagpole〕
 - C5.D1 离群 = 单请求 > 客户端 p99×10（样本≥1000）；从桶标量剔除、计数/直方图全量 —— R-LAT-4 〔test_outlier_scatter_toggle_and_merge〕
 - C5.D2 总计 = 同桶按请求数加权平均，max 取最大 —— R-SHELL-15 〔◐ 页脚文字被 test_section_order_and_footer_note 覆盖〕

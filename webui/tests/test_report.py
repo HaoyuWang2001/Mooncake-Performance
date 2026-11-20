@@ -3054,6 +3054,26 @@ def test_volume_card_estimates(tmp_path):
     assert "行/s" in vt, vt
 
 
+def test_endlabel_focus_single_object(tmp_path):
+    """单对象多指标模式：悬浮指标标签聚焦该指标（压暗其他指标，与多对象同机制，
+    不依赖 emphasis）；移开恢复。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    res = _js_check(tmp_path, data, "--endlabels-focus")
+    if res is None:
+        return
+    assert res["errors"] == []
+    labels = res.get("el_labels") or []
+    assert labels, labels
+    assert res.get("el_box_set") is True
+    dims = res.get("el_focus") or []
+    assert dims and any(x == 0.15 for x in dims) and any(x == 1 for x in dims), \
+        dims
+    assert res.get("el_restored") and all(x == 1 for x in res["el_restored"]), \
+        res.get("el_restored")
+    assert "悬浮聚焦" in (res.get("el_title") or ""), res.get("el_title")
+
+
 def test_anomaly_lines_low_weight_and_outlier_flagpole(tmp_path):
     """异常窗口竖线降到 25% 透明度（不抢离群点视觉）+ 图注说明；
     离群点散点带 0→点 的旗杆虚线（上端止于离群点）；globalout 必隐藏 tooltip。"""
@@ -3070,7 +3090,7 @@ def test_anomaly_lines_low_weight_and_outlier_flagpole(tmp_path):
         return
     assert res["errors"] == []
     st = res.get("anom_line_style") or {}
-    assert st.get("opacity") == 0.25, st
+    assert st.get("opacity") == 0.15, st
     os_ = res.get("outlier_series") or []
     assert os_, res.get("outlier_series")
     assert os_[0]["marks"] == 1, os_[0]

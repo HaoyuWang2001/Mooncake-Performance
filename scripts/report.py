@@ -2272,7 +2272,7 @@ function markLines(){
   if(z&&z.anomalies&&z.anomalies.length)
     z.anomalies.slice(0,50).forEach(function(a){
       data.push({xAxis:a.t*1000,
-        lineStyle:{color:C.hero,width:1,opacity:0.25},
+        lineStyle:{color:C.hero,width:1,opacity:0.15},
         label:{show:false}});});
   return data.length?{symbol:'none',silent:true,data:data}:null;
 }
@@ -2594,6 +2594,7 @@ function layoutEndLabels(ch){
   const ov=document.getElementById('endlabels');
   if(!ov) return;
   ov.innerHTML='';
+  ch.__mcLabelBox=ov;
   /* 多对象：固定槽位对象名标签（不绑任何曲线、不画引线） */
   if(selObjs.length>1){ layoutFixedLabels(ch,ov); return; }
   if(!ch||!ch.convertToPixel) return;          /* 桩环境跳过 */
@@ -2624,20 +2625,8 @@ function layoutEndLabels(ch){
   if(!items.length) return;
   endLabelLayout(items,top,bot);
   items.forEach(function(it){
-    /* A5：单对象=该指标序列；多对象=该对象全部指标序列（曲线簇） */
-    function focusCluster(on){
-      let names=[];
-      try{
-        const opt=ch.getOption();
-        names=((opt&&opt.series)||[]).map(function(sr){return sr.name;})
-          .filter(function(n){ return n===it.name||
-            String(n).indexOf(it.name+' ')===0; });
-      }catch(e){ names=[it.name]; }
-      names.forEach(function(n){
-        try{ ch.dispatchAction({type:on?'highlight':'downplay',
-          seriesName:n}); }catch(e){}
-      });
-    }
+    /* 单对象标签聚焦：与多对象/分级曲线同一机制（setOption 压暗其他指标，
+       不依赖 emphasis —— DR-42 已删除线序列 emphasis） */
     const dx=anchorX-it.px, dy=it.ly-it.py;
     const len=Math.max(1,Math.sqrt(dx*dx+dy*dy));
     const line=el('div','endleader');
@@ -2650,9 +2639,9 @@ function layoutEndLabels(ch){
     const lab=el('div','endlabel',it.name);
     lab.style.left=anchorX+'px'; lab.style.top=it.ly+'px';
     lab.style.color=it.color;
-    lab.title='悬浮聚焦该曲线（多对象时高亮整个曲线簇）';
-    lab.onmouseenter=function(){focusCluster(true);};
-    lab.onmouseleave=function(){focusCluster(false);};
+    lab.title=it.name+'：悬浮聚焦该指标曲线';
+    lab.onmouseenter=function(){mcFocus(ch,[it.name]);};
+    lab.onmouseleave=function(){mcClearFocus(ch);};
     ov.appendChild(lab);
   });
 }
