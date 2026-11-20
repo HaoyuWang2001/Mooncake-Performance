@@ -141,6 +141,13 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                        if k not in ("bin", "sudo")}
                    for t in MONITOR_ARTIFACTS
                    if matrix["tools"].get(t, {}).get("enabled")}
+        # 报表侧节点显示名 = 节点 IP（k8s=宿主 IP / ssh=管理 IP）；
+        # 产物目录仍按节点原名（唯一），标签由本字段覆盖
+        if mon_cfg:
+            try:
+                mon_cfg["node_ip"] = bm._node_display(cluster, n, node_name)
+            except Exception:
+                pass
         if mon_cfg:
             try:
                 _run(ip, n, "printf '%s' {} > {}/{}".format(

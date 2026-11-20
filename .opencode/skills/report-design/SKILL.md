@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 227 条 · ✓200 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 228 条 · ✓201 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -415,6 +415,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### C17 实例与日志现场（合并卡）
 
 - C17.V1 节点树：节点行可展开/收起 → 客户端行；同一节点内 **writer 在前、reader 在后** —— R-INST-1 〔test_client_site_tree_readonly_rows, test_client_site_contribution_and_writer_first〕
+- C17.V7 **节点身份 = 节点 IP**（k8s=宿主机 `status.hostIP`，ssh=管理 IP；同主机多 pod 节点级合并；pod 名保留在 `meta.pod`）—— 节点标签直接取数据，不做前端映射 —— R-INST-4 〔test_node_display_k8s_uses_host_ip, test_node_display_ssh_uses_management_ip, test_reduce_monitors_labels_by_node_ip_and_dedupes_host〕
 - C17.V2 列 = 角色 / 节点 / 客户端 / 总数 / 成功 / 失败 / 日志 + **对慢点追踪的贡献**（Top-N 条数） —— R-INST-1 〔test_client_site_header_and_columns, test_client_site_contribution_and_writer_first〕
 - C17.V3 无 C++ trace 时「贡献」整列隐藏 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
 - C17.V4 日志列 = 大小 · 文件名（CSS 截断），title = 远程全路径 —— R-INST-1 〔✗〕

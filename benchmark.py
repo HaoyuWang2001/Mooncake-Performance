@@ -1708,11 +1708,12 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         _view = " ".join(kubectl_prefix({"_ctx": c.get("_ctx", ""),
                                           "_ns": ns}))
         log("[k8s] shell:    {} exec -it {} -- bash".format(_view, pod))
+    host_ip = "" if dry_run else _k8s_pod_host_ip(c, ns, pod)
     node = {"kind": "k8s-pod", "_pod": pod, "_ns": ns,
             "_ctx": c.get("_ctx", ""), "_controller": c,
             "_controller_workspace": k8s["controller_workspace"],
             "_run_label": run_label, "_role": "client-0",
-            "ip": ip, "fabric_ip": ip}
+            "ip": ip, "fabric_ip": ip, "host_ip": host_ip}
     cluster.setdefault("nodes", {})[pod] = node
     if dry_run:
         log("[k8s] (dry-run) pod {} would be ready "
@@ -2215,7 +2216,8 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
             shlex.quote(remote_scripts + "/tracestats.py"),
             shlex.quote(log_path))
         if node_name:
-            cmd += " --node {}".format(shlex.quote(str(node_name)))
+            cmd += " --node {}".format(shlex.quote(
+                str(_node_display(cluster, node, node_name))))
         if node.get("_pod"):
             cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
         if role:
@@ -2269,7 +2271,8 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             shlex.quote(remote_scripts + "/logstats.py"),
             shlex.quote(log_path))
         if node_name:
-            cmd += " --node {}".format(shlex.quote(str(node_name)))
+            cmd += " --node {}".format(shlex.quote(
+                str(_node_display(cluster, node, node_name))))
         if node.get("_pod"):
             cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
         file_role = (roles or {}).get(log_path, role)
@@ -4296,6 +4299,36 @@ def _k8s_pod_ip(controller, ns, pod):
     return ip
 
 
+def _k8s_pod_host_ip(controller, ns, pod):
+    """Pod 所在集群节点 IP（pod.status.hostIP，与 podIP 同权限，无需 node RBAC）。"""
+    out, rc = controller_run(
+        controller, ["-n", ns, "get", "pod", pod, "-o",
+                     "jsonpath={.status.hostIP}"], check=False)
+    ip = out.strip()
+    if rc != 0 or not ip:
+        return ""
+    return ip
+
+
+def _node_display(cluster, node, name):
+    """报表/产物的节点显示名 = **节点 IP**：
+    - k8s-pod → 宿主节点 IP（status.hostIP）；同主机多 pod 共用同一显示名
+      （节点视角合并，符合「节点级」语义）；
+    - ssh → 节点管理 IP；若多个节点共用同一 IP（示例配置常见 127.0.0.1）
+      则回退原节点名，避免误合并；
+    - 取不到 IP 时回退名称（绝不丢节点）。"""
+    if not node:
+        return name
+    if node.get("kind") == "k8s-pod":
+        return node.get("host_ip") or name
+    ip = node.get("ip")
+    if not ip:
+        return name
+    same = sum(1 for n in (cluster.get("nodes") or {}).values()
+               if not n.get("_pod") and n.get("ip") == ip)
+    return name if same > 1 else ip
+
+
 def _pipeline_k8s_roles(plan):
     """Deployment role list for the k8s pipeline channel. dual mode deploys
     ONE "client" role (pod = dual-role process); separate mode deploys a
@@ -4605,13 +4638,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     entry["port"] = base
                     ip = "0.0.0.0" if dry else _k8s_pod_ip(
                         cluster["_controller"], _k8s["namespace"], pod)
+                    host_ip = "" if dry else _k8s_pod_host_ip(
+                        cluster["_controller"], _k8s["namespace"], pod)
                     cluster.setdefault("nodes", {})[pod] = {
                         "kind": "k8s-pod", "_pod": pod, "_ns": _k8s["namespace"],
                         "_ctx": cluster["_controller"].get("_ctx", ""),
                         "_controller": cluster["_controller"],
                         "_controller_workspace": _k8s["controller_workspace"],
                         "_run_label": _run_label, "_role": role,
-                        "ip": ip, "fabric_ip": ip}
+                        "ip": ip, "fabric_ip": ip, "host_ip": host_ip}
             involved_nodes = []
             for e in plan["writers"] + plan["readers"]:
                 if e["node"] not in involved_nodes:
@@ -6071,13 +6106,15 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     entry["port"] = base
                     ip = "0.0.0.0" if dry else _k8s_pod_ip(
                         cluster["_controller"], _k8s["namespace"], pod)
+                    host_ip = "" if dry else _k8s_pod_host_ip(
+                        cluster["_controller"], _k8s["namespace"], pod)
                     cluster.setdefault("nodes", {})[pod] = {
                         "kind": "k8s-pod", "_pod": pod, "_ns": _k8s["namespace"],
                         "_ctx": cluster["_controller"].get("_ctx", ""),
                         "_controller": cluster["_controller"],
                         "_controller_workspace": _k8s["controller_workspace"],
                         "_run_label": _run_label, "_role": role,
-                        "ip": ip, "fabric_ip": ip}
+                        "ip": ip, "fabric_ip": ip, "host_ip": host_ip}
             _kvtest_bind_split_pods(plan)
             involved_nodes = []
             for e in plan["writers"] + plan["readers"]:

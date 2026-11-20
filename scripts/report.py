@@ -1400,36 +1400,44 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
     Returns {config, mem_host, mem_proc, urma, summary} or {} when no monitor
     artifact exists (old runs / monitoring disabled). Never raises."""
     mem_host, mem_proc, urma, cfg = [], [], [], {}
+    seen_host = set()     # 同主机多 pod 的宿主内存只保留一份
     try:
         for root, _dirs, files in os.walk(local_log_dir):
             fset = set(files)
             if not (fset & {MEM_HOST, MEM_PROC, URMA_FLITS}):
                 continue
             node = os.path.basename(root)
-            if not cfg and MONITOR_CONFIG in fset:
+            rcfg = {}
+            if MONITOR_CONFIG in fset:
                 try:
                     with open(os.path.join(root, MONITOR_CONFIG),
                               "r", encoding="utf-8") as f:
-                        cfg = json.load(f) or {}
+                        rcfg = json.load(f) or {}
                 except (OSError, ValueError):
-                    cfg = {}
-            mem_cfg = cfg.get("mem") or {}
+                    rcfg = {}
+                if not cfg:
+                    cfg = rcfg
+            # 节点显示名：monitor.config 的 node_ip（k8s=宿主 IP / ssh=管理 IP），
+            # 缺省回退目录名（节点原名/pod 名）
+            disp = str(rcfg.get("node_ip") or node)
+            mem_cfg = rcfg.get("mem") or cfg.get("mem") or {}
             leak_pct = float(mem_cfg.get("leak_growth_pct") or _MON_LEAK_PCT)
             leak_mb = float(mem_cfg.get("leak_min_mb") or _MON_LEAK_MB)
-            flit_bytes = int((cfg.get("urma") or {}).get("bytes_per_flit")
-                             or _MON_FLIT_BYTES)
-            if MEM_HOST in fset:
-                h = _parse_mem_host(os.path.join(root, MEM_HOST), node,
+            flit_bytes = int((rcfg.get("urma") or cfg.get("urma") or {})
+                             .get("bytes_per_flit") or _MON_FLIT_BYTES)
+            if MEM_HOST in fset and disp not in seen_host:
+                seen_host.add(disp)
+                h = _parse_mem_host(os.path.join(root, MEM_HOST), disp,
                                     t0=t0, t1=t1)
                 if h:
                     mem_host.append(h)
             if MEM_PROC in fset:
                 mem_proc.extend(_parse_mem_proc(
-                    os.path.join(root, MEM_PROC), node, leak_pct, leak_mb,
+                    os.path.join(root, MEM_PROC), disp, leak_pct, leak_mb,
                     t0=t0, t1=t1))
             if URMA_FLITS in fset:
                 urma.extend(_parse_urma(
-                    os.path.join(root, URMA_FLITS), node, flit_bytes,
+                    os.path.join(root, URMA_FLITS), disp, flit_bytes,
                     t0=t0, t1=t1))
     except Exception:
         pass

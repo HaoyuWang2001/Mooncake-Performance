@@ -582,6 +582,12 @@ mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`�
 | C++ SDK glog（`LOG()`/`MC_LOG()`） | setup 期连接证据：`ConnectToCvmSubmasters`、`connected to submaster`、`Loaded partition routing`、`Version mismatch`、`MountSegment` 等 | SDK 默认写 **OS fd1（stdout）**（`MC_LOG_ENABLE=on` 且未设 `MC_LOG_DIR` 时）；runner 把 fd1+fd2 收进 **`<GLOG_FILE>`**（Python fatal traceback 也在其中）。若需 SDK 自管日志文件，可设 `MC_LOG_DIR`（实测可靠），但本仓库默认不用它——stdout 单一流最简单 |
 | C++ ylt easylog（coro_rpc 内部） | 连接池事件、建连失败细节（connect/fail/refuse/timeout） | `<LOG_FILE>.ylt.log`（绝对路径，multi-client 带 `===== client.N =====` 分节头） |
 
+**节点身份（报表口径）**：报告里的「节点」= **节点 IP**——k8s 场景取
+`pod.status.hostIP`（宿主节点 IP），ssh 场景取节点管理 IP；同一宿主上的多个
+client pod 在节点级合并为一个节点（pod 名保留在 `meta.pod` 与客户端名中，明细
+不丢）；取不到 IP 或 ssh 配置出现重复 IP 时回退原节点名。历史产物（IP 未记录）
+沿用 pod 名/节点名。
+
 glog 文件名：dual `<base>.glog`；分离角色 `<base>.writer_<node>_w<gid>.glog` /
 `<base>.reader_<node>_r<idx>_p<port>.glog`；basic/stage `LOG_FILE` 去掉 `.log` 换 `.glog`
 （basic 多客户端逐 client 拆分后合并）。WebUI 已把 `.glog` 归入日志分组。
