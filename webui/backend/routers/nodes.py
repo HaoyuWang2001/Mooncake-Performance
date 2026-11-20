@@ -192,7 +192,7 @@ def _parse_sections(text):
     sections = {}
     cur = None
     for line in (text or "").split("\n"):
-        m = re.match(r"^@@([A-Z]+)@@$", line.strip())
+        m = re.match(r"^@@([A-Z0-9]+)@@$", line.strip())
         if m:
             cur = m.group(1)
             sections.setdefault(cur, [])
