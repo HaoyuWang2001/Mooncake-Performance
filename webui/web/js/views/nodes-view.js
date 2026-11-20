@@ -82,12 +82,10 @@ const NodesView = {
         <el-table-column label="mooncake 服务" min-width="190">
           <template #default="{ row }">
             <template v-if="probe[row.name] && probe[row.name].ok">
-              <el-tooltip v-for="p in probe[row.name].processes" :key="p.pid"
-                          :content="'PID ' + p.pid + '  ' + p.cmd" placement="top">
-                <el-tag size="small" :type="procType(p.kind)" effect="plain" class="tag-gap">
-                  {{ procText(p.kind) }} #{{ p.pid }}
-                </el-tag>
-              </el-tooltip>
+              <el-tag v-for="p in probe[row.name].processes" :key="p.pid"
+                      size="small" :type="procType(p.kind)" effect="plain" class="tag-gap">
+                {{ procText(p.kind) }} #{{ p.pid }}
+              </el-tag>
               <span v-if="!probe[row.name].processes.length" class="mc-muted">无进程</span>
             </template>
             <span v-else class="mc-muted">-</span>
