@@ -4380,6 +4380,41 @@ def _k8s_deployment_pods(cluster, run_label, role):
     return sorted(p for p in out.split() if p)
 
 
+def _pipeline_reader_launch_cmd(launch_prefix, remote_runner, merged_log,
+                                client_id, reader_threads, port,
+                                client_timeout_s, reader_op, numa_arg,
+                                nohup_log):
+    """SSH launch command for one standalone pipeline reader process.
+
+    The argument order is positionally bound to the format string; keep
+    ``--timeout`` paired with ``client_timeout_s`` and ``--operation`` with
+    ``reader_op``. A pre-merge revision passed them in the opposite order
+    (``reader_op, _client_timeout``), so every reader exited with argparse
+    rc=2 before registering in etcd and each writer waited out its rendezvous
+    (``0/5 readers``). Regression test: test_pipeline_launch_args.py."""
+    return ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
+            "--role reader --listen-port {} --warmup false --timeout {} "
+            "--operation {} {} > {} 2>&1 & echo $!").format(
+        launch_prefix, remote_runner, merged_log, client_id, reader_threads,
+        port, client_timeout_s, reader_op, numa_arg, nohup_log)
+
+
+def _pipeline_writer_launch_cmd(launch_prefix, remote_runner, merged_log,
+                                client_id, port, warmup, writer_op, kc_arg,
+                                numa_arg, nohup_log):
+    """SSH launch command for one standalone pipeline writer process.
+
+    Same positional contract as the reader builder: ``--listen-port`` pairs
+    with ``port``, ``--warmup`` with ``warmup``, ``--operation`` with
+    ``writer_op`` and the following two placeholders with ``kc_arg`` /
+    ``numa_arg``."""
+    return ("nohup {}bash {} pipeline {} --client-id {} --role writer "
+            "--listen-port {} --warmup {} --operation {}{} {} > {} 2>&1 "
+            "& echo $!").format(
+        launch_prefix, remote_runner, merged_log, client_id, port, warmup,
+        writer_op, kc_arg, numa_arg, nohup_log)
+
+
 def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
     matrix = getattr(args, "_matrix", None)
@@ -4907,10 +4942,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         numa_arg = "--cpu-bind {}".format(cl)
                         if numactl_ok.get(r["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                    rcmd = ("nohup {}bash {} pipeline {} --client-id {} --num-threads {} "
-                            "--role reader --listen-port {} --warmup false "
-                            "--timeout {} "
-                            "--operation {} {} > {} 2>&1 & echo $!").format(
+                    rcmd = _pipeline_reader_launch_cmd(
                         launch_prefix, remote_runner, merged_log, r["index"],
                         reader_threads, r["port"], client_timeout_s, reader_op,
                         numa_arg, nohup_log)
@@ -4970,11 +5002,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         numa_arg = "--cpu-bind {}".format(cl)
                         if numactl_ok.get(w["node"]):
                             launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
-                    wcmd = ("nohup {}bash {} pipeline {} --client-id {} --role writer "
-                            "--listen-port {} --warmup {} --operation {}{} {} > {} 2>&1 "
-                            "& echo $!").format(
-                        launch_prefix, remote_runner, merged_log, w["gid"], w["port"],
-                        warmup, writer_op, kc_arg, numa_arg, nohup_log)
+                    wcmd = _pipeline_writer_launch_cmd(
+                        launch_prefix, remote_runner, merged_log, w["gid"],
+                        w["port"], warmup, writer_op, kc_arg, numa_arg,
+                        nohup_log)
                     pid = ssh_check_output(wn["ip"], wn, wcmd, dry_run=dry)
                     writer_pids.append((w, pid))
                     if not dry and pid:
