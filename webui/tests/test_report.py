@@ -2309,18 +2309,19 @@ def test_line_widths_avg_thicker_only(tmp_path):
         return
     assert res["errors"] == []
     lw = {x["name"]: x for x in res["main_line_w"]}
-    assert lw["avg"]["width"] == 1.0 and lw["avg"]["emphasis"] == 1.2, lw["avg"]
+    assert lw["avg"]["width"] == 1.0, lw["avg"]
     for k in ("p50", "p99", "p999", "min", "max", "队列等待"):
         if k in lw:
             assert lw[k]["width"] == 0.8, (k, lw[k])
-            assert lw[k]["emphasis"] == 1.0, (k, lw[k])
     tc = {x["name"]: x for x in res["tchart_line_w"]}
     total = tc.get("total")
     assert total and total["width"] == 1.0, tc
-    # 阶段序列（若本次产物带阶段秒桶）同样 0.8 / 1.0
     for nm, x in tc.items():
         if nm != "total":
-            assert x["width"] == 0.8 and x["emphasis"] == 1.0, (nm, x)
+            assert x["width"] == 0.8, (nm, x)
+    # 线序列不再有 hover 聚焦/加粗（强调只由右侧标签触发）
+    assert all(not x.get("emphasis") for x in res["main_line_w"]), \
+        res["main_line_w"]
 
 
 def test_endlabel_fixed_slots_and_cluster_focus(tmp_path):
@@ -2384,8 +2385,9 @@ def test_multilabel_tree_order_and_truncation(tmp_path):
     assert res.get("legend_selmode") is False, res.get("legend_selmode")
 
 
-def test_all_charts_tooltip_hover_pointer_click_box(tmp_path):
-    """#4：tooltip 悬浮只显示竖线+交点（showContent=false），内容框点击才出现。"""
+def test_all_charts_native_hover_tooltip(tmp_path):
+    """全图统一原生悬浮 tooltip：竖线+交点+内容框同时出现（showContent=true，
+    无点击钉住状态机）；分级时延 tooltip 时间已格式化。"""
     a = _stats(tmp_path, "a.reader", "reader")
     tr = _trace_stats_span(tmp_path, "s300.glog", 300)
     data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
@@ -2398,39 +2400,11 @@ def test_all_charts_tooltip_hover_pointer_click_box(tmp_path):
                 "tchart", "tstackchart"):
         assert cid in tips, (cid, tips.keys())
         assert tips[cid]["triggerOn"] == "mousemove", (cid, tips[cid])
-        assert tips[cid]["showContent"] is False, (cid, tips[cid])
+        assert tips[cid]["showContent"] is True, (cid, tips[cid])
         assert tips[cid]["enterable"] is True, (cid, tips[cid])
-
-
-def test_tooltip_click_anywhere_opens(tmp_path):
-    """点击绘图区任意位置（含空白）→ 按点击 x 打开详情框；区外点击 → 收起。
-    分级时延曲线走同一 bindClickTip，必须同样生效。"""
-    a = _stats(tmp_path, "a.reader", "reader")
-    tr = _trace_stats_span(tmp_path, "s300.glog", 300)
-    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, traces=[tr])
-    res = _js_check(tmp_path, data, "--tip-click")
-    if res is None:
-        return
-    assert res["errors"] == []
-    assert res["tip_after_click"] == {"triggerOn": "none",
-                                      "showContent": True}, \
-        res["tip_after_click"]
-    act = [a for a in res["tip_click_actions"] if a.get("type") == "showTip"]
-    assert act and act[0].get("x") == 600 and act[0].get("y") == 200, act
-    assert res["tip_after_outside"] == {"triggerOn": "mousemove",
-                                       "showContent": False}, \
-        res["tip_after_outside"]
-    assert any(a.get("type") == "hideTip"
-               for a in res["tip_outside_actions"]), res["tip_outside_actions"]
-    # 分级时延曲线：空白点击同样 showTip（x/y = 点击位置）
     # 分级时延 tooltip 内容必须格式化时间（不得落回原始毫秒）
     fmt = res.get("tchart_tip_fmt") or ""
     assert "2026-" in fmt and "5.35 ms" in fmt, fmt
-    tacts = [a for a in (res.get("tchart_tip_actions") or [])
-             if a.get("type") == "showTip"]
-    assert tacts and tacts[0].get("x") == 500, tacts
-    assert res["tchart_tip"] == {"triggerOn": "none",
-                                 "showContent": True}, res["tchart_tip"]
 
 
 def test_latency_metric_select_all_clear(tmp_path):
@@ -2935,8 +2909,8 @@ def test_label_focus_hover_restores(tmp_path):
 
 
 def test_qps_single_pointer_and_all_object_tooltip(tmp_path):
-    """QPS：一个时间点只用一根竖直虚线（axisPointer dashed line）；点击详情框
-    （自绘）同时列出该桶全部对象的 QPS+失败；柱不逐根强调。"""
+    """QPS：一个时间点只用一根竖直虚线（axisPointer dashed line）；原生悬浮
+    详情框（formatter 兜底）同时列出该桶全部对象的 QPS+失败；柱不逐根强调。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.writer", "writer", node="n2")
     data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
@@ -2947,7 +2921,8 @@ def test_qps_single_pointer_and_all_object_tooltip(tmp_path):
     ap = res.get("qps_axis_pointer") or {}
     assert ap.get("type") == "line", ap
     assert (ap.get("lineStyle") or {}).get("type") == "dashed", ap
-    tip = res.get("qps_custom_tip") or ""
+    # 原生悬浮 formatter：即使 ECharts 只匹配到一条，也必须列出该桶全部对象
+    tip = res.get("qps_fmt_tip") or ""
     assert "2026-" in tip, tip                       # 时间已格式化
     assert tip.count("：QPS ") >= 2, tip             # 全部对象在同一框
     assert "失败 " in tip, tip

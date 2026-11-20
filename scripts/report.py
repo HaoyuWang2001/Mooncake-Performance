@@ -2003,11 +2003,12 @@ const LFTIP = LF_DARK
       _src:(LF_M&&LF_M.tipLight)});
 const LFFONT="'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif";
 function lfTooltip(extra){
-  /* 所有图统一：悬浮=竖线+交点（axisPointer），不弹内容框；点击才钉住内容框
-     （bindClickTip 把 showContent 切到 true + triggerOn 切到 none + showTip） */
+  /* 所有图统一：**原生悬浮** —— 竖线 + 各曲线交点 + 内容框同时出现/消失，
+     不做点击钉住（复杂状态机已拒绝，见 DR-42）；showDelay 避免快速扫过弹框，
+     enterable 允许鼠标移入框内滚动/复制。 */
   const o={trigger:'axis',confine:true,
-    triggerOn:'mousemove',showContent:false,
-    enterable:true,hideDelay:250,className:'mc-tip',
+    triggerOn:'mousemove',showContent:true,
+    showDelay:150,hideDelay:250,enterable:true,className:'mc-tip',
     extraCssText:'max-height:46vh;overflow-y:auto',
     backgroundColor:LFTIP.backgroundColor,borderWidth:0,
     padding:LFTIP.padding,
@@ -2016,124 +2017,16 @@ function lfTooltip(extra){
   if(extra)Object.keys(extra).forEach(function(k){o[k]=extra[k];});
   return o;
 }
-/* 点击显示 tooltip（所有图）：悬浮只走 axisPointer（竖线+各曲线交点），
-   不弹内容框；点击**绘图区内任意位置**（不要求命中曲线）即视为点击了
-   竖线所在时间点，按点击 x 轴 showTip 并钉住内容框。鼠标在框内或图内
-   保持，离开两者 250ms 收起；Esc / 缩放 / 点击绘图区外收起。
-   网格从 option.grid 读取（主图/阶段图/慢点/监控各自 grid 自动适配），
-   桩环境（无 on/getZr）自动跳过。 */
-function bindClickTip(ch){
-  if(!ch||!ch.on||!ch.getZr||ch.__mcTipBound) return;
-  ch.__mcTipBound=true;
-  let anchor=null, hideTimer=null, docMove=null, docKey=null;
-  function tipDom(){
-    try{ return ch.getDom().querySelector('.mc-tip'); }catch(e){ return null; }
-  }
-  function chartRect(){
-    try{ return ch.getDom().getBoundingClientRect(); }catch(e){ return null; }
-  }
-  function plotRect(){
-    let g=null;
-    try{
-      const o=ch.getOption();
-      g=(o&&o.grid)||null;
-      if(Array.isArray(g)) g=g[0];
-    }catch(e){ g=null; }
-    const W=ch.getWidth?ch.getWidth():0, H=ch.getHeight?ch.getHeight():0;
-    if(!W||!H) return null;
-    const left=Number((g&&g.left)||0), right=Number((g&&g.right)||0);
-    const top=Number((g&&g.top)||0), bot=Number((g&&g.bottom)||0);
-    return {x0:left, x1:W-right, y0:top, y1:H-bot};
-  }
-  function boxHover(e){
-    const d=tipDom(); if(!d||!e) return false;
-    try{
-      const r=d.getBoundingClientRect();
-      return e.clientX>=r.left&&e.clientX<=r.right&&
-        e.clientY>=r.top&&e.clientY<=r.bottom;
-    }catch(err){ return false; }
-  }
-  function inChart(e){
-    const r=chartRect(); if(!r||!e) return false;
-    return e.clientX>=r.left&&e.clientX<=r.right&&
-      e.clientY>=r.top&&e.clientY<=r.bottom;
-  }
-  function hoverMode(){
-    try{ ch.setOption({tooltip:{showContent:false,triggerOn:'mousemove'}}); }
-    catch(e){}
-  }
-  function unlisten(){
-    if(hideTimer){clearTimeout(hideTimer);hideTimer=null;}
-    if(docMove){
-      try{ document.removeEventListener('mousemove',docMove); }catch(e){}
-      docMove=null;
-    }
-    if(docKey){
-      try{ document.removeEventListener('keydown',docKey); }catch(e){}
-      docKey=null;
-    }
-  }
-  function hide(){
-    anchor=null; unlisten();
-    try{ ch.dispatchAction({type:'hideTip'}); }catch(e){}
-    if(ch.__mcTipEl){
-      try{ ch.__mcTipEl.parentNode.removeChild(ch.__mcTipEl); }catch(e){}
-      ch.__mcTipEl=null;
-    }
-    hoverMode();
-  }
-  function scheduleHide(){
-    if(hideTimer) return;
-    hideTimer=setTimeout(function(){hideTimer=null;hide();},250);
-  }
-  function pinAt(x,y,ev){
-    const r=chartRect();
-    anchor=r?[r.left+x,r.top+y]:[x,y];
-    if(ch.__mcCustomTip){
-      /* 自绘详情框（value 轴分组柱的槽位偏移会破坏 ECharts axis 匹配） */
-      try{ ch.__mcCustomTip(x,y); }catch(e){}
-    }else{
-      try{ ch.setOption({tooltip:{showContent:true,triggerOn:'none'}}); }
-      catch(e){}
-      try{ ch.dispatchAction({type:'showTip',x:x,y:y}); }catch(e){}
-    }
-    if(!docMove){
-      docMove=function(e){
-        if(boxHover(e)||inChart(e)){
-          if(hideTimer){clearTimeout(hideTimer);hideTimer=null;}
-          return;
-        }
-        scheduleHide();
-      };
-      try{ document.addEventListener('mousemove',docMove); }catch(e){}
-    }
-    if(!docKey){
-      docKey=function(e){
-        if(e&&(e.key==='Escape'||e.keyCode===27)){ hide(); mcClearFocus(ch); }
-      };
-      try{ document.addEventListener('keydown',docKey); }catch(e){}
-    }
-  }
+/* 图表辅助绑定：仅保留「标签悬浮聚焦」的清理钩子（悬浮/悬出画布即恢复全部），
+   与 tooltip 无关（tooltip 走 ECharts 原生悬浮）。 */
+function bindHoverGuards(ch){
+  if(!ch||!ch.on||!ch.getZr||ch.__mcGuardsBound) return;
+  ch.__mcGuardsBound=true;
   const zr=ch.getZr();
-  zr.on('mousemove',function(){
-    /* 指针移到画布上：结束悬浮预览聚焦（防止标签重建导致 mouseleave 丢失） */
-    mcClearFocus(ch);
-  });
-  zr.on('click',function(e){
-    mcClearFocus(ch);
-    if(!e) { hide(); return; }
-    const pr=plotRect();
-    const x=e.offsetX, y=e.offsetY;
-    if(!pr||x<pr.x0||x>pr.x1||y<pr.y0||y>pr.y1){ hide(); return; }
-    pinAt(x,y,e);
-  });
-  zr.on('globalout',function(){
-    mcClearFocus(ch);            /* 移出图表也必定结束悬浮聚焦 */
-    if(anchor) scheduleHide();
-  });
-  ch.on('datazoom',function(){ hide(); });
+  zr.on('mousemove',function(){ mcClearFocus(ch); });
+  zr.on('globalout',function(){ mcClearFocus(ch); });
   /* 兜底：指针移动到任何「标签之外」的元素即结束悬浮聚焦
-     （修复长截断标签向右移出后事件不再命中导致聚焦残留） */
+     （修复长截断标签向右移出后鼠标事件不再命中导致聚焦残留） */
   try{
     document.addEventListener('mousemove',function(ev){
       if(!ch.__mcFocus) return;
@@ -2273,7 +2166,6 @@ const LAT_COLORS = LF_DARK
 const LAT_LINES=[['avg','avg',1.0],['p50','p50',0.8],['p99','p99',0.8],
   ['p999','p999',0.8],['p9999','p9999',0.8],['min','min',0.8],
   ['max','max',0.8],['qw','队列等待',0.8]];
-const EMPHASIS_ADD=0.2;
 const MAIN_GRID={left:56,right:104,top:44,bottom:58};
 const QPS_GRID={left:56,right:104,top:48,bottom:34};
 function latColor(k){return LAT_COLORS[k]||C.fg;}
@@ -2348,7 +2240,7 @@ function outlierScatter(key,name,color){
   if(!pts.length) return null;
   return {name:name,type:'scatter',symbolSize:6,clip:true,z:9,
     itemStyle:{color:color||C.hero},
-    emphasis:{focus:'series',itemStyle:{borderColor:C.ink,borderWidth:1}},
+    emphasis:{itemStyle:{borderColor:C.ink,borderWidth:1}},
     data:pts};
 }
 function latLineSeries(col,x,meta,key){
@@ -2361,7 +2253,6 @@ function latLineSeries(col,x,meta,key){
     return {name:L[1],type:'line',showSymbol:false,clip:true,
       lineStyle:{width:L[2],color:color}, itemStyle:{color:color},
       z:(k==='p99')?6:3,
-      emphasis:{focus:'series',lineStyle:{width:L[2]+EMPHASIS_ADD}},
       data:data};
   });
 }
@@ -2493,7 +2384,7 @@ function emptyOpt(){const o=axisCommon();o.yAxis={type:'value'};o.series=[];retu
 function buildChart(){
   const box=document.getElementById('mainchart'); if(!box) return;
   if(!chart) chart=echarts.init(box);
-  bindClickTip(chart);
+  bindHoverGuards(chart);
   const z=Z();
   if(!z){chart.clear();return;}
   ensureSel();
@@ -2596,7 +2487,6 @@ function multiOpt(tier){
         lineStyle:{width:L[2],color:color},
         itemStyle:{color:color},
         z:(k==='p99')?(zbase+2):zbase,
-        emphasis:{focus:'series',lineStyle:{width:L[2]+EMPHASIS_ADD}},
         data:data});
     });
     if(outlierOn){
@@ -3155,9 +3045,26 @@ function bindXPan(){
 function qpsOpt(tier){
   const o=axisCommon();
   o.grid=QPS_GRID;
-  /* 一个时间点只用一根竖直虚线锁定；点击弹出该桶**全部对象**的 QPS+失败 */
+  /* 一个时间点只用一根竖直虚线；原生悬浮详情框列出该桶**全部对象**
+     的 QPS+失败（槽位偏移会破坏 ECharts 按序列匹配，故用 formatter 兜底：
+     按轴值找最近时间桶，直接从 qpsEntries 渲染全对象）。 */
   o.tooltip=lfTooltip({trigger:'axis',
     axisPointer:{type:'line',lineStyle:{type:'dashed',width:1,color:C.faint}}});
+  o.tooltip.formatter=function(ps){
+    if(!qpsChart||!qpsChart.__mcBuildTipAt||!qpsEntries.length) return '';
+    let v=null;
+    if(ps&&ps.length){
+      v=(ps[0].value&&ps[0].value[0]);
+      if(v==null) v=ps[0].axisValue;
+    }
+    const tArr=qpsEntries[0].t;
+    let bi=0,best=Infinity;
+    tArr.forEach(function(t,i){
+      const d=Math.abs(t*1000-(Number(v)||0));
+      if(d<best){best=d;bi=i;}
+    });
+    return qpsChart.__mcBuildTipAt(bi);
+  };
   o.xAxis=lfAxisTime(null,'main');
   o.yAxis=[lfAxisValue({name:'QPS',scale:true,nameLocation:'end',nameGap:16}),
            lfAxisValue({name:'失败',position:'right',splitLine:{show:false},
@@ -3265,7 +3172,7 @@ function totalFails(tier){
 function buildQpsChart(){
   const box=document.getElementById('qpschart'); if(!box) return;
   if(!qpsChart) qpsChart=echarts.init(box);
-  bindClickTip(qpsChart);
+  bindHoverGuards(qpsChart);
   if(!qpsChart.__slotBound){
     qpsChart.__slotBound=true;
     try{ qpsChart.on('dataZoom',refreshQpsSlots); }catch(e){}
@@ -3284,39 +3191,6 @@ function buildQpsChart(){
         ' · 失败 '+f;
     });
     return '<b>'+fullts(t0)+'</b><br>'+rows.join('<br>');
-  };
-  qpsChart.__mcCustomTip=function(px,py){
-    if(!qpsEntries.length) return;
-    let v=null;
-    try{
-      const r=qpsChart.convertFromPixel({xAxisIndex:0},[px,py]);
-      v=Array.isArray(r)?r[0]:r;
-    }catch(e){}
-    if(v==null) return;
-    const tArr=qpsEntries[0].t;
-    let bi=0,best=Infinity;
-    tArr.forEach(function(t,i){
-      const d=Math.abs(t*1000-v);
-      if(d<best){best=d;bi=i;}
-    });
-    const html=qpsChart.__mcBuildTipAt(bi);
-    if(!html) return;
-    let el=qpsChart.__mcTipEl;
-    if(!el||!el.parentNode){
-      el=document.createElement('div');
-      el.className='mc-tip mc-tip-box';
-      qpsChart.getDom().appendChild(el);
-      qpsChart.__mcTipEl=el;
-    }
-    el.innerHTML=html;
-    /* confine：靠近点击点，超出则翻转/夹紧 */
-    const W=qpsChart.getWidth(),H=qpsChart.getHeight();
-    const bw=el.offsetWidth||260,bh=el.offsetHeight||90;
-    let lx=px+12,ly=py+12;
-    if(lx+bw>W-8) lx=px-bw-12;
-    if(lx<8) lx=8;
-    if(ly+bh>H-8) ly=Math.max(8,H-bh-8);
-    el.style.left=lx+'px'; el.style.top=ly+'px';
   };
   const z=Z(); if(!z){qpsChart.clear();return;}
   const tier=currentTier();
@@ -3620,7 +3494,7 @@ function renderHist(){
   card.style.display='';
   const box=document.getElementById('histchart');
   if(!histChart) histChart=echarts.init(box);
-  bindClickTip(histChart);
+  bindHoverGuards(histChart);
   const labels=[], counts=[];
   bins.forEach(function(x){
     const lo=edges[x[0]]!=null?edges[x[0]]:0;
@@ -3854,7 +3728,7 @@ function renderSlowStrip(){
   card.style.display='';
   const box=document.getElementById('slowchart');
   if(!slowChart) slowChart=echarts.init(box);
-  bindClickTip(slowChart);
+  bindHoverGuards(slowChart);
   const pts=rows.filter(function(r){return rowEpoch(r)!=null;});
   const shape=(isPipeMode()&&slowRole==='writer')?'rect':'circle';
   const series=[];
@@ -4517,7 +4391,7 @@ let monCharts={};
 function _monChart(id, series, yname){
   const box=document.getElementById(id); if(!box||!series.length) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
-  bindClickTip(c);
+  bindHoverGuards(c);
   const o=axisCommon();
   o.grid={left:104,right:104,top:26,bottom:42};
   o.yAxis=[lfAxisValue({name:yname,scale:true,nameLocation:'end',nameGap:14})];
@@ -5457,7 +5331,6 @@ function buildStageChart(cur){
     series.push({name:nm,type:'line',showSymbol:false,clip:true,
       lineStyle:{width:w,color:color,type:dash||'solid'},
       itemStyle:{color:color},z:3,
-      emphasis:{focus:'series',lineStyle:{width:w+EMPHASIS_ADD}},
       data:data});
     data.forEach(function(d){
       const t=d[0]/1000;
@@ -5515,7 +5388,7 @@ function buildStageChart(cur){
     }
   }
   if(!tChart) tChart=echarts.init(box);
-  bindClickTip(tChart);
+  bindHoverGuards(tChart);
   if(!hasData){
     try{tChart.clear();}catch(e){}
     safe('stage-endlabels',function(){tLayoutEndLabels(tChart);});
@@ -5931,7 +5804,7 @@ function renderTreeDetail(cur){
     const keys=Object.keys(st.hist).map(Number)
       .sort(function(a,b){return a-b;});
     tdetailChart=echarts.init(div);
-    bindClickTip(tdetailChart);
+    bindHoverGuards(tdetailChart);
     tdetailChart.setOption({animation:false,
       textStyle:{fontFamily:LFFONT,color:C.fg,fontSize:12},
       tooltip:{trigger:'axis'},grid:{left:56,right:16,top:16,bottom:40},
@@ -6062,7 +5935,7 @@ function renderTraceStack(){
   if(!rows.length){box.style.display='none';return;}
   box.style.display='';
   if(!tStackChart) tStackChart=echarts.init(box);
-  bindClickTip(tStackChart);
+  bindHoverGuards(tStackChart);
   const tree=tTree(g).filter(function(x){return x[1]===1;});
   const keys=tree.map(function(x){return x[0];});
   function l1sum(r){

@@ -473,10 +473,10 @@ if (!errs.length) {
   out.qps_legend_data = (_qo && _qo.legend && _qo.legend.data) || null;
   out.qps_axis_pointer = (_qo && _qo.tooltip && _qo.tooltip.axisPointer) || null;
   try {
-    const qc = chartRefs.qpschart;
-    out.qps_custom_tip = (qc && typeof qc.__mcBuildTipAt === "function")
-      ? String(qc.__mcBuildTipAt(0)) : null;
-  } catch (e) { out.qps_custom_tip = null; }
+    const qf = (_qo && _qo.tooltip && _qo.tooltip.formatter);
+    out.qps_fmt_tip = (typeof qf === "function")
+      ? String(qf([{value: [0, 0], seriesName: "x"}])) : null;
+  } catch (e) { out.qps_fmt_tip = null; }
   out.qps_emphasis = ((_qo && _qo.series) || []).map(function (s) {
     return (s.emphasis || {}).disabled === true;});
   out.qps_colors = ((_qo && _qo.series) || []).map(function (s) {
@@ -746,37 +746,6 @@ if (!errs.length) {
       out.ml_client_label=clients[0]
         ? String((all[clients[0]]||{}).label||clients[0]) : null;
     } catch (e) { errs.push("mlabels: " + String(e && e.stack || e)); }
-  }
-  if (process.argv.includes("--tip-click")) {
-    try {
-      const c = chartRefs.mainchart;
-      const n0 = ((c && c.__acts) || []).length;
-      const zr = c.getZr();
-      // 空白处（不命中任何曲线）点击：按点击 x 打开详情框
-      zr.fire("click", {offsetX: 600, offsetY: 200, clientX: 700, clientY: 300});
-      const o = mainOpt();
-      out.tip_after_click = {triggerOn: o.tooltip && o.tooltip.triggerOn,
-        showContent: o.tooltip && o.tooltip.showContent};
-      out.tip_click_actions = ((c.__acts) || []).slice(n0);
-      // 绘图区外点击（x 轴左侧边距）：收起
-      const n1 = ((c.__acts) || []).length;
-      zr.fire("click", {offsetX: 10, offsetY: 200, clientX: 20, clientY: 300});
-      const o2 = mainOpt();
-      out.tip_after_outside = {triggerOn: o2.tooltip && o2.tooltip.triggerOn,
-        showContent: o2.tooltip && o2.tooltip.showContent};
-      out.tip_outside_actions = ((c.__acts) || []).slice(n1);
-      // 分级时延曲线同策略：空白点击同样打开（x/y 来自点击位置）
-      const tc = chartRefs.tchart;
-      if (tc) {
-        const m0 = ((tc.__acts) || []).length;
-        tc.getZr().fire("click", {offsetX: 500, offsetY: 180,
-          clientX: 600, clientY: 1800});
-        out.tchart_tip_actions = ((tc.__acts) || []).slice(m0);
-        const to = (charts.tchart || []).slice(-1)[0] || {};
-        out.tchart_tip = {triggerOn: to.tooltip && to.tooltip.triggerOn,
-          showContent: to.tooltip && to.tooltip.showContent};
-      }
-    } catch (e) { errs.push("tip-click: " + String(e && e.stack || e)); }
   }
   if (process.argv.includes("--lat-buttons")) {
     try {
@@ -1132,10 +1101,10 @@ if (!errs.length) {
           radius:(x.itemStyle||{}).borderRadius};});
       out.qps_legend_data=(o&&o.legend&&o.legend.data)||null;
       try{
-        const qc=chartRefs.qpschart;
-        out.qps_custom_tip=(qc&&typeof qc.__mcBuildTipAt==='function')
-          ?String(qc.__mcBuildTipAt(0)):null;
-      }catch(e){ out.qps_custom_tip=null; }
+        const qf=(o&&o.tooltip&&o.tooltip.formatter);
+        out.qps_fmt_tip=(typeof qf==='function')
+          ?String(qf([{value:[0,0],seriesName:'x'}])):null;
+      }catch(e){ out.qps_fmt_tip=null; }
     } catch (e) { errs.push("qps-colors: " + String(e && e.stack || e)); }
   }
   out.legend_selmode = (mainOpt()&&mainOpt().legend)

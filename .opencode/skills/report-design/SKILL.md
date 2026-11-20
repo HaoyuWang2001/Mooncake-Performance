@@ -101,7 +101,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### 4f. 交互（tooltip / 端点标签 / 时间）
 
-- **tooltip 悬浮与点击分离**：悬浮只显示轴指针（竖线 + 各曲线交点，`showContent:false`），**不弹框**；**点击绘图区内任意位置（含空白）**即按点击 x 对应的竖线时间点显示并钉住内容框（`showContent:true` + `triggerOn:'none'` + `showTip`），框内可滚动（`max-height:46vh`）；鼠标在框内或图表内保持，离开两者 250ms 收起；点击绘图区外、Esc、缩放时收起。`bindClickTip` 统一挂到所有图表，绘图区由 `option.grid` 推导。
+- **tooltip 一律原生悬浮**：竖线 + 各曲线交点 + 内容框由 ECharts 同时渲染/消失（`triggerOn:'mousemove'`、`showContent:true`、`showDelay:150`、`hideDelay:250`、`enterable:true`，框内滚动 `max-height:46vh`）。**拒绝点击钉住**（自定义 showContent/triggerOn 切换 + showTip + document 保活的状态机导致交点消失、虚线残留、左右关闭不对称，见 DR-42）。所有图统一由 `lfTooltip` 提供。
 - **端点标签聚焦**：多对象标签 hover = 该对象整簇保持原色、其他对象压暗（`opacity:0.15`，用 `setOption` 局部更新，**不用 highlight/focus blur**——多条 highlight 的 blur 会互相覆盖导致只亮一条）；单对象标签 hover = 高亮该指标序列。多对象图例 `selectedMode:false`（只说明颜色，不可点击隐藏）。
 - **多对象 tooltip** 显示时间 + 各对象各指标（带颜色圆点与单位），不得落回 ECharts 默认的原始毫秒时间戳。
 - **SDK 对象树 = 总计 + 节点与实例**（角色由 section 顶部写/读总控决定，树里不再有角色行）；节点/实例行可用（阶段桶按 node/pod 保留）。
@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 226 条 · ✓199 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 227 条 · ✓200 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -254,12 +254,12 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 - C5.V1 指标清单锁定 `LAT_LINES`（avg/p50/p99/p999/p9999/min/max/qw），无超纲 —— R-LAT-3 〔test_a06_metric_list_locked_to_spec〕
 - C5.V2 色语义：总览/总计灰阶、节点色系（按名排序固定）、实例=节点色阶 —— R-LAT-12 〔test_a03_latency_color_semantics_gray_only, test_multi_object_node_hues_and_metric_buttons_removed〕
-- C5.V3 线宽 avg 1.0 / 其余 0.8；hover +0.2；无「首对象加粗」 —— R-LAT-15 〔test_line_widths_avg_thicker_only〕
+- C5.V3 线宽恒定：avg 1.0 / 其余 0.8；**无 hover 加粗、无「首对象加粗」**（鼠标扫过曲线不产生聚焦/变粗；强调只由右侧标签触发） —— R-LAT-15 〔test_line_widths_avg_thicker_only〕
 - C5.V4 单对象无图例；多对象图例 `selectedMode:false`（只说明颜色） —— R-LAT-1/19 〔test_multi_object_node_hues_and_metric_buttons_removed, test_multilabel_tree_order_and_truncation〕
 - C5.V5 异常窗口竖线（强调色，≤50 条） —— R-LAT-10 〔test_a07_anomalies_capped_at_50〕
 - C5.V6 无数据窗口浅带，**仅第一处**标注时长；判定用真实缺失桶 —— R-LAT-9 〔test_a01_gap_markarea_between_runs, test_a02_no_gap_no_markarea, test_qps_zoom_keeps_y_and_gap_labels_once〕
-- C5.I1 点击绘图区任意位置（含空白）按竖线时间点开框；点击其它处换钉位；区外/Esc/缩放收起 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
-- C5.I2 悬浮只显示竖线+交点（showContent:false），不弹框 —— R-SHELL-14 〔test_all_charts_tooltip_hover_pointer_click_box〕
+- C5.I1 tooltip 原生悬浮：鼠标在绘图区任意位置（含空白）即按竖线时间点显示竖线+交点+内容框；移出/离开即收起 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip〕
+- C5.I2 内容框 `showDelay:150`（快速扫过不弹）、`enterable:true`（移入框保持并滚动）；不做点击钉住 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip〕
 - C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断，**悬浮时用详情框展示全名**（`data-full` + `.mc-label-tip`，不用原生 title）；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 - C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；**离开标签/移入画布/移出图表（globalout）都必须恢复**；不做点击锁定。清除机制三重兜底：标签 mouseleave + 画布 mousemove + **document mousemove（指针不在标签上即清）+ globalout**——修复长截断标签向右移出后事件不再命中而聚焦残留 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
 - C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠 —— R-LAT-7/14 〔test_end_label_layout_stays_inside_plot〕
@@ -269,10 +269,11 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.D3 时间口径统一 `ts_epoch`（节点 UTC vs 宿主 CST 的时区归一） —— R-SLOW-2 〔test_slowest_ts_epoch_matches_buckets, test_c02_slow_tooltip_epoch_not_undefined〕
 - C5.B1 逐条 highlight 与 `emphasis.focus` blur 互撞 → 只剩一条；聚焦一律 setOption 压暗 —— DR-28 〔test_endlabel_fixed_slots_and_cluster_focus〕
 - C5.B2 标签绑 p99 端点 → p99 隐藏/无可见点时标签消失或堆顶；改固定槽位 —— DR-27 〔test_endlabel_fixed_slots_and_cluster_focus〕
-- C5.B3 点击必须命中曲线才开框（命中精度过高）→ 任意位置按竖线时间 —— DR-29 〔test_tooltip_click_anywhere_opens〕
+- C5.B3 曾为「点击任意位置开框」引入自定义状态机（triggerOn 切换/showTip/保活）→ 交点消失、虚线残留、左右关闭不对称；已回归原生悬浮 —— DR-42 〔test_all_charts_native_hover_tooltip〕
 - C5.B4 markLine `xAxis=undefined` 曾杀整页 —— DR-18 〔test_real_echarts_render_smoke〕
 - C5.B5 单区块异常外溢（opt/series 空）→ `safe()` 隔离 —— R-SHELL-8 〔test_a14_safe_isolation_single_block〕
-- C5.B6 标签曾按树序均分槽位，与曲线位置错位（query 在下、标签居中）；且聚焦靠标签 mouseleave 恢复，分级图 `finished` 每次 setOption 重渲标签导致元素销毁、mouseleave 丢失 → 聚焦卡死无法取消。改为锚定排布 + 画布 mousemove 兜底恢复（放弃点击锁定） —— DR-33 〔test_label_anchor_follows_curve, test_label_focus_hover_restores〕
+- C5.B6 曲线曾配 `emphasis.focus:'series'`：鼠标扫过曲线即 blur 其他线 → 闪烁；已删除全部线序列 emphasis（强调只由标签触发） —— DR-42 〔test_line_widths_avg_thicker_only〕
+- C5.B7 标签曾按树序均分槽位，与曲线位置错位（query 在下、标签居中）；且聚焦靠标签 mouseleave 恢复，分级图 `finished` 每次 setOption 重渲标签导致元素销毁、mouseleave 丢失 → 聚焦卡死无法取消。改为锚定排布 + 画布 mousemove 兜底恢复（放弃点击锁定） —— DR-33 〔test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 
 ### C6 端到端时延曲线 · 工具行
 
@@ -291,7 +292,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C7.V1 双轴：QPS 柱（左）+ 失败柱（右，独立计数）；**多对象时 QPS 用细柱（按槽位像素宽自适应 1–3px）、同桶按槽位并排**（第 i 个对象 x 偏移 `(i-(n-1)/2)·桶距×0.8/n`，不重叠；全览桶密时必然贴拢，放大后分开）；失败柱**与所属对象同槽位对齐**（位置即归属）、统一强调橙、同宽；单对象维持 7px/3px 且不偏移 —— R-LAT-8 〔test_a05_qps_fail_series_hero_only, test_qps_grouped_thin_bars, test_qps_single_object_bars_unchanged〕
 - C7.V2 柱色随对象：总计灰阶 / 节点色系 / 实例色阶 —— R-LAT-8 〔test_qps_bars_follow_object_colors〕
 - C7.V3 图例固定不可点，**只列各对象的 QPS**（失败统一橙色，不逐个列）；无失败显示「本次测试无失败」；副图上方无小标题 —— R-LAT-8 〔test_qps_legend_fixed_and_caption_removed, test_qps_grouped_thin_bars〕
-- C7.V4 同一时间点只用**一根竖直虚线**（`axisPointer` line/dashed）锁定；柱不逐根强调（`emphasis.disabled`）；点击详情框一次性列出该时间桶**全部对象**的 QPS+失败（`对象：QPS x · 失败 y`，带对象色圆点） —— R-LAT-8 〔test_qps_single_pointer_and_all_object_tooltip〕
+- C7.V4 同一时间点只用**一根竖直虚线**（`axisPointer` line/dashed）；柱不逐根强调（`emphasis.disabled`）；**原生悬浮**详情框用 formatter 兜底（按轴值找最近桶，忽略 ECS 序列匹配）一次性列出该桶**全部对象**的 QPS+失败（`对象：QPS x · 失败 y`，带对象色圆点） —— R-LAT-8 〔test_qps_single_pointer_and_all_object_tooltip〕
 - C7.I1 x 缩放时 y 不重算（`filterMode:'none'`） —— R-LAT-8 〔test_qps_zoom_keeps_y_and_gap_labels_once〕
 - C7.I2 主图与 QPS 缩放联动（zoomState 同步） —— R-LAT-6 〔test_a13_zoom_links_main_and_qps〕
 - C7.D1 QPS 分母 = 实测 wall_s（writer elapsed / reader notify 跨度），不是数据 span —— DR-25 〔test_measured_wall_prefers_notify_span〕
@@ -382,9 +383,9 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C14.V10 组合呈现：**单对象**=阶段调色板（可叠加任意多阶段）；**多对象**=颜色按对象（总计灰/节点色系/实例色阶），**阶段>1 时线型区分阶段**（实/虚/点循环）；多对象多阶段的序列名 = `对象 · 阶段` —— R-TRACE-12 〔test_trace_curve_dimension_coupling〕
 - C14.I2 阶段**树**头 全选/清空：全选=全部可选阶段（total/L1/残差，不影响对象选择）；**清空=允许空**（图表空态，不回填 total） —— R-TRACE-12 〔test_trace_stage_row_all_clear, test_trace_curve_dimension_coupling〕
 - C14.I3 右侧标签与端到端同构：**锚定各序列曲线末端**（endLabelLayout 防重叠，无引线）；单序列不出标签；聚焦=悬浮预览（移入画布/离开标签即恢复） —— R-TRACE-12 〔test_trace_curve_fixed_labels_and_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
-- C14.I4 点击绘图区任意位置开框（含空白），内容为格式化时间 + 各序列值 —— R-SHELL-14 〔test_tooltip_click_anywhere_opens〕
+- C14.I4 原生悬浮详情框（同主图）：格式化时间 + 各序列值；不做点击钉住 —— R-SHELL-14 〔test_all_charts_native_hover_tooltip〕
 - C14.I5 粒度档/重置/缩放/平移与端到端同构（含 y 滑块） —— R-TRACE-5 〔test_stage_tier_policy_by_span〕
-- C14.B1 tooltip 落回原始毫秒时间戳（无 formatter） —— DR-29 〔test_tooltip_click_anywhere_opens〕
+- C14.B1 tooltip 落回原始毫秒时间戳（无 formatter） —— DR-29 〔test_all_charts_native_hover_tooltip〕
 - C14.B2 三重维度无收敛 → 曲线灾难（阶段×对象×指标全开） —— DR-29 〔test_trace_curve_dimension_coupling〕
 - C14.B3 阶段曲线对象树在角色行/节点禁用状态间的历史漂移 —— DR-27/29 〔test_stage_tree_objects_enabled〕
 
