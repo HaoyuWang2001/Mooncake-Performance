@@ -132,6 +132,37 @@ def _parallel_start_barrier(args):
     log("[parallel] rank and recall aligned at /start; continuing benchmark")
 
 
+def _parallel_measure_barrier(args):
+    """Align the first post-warmup kvtest /resume across rank and recall."""
+    ready_dir = getattr(args, "parallel_ready_dir", None)
+    role = getattr(args, "parallel_ready_role", None)
+    if not ready_dir or not role or getattr(
+            args, "_parallel_measure_ready_done", False):
+        return
+    if role not in ("rank", "recall"):
+        raise RuntimeError("invalid parallel ready role: {}".format(role))
+    os.makedirs(ready_dir, exist_ok=True)
+    marker = os.path.join(ready_dir, role + ".measure.ready")
+    tmp = marker + ".{}.tmp".format(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as stream:
+        stream.write("{}\n".format(os.getpid()))
+    os.replace(tmp, marker)
+    peer = "recall" if role == "rank" else "rank"
+    peer_marker = os.path.join(ready_dir, peer + ".measure.ready")
+    log("[parallel] {} warmup drained; holding /resume, waiting for {}"
+        "".format(role, peer))
+    deadline = time.time() + _PARALLEL_READY_TIMEOUT_S
+    while not os.path.isfile(peer_marker):
+        _check_stop()
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "parallel /resume barrier timed out after {}s: {} marker "
+                "not found".format(_PARALLEL_READY_TIMEOUT_S, peer))
+        time.sleep(0.2)
+    args._parallel_measure_ready_done = True
+    log("[parallel] rank and recall aligned after warmup; resuming measurement")
+
+
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 # RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
@@ -146,16 +177,22 @@ PIPELINE_PUT_IFACES = ("put", "put_batch", "put_from", "upsert_from")
 PIPELINE_GET_IFACES = ("get", "get_batch", "get_into", "get_buffer")
 PIPELINE_PUT_BATCH_IFACES = ("put_batch",)
 PIPELINE_GET_BATCH_IFACES = ("get_batch",)
+LATENCY_THRESHOLD_US = (2000, 5000, 6000, 7000, 8000, 9000, 10000, 20000)
+LATENCY_THRESHOLD_COLUMNS = [">{}us".format(value)
+                             for value in LATENCY_THRESHOLD_US]
+LATENCY_SUMMARY_COLUMNS = [
+    "min_ms", "avg_ms", "p50_ms", "p90_ms", "p95_ms", "p99_ms",
+    "p999_ms", "p9999_ms", "max_ms",
+] + LATENCY_THRESHOLD_COLUMNS
 BASIC_CSV_HEADER = [
     "scenario", "work_mode", "operation", "node", "topology", "protocol",
     "num_clients", "num_threads",
     "data_size", "key_count", "batch_size", "put_ratio", "duration", "warmup_duration",
     "target_qps",
-    "total", "total_bytes", "wall_s",
+    "total", "fail", "fail_rate", "qps",
+] + LATENCY_SUMMARY_COLUMNS + [
+    "ok", "total_bytes", "wall_s",
     "throughput_mb_s", "throughput_gb_s",
-    "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
-    "p9999_ms",
-    "ok", "fail", "qps", "actual_qps", "fail_rate",
 ]
 PIPELINE_CSV_HEADER = [
     "config_name",
@@ -164,11 +201,10 @@ PIPELINE_CSV_HEADER = [
     "data_size", "key_count", "batch_size", "duration", "warmup_duration",
     "client_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps", "notify_pipeline", "traffic_mode",
-    "total", "success", "fail", "fail_rate",
-    "total_bytes", "wall_s", "qps", "actual_qps",
+    "total", "fail", "fail_rate", "qps",
+] + LATENCY_SUMMARY_COLUMNS + [
+    "success", "total_bytes", "wall_s",
     "throughput_mb_s", "throughput_gb_s",
-    "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
-    "p9999_ms",
     "queue_wait_avg_ms", "queue_wait_max_ms", "max_depth",
     "notify_async", "notify_max_inflight", "notify_submitted", "notify_ok",
     "notify_fail", "notify_inflight_peak", "notify_backpressure_ms",
@@ -183,14 +219,13 @@ KVTEST_CSV_HEADER = [
     "config_name",
     "scenario", "work_mode", "operation", "role", "node", "instance", "topology", "protocol",
     "num_threads", "notify_threads",
-    "data_size", "key_pool_size", "batch_size", "duration",
+    "data_size", "key_pool_size", "batch_size", "duration", "warmup_duration",
     "client_count", "notify_count", "store_count",
     "base_qps", "qps_multiple", "target_qps",
-    "total", "success", "fail", "fail_rate",
-    "total_bytes", "wall_s", "qps", "actual_qps",
+    "total", "fail", "fail_rate", "qps",
+] + LATENCY_SUMMARY_COLUMNS + [
+    "success", "total_bytes", "wall_s",
     "throughput_mb_s", "throughput_gb_s",
-    "avg_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms", "p9999_ms",
-    "max_ms",
     "verify_failures",
     "notify_submitted", "notify_ok", "notify_fail",
     "notify_avg_ms", "notify_max_ms",
@@ -994,6 +1029,42 @@ def _kvtest_split_qps(per_node_qps, cpn, local):
     cpn = max(1, int(cpn))
     base, rem = divmod(total, cpn)
     return base + (1 if local < rem else 0)
+
+
+def _kvtest_numa_node(cfg, entry, role):
+    """Return an explicit per-process NUMA node from kvtest.numa_bindings."""
+    bindings = (cfg.get("kvtest", {}) or {}).get("numa_bindings")
+    if bindings is None:
+        return None
+    if role not in ("writer", "reader"):
+        raise RuntimeError(
+            "kvtest.numa_bindings only supports split writer/reader roles")
+    if not isinstance(bindings, list):
+        raise RuntimeError("kvtest.numa_bindings must be a list")
+    local = int(entry.get("local", -1))
+    if local < 0 or local >= len(bindings):
+        raise RuntimeError(
+            "kvtest.numa_bindings has no mapping for client local {}"
+            .format(local))
+    binding = bindings[local]
+    if not isinstance(binding, dict) or role not in binding:
+        raise RuntimeError(
+            "kvtest.numa_bindings[{}] must define {}".format(local, role))
+    node = binding[role]
+    if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+        raise RuntimeError(
+            "kvtest.numa_bindings[{}].{} must be a non-negative integer"
+            .format(local, role))
+    return node
+
+
+def _kvtest_warmup_duration(cfg, args):
+    if getattr(args, "no_warmup", False):
+        return 0.0
+    value = float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0)
+    if value < 0:
+        raise RuntimeError("kvtest warmup.duration must be >= 0")
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -2892,6 +2963,16 @@ def _stop_reports():
         log("[WARN] [STOP] report failed: {}".format(exc))
 
 
+def basic_k8s_numa_node(cfg):
+    """Return the explicit NUMA node for a K8s basic client, if configured."""
+    node = cfg.get("k8s_numa_node")
+    if node is None:
+        return None
+    if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+        raise RuntimeError("k8s_numa_node must be a non-negative integer")
+    return node
+
+
 _LOG_PULL_ATTEMPTS = 3
 _LOG_PULL_BACKOFF_S = (1.0, 3.0)
 
@@ -3881,12 +3962,16 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
         if cpu_shard > 0 and not numa_bind:
             numa_bind = True
-        # containers do not do numactl: k8s primary node forces binding off
-        if is_k8s_node(node) and (numa_bind or cpu_shard > 0):
+        k8s_numa_node = basic_k8s_numa_node(cfg) if is_k8s_node(node) else None
+        if is_k8s_node(node):
             numa_bind = False
             cpu_shard = 0
-            log("k8s pod node {}: numa/cpu binding disabled (container)"
-                "".format(primary_node_name))
+            if k8s_numa_node is None:
+                log("k8s pod node {}: numa/cpu binding disabled (no "
+                    "k8s_numa_node)".format(primary_node_name))
+            else:
+                log("k8s pod node {}: bind basic clients to NUMA {}"
+                    "".format(primary_node_name, k8s_numa_node))
         # numactl policy: membind (strict, default) | preferred | off, and
         # strict/auto behavior when numactl is missing on the node
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
@@ -3944,7 +4029,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                                              node)
             command = "bash {} benchmark {} --num-clients {} --num-threads {} --warmup {}".format(
                 remote_runner, remote_log, c, t, warmup)
-            if numa_bind:
+            if k8s_numa_node is not None:
+                command += " --numa-node {}".format(k8s_numa_node)
+            elif numa_bind:
                 # orchestrator-computed per-client bindings; the runner only
                 # prepends numactl (m/p/c spec) or falls back to client-side
                 # --cpu-bind when numactl is missing on the node
@@ -5401,10 +5488,18 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         globals_cfg, cluster_session)
     writer_op = KVTEST_WRITER_OPS[_kvtest_writer_operation(cfg)]
     reader_op = KVTEST_READER_OPS[_kvtest_reader_operation(cfg)]
+    rpc_port_offset = int(kv.get("notify_rpc_port_offset", 10000) or 10000)
+    notify_rpc_port = int(entry["port"]) + rpc_port_offset
+    if not 0 < notify_rpc_port <= 65535:
+        raise RuntimeError(
+            "kvtest notify RPC port {} is invalid (HTTP port {} + offset {})"
+            "".format(notify_rpc_port, entry["port"], rpc_port_offset))
     return {
         "mode": "pipeline",
         "instance_id": entry["iid"],
         "listen_port": entry["port"],
+        "notify_rpc_port": notify_rpc_port,
+        "notify_rpc_threads": int(kv.get("notify_rpc_threads", 4) or 4),
         "role": role,
         "pipeline": [writer_op],
         "notify_pipeline": [reader_op],
@@ -5412,6 +5507,12 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "num_threads": writer_threads,
         "num_total_threads": writer_threads + plan["reader_threads"],
         "notify_threads": plan["notify_threads"],
+        "notify_rpc_connections_per_peer": int(
+            kv.get("notify_rpc_connections_per_peer", 4) or 4),
+        "notify_rpc_reuse_limit": int(
+            kv.get("notify_rpc_reuse_limit", 4)),
+        "notify_rpc_timeout_ms": int(
+            kv.get("notify_rpc_timeout_ms", 3000) or 3000),
         "notify_count": plan["notify_count"],
         "batch_keys_count": max(1, int(cfg.get("batch_size", 1) or 1)),
         "key_pool_size": key_pool,
@@ -5428,6 +5529,7 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "verify_fail_op": bool(kv.get("verify_fail_op", False)),
         "nodes": [
             {"host": i["host"], "port": i["port"],
+             "notify_rpc_port": int(i["port"]) + rpc_port_offset,
              "instance_id": i["iid"], "role": i["role"]}
             for i in all_instances
         ],
@@ -5950,8 +6052,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
       2. split/separate readers first, health-gated, then writers (kvtest
          README rule); dual clients launch together (one process hosts both)
       3. after every /health gate passes, POST /start resets metrics and
-         releases the paused C++ writer threads; run for `duration`
-      4. POST /stop; the C++ shutdown path writes the final summary
+         releases the paused C++ writer threads; optionally run warmup,
+         pause+drain both notification sides, reset, then resume measurement
+      4. run for `duration`, then POST /stop; the C++ shutdown path writes
+         the final summary
       5. flatten artifacts, pull logs, verify exit codes
 
     kvtest needs no etcd rendezvous and no value.bin (the binary fills its
@@ -6002,6 +6106,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     if not cfg_duration or float(cfg_duration) <= 0:
         raise RuntimeError("kvtest config requires duration > 0 "
                            "(missing or invalid)")
+    warmup_duration = _kvtest_warmup_duration(cfg, args)
+    cfg["_kvtest_warmup_duration"] = warmup_duration
     writer_op = _kvtest_writer_operation(cfg)
     reader_op = _kvtest_reader_operation(cfg)
     if writer_op not in KVTEST_WRITER_OPS:
@@ -6237,10 +6343,11 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
 
         log("scenario {} (kvtest, {}): N={}, writers={}, readers={}, "
             "notify_count={}, total_qps={}, per_node_qps={}, binary={}, "
-            "health_timeout={}s, sizes={}".format(
+            "warmup={}s, duration={}s, health_timeout={}s, sizes={}".format(
                 cfg_name, work_mode, n_nodes, len(plan["writers"]),
                 len(plan["readers"]), plan["notify_count"], plan["total_qps"],
-                plan["per_node_qps"], kv_binary, health_timeout_s, sizes))
+                plan["per_node_qps"], kv_binary, warmup_duration, duration,
+                health_timeout_s, sizes))
 
         def _prepare_instance(entry, role, ds, key_pool, all_instances,
                               lhost_counter):
@@ -6271,7 +6378,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                                   entry["local"])
             else:
                 entry["_qps"] = 0
-            # NUMA binding (ssh only): numactl prefix + JSON cpu_affinity
+            # SSH uses the legacy topology-driven binding. K8s split-mode
+            # scenarios may provide an explicit writer/reader NUMA map; the
+            # runner applies CPU-node and memory-node binding inside the pod.
             launch_prefix = ""
             if (cpu_shard > 0 or numa_bind) and not dry \
                     and not is_k8s_node(n):
@@ -6286,6 +6395,13 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     launch_prefix = numactl_launch_prefix(membind_mode, nn, cl) + " "
             else:
                 entry["_cpu_affinity"] = ""
+            explicit_numa_node = None
+            if is_k8s:
+                explicit_numa_node = _kvtest_numa_node(cfg, entry, role)
+                if explicit_numa_node is not None:
+                    launch_prefix = "env KVTEST_NUMA_NODE={} ".format(
+                        explicit_numa_node)
+            entry["_numa_node"] = explicit_numa_node
             inst_cfg = build_kvtest_instance_config(
                 cfg, globals_cfg, cluster_session, plan, entry, role, ds,
                 key_pool, all_instances)
@@ -6293,9 +6409,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 json.dumps(inst_cfg).encode("utf-8")).decode("ascii")
             if dry:
                 log("[dry-run] kvtest {} i{} on {}: config {} ({} B), "
-                    "qps={}, out {}".format(
+                    "qps={}, numa_node={}, out {}".format(
                         role, entry["iid"], entry["node"], cfg_file,
-                        len(payload), entry["_qps"], entry["_out_dir"]))
+                        len(payload), entry["_qps"], explicit_numa_node,
+                        entry["_out_dir"]))
             else:
                 ssh_check_output(
                     n["ip"], n,
@@ -6397,46 +6514,78 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _kvtest_health_gate(cluster, plan["writers"],
                                         health_timeout_s, "writers")
             # All processes are healthy but start_paused=true keeps writer
-            # threads inert. Reset metrics and release every instance through
-            # /start only after the full topology is ready.
+            # threads inert. /start releases the same deployment for warmup
+            # (when configured) or directly for measurement.
             items = [(get_node(cluster, e["node"]), e["port"], "",
                       "kvtest i{}".format(e["iid"]))
                      for e, _pid in instance_pids if "node" in e]
-            _parallel_start_barrier(args)
-            start_results = _pipeline_http_parallel(
-                cluster, items, "/start", timeout=health_timeout_s, dry=dry)
-            start_failures = ["{}: {}".format(what, err or "HTTP non-200")
-                              for what, ok, err in start_results if not ok]
-            if start_failures:
-                raise RuntimeError("kvtest /start failed: {}".format(
-                    "; ".join(start_failures)))
-            if not dry:
-                # samples' elapsed_us is measured from this /start reset
-                cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = time.time()
+            def _control(path, phase, timeout=health_timeout_s):
+                results = _pipeline_http_parallel(
+                    cluster, items, path, timeout=timeout, dry=dry)
+                failures = ["{}: {}".format(what, err or "HTTP non-200")
+                            for what, ok, err in results if not ok]
+                if failures:
+                    raise RuntimeError("kvtest {} failed: {}".format(
+                        phase, "; ".join(failures)))
 
-            # ---- measurement window: every C++ collector was reset by
-            # /start. Per-instance elapsed_seconds from summary.json is used
-            # for QPS/throughput, avoiding launch/health-gate contamination.
-            if not dry:
-                log("kvtest measurement window: {}s (all instances healthy; "
-                    "ETA {})".format(
-                        int(duration),
-                        time.strftime("%H:%M:%S",
-                                      time.localtime(time.time() + duration))))
-                t0 = time.time()
-                try:
-                    while time.time() - t0 < duration:
-                        _check_stop()
-                        time.sleep(min(1.0, max(0.05,
-                                                duration - (time.time() - t0))))
-                except StopRequested:
-                    # /stop first: the C++ collector flushes its request
-                    # samples only there, and the partial HTML report is
-                    # built from exactly those samples
-                    _kvtest_stop_collect(
-                        cluster, cfg, cfg_name, remote_log_dir,
-                        local_log_dir, local_result_dir, instance_pids, items)
-                    raise
+            def _wait_window(seconds, label):
+                if dry or seconds <= 0:
+                    return
+                log("kvtest {} window: {}s (ETA {})".format(
+                    label, seconds,
+                    time.strftime("%H:%M:%S",
+                                  time.localtime(time.time() + seconds))))
+                started = time.time()
+                while time.time() - started < seconds:
+                    _check_stop()
+                    time.sleep(min(
+                        1.0, max(0.05, seconds - (time.time() - started))))
+
+            try:
+                _parallel_start_barrier(args)
+                _control("/start", "/start")
+                if not dry:
+                    # /start is the epoch origin for samples' elapsed_us; a
+                    # warmup run refreshes it at /arm below (a STOP during
+                    # warmup then still maps onto the warmup window)
+                    cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = \
+                        time.time()
+
+                if warmup_duration > 0:
+                    _wait_window(warmup_duration, "warmup")
+                    # Match the Python pipeline warmup boundary: stop new
+                    # writes, drain every outbound notify, then drain every
+                    # inbound reader queue before clearing metrics/samples.
+                    # No warmup request can leak into the measured
+                    # distribution.
+                    transition_timeout = max(45, health_timeout_s)
+                    _control("/pause", "warmup /pause", transition_timeout)
+                    _control("/drain", "warmup /drain", transition_timeout)
+                    _control("/reset", "warmup /reset", transition_timeout)
+                    _parallel_measure_barrier(args)
+                    _control("/arm", "measurement /arm", transition_timeout)
+                    if not dry:
+                        # warmup run: the measured epoch starts at /arm
+                        # (summary elapsed_seconds and samples' elapsed_us
+                        # share this origin; warmup was cleared by /reset)
+                        cfg.setdefault(
+                            "_kvtest_start_epochs", {})[str(ds)] = time.time()
+                    _control("/resume", "measurement /resume",
+                             transition_timeout)
+                    log("kvtest warmup complete: queues drained, metrics "
+                        "reset, measurement armed")
+
+                # ---- measurement window: /start (no warmup) or /arm (warmup)
+                # established the measured epoch. summary elapsed_seconds
+                # therefore excludes launch, health gates and warmup.
+                _wait_window(duration, "measurement")
+            except StopRequested:
+                # /stop first: the C++ collector flushes its request samples
+                # only there, and the partial HTML report is built from them
+                _kvtest_stop_collect(
+                    cluster, cfg, cfg_name, remote_log_dir,
+                    local_log_dir, local_result_dir, instance_pids, items)
+                raise
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
             for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
@@ -6866,6 +7015,9 @@ def parse_benchmark_log(paths, op_filter=None):
         "throughput_gb_s": (total_bytes / wall / 1024.0 ** 3) if wall > 0 else 0.0,
         "avg_ms": (sum(latencies) / n) if n else 0.0,
         "min_ms": percentile(latencies, 0.0),
+        "p50_ms": percentile(latencies, 0.50),
+        "p90_ms": percentile(latencies, 0.90),
+        "p95_ms": percentile(latencies, 0.95),
         "max_ms": percentile(latencies, 1.0),
         "p99_ms": percentile(latencies, 0.99),
         "p999_ms": percentile(latencies, 0.999),
@@ -6873,11 +7025,16 @@ def parse_benchmark_log(paths, op_filter=None):
         "lat_sum_ms": lat_sum_ms,
         "ok": ok,
         "fail": fail,
-        "qps": (total / wall) if wall > 0 else 0.0,
-        "fail_rate": (fail / total) if total else 0.0,
+        "qps": (ok / wall) if wall > 0 else 0.0,
+        "fail_rate": (fail * 100.0 / total) if total else 0.0,
         "queue_wait_avg_ms": (sum(queue_waits) / len(queue_waits)) if queue_waits else 0.0,
         "queue_wait_max_ms": max(queue_waits) if queue_waits else 0.0,
         "max_depth": max_depth,
+    }, **{
+        column: sum(1 for latency in latencies
+                    if latency > threshold_us / 1000.0)
+        for threshold_us, column in zip(
+            LATENCY_THRESHOLD_US, LATENCY_THRESHOLD_COLUMNS)
     })
 
 
@@ -6886,13 +7043,21 @@ def _kvtest_latency_stats(values):
     ordered = sorted(values)
     n = len(ordered)
     return {
+        "min_ms": ordered[0] if ordered else 0.0,
         "avg_ms": (sum(ordered) / n) if n else 0.0,
         "p50_ms": percentile(ordered, 0.50),
         "p90_ms": percentile(ordered, 0.90),
+        "p95_ms": percentile(ordered, 0.95),
         "p99_ms": percentile(ordered, 0.99),
         "p999_ms": percentile(ordered, 0.999),
         "p9999_ms": percentile(ordered, 0.9999),
         "max_ms": ordered[-1] if ordered else 0.0,
+        **{
+            column: sum(1 for latency in ordered
+                        if latency > threshold_us / 1000.0)
+            for threshold_us, column in zip(
+                LATENCY_THRESHOLD_US, LATENCY_THRESHOLD_COLUMNS)
+        },
     }
 
 
@@ -6933,8 +7098,11 @@ def _merge_stats_op(stats_list, op, ls):
     max_depth = 0
     versions = set()
     ts_from = ts_to = None
+    th_counts = dict.fromkeys(LATENCY_THRESHOLD_COLUMNS, 0)
     for st in stats_list:
         o = (st.get("ops") or {}).get(op) or {}
+        for column in LATENCY_THRESHOLD_COLUMNS:
+            th_counts[column] += int(o.get(column, 0) or 0)
         n_ok = int(o.get("ok") or 0)
         ok += int(o.get("keys_ok", n_ok) or 0)
         fail += int(o.get("keys_fail", o.get("fail") or 0) or 0)
@@ -6992,13 +7160,17 @@ def _merge_stats_op(stats_list, op, ls):
         "avg_ms": (lat_sum / ok_rows) if ok_rows else 0.0,
         "min_ms": gmin if gmin is not None else 0.0,
         "max_ms": gmax if gmax is not None else 0.0,
-        "p50_ms": pct(0.50, "p50_ms"), "p95_ms": pct(0.95, "p95_ms"),
+        "p50_ms": pct(0.50, "p50_ms"), "p90_ms": pct(0.90, "p90_ms"),
+        "p95_ms": pct(0.95, "p95_ms"),
         "p99_ms": pct(0.99, "p99_ms"), "p999_ms": pct(0.999, "p999_ms"),
         "p9999_ms": pct(0.9999, "p9999_ms"),
+        **th_counts,
         "lat_sum_ms": lat_sum,
         "ok": ok, "fail": fail,
-        "qps": (total / wall) if wall > 0 else 0.0,
-        "fail_rate": (fail / total) if total else 0.0,
+        # YLT unified semantics: qps = successful requests / wall,
+        # fail_rate is a percentage
+        "qps": (ok / wall) if wall > 0 else 0.0,
+        "fail_rate": (fail * 100.0 / total) if total else 0.0,
         "queue_wait_avg_ms": 0.0,
         "queue_wait_max_ms": 0.0,
         "max_depth": max_depth,
@@ -7055,15 +7227,18 @@ def _merge_stats_aggs(stats_list, op_filter=None):
             "min_ms": g.get("min_ms") or 0.0,
             "max_ms": g.get("max_ms") or 0.0,
             "p50_ms": g.get("p50_ms") or 0.0,
+            "p90_ms": g.get("p90_ms") or 0.0,
             "p95_ms": g.get("p95_ms") or 0.0,
             "p99_ms": g.get("p99_ms") or 0.0,
             "p999_ms": g.get("p999_ms") or 0.0,
             "p9999_ms": g.get("p9999_ms") or 0.0,
+            **{column: int(g.get(column, 0) or 0)
+               for column in LATENCY_THRESHOLD_COLUMNS},
             "lat_sum_ms": (g.get("avg_ms") or 0.0) * (g.get("ok") or 0),
             "ok": ok,
             "fail": fail,
-            "qps": (total / wall) if wall > 0 else 0.0,
-            "fail_rate": (fail / total) if total else 0.0,
+            "qps": (ok / wall) if wall > 0 else 0.0,
+            "fail_rate": (fail * 100.0 / total) if total else 0.0,
             "queue_wait_avg_ms": (g.get("qw_avg_ms")
                                   if g.get("qw_avg_ms") is not None else 0.0),
             "queue_wait_max_ms": (g.get("qw_max_ms")
@@ -7080,9 +7255,12 @@ def _merge_stats_aggs(stats_list, op_filter=None):
     ts_from = ts_to = None
     wall_summary = 0.0
     hist = {}
+    th_counts = dict.fromkeys(LATENCY_THRESHOLD_COLUMNS, 0)
     for st in stats_list:
         g = st.get("global") or {}
         meta = st.get("meta") or {}
+        for column in LATENCY_THRESHOLD_COLUMNS:
+            th_counts[column] += int(g.get(column, 0) or 0)
         total += g.get("key_total") or 0
         ok += g.get("key_ok") or 0
         fail += g.get("key_fail") or 0
@@ -7129,15 +7307,17 @@ def _merge_stats_aggs(stats_list, op_filter=None):
         "min_ms": (ls.hist_percentile(hist, 0.0, hist_edges) if hist else 0.0),
         "max_ms": (ls.hist_percentile(hist, 1.0, hist_edges) if hist else 0.0),
         "p50_ms": (ls.hist_percentile(hist, 0.50, hist_edges) if hist else 0.0),
+        "p90_ms": (ls.hist_percentile(hist, 0.90, hist_edges) if hist else 0.0),
         "p95_ms": (ls.hist_percentile(hist, 0.95, hist_edges) if hist else 0.0),
         "p99_ms": (ls.hist_percentile(hist, 0.99, hist_edges) if hist else 0.0),
         "p999_ms": (ls.hist_percentile(hist, 0.999, hist_edges) if hist else 0.0),
         "p9999_ms": (ls.hist_percentile(hist, 0.9999, hist_edges) if hist else 0.0),
+        **th_counts,
         "lat_sum_ms": lat_sum,
         "ok": ok,
         "fail": fail,
-        "qps": (total / wall) if wall > 0 else 0.0,
-        "fail_rate": (fail / total) if total else 0.0,
+        "qps": (ok / wall) if wall > 0 else 0.0,
+        "fail_rate": (fail * 100.0 / total) if total else 0.0,
         "queue_wait_avg_ms": (qw_sum / qw_n) if qw_n else 0.0,
         "queue_wait_max_ms": qw_max,
         "max_depth": max_depth,
@@ -7317,8 +7497,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             # bytes/throughput count successful operations only
             row["total_bytes"] = int(ok * bytes_per_op)
             row["wall_s"] = wall
-            row["qps"] = (total / wall) if wall > 0 else 0.0
-            row["actual_qps"] = (ok / wall) if wall > 0 else 0.0
+            row["qps"] = (ok / wall) if wall > 0 else 0.0
             if throughput_mb is None:
                 # interface throughput = successful bytes / sum of successful
                 # interface call durations (busy time, not wall clock)
@@ -7326,19 +7505,21 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 throughput_mb = (row["total_bytes"] / busy_s / 1024.0 ** 2) if busy_s > 0 else 0.0
             row["throughput_mb_s"] = throughput_mb
             row["throughput_gb_s"] = throughput_mb / 1024.0
-            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms"):
-                row[k] = agg[k]
+            for k in LATENCY_SUMMARY_COLUMNS:
+                # older stats products predate p90/threshold columns
+                row[k] = agg.get(k, 0)
             if with_queue:
                 row["queue_wait_avg_ms"] = agg["queue_wait_avg_ms"]
                 row["queue_wait_max_ms"] = agg["queue_wait_max_ms"]
                 row["max_depth"] = agg["max_depth"]
-            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
+            for k in ("avg_ms", "min_ms", "max_ms", "p50_ms", "p90_ms",
+                      "p95_ms", "p99_ms", "p999_ms", "p9999_ms",
                       "queue_wait_avg_ms", "queue_wait_max_ms", "wall_s"):
                 v = row.get(k)
                 if isinstance(v, float):
                     row[k] = round(v, 4)
             for k in ("throughput_mb_s", "throughput_gb_s",
-                      "qps", "actual_qps", "fail_rate"):
+                      "qps", "fail_rate"):
                 v = row.get(k)
                 if isinstance(v, float):
                     row[k] = round(v, 2)
@@ -7477,8 +7658,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         duration = float(cfg.get("duration", 0) or 0)
         writer_op = KVTEST_WRITER_OPS[_kvtest_writer_operation(cfg)]
         reader_op = KVTEST_READER_OPS[_kvtest_reader_operation(cfg)]
-        lat_keys = ("avg_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms",
-                    "p9999_ms", "max_ms")
+        lat_keys = tuple(LATENCY_SUMMARY_COLUMNS)
 
         def base_row(role, instance, nodename, ds):
             op = writer_op if role == "writer" else reader_op
@@ -7517,6 +7697,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "key_pool_size": effective_pool,
                 "batch_size": cfg.get("batch_size", ""),
                 "duration": cfg.get("duration", ""),
+                "warmup_duration": cfg.get(
+                    "_kvtest_warmup_duration",
+                    (cfg.get("warmup", {}) or {}).get("duration", 0)),
                 "client_count": client_count,
                 "notify_count": plan["notify_count"],
                 "store_count": ("N*{}".format(cfg.get("store_count_per_node"))
@@ -7539,8 +7722,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["fail_rate"] = (fail * 100.0 / total) if total else 0.0
             row["total_bytes"] = int(st.get("bytes", 0) or 0)
             row["wall_s"] = wall
-            row["qps"] = (total / wall) if wall > 0 else 0.0
-            row["actual_qps"] = (ok / wall) if wall > 0 else 0.0
+            row["qps"] = (ok / wall) if wall > 0 else 0.0
             row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
                                       if wall > 0 else 0.0)
             row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
@@ -7548,12 +7730,15 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                      else st)
             for k in lat_keys:
                 row[k] = round(float(stats.get(k, 0) or 0), 4)
-            for k in ("qps", "actual_qps", "fail_rate", "throughput_mb_s",
+            for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
 
         def fill_notify(row, summary, values=None):
-            nt = op_stats(summary, "notify_http")
+            operation = ("notify_rpc"
+                         if "notify_rpc" in (summary.get("operations") or {})
+                         else "notify_http")
+            nt = op_stats(summary, operation)
             row["notify_submitted"] = int(nt.get("total", 0) or 0)
             row["notify_ok"] = int(nt.get("success", 0) or 0)
             row["notify_fail"] = int(nt.get("failure", 0) or 0)
@@ -7594,9 +7779,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["total_bytes"] = sum(r["total_bytes"] for r in inst_rows)
             row["wall_s"] = max((float(r.get("wall_s", 0) or 0)
                                  for r in inst_rows), default=wall)
-            row["qps"] = sum(float(r.get("qps", 0) or 0)
-                             for r in inst_rows)
-            row["actual_qps"] = sum(
+            row["qps"] = sum(
                 (float(r.get("success", 0) or 0) /
                  float(r.get("wall_s", 0) or 1))
                 if float(r.get("wall_s", 0) or 0) > 0 else 0.0
@@ -7614,13 +7797,21 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 # avg/percentiles remain weighted approximations, but max is
                 # still exactly the largest per-instance maximum.
                 for k in lat_keys:
-                    if k == "max_ms":
+                    if k == "min_ms":
+                        row[k] = min((float(r.get(k, 0) or 0)
+                                      for r in inst_rows
+                                      if int(r.get("success", 0) or 0) > 0),
+                                     default=0.0)
+                    elif k == "max_ms":
                         row[k] = max((float(r.get(k, 0) or 0)
                                       for r in inst_rows), default=0.0)
+                    elif k in LATENCY_THRESHOLD_COLUMNS:
+                        row[k] = sum(int(r.get(k, 0) or 0)
+                                     for r in inst_rows)
                     else:
                         row[k] = weighted_of(
                             inst_rows, k, weight_key="success")
-            for k in ("qps", "actual_qps", "fail_rate", "throughput_mb_s",
+            for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
             return row
@@ -7685,9 +7876,12 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                         int(writer_st.get("success", 0) or 0))
                     row = base_row("writer", "i{}".format(iid), nodename, ds)
                     fill_metrics(row, writer_st, instance_wall, writer_values)
-                    notify_st = op_stats(summary, "notify_http")
+                    notify_operation = (
+                        "notify_rpc" if "notify_rpc" in ops
+                        else "notify_http")
+                    notify_st = op_stats(summary, notify_operation)
                     notify_values = sample_values(
-                        ds, iid, nodename, "notify_http",
+                        ds, iid, nodename, notify_operation,
                         int(notify_st.get("success", 0) or 0))
                     fill_notify(row, summary, notify_values)
                     writer_rows.append(row)
@@ -7748,20 +7942,20 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["operation"] = op_label
             row.update({k: agg[k] for k in (
                 "total", "total_bytes", "wall_s", "throughput_mb_s", "throughput_gb_s",
-                "avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms",
                 "ok", "fail", "qps", "fail_rate")})
-            row["actual_qps"] = (
-                row["ok"] / row["wall_s"] if row["wall_s"] > 0 else 0.0)
+            for key in LATENCY_SUMMARY_COLUMNS:
+                row[key] = agg.get(key, 0)
             # throughput recomputed from this row's own bytes/wall so split
             # (mixed) rows never inherit combined SUMMARY bytes
             row["throughput_mb_s"] = (row["total_bytes"] / row["wall_s"] / 1024.0 ** 2) if row["wall_s"] > 0 else 0.0
             row["throughput_gb_s"] = (row["total_bytes"] / row["wall_s"] / 1024.0 ** 3) if row["wall_s"] > 0 else 0.0
-            for k in ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms", "p9999_ms", "wall_s"):
+            for k in ("avg_ms", "min_ms", "max_ms", "p50_ms", "p90_ms",
+                      "p95_ms", "p99_ms", "p999_ms", "p9999_ms", "wall_s"):
                 v = row.get(k)
                 if v is not None and isinstance(v, float):
                     row[k] = round(v, 4)
             for k in ("throughput_mb_s", "throughput_gb_s",
-                      "qps", "actual_qps", "fail_rate", "total_bytes"):
+                      "qps", "fail_rate", "total_bytes"):
                 v = row.get(k)
                 if v is not None and isinstance(v, float):
                     row[k] = round(v, 2)

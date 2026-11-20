@@ -106,6 +106,45 @@ def test_write_scenario_csv_from_stats_only(tmp_path, monkeypatch):
     r = [r for r in rows if r["role"] == "reader" and r["instance"] == "c0"][0]
     assert r["queue_wait_avg_ms"] == 0.5
     assert r["max_depth"] == 5
+    # YLT semantics on the stats-first path: qps = successful requests/wall,
+    # fail_rate is a percentage, p90 + latency-threshold columns are present
+    assert w["qps"] == 20.0 and w["fail_rate"] == 0.0
+    assert w["p90_ms"] > 0 and r["p90_ms"] > 0
+    assert w[">2000us"] == 9          # writer 1.0..2.9 ms -> 9 rows > 2.0
+    assert r[">2000us"] == 19         # reader 2.1..3.9 ms (strict >, 2.0 excluded)
+    assert r[">5000us"] == 0
+    # every header column is populated in both role rows
+    for row in (w, r):
+        assert set(bm.LATENCY_SUMMARY_COLUMNS) <= set(row)
+
+
+def test_stats_first_csv_tolerates_old_stats_products(tmp_path, monkeypatch):
+    """Stats produced before the threshold columns existed must still render."""
+    monkeypatch.setattr(bm, "RESULTS_DIR", str(tmp_path / "results"))
+    os.makedirs(str(tmp_path / "results" / "20261112-1000"))
+    logdir = tmp_path / "logs" / "rank_smoke"
+    logdir.mkdir(parents=True)
+    stem = "rank_smoke.benchmark_c1_t1_8MB.dual_node1_c0_p9301"
+    sp = _mk_stats(str(logdir), stem + ".writer", WRITER_ROWS, SUMMARY_W)
+    st = json.load(open(sp, encoding="utf-8"))
+    for key in ("p90_ms",) + tuple(bm.LATENCY_THRESHOLD_COLUMNS):
+        st["global"].pop(key, None)
+        for op in (st.get("ops") or {}).values():
+            op.pop(key, None)
+    with open(sp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    cfg = {
+        "scenario": "pipeline", "protocol": "ub", "work_mode": "rank",
+        "data_size": ["8MB"], "batch_size": 1, "duration": 0,
+        "client": {"count_per_node": 1},
+        "_writer_count": 1, "_reader_count": 1,
+        "_key_space": {"8MB": 1000},
+    }
+    rows = bm.write_scenario_csv(
+        str(logdir), cfg, "20261112-1000", "rank_smoke.json")
+    w = [r for r in rows if r["role"] == "writer" and r["instance"] == "c0"][0]
+    assert w["p90_ms"] == 0 and w[">2000us"] == 0
+    assert w["qps"] == 20.0 and w["total"] == 200
 
 
 def test_mixed_op_filter_splits_put_and_get(tmp_path):

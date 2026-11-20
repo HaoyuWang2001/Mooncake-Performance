@@ -263,6 +263,7 @@ def test_kvtest_report_end_to_end(tmp_path):
                     bad=(800.0,))
     _write_instance(str(logs), 1, 9302, "8MB", [4.0], [5.0, 6.0])
     cfg = _cfg()
+    cfg["warmup"] = {"duration": 5}       # YLT: warmup now applies to kvtest
     cfg["__cfg_path__"] = str(tmp_path / "kvtest_demo.json")
     bm._kvtest_generate_reports(cfg, str(logs), _args())
     out = logs / "report" / "8MB"
@@ -273,6 +274,8 @@ def test_kvtest_report_end_to_end(tmp_path):
     assert meta["mode"] == "kvtest"
     assert meta["unit_size"] == "8MB"
     assert any(p[0] == "场景" and p[1] == "kvtest" for p in meta["params"])
+    # kvtest warmup now reaches the params card ("预热时长")
+    assert ["预热时长", "5 s"] in meta["params"]
 
     raw = (out / "data.js").read_text(encoding="utf-8")
     data = json.loads(re.search(r"=\s*(\{.*\})\s*;?\s*$", raw,
@@ -598,7 +601,25 @@ def test_collect_local_stats_ignores_kvtest_raw_logs(tmp_path):
     assert bm._is_client_log("cfg.dual_node_c0_p9301.reader.log") is True
 
 
-# --------------------------------------------------------------------- CLI
+def test_kvtest_warmup_epoch_and_stop_integration():
+    """YLT warmup shifts the measured epoch to /arm; the report map must use
+    that epoch, and STOP must still collect samples from either window."""
+    src = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
+    start_pos = src.index('_control("/start", "/start")')
+    arm_pos = src.index('_control("/arm", "measurement /arm"')
+    resume_pos = src.index('_control("/resume", "measurement /resume"')
+    wait_pos = src.index('_wait_window(duration, "measurement")')
+    assert start_pos < arm_pos < resume_pos < wait_pos
+    # cold path (/start) records an epoch before the warmup branch
+    assert "_kvtest_start_epochs" in src[start_pos:arm_pos]
+    # warmup path refreshes it between /arm and /resume
+    assert "_kvtest_start_epochs" in src[arm_pos:resume_pos]
+    # StopRequested from either window collects samples and re-raises
+    stop_pos = src.index("except StopRequested:", wait_pos)
+    block = src[stop_pos:stop_pos + 900]
+    assert "_kvtest_stop_collect(" in block and "raise" in block
+
+
 # --------------------------------------------------------------------- CLI
 
 def test_logstats_cli_kvtest_mode(tmp_path):

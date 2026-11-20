@@ -257,6 +257,8 @@ def test_render_deployment_yaml_structure():
         "Deployment pod template restartPolicy must be Always")
     assert "{{MC_" not in text
     assert "replicas: 4" in text and "role: client" in text
+    assert "name: MC_UB_ELECTRICAL_NETWORK_ENABLE" in text
+    assert 'value: "off"' in text
 
 
 def test_pipeline_http_call_always_loops_back_via_node(monkeypatch):

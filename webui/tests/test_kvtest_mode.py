@@ -2,9 +2,10 @@
 
 The C++ mooncake_kvtest binary records summary.json operation keys exactly
 as the config strings we ship (metric_name is the pre-normalization name),
-so the aggregation matches on "upsert_from"/"get_buffer"/"notify_http"/
+so the aggregation matches on "upsert_from"/"get_buffer"/"notify_rpc"/
 "notify_queue_wait".
 """
+import argparse
 import csv
 import json
 import os
@@ -116,9 +117,37 @@ def test_kvtest_split_qps_matches_binary_rate_gate():
     assert bm._kvtest_split_qps(60, 1, 0) == 60
 
 
+def test_kvtest_warmup_duration_and_no_warmup_override():
+    cfg = {"warmup": {"duration": 5}}
+    assert bm._kvtest_warmup_duration(
+        cfg, argparse.Namespace(no_warmup=False)) == 5.0
+    assert bm._kvtest_warmup_duration(
+        cfg, argparse.Namespace(no_warmup=True)) == 0.0
+    try:
+        bm._kvtest_warmup_duration(
+            {"warmup": {"duration": -1}},
+            argparse.Namespace(no_warmup=False))
+        raise AssertionError("negative warmup should fail")
+    except RuntimeError as exc:
+        assert "warmup.duration" in str(exc)
+
+    inherited = bm.load_scenario_config(os.path.join(
+        ROOT, "configs", "kvtest", "smoke", "kvtest_smoke.json"))
+    assert inherited["warmup"]["duration"] == 5
+
+
+def test_kvtest_warmup_control_barrier_order():
+    source = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
+    calls = ['_control("/pause"', '_control("/drain"',
+             '_control("/reset"', '_control("/arm"',
+             '_control("/resume"']
+    positions = [source.index(call) for call in calls]
+    assert positions == sorted(positions)
+
+
 # ------------------------------------------------- per-instance config build
 
-def test_build_kvtest_instance_config_http_master():
+def test_build_kvtest_instance_config_rpc_notify():
     plan = bm.kvtest_plan(_kv_cfg(), node_count=1)
     entry = plan["clients"][0]
     entry["_qps"] = 53
@@ -142,6 +171,9 @@ def test_build_kvtest_instance_config_http_master():
     assert inst["num_threads"] == 1
     assert inst["num_total_threads"] == 1 + plan["reader_threads"] == 5
     assert inst["notify_count"] == 10 and inst["notify_threads"] == 10
+    assert inst["notify_rpc_port"] == entry["port"] + 10000
+    assert inst["notify_rpc_connections_per_peer"] == 4
+    assert inst["notify_rpc_reuse_limit"] == 4
     assert inst["key_pool_size"] == 256
     assert inst["start_paused"] is True
     # late-bound placeholders (filled by run_kvtest.sh per pod)
@@ -154,6 +186,8 @@ def test_build_kvtest_instance_config_http_master():
     # nodes view: the whole cluster as kvtest peers
     assert [n["instance_id"] for n in inst["nodes"]] == [0, 1]
     assert all(n["role"] == "dual" for n in inst["nodes"])
+    assert all(n["notify_rpc_port"] == n["port"] + 10000
+               for n in inst["nodes"])
 
 
 def test_build_kvtest_instance_config_etcd_master():
@@ -227,6 +261,32 @@ def test_kvtest_runner_replaces_both_runtime_placeholders():
                   encoding="utf-8").read()
     assert "s/__FABRIC_IP__/${fabric_escaped}/g" in runner
     assert "s/__UB_DEVICE__/${device_escaped}/g" in runner
+
+
+def test_kvtest_runner_binds_cpu_and_memory_to_requested_numa_node():
+    runner = open(os.path.join(ROOT, "scripts", "run_kvtest.sh"),
+                  encoding="utf-8").read()
+    assert "KVTEST_NUMA_NODE" in runner
+    assert '"--cpunodebind=$KVTEST_NUMA_NODE"' in runner
+    assert '"--membind=$KVTEST_NUMA_NODE"' in runner
+
+
+def test_rank_smoke_numa_process_mapping():
+    cfg = bm.load_scenario_config(_smoke_path("kvtest_rank_smoke.json"))
+    plan = bm.kvtest_plan(cfg, node_count=1)
+    assert [bm._kvtest_numa_node(cfg, entry, "writer")
+            for entry in plan["writers"]] == [0, 2]
+    assert [bm._kvtest_numa_node(cfg, entry, "reader")
+            for entry in plan["readers"]] == [1, 3]
+
+
+def test_recall_smoke_numa_process_mapping():
+    cfg = bm.load_scenario_config(_smoke_path("kvtest_recall_smoke.json"))
+    plan = bm.kvtest_plan(cfg, node_count=1)
+    assert [bm._kvtest_numa_node(cfg, entry, "writer")
+            for entry in plan["writers"]] == [0, 0, 0, 2, 2, 2]
+    assert [bm._kvtest_numa_node(cfg, entry, "reader")
+            for entry in plan["readers"]] == [1, 1, 1, 3, 3, 3]
 
 
 def test_kvtest_artifact_flatten_includes_request_samples(monkeypatch):
@@ -378,7 +438,7 @@ def _summary(iid, up_total, get_total, verify):
                            "p999_ms": 9.0, "p9999_ms": 11.0, "max_ms": 13.0,
                            "total": get_total, "success": get_total,
                            "failure": 0, "bytes": get_total * mb},
-            "notify_http": {"count": up_total * 10, "avg_ms": 1.5,
+            "notify_rpc": {"count": up_total * 10, "avg_ms": 1.5,
                             "max_ms": 9.0, "total": up_total * 10,
                             "success": up_total * 10 - 10, "failure": 10,
                             "bytes": 0},
@@ -423,7 +483,6 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     assert w0["operation"] == "upsert_from" and w0["total"] == 1500
     assert w0["total_bytes"] == 1500 * 8 * 1024 * 1024
     assert w0["qps"] == 50.0                     # 1500 / 30s
-    assert w0["actual_qps"] == 50.0              # all requests succeeded
     assert w0["notify_submitted"] == 15000 and w0["notify_fail"] == 10
     assert w0["key_pool_size"] == 256
     assert w0["num_threads"] == 1 and w0["notify_threads"] == 10
@@ -451,7 +510,7 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
         assert set(r.keys()) <= set(bm.KVTEST_CSV_HEADER)
 
 
-def test_kvtest_actual_qps_excludes_failed_requests(tmp_path):
+def test_kvtest_qps_is_measured_success_qps(tmp_path):
     local_logs = tmp_path / "logs"
     local_logs.mkdir()
     summary = _summary(0, 100, 0, 0)
@@ -464,10 +523,8 @@ def test_kvtest_actual_qps_excludes_failed_requests(tmp_path):
         os.path.join(str(tmp_path), "kvtest_csv.json"), cluster=None,
         mooncake_store_nodes=[], result_dir=str(tmp_path))
     writer, total = [r for r in rows if r["role"] == "writer"]
-    assert writer["qps"] == 3.33       # 100 attempted / 30s
-    assert writer["actual_qps"] == 3.0  # 90 successful / 30s
-    assert total["qps"] == 3.33
-    assert total["actual_qps"] == 3.0
+    assert writer["qps"] == 3.0  # 90 successful / 30s
+    assert total["qps"] == 3.0
 
 
 def test_kvtest_total_latency_recomputed_from_merged_ok_samples(tmp_path):
@@ -480,7 +537,7 @@ def test_kvtest_total_latency_recomputed_from_merged_ok_samples(tmp_path):
         summary = _summary(iid, len(values), 0, 0)
         summary["operations"].pop("get_buffer")
         summary["operations"].pop("notify_queue_wait")
-        summary["operations"]["notify_http"].update(
+        summary["operations"]["notify_rpc"].update(
             {"total": 0, "success": 0, "failure": 0, "count": 0})
         # Deliberately wrong summary latency fields: raw OK samples must win.
         summary["operations"]["upsert_from"].update(
@@ -511,11 +568,16 @@ def test_kvtest_total_latency_recomputed_from_merged_ok_samples(tmp_path):
     assert w0["avg_ms"] == 1.5 and w0["max_ms"] == 2.0
     assert w1["avg_ms"] == 100.0 and w1["max_ms"] == 100.0
     assert total["avg_ms"] == 34.3333
+    assert total["min_ms"] == 1.0
     assert total["max_ms"] == 100.0
     assert total["p50_ms"] == 2.0
+    assert total["p95_ms"] == 100.0
     assert total["p99_ms"] == 100.0
     assert total["p999_ms"] == 100.0
     assert total["p9999_ms"] == 100.0
+    # Strictly greater: the 2ms sample is not part of >2000us.
+    assert total[">2000us"] == 1
+    assert total[">20000us"] == 1
 
 
 def test_kvtest_csv_skips_bad_summary_json(tmp_path, capsys):

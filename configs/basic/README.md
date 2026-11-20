@@ -51,6 +51,7 @@ configs/basic/
 | `client_node` | 是 | cluster.json 节点名（决定拓扑标注） |
 | `work_mode` | 是 | 与 operation 一致的标注（put/get/mixed） |
 | `data_size` | 否 | 覆盖根基座扫掠（单 size 写 `["8MB"]`） |
+| `k8s_numa_node` | 否 | K8s basic client 显式绑定的 NUMA 节点，同时绑定 CPU 与内存；未配置则不绑定 |
 
 ## duration 压测语义（全部操作支持）
 

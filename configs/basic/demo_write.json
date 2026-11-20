@@ -1,0 +1,26 @@
+{
+  "scenario": "basic",
+  "operation": "upsert_from",
+  "batch_size": 1,
+  "protocol": "ub",
+  "client_node": "node1",
+  "key_prefix": "mc_bench",
+  "key_count": 1000,
+  "data_size": ["8MB"],
+  "target_qps": null,
+  "duration": 30,
+  "numa_bind": true,
+  "params": [
+    {
+      "num_clients": 1,
+      "num_threads": 1
+    }
+  ],
+  "warmup": {
+    "key_count": 20,
+    "data_size": "1MB",
+    "num_clients": 1,
+    "num_threads": 1
+  },
+  "work_mode": "put"
+}

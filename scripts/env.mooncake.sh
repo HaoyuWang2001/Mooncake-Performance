@@ -36,6 +36,20 @@ export MC_URMA_LOG_REDIRECT=1                 # 导入urma日志到glog，方便
 export URMA_LOG_LEVEL=debug                   # urma日志级别
 export GLOG_v=1                               # glog日志级别
 # --- 传输层（URMA/UB） ---
+# TENT UB 与当前 TE 使用同一 bonding 配置；显式设备沿用 SETUP_UB_DEVICE。
+# 设置 MC_TENT_CONF 可覆盖此默认 JSON（包括 device_filter）。
+export MC_USE_TENT=1
+if [ -z "${MC_TENT_CONF:-}" ]; then
+    if [ -n "${SETUP_UB_DEVICE:-}" ]; then
+        if [[ ! "$SETUP_UB_DEVICE" =~ ^[a-zA-Z0-9_.:-]+$ ]]; then
+            echo "[FATAL] TENT UB requires a single valid SETUP_UB_DEVICE: $SETUP_UB_DEVICE" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        export MC_TENT_CONF="{\"transports\":{\"ub\":{\"enable\":true,\"device_filter\":\"${SETUP_UB_DEVICE}\",\"slice_size\":1048576,\"worker_count\":2}}}"
+    else
+        export MC_TENT_CONF='{"transports":{"ub":{"enable":true,"slice_size":1048576,"worker_count":2}}}'
+    fi
+fi
 export MC_SLICE_SIZE=1048576                 # slice 大小（1MB）
 export MC_WORKERS_PER_CTX=2                  # 每个 ctx 的 worker 数
 export MC_NUM_CQ_PER_CTX=2                   # 每个 ctx 的 CQ 数
@@ -43,6 +57,8 @@ export MC_MAX_WR=32                          # 最大 outstanding work request
 export MC_URMA_TRANS_MODE=RM                 # URMA 传输模式（RM）
 export MC_OFFLOAD_PUSH=false                 # 关闭 offload push
 export MC_URMA_BONDING_MULTIPATH_ENABLE=on
+export MC_URMA_BONDING_MODE=BALANCE          # BALANCE|STANDALONE|ACTIVE-BACKUP
+export MC_URMA_BONDING_LEVEL=PORT            # IODIE|PORT
 export MC_UB_NUMA_AFFINITY_ENABLE=on
 export MC_URMA_SET_BONDING_MODE=on
 # export MC_YLT_LOG_LEVEL=info                  # ylt easylog（coro_rpc 内部事件）级别

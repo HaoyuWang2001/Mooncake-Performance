@@ -56,6 +56,12 @@ EDGES_BY_VERSION = {1: BIN_EDGES, 2: BIN_EDGES_V2}
 BIN_EDGES_US = [0.001 * (1.2 ** i) for i in range(121)]
 BIN_EDGES_US[0] = 0.0
 EXACT_LIMIT = 5_000_000        # 样本数上限内用精确分位数，超出用直方图
+# 成功请求的时延阈值计数（微秒 -> CSV 的 ">Nus" 列）。与
+# benchmark.LATENCY_THRESHOLD_US 保持一致：stats-first 与原始日志两条
+# CSV 路径输出同一套列，阈值口径都是「严格大于」。
+LATENCY_THRESHOLDS_US = (2000, 5000, 6000, 7000, 8000, 9000, 10000, 20000)
+LATENCY_THRESHOLD_COLUMNS = [">{}us".format(v)
+                             for v in LATENCY_THRESHOLDS_US]
 # 离群体系（S5）：离群值 = 单请求 > 该客户端 p99 × 10（需足够样本）；
 # 离群样本从 1s 桶的标量统计（sum/max/队列等待）中剔除；
 # 计数（c/ok/fail）与直方图保持全量（QPS 与时延分布口径不变）。
@@ -282,6 +288,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     first_error_status = None
     slowest = []                    # min-heap of (lat, seq, row), size<=top_n
     slow_seq = 0
+    threshold_counts = dict.fromkeys(LATENCY_THRESHOLDS_US, 0)
     abnormal = []                   # 异常请求（未完成/失败）清单，<=LIST_CAP
     seconds = {}                    # epoch-second -> bucket dict
     ts_from = ts_to = None
@@ -297,12 +304,17 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0,
                                    "_keys_ok": 0, "_keys_fail": 0,
                                    "_lats": [], "_h": {}, "_sum": 0.0,
-                                   "_min": None, "_max": None, "_exact": True})
+                                   "_min": None, "_max": None, "_exact": True,
+                                   "_th": dict.fromkeys(
+                                       LATENCY_THRESHOLDS_US, 0)})
         opd["count"] += 1
         opd["keys"] += kc
         if okrow:
             opd["ok"] += 1
             opd["_keys_ok"] += kc
+            for threshold in LATENCY_THRESHOLDS_US:
+                if row["lat"] > threshold / 1000.0:
+                    opd["_th"][threshold] += 1
             ob = bin_of(row["lat"], BIN_EDGES_V2)
             opd["_h"][ob] = opd["_h"].get(ob, 0) + 1
             opd["_sum"] += row["lat"]
@@ -350,6 +362,9 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         ok += 1
         key_ok += kc
         lat = row["lat"]
+        for threshold in LATENCY_THRESHOLDS_US:
+            if lat > threshold / 1000.0:
+                threshold_counts[threshold] += 1
         lat_sum += lat
         lat_min = lat if lat_min is None else min(lat_min, lat)
         lat_max = lat if lat_max is None else max(lat_max, lat)
@@ -449,9 +464,13 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "exact": bool(opd["_exact"]),
             "avg_ms": round(opd["_sum"] / opd["ok"], 6) if opd["ok"] else 0.0,
             "min_ms": opmin, "max_ms": opmax,
-            "p50_ms": opct(0.50), "p95_ms": opct(0.95), "p99_ms": opct(0.99),
+            "p50_ms": opct(0.50), "p90_ms": opct(0.90), "p95_ms": opct(0.95),
+            "p99_ms": opct(0.99),
             "p999_ms": opct(0.999), "p9999_ms": opct(0.9999),
         }
+        for column, threshold in zip(LATENCY_THRESHOLD_COLUMNS,
+                                     LATENCY_THRESHOLDS_US):
+            ops_out[op][column] = opd["_th"][threshold]
 
     # ---- 离群体系：第二遍扫描（阈值需在全局 p99 之后才知道） ----
     outliers = []
@@ -610,8 +629,12 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "avg_ms": round(avg_ms, 6) if ok else 0.0,
             "min_ms": round(lat_min, 6) if lat_min is not None else 0.0,
             "max_ms": round(lat_max, 6) if lat_max is not None else 0.0,
-            "p50_ms": pct(0.50), "p95_ms": pct(0.95), "p99_ms": pct(0.99),
+            "p50_ms": pct(0.50), "p90_ms": pct(0.90), "p95_ms": pct(0.95),
+            "p99_ms": pct(0.99),
             "p999_ms": pct(0.999), "p9999_ms": pct(0.9999),
+            **{column: threshold_counts[threshold]
+               for column, threshold in zip(LATENCY_THRESHOLD_COLUMNS,
+                                            LATENCY_THRESHOLDS_US)},
             "qw_avg_ms": round(qw_sum / qw_n, 6) if qw_n else None,
             "qw_max_ms": round(qw_max, 6) if qw_n else None,
             "qw_n": qw_n,

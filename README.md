@@ -91,6 +91,7 @@ basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字
 | `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
 | `target_qps` | 总限速 QPS（可选）：按该总 QPS 对操作均匀限速（跨 client×thread 均分，绝对时间表自纠偏） | 空/0：计数模式极速连发（现行为）；设置后用于低压时延对比 |
 | `numa_bind` | 客户端 NUMA 绑定：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配）。解析优先级：用例/层级显式值 > global.json（默认 true）> 代码缺省 true | `true` |
+| `k8s_numa_node` | K8s basic 场景显式 NUMA 节点；通过 `numactl --cpunodebind/--membind` 同时绑定 CPU 和内存，未配置时 K8s basic 不绑定 | 未配置 |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。
 - **核分片（cpu_shard）**：`"cpu_shard": N`（basic/pipeline 根基座或用例，缺省 null 关闭）时每个 client 绑
@@ -334,11 +335,11 @@ demo/ 另有 2 个传统分离角色冒烟配置。
 | 指标 | 含义 | 单位 |
 | --- | --- | --- |
 | throughput_mb_s / throughput_gb_s | 吞吐量（1024 进制，1 MB/s = 1024² B/s），详见下方公式 | MB/s、GB/s |
-| qps | 每秒操作数（total / wall_s） | ops/s |
-| actual_qps | 真实成功 QPS（success/ok / wall_s）；实例行按本实例真实时长计算，TOTAL 行为并发实例成功 QPS 汇总 | ops/s |
+| qps | 实测成功 QPS（success/ok / wall_s）；TOTAL 行汇总并发实例成功 QPS | ops/s |
 | total | 总操作数；pipeline 场景按 key 数计（writer 为写入 key 数，reader 为读取 key 数） | ops |
 | success / ok、fail、fail_rate | 成功数 / 失败数 / 失败率（fail / total） | ops、% |
-| avg_ms / min_ms / max_ms / p99_ms / p999_ms / p9999_ms | 时延（平均 / 最小 / 最大 / P99 / P99.9 / P99.99），仅统计成功样本 | ms |
+| min_ms / avg_ms / p50_ms / p90_ms / p95_ms / p99_ms / p999_ms / p9999_ms / max_ms | 成功请求时延分布 | ms |
+| >2000us ... >20000us | 成功请求时延严格超过对应微秒阈值的样本数 | ops |
 | queue_wait_avg_ms / queue_wait_max_ms / max_depth | reader 队列积压诊断：notify 到达→出队等待（平均/最大）与最大队列深度 | ms、ops |
 
 - 时延基于全部 client 上报的成功操作样本精确统计（失败样本计入 fail/fail_rate，不计入时延百分位）；
@@ -362,7 +363,7 @@ demo/ 另有 2 个传统分离角色冒烟配置。
   的通信路径差异）、全 reader 聚合一行；
   reader 的 pipeline_read 时延为 reader 节点本地对 `store.get` 接口调用的耗时（`time.perf_counter()`
   计时，不依赖跨节点时钟同步；exist 预检与数据校验不计入时延）。writer 时延样本为每次 `put_batch`
-  接口调用的耗时，total/success/fail/qps 均按 key 数计（qps = key 数 / duration），TOTAL 行将
+  接口调用的耗时，total/success/fail 均按 key 数计（qps = 成功 key 数 / duration），TOTAL 行将
   全部 writer 写入的 key 数或全部 reader 读取的 key 数叠加后除以 duration。reader 行附
   queue_wait/max_depth 列用于观察积压是否发生及严重程度（writer 行为空）；
 - **basic mixed（put/get）拆分输出**：put 与 get 分别统计、各输出一行（operation 列取
@@ -552,6 +553,15 @@ client 前也会 echo 同样的快照（实时进入编排日志）。
 
 mooncake store/SDK 级调优环境变量独立放在 `scripts/env.mooncake.sh`（git 跟踪，手工编辑），
 与编排器生成的 `env.sh` 分离——调优项可自由增删改而不会在每次运行时被覆盖。
+
+当前面板启用 TENT（`MC_USE_TENT=1`），默认通过 `MC_TENT_CONF` 启用 UB，
+沿用 `SETUP_UB_DEVICE` 选择单个 UB 设备，并设置 1 MiB slice 和 2 个 worker。
+`MC_URMA_BONDING_MODE=BALANCE` / `MC_URMA_BONDING_LEVEL=PORT` 与 TE 共用；
+需使用包含 TENT bonding 支持的 Mooncake 构建。预先设置非空 `MC_TENT_CONF` 可替换默认配置。
+TENT 不使用 setup 的 `device_names` 作为 UB 过滤器，因此自定义 JSON 时应自行设置
+`transports.ub.device_filter`。`MC_UB_NUMA_AFFINITY_ENABLE`、`MC_MAX_WR` 等 classic TE
+参数不等同于 TENT UB 的配置；进程的 numactl CPU/内存绑定仍由编排器独立控制。
+客户端 wheel / kvtest 可执行文件须编入 TENT，且运行时可找到 `libtent_metrics.so` 和 URMA 依赖。
 
 - **内容**：连接与容错（`MC_STORE_CLIENT_SETUP_RETRIES`/`MC_STORE_WARMUP`/
   `MC_STORE_CLIENT_METRIC_BANDWIDTH`）、客户端资源（`MC_GLOBAL_SEGMENT_SIZE`）、
@@ -847,7 +857,8 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   原始日志留在节点（失败路径、`--pull-raw-logs`，或「`.log` + `.glog` 合计 ≤100MB」的
   小 run 才自动回拉——阈值把 SDK glog 体积算在内，避免把 GB 级 glog 拖回来）。
 - **kvtest（C++ 场景）同样走 map-reduce**：`scripts/logstats.py --kvtest-samples`
-  把每个实例的请求级 `samples.csv`（`elapsed_us` 以该 size 的 `/start` 为原点）
+  把每个实例的请求级 `samples.csv`（`elapsed_us` 以测量起点为原点：无 warmup 是
+  `/start`，有 warmup 是 `/arm`，warmup 样本已被 C++ `/reset` 清空）
   转成与 Python 客户端完全同构的 `<...>.stats.json`——dual 实例按 operation 拆成
   writer/reader 两份产物；reduce 复用同一套 `report.py`，按 data_size 出
   `report.html`/`data.js`/`meta.json` 与 run 级 `overview.html`。map 在编排器本地

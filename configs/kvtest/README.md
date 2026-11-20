@@ -1,12 +1,13 @@
 # configs/kvtest — mooncake_kvtest（C++ 原生压测）配置
 
 `scenario: "kvtest"` 调用 mooncake-store 仓库 `benchmarks/kvtest` 编译出的
-`mooncake_kvtest` C++ 二进制：HTTP 通知处理、通知队列、Mooncake 调用与指标
-采集全部留在 C++ 内（无 Python 请求路径），用于对照 Python client 的
-pipeline（rank/recall）结果。
+`mooncake_kvtest` C++ 二进制：Writer→Reader 通知使用 YLT `coro_rpc`，HTTP
+仅保留控制接口；通知队列、Mooncake 调用与指标采集全部留在 C++ 内（无
+Python 请求路径），用于对照 Python client 的 pipeline（rank/recall）结果。
 
-> 需要包含 `start_paused`、`POST /start` 和 summary `elapsed_seconds` 的新版
-> `mooncake_kvtest`；旧二进制会在编排器的 `/start` 健康门处明确失败。
+> 需要包含 `start_paused`、`POST /start|pause|drain|reset|arm|resume` 和 summary
+> `elapsed_seconds` 的新版 `mooncake_kvtest`；开启 warmup 时，旧二进制会在
+> `/pause` 控制门处明确失败。
 
 ## 运行方式（与现有场景一致）
 
@@ -93,8 +94,9 @@ cross-child barrier，再并行 `POST /start`，由 C++ 清空启动阶段指标
 writer。这样 rank/recall 的 Store 初始化耗时不同也不会污染窗口对齐。注意并行建议单 data_size 场景
 （barrier 是一次性的，后续 sweep 条目不再对齐，与 pipeline 并行语义一致）。
 
-编排器把本目录的场景配置翻译成 **每实例一份 kvtest JSON**（`role`/`listen_port`/
-`target_qps`/`nodes`/`store` 全部由 cluster.json + global.json 派生），推送到每个
+编排器把本目录的场景配置翻译成 **每实例一份 kvtest JSON**（`role`/
+`listen_port`/`notify_rpc_port`/`target_qps`/`nodes`/`store` 全部由
+cluster.json + global.json 派生），推送到每个
 pod/节点后经 `scripts/run_kvtest.sh` 启动；运行窗口 = `duration`，到点后编排器
 `POST /stop`，C++ 停机路径落盘最终 `summary.json`。
 
@@ -124,6 +126,13 @@ pod/节点后经 `scripts/run_kvtest.sh` 启动；运行窗口 = `duration`，�
 Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，因此一个 Pod 的
 内存预算至少要覆盖两个 client buffer 加进程额外开销。
 
+K8s split 场景可用 `kvtest.numa_bindings` 按节点内 client 序号分别指定
+writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node>` 和
+`--membind=<node>` 同时绑定 CPU 与内存；目标节点必须位于 kubelet 为该 Pod
+生成的 cgroup `cpuset.cpus` / `cpuset.mems` 允许范围内。rank smoke 的两对进程
+映射为 `0/1`、`2/3`，recall smoke 的前三对映射为 `0/1`、后三对映射为
+`2/3`。
+
 | 字段 | 语义 |
 | --- | --- |
 | `client.count_per_node` | dual/split 模式每节点目标 Pod 数 |
@@ -134,13 +143,20 @@ Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，�
 | `reader.operation` | `get_buffer` / `batch_get_buffer` / `exist` |
 | `writer.port_base` / `reader.port_base` | split/完全分离模式的进程 HTTP 端口，必须不同 |
 | `kvtest.local_port_base` | 每个节点/Pod 的 Mooncake 传输监听端口基址；真机并行场景之间必须错开 |
+| `kvtest.numa_bindings` | K8s split 模式按 client 序号指定 `{writer, reader}` NUMA 节点，并同时绑定 CPU/内存 |
 | `writer.num_threads` | 每进程 C++ 写管线线程数（默认 1） |
 | `reader.num_threads` | 每进程 C++ 通知消费 worker 数（默认 4；纯 reader 进程同理） |
-| `writer.notify_threads` | 出站 HTTP 通知线程池大小 |
+| `writer.notify_threads` | 出站 RPC 任务线程池大小 |
+| `kvtest.notify_rpc_port_offset` | YLT RPC 端口相对 HTTP 控制端口的偏移，默认 10000 |
+| `kvtest.notify_rpc_threads` | 每实例 YLT RPC server 的 I/O 线程数，默认 4 |
+| `kvtest.notify_rpc_connections_per_peer` | 每个 Reader 的 YLT 长连接缓存容量，默认 4；突发时 YLT 可临时创建额外连接 |
+| `kvtest.notify_rpc_reuse_limit` | YLT 连接开始 pipeline 复用的并发阈值，默认 4 |
+| `kvtest.notify_rpc_timeout_ms` | 建连和单次 RPC 请求超时，默认 3000 ms |
 | `batch_size` | 映射 kvtest `batch_keys_count` |
 | `kvtest.key_pool_size` | `auto`（默认）= 按 Store 容量计算；0 = 无限新 key（YuanRong 行为）；>0 = 显式容量受限 key 池 |
 | `kvtest.verify_level` | `off` / `size`（默认）/ `sample` / `full` |
-| `duration` | 测量窗口秒数（kvtest 无 warmup 概念，残留 warmup 字段会被忽略并 WARN） |
+| `warmup.duration` | warmup 窗口秒数，默认 5；`--no-warmup` 强制设为 0 |
+| `duration` | 正式测量窗口秒数，不包含 warmup 和队列排空时间 |
 
 ## 结果
 
@@ -150,14 +166,19 @@ PNG、**HTML 报表（map-reduce 产物，见下节）**，以及 run 级 `<cfg>
 报表 map 的临时输入，成功后自动删除；失败或绘图失败时保留它们用于排障、
 重画与 `--rebuild-report`。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
-开始。每实例 QPS/吞吐使用 summary 中的实际 `elapsed_seconds`。
+开始。配置 warmup 时，`/start` 先释放 warmup；到时后编排器依次执行
+`/pause`（停 writer 并排空出站通知）、`/drain`（排空 reader 入站队列）、
+`/reset`（清除 warmup metrics/samples）、`/arm`（启动正式计时）和 `/resume`
+（进入正式测量）。每实例 QPS/吞吐使用 summary 中从 arm 后开始计算的实际
+`elapsed_seconds`，不包含跨任务 barrier 等待。
 延迟统计只使用 `status=OK` 的请求；TOTAL 行会先合并全部实例的成功请求样本，
 再重新计算 avg/max/P50/P90/P99/P999/P9999，因此 max 是真正的全局最大值，
 分位数也不是各实例分位数的加权平均。旧二进制没有请求样本时才回退为近似值并
 打印 WARN。
-CSV 中 `qps=total/wall_s` 表示成功和失败请求合计速率，
-`actual_qps=success/wall_s` 表示真实成功 QPS；TOTAL 行汇总所有并发实例的
-`actual_qps`。
+CSV 中 `qps=success/wall_s`，直接表示实测成功 QPS；TOTAL 行汇总所有并发
+实例的成功 QPS。汇总延迟列为 min/avg/P50/P90/P95/P99/P99.9/P99.99/max，
+并记录 `>2000us`、`>5000us`、`>6000us`、`>7000us`、`>8000us`、
+`>9000us`、`>10000us`、`>20000us` 的成功请求数。
 
 kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
 内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其
@@ -175,10 +196,12 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
 单元报表：
 
 1. **map**（编排器本地，场景结束、CSV 汇总后自动执行）：
-   `scripts/logstats.py --kvtest-samples <实例>.samples.csv --start-epoch <该 size 的
-   /start 时刻> --summary <实例>.summary.json --role writer|reader`。
-   `samples.csv` 的 `elapsed_us` 是相对 `/start` 的偏移，编排器把该 size 的 `/start`
-   epoch 传进 map，因此报表时间轴、1s/1min 桶与慢点列表使用绝对时刻；每个实例
+   `scripts/logstats.py --kvtest-samples <实例>.samples.csv --start-epoch <测量起点
+   epoch> --summary <实例>.summary.json --role writer|reader`。
+   `samples.csv` 的 `elapsed_us` 是相对**测量起点**的偏移：无 warmup 时即 `/start`；
+   配置 warmup 时 C++ 在 `/reset` 清空样本、`/arm` 启动正式计时，编排器在 `/arm`
+   完成后刷新 epoch（`/start` 时刻先记录一次，warmup 中途 STOP 也能得到正确的
+   warmup 时间轴）。报表时间轴、1s/1min 桶与慢点列表因此都是绝对时刻；每个实例
    按 operation 拆成 **writer**（`upsert*`/`remove`）与 **reader**
    （`get*`/`exist`）两份产物（dual 实例同时有两边，对应 Python dual client 的
    writer.log/reader.log）。
@@ -189,7 +212,7 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
    若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
 3. **重建**：`python benchmark.py --rebuild-report <ts>`。失败 run 保留了
    `samples.csv` 时，会自动先补跑 map 再重建报表。运行期会把
-   `iid→节点/节点数/每个 size 的 /start 时刻`写进
+   `iid→节点/节点数/每个 size 的测量起点 epoch`写进
    `logs/<cfg>/kvtest_report_meta.json`（旁挂文件，成功后也保留），重建据此
    恢复真实节点名与精确时间轴；该文件缺失时才回退为
    `summary.json` 的 mtime 减去 `elapsed_seconds` 估算。
@@ -204,7 +227,8 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
 - **只存在于 summary 的指标也已进 HTML**：reader 的「值校验失败」
   （`verify_failures`，数据正确性信号）与「队列等待均/峰」
   （`notify_queue_wait` 的 avg/max）由 map 从 `summary.json` 提升进 reader
-  角色概要；`notify_http`（通知提交/失败/平均/最大）仍只在 CSV；
+  角色概要；通知发送侧指标（YLT 为 `notify_rpc`，旧二进制为 `notify_http`
+  的提交/失败/平均/最大）仍只在 CSV；
 - **节点日志体积取真实日志**：stats 的 `meta.bytes` 优先用该实例
   `log + glog` 体积（另存 `meta.samples_bytes` 为样本文件体积），
   run 总览的“节点日志量”不再被样本 CSV 低估；

@@ -45,7 +45,9 @@ source "$ENV_FILE"
 # Sourced AFTER env.sh: same-name vars here override the generated env.sh.
 # -f guard keeps the script working without the file (local ad-hoc runs).
 # Command-line inline env (e.g. MC_YLT_LOG_PATH) still wins over both.
-[ -f "$SCRIPT_DIR/env.mooncake.sh" ] && source "$SCRIPT_DIR/env.mooncake.sh"
+if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
+  source "$SCRIPT_DIR/env.mooncake.sh" || exit 1
+fi
 
 print_client_env() {
   printf '[client-env] %s POD_IP=%s NODE_NAME=%s LD_LIBRARY_PATH=%s SETUP_FABRIC_IP=%s MC_FABRIC_IP=%s MC_TCP_BIND_ADDRESS=%s SETUP_UB_DEVICE=%s MC_URMA_TRANS_MODE=%s SETUP_PROTOCOL=%s\n' \
