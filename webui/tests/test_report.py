@@ -2995,6 +2995,73 @@ def test_qps_single_object_bars_unchanged(tmp_path):
     assert fails[0]["x0"] == qps[0]["x0"]                 # 单对象不加偏移
 
 
+def test_volume_card_estimates(tmp_path):
+    """数据量与优化卡：输入/行数速率/原始分文件（ylt 未采集）/单实例 map 后/
+    reduce 回传/输出大小/优化倍数；data.js 大小与实测一致。"""
+    import os as _os
+    import re as _re
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    trs = [_trace_stats2(tmp_path, "n1.glog", node="n1", pod="p1"),
+           _trace_stats2(tmp_path, "n2.glog", node="n2", pod="p2")]
+    tpaths = []
+    for i, tr in enumerate(trs):
+        tp = tmp_path / ("t%d.trace.json" % i)
+        tp.write_text(json.dumps(tr, ensure_ascii=False), encoding="utf-8")
+        tpaths.append(str(tp))
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"},
+                              traces=rp.load(tpaths))
+    z = list(data["sizes"].values())[0]
+    v = z.get("volume")
+    assert v, "缺少 volume 块"
+    assert v["raw"]["writer_bytes"] > 0 and v["raw"]["reader_bytes"] > 0
+    assert v["raw"]["glog_bytes"] > 0
+    assert v["raw"]["ylt_bytes"] is None            # 未采集
+    assert v["map"]["stats_bytes"] > 0 and v["map"]["trace_bytes"] > 0
+    assert v["reduce"]["pulled_bytes"] == (
+        v["map"]["stats_bytes"] + v["map"]["trace_bytes"])
+    assert v["ratio"]["raw_to_pulled"] > 0, v["ratio"]
+    assert v["rates"]["rows_per_s"] > 0
+    # 比例口径：真实规模下原始 >> 回传（用 0910 量级的合成块验证公式）
+    blk = {"summary": {"wall_s": 600, "total": 299995}, "span": 600,
+           "clients": [
+               {"role": "writer", "bytes": 700655, "map_bytes": 75513},
+               {"role": "reader", "bytes": 3019512, "map_bytes": 112024}],
+           "trace": {"meta": {"trace_lines": 38203,
+                              "raw_bytes": 61265549,
+                              "product_bytes": 461545,
+                              "sample_rate": 1.0}}}
+    vv = rp._volume_block(blk, [])
+    raw = 700655 + 3019512 + 61265549
+    pulled = 75513 + 112024 + 461545
+    assert vv["raw"]["total_bytes"] == raw, vv["raw"]
+    assert vv["reduce"]["pulled_bytes"] == pulled
+    assert vv["ratio"]["raw_to_pulled"] == round(raw / pulled, 1)
+    assert vv["ratio"]["raw_to_pulled"] > 50, vv["ratio"]
+
+    html, dj = rp.render_scenario(data, str(tmp_path / "o"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert "数据量与优化" in src and 'id="volumecard"' in src
+    emb = json.loads(_re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
+                                src, _re.S).group(1))
+    vo = emb["meta"]["volume_out"]
+    assert vo["data_js"] == _os.path.getsize(dj), (vo["data_js"],
+                                                  _os.path.getsize(dj))
+    assert abs(vo["report_html"] - _os.path.getsize(html)) <= 8, (
+        vo["report_html"], _os.path.getsize(html))
+
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    vt = res.get("volume_text") or ""
+    assert "原始" in vt and "glog" in vt and "ylt" in vt, vt
+    assert "未采集" in vt and "暂不处理" in vt, vt
+    assert "map 后" in vt and "stats.json" in vt and "trace.json" in vt, vt
+    assert "回传统计总量" in vt, vt
+    assert "行/s" in vt, vt
+
+
 def test_qps_zoom_keeps_y_and_gap_labels_once(tmp_path):
     """S6：QPS 副图 x 缩放不重算 y（filterMode none）；无数据窗口仅首处标注。"""
     a = _stats(tmp_path, "a.writer", "writer")

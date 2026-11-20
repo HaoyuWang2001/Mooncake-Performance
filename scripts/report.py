@@ -54,6 +54,10 @@ def load(paths):
             st = None
         if st:
             st["_path"] = p
+            try:
+                st["_bytes"] = os.path.getsize(p)
+            except OSError:
+                st["_bytes"] = 0
             out.append(st)
     return out
 
@@ -411,6 +415,7 @@ def _client_entry(st, role):
         "source": meta.get("source") or "",
         "remote_path": meta.get("remote_path") or "",
         "bytes": meta.get("bytes") or 0,
+        "map_bytes": st.get("_bytes") or 0,
         "total": g.get("key_total") or 0,
         "ok": g.get("key_ok") or 0,
         "fail": g.get("key_fail") or 0,
@@ -1051,7 +1056,7 @@ def reduce_trace_size(trace_list):
     tops = []
     metad = {"files": 0, "lines": 0, "trace_lines": 0, "slice_lines": 0,
              "parse_errors": 0, "sample_rates": {}, "bins": "us-v1",
-             "markers": False,
+             "markers": False, "raw_bytes": 0, "product_bytes": 0,
              "phase_counts": {"setup": 0, "warmup": 0, "measured": 0,
                               "teardown": 0}}
     for st in trace_list:
@@ -1068,8 +1073,14 @@ def reduce_trace_size(trace_list):
         if m.get("sample_rate") is not None:
             key = str(m["sample_rate"])
             metad["sample_rates"][key] = metad["sample_rates"].get(key, 0) + 1
+        metad["raw_bytes"] = metad.get("raw_bytes", 0) + int(
+            m.get("bytes") or 0)
+        metad["product_bytes"] = metad.get("product_bytes", 0) + int(
+            st.get("_bytes") or 0)
         cl = {"name": m.get("source") or "", "node": m.get("node") or "",
               "pod": m.get("pod") or "", "role": m.get("role") or "",
+              "map_bytes": st.get("_bytes") or 0,
+              "raw_bytes": m.get("bytes") or 0,
               "ops": {}}
         for g in (st.get("groups") or {}).values():
             for op, o in (g.get("ops") or {}).items():
@@ -1112,6 +1123,82 @@ def reduce_trace_size(trace_list):
             "object_total": len(objects)}
 
 
+def _volume_block(blk, traces):
+    """每个 size 的数据量账本：输入 → 行数速率 → 原始(分文件) → 单实例 map 后
+    → reduce 回传 → 输出（输出大小由 render_scenario 回填）。
+
+    glog **参与 map-reduce**（tracestats → trace.json）；ylt（coro_rpc
+    easylog）当前**不采集/不处理**，只作为“原始数据”存在，绝不进入 map 或
+    reduce 统计（V-7/DR-40）。原始 glog 字节来自 map 产物 meta.bytes（实测），
+    map 产物字节来自文件大小（实测）。"""
+    sm = blk.get("summary") or {}
+    tr = blk.get("trace") or {}
+    tm = tr.get("meta") or {}
+    clients = blk.get("clients") or []
+    wall = float(sm.get("wall_s") or 0)
+    span = float(blk.get("span") or wall or 0)
+    ops = int(sm.get("total") or 0)
+    if not ops:
+        ops = int(sm.get("ok") or 0) + int(sm.get("fail") or 0)
+    trace_lines = int(tm.get("trace_lines") or 0)
+    glog_raw = int(tm.get("raw_bytes") or 0)
+    py_bytes = sum(int(c.get("bytes") or 0) for c in clients)
+    w_bytes = sum(int(c.get("bytes") or 0) for c in clients
+                  if (c.get("role") or "") == "writer")
+    r_bytes = sum(int(c.get("bytes") or 0) for c in clients
+                  if (c.get("role") or "") == "reader")
+    stats_map = sum(int(c.get("map_bytes") or 0) for c in clients)
+    trace_map = int(tm.get("product_bytes") or 0)
+    n = max(1, len(clients))
+    n_trace = max(1, len(traces or []))
+    nodes = len({c.get("node") for c in clients if c.get("node")})
+
+    def rate(v):
+        return round(v / span, 1) if span else None
+
+    out = {
+        "inputs": {
+            "wall_s": round(wall, 3), "span_s": round(span, 3),
+            "clients": len(clients), "nodes": nodes or None,
+            "writer_clients": sum(1 for c in clients
+                                  if (c.get("role") or "") == "writer"),
+            "reader_clients": sum(1 for c in clients
+                                  if (c.get("role") or "") == "reader"),
+            "sample_rate": tm.get("sample_rate"),
+            "ops": ops, "trace_lines": trace_lines,
+        },
+        "rates": {
+            "rows_per_s": rate(ops),
+            "trace_rows_per_s": rate(trace_lines),
+        },
+        "raw": {
+            "writer_bytes": w_bytes, "reader_bytes": r_bytes,
+            "other_python_bytes": max(0, py_bytes - w_bytes - r_bytes),
+            "glog_bytes": glog_raw,
+            "ylt_bytes": None,          # 未采集（暂不处理）
+            "total_bytes": py_bytes + glog_raw,
+        },
+        "map": {
+            "stats_bytes": stats_map, "trace_bytes": trace_map,
+            "stats_per_client": round(stats_map / n),
+            "trace_per_client": round(trace_map / n_trace),
+            "trace_files": len(traces or []),
+            "bucket_cap": MAX_TIER_BUCKETS,
+            "hist_bins": len(ls.BIN_EDGES_US) - 1,
+            "top_n": TRACE_TOP_N, "list_cap": ls.LIST_CAP,
+            "trace_top_n": TRACE_TOP_N,
+        },
+        "reduce": {"pulled_bytes": stats_map + trace_map},
+        "output": {},
+        "ratio": {},
+    }
+    raw = out["raw"]["total_bytes"]
+    pulled = out["reduce"]["pulled_bytes"]
+    out["ratio"]["raw_to_pulled"] = (round(raw / pulled, 1)
+                                     if pulled else None)
+    return out
+
+
 def reduce_scenario(stats, meta, monitors=None, traces=None):
     """Full scenario report data: stats grouped by data-size (caller passes a
     flat list where possible; the size label is taken from meta["size"] when
@@ -1139,6 +1226,12 @@ def reduce_scenario(stats, meta, monitors=None, traces=None):
                                  "error_excerpt_status": None,
                                  "slowest": [], "anomalies": []}
         blk["trace"] = reduce_trace_size(group)
+    for size, blk in sizes.items():
+        if blk.get("summary"):
+            blk["volume"] = _volume_block(
+                blk, [t for t in trace_list
+                      if str((t.get("meta") or {}).get("size")
+                             or meta.get("size") or "all") == size])
     sources, nodes = _sources(stats, trace_list)
     return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
             "monitors": monitors or {}}
@@ -1616,6 +1709,7 @@ flex:0 0 auto}
 min-width:0;flex:1 1 auto}
 .objdrop-tag{font-size:12px;color:var(--mut)}
 .node-row td{background:var(--quiet);font-weight:700}
+tr.volume-key td{font-weight:700}
 td.logcell{max-width:220px;overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}
 .node-row .node-name{color:var(--ink)}
@@ -3837,6 +3931,84 @@ function renderSlowStrip(){
   o.series=series;
   slowChart.setOption(o,true);
 }
+/* 数据量与优化：按实测大小/请求数还原各层级，并给出优化倍数。
+   glog 参与 map-reduce；ylt 不采集（仅占节点磁盘）。 */
+function fmtNum(n){
+  if(n==null||n==='') return '-';
+  const v=Number(n);
+  return isFinite(v)?v.toLocaleString('en-US'):String(n);
+}
+function renderVolume(){
+  const box=document.getElementById('volume'); if(!box) return;
+  const note=document.getElementById('volumeNote');
+  const z=Z(); const v=z&&z.volume;
+  const out=(D.meta&&D.meta.volume_out)||{};
+  box.innerHTML='';
+  if(!v){
+    if(note) note.textContent='本产物不含数据量统计（旧产物）：用 --rebuild-report 重新生成后可见。';
+    return;
+  }
+  if(note) note.textContent='各层级数据量按实测文件大小与请求计数还原；glog 参与 map-reduce，ylt 暂不处理（仅占节点磁盘）。';
+  const inp=v.inputs||{},rt=v.rates||{},raw=v.raw||{},mp=v.map||{};
+  const red=v.reduce||{};
+  const t=el('table'); const thead=el('thead'); const hr=el('tr');
+  ['层级','项目','数值','计算口径'].forEach(function(h,i){
+    hr.appendChild(el('th',i===2?'n':'',h));});
+  thead.appendChild(hr); t.appendChild(thead);
+  const tb=el('tbody');
+  function row(level,item,val,formula,strong){
+    const tr=el('tr');
+    tr.appendChild(el('td','',level));
+    tr.appendChild(el('td','',item));
+    tr.appendChild(el('td','n',val));
+    tr.appendChild(el('td','',formula||''));
+    if(strong) tr.className='volume-key';
+    tb.appendChild(tr);
+  }
+  function b(level,item,bytes,formula,strong){
+    row(level,item,bytes==null?'-':fmtBytes(bytes),formula,strong);
+  }
+  row('输入','运行时长',String(inp.wall_s)+' s','统计窗口 '+inp.span_s+' s');
+  row('输入','节点数',fmtNum(inp.nodes),'');
+  row('输入','实例数',fmtNum(inp.clients),
+    '写 '+fmtNum(inp.writer_clients)+' · 读 '+fmtNum(inp.reader_clients));
+  row('输入','trace 采样率',
+    inp.sample_rate==null?'-':String(inp.sample_rate),'');
+  row('行数','总请求行',fmtNum(inp.ops),
+    '行/秒 ≈ 总请求 ÷ 时长 = '+fmtNum(rt.rows_per_s)+' 行/s');
+  row('行数','trace 行',fmtNum(inp.trace_lines),
+    '行/秒 ≈ trace 行 ÷ 时长 = '+fmtNum(rt.trace_rows_per_s)+' 行/s');
+  b('原始','writer.log',raw.writer_bytes,'实测（map 前原始文件）');
+  b('原始','reader.log',raw.reader_bytes,'实测（map 前原始文件）');
+  b('原始','glog（C++ SDK）',raw.glog_bytes,
+    '实测；参与 map-reduce（tracestats → trace.json）');
+  row('原始','ylt（coro_rpc easylog）','未采集',
+    '暂不处理，仅占节点磁盘（轮转上限 50MB×3）');
+  b('原始','合计',raw.total_bytes,'writer + reader + glog（不含 ylt）',true);
+  b('map 后','stats.json · 单实例均值',mp.stats_per_client,
+    '时间桶 ≤ '+fmtNum(mp.bucket_cap)+'/档 + 直方图 '+mp.hist_bins+
+    ' 箱 + 慢点 Top-'+mp.top_n+' + 异常/离群清单 ≤'+mp.list_cap+'/实例');
+  b('map 后','trace.json · 单实例均值',mp.trace_per_client,
+    '阶段秒桶 + 慢点 Top-'+mp.trace_top_n+'（含 L1/L2）');
+  b('reduce','回传统计总量',red.pulled_bytes,
+    'stats '+fmtBytes(mp.stats_bytes)+' + trace '+fmtBytes(mp.trace_bytes)+
+    '（原始日志留节点）',true);
+  b('输出','data.js',out.data_js,'全量明细（深查用）');
+  b('输出','report.html',out.report_html,'自包含单文件（内嵌当前档位）');
+  const rawT=Number(raw.total_bytes)||0;
+  const pulled=Number(red.pulled_bytes)||0;
+  const repTotal=(Number(out.data_js)||0)+(Number(out.report_html)||0);
+  if(pulled) row('对比','原始 → 回传',
+    (rawT/pulled).toFixed(1)+'×',
+    fmtBytes(rawT)+' ÷ '+fmtBytes(pulled)+
+    '：map 只回传统计产物，原始日志留在节点',true);
+  if(repTotal) row('对比','原始 → 报表',
+    (rawT/repTotal).toFixed(1)+'×',
+    fmtBytes(rawT)+' ÷ ('+fmtBytes(out.data_js)+' + '+
+    fmtBytes(out.report_html)+')',true);
+  t.appendChild(tb);
+  const wrapx=el('div','wrapx'); wrapx.appendChild(t); box.appendChild(wrapx);
+}
 /* 实例与日志现场（合并卡）：节点树（节点可展开）+ 客户端行（writer 在前）
    + 日志文件/大小 + 对慢点追踪的贡献（无 C++ trace 时整列隐藏）。 */
 let clientOpen={};
@@ -4341,6 +4513,7 @@ function renderAll(){
   safe('histogram',renderHist);
   safe('slow-strip',renderSlowStrip);
   safe('client-table',renderClientSite);
+  safe('volume',renderVolume);
   safe('errors',renderErrors);
   safe('trace',renderTrace);
   safe('sources',function(){
@@ -6427,6 +6600,10 @@ WebUI/HTTP 直接打开）：实例表按 p99 显示前 20 名。
 <div id="clients"></div>
 <h3 class="sec">节点与登录现场</h3><div id="sources"></div></div>
 """
+_SEC_VOLUME = """<div class="card" id="volumecard"><h2>数据量与优化</h2>
+<div class="sub" id="volumeNote"></div>
+<div id="volume"></div></div>
+"""
 _SEC_FOOTER = """<div class="note" id="pipelineNote">
 <b>数据文件</b>：report.html（自包含，数据内嵌，可离线打开）+ data.js（全量，
 深查用；经 WebUI 打开时自动加载）。<br>
@@ -6456,11 +6633,11 @@ _MONITOR_CARD = """
 _BODY_BASIC = "<!-- tpl:basic -->\n" + "".join([
     _SEC_SUMMARY, _SEC_LATENCY, _SEC_HIST, _SEC_SLOW,
     _SEC_TRACE, _SEC_ERRORS, _SEC_CLIENTSITE, "<!-- monitor -->",
-    _SEC_FOOTER])
+    _SEC_VOLUME, _SEC_FOOTER])
 _BODY_PIPELINE = "<!-- tpl:pipeline -->\n" + "".join([
     _SEC_SUMMARY, _SEC_LATENCY, _SEC_HIST, _SEC_SLOW,
     _SEC_TRACE, _SEC_ERRORS, _SEC_CLIENTSITE, "<!-- monitor -->",
-    _SEC_FOOTER])
+    _SEC_VOLUME, _SEC_FOOTER])
 
 
 
@@ -6544,19 +6721,38 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
         str(meta.get("unit") or "")) if x)
     _base_name = "Pipeline 场景报表" if is_pipe else "场景报表"
     page_title = (_base_name + " · " + _ident) if _ident else _base_name
+    # 数据量卡：输出文件大小要在页面内显示 —— 先产 data.js（首轮测长），
+    # 再两遍渲染 report.html（大小写回页面）
+    meta["volume_out"] = {"data_js": 0, "report_html": 0}
+    _prefix = "window.__MC_FULL__ = "
+    full_literal = ""
+    for _ in range(6):
+        full_literal = json.dumps(data, ensure_ascii=False,
+                                  separators=(",", ":")).replace("</", "<\\/")
+        _n = len((_prefix + full_literal + ";\n").encode("utf-8"))
+        if _n == meta["volume_out"]["data_js"]:
+            break
+        meta["volume_out"]["data_js"] = _n
     echarts_js = _read_echarts(echarts_path)
     html = _page_html(page_title,
                       subtitle, body, embedded, echarts_js,
                       "data.js", True, rel_base=rel_base,
                       data_rel="data.js", theme_js=_lieflat_tokens_js())
+    for _ in range(4):
+        _h = len(html.encode("utf-8"))
+        if _h == meta["volume_out"]["report_html"]:
+            break
+        meta["volume_out"]["report_html"] = _h
+        html = _page_html(page_title,
+                          subtitle, body, embedded, echarts_js,
+                          "data.js", True, rel_base=rel_base,
+                          data_rel="data.js", theme_js=_lieflat_tokens_js())
     html_path = os.path.join(out_dir, "report.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     full_js = os.path.join(out_dir, "data.js")
-    full_literal = json.dumps(data, ensure_ascii=False,
-                              separators=(",", ":")).replace("</", "<\\/")
     with open(full_js, "w", encoding="utf-8") as f:
-        f.write("window.__MC_FULL__ = " + full_literal + ";\n")
+        f.write(_prefix + full_literal + ";\n")
     return html_path, full_js
 
 

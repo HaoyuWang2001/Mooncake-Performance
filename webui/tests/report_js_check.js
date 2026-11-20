@@ -1145,6 +1145,8 @@ if (!errs.length) {
   out.errors_text = textOf(getEl("errors"));
   out.clients_text = textOf(getEl("clients"));
   out.sources_text = textOf(getEl("sources"));
+  out.volume_text = textOf(getEl("volume"));
+  out.volume_note = textOf(getEl("volumeNote"));
 
   if (process.argv.includes("--reset-view")) {
     try {

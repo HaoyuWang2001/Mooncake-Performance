@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 218 条 · ✓191 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 226 条 · ✓199 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -447,6 +447,17 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C19.I2 相对链接在 WebUI raw 模式下改写为 /api/file（`..` 逐级解析，不裁前缀） —— R-OV-3 〔test_render_overview_has_rel_base_and_adapter, test_adapter_resolves_parent_relative_links〕
 - C19.B1 链接被 `slice(3)` 裁掉 `../` → 404 —— R-OV-3 〔test_adapter_resolves_parent_relative_links〕
 
+### C21 数据量与优化（volume）
+
+- C21.V1 独立卡「数据量与优化」，位于 **节点监控之后、页脚之前** —— R-SHELL-15/DR-40 〔test_volume_card_estimates〕
+- C21.V2 表格分七段：输入（时长/实例数/采样率）→ 行数（总请求行/trace 行 + `行/秒 = 行数 ÷ 时长` 公式）→ 原始（writer.log / reader.log / glog / ylt / 合计）→ map 后（单实例 stats.json / trace.json 均值 + 构成口径：时间桶 ≤8192/档、直方图箱数、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ reduce 回传总量 → 输出（data.js / report.html）→ 对比（原始→回传、原始→报表倍数） —— DR-40 〔test_volume_card_estimates〕
+- C21.V3 **ylt（coro_rpc easylog）不采集/不处理**：只出现在「原始」行并标注「未采集/暂不处理（仅占节点磁盘，轮转 50MB×3）」，**绝不进入 map 回传或 reduce 统计** —— DR-40 〔test_volume_card_estimates〕
+- C21.V4 **glog 参与 map-reduce**：原始 glog 字节取 trace meta.bytes（实测），回传取 trace.json 文件大小（实测）；卡内必须注明该关系 —— DR-40 〔test_volume_card_estimates〕
+- C21.D1 数值来源：原始 = stats/trace meta.bytes；map 产物 = 文件大小（load 时记 `_bytes`）；输出 = data.js 精确（数值迭代收敛）、report.html 两遍渲染实测 —— DR-40 〔test_volume_card_estimates〕
+- C21.D2 对比口径：`原始合计 ÷ 回传总量` 与 `原始合计 ÷ (data.js + report.html)`；0910 实测约 500MB → 5MB（≈100×）→ 报表 14MB —— 〔test_volume_card_estimates〕
+- C21.B1 旧产物无 volume 块 → 卡内降级说明（用 --rebuild-report 重生成），不隐藏 —— 〔test_volume_card_estimates〕
+- C21.B2 曾把 ylt 误当 map 输入/回传量 → 行级文案与统计口径必须分离（ylt 只有原始行） —— 〔test_volume_card_estimates〕
+
 ### C20 跨切面（排版 / 数据口径 / 工程约束）
 
 - C20.V1 全站字号 ≥12px（无微字幕） —— DR-24 〔test_report_has_no_micro_captions_and_tiny_fonts〕
@@ -454,7 +465,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C20.V3 数字 `tabular-nums`；时延 `fmtUs` 自适应 µs/ms/s —— R-SHELL-10 〔test_a16_theme_and_numeric_css, test_a17_fmt_us_adaptive_units〕
 - C20.V4 中文全角标点、省略号 `…`、中英混排保留技术词 —— 设计基调 〔◐〕
 - C20.V5 卡片仅 1px 描边或底色区分（无阴影/渐变/装饰图形） —— 设计基调 〔test_c01_dr24_alignment_lock〕
-- C20.V6 章节顺序与标题：SDK → 错误与异常 → 实例与日志现场 → 监控 → 页脚 —— R-SHELL-15 〔test_section_order_and_footer_note, test_section_order_and_renames〕
+- C20.V6 章节顺序与标题：SDK → 错误与异常 → 实例与日志现场 → 节点监控 → **数据量与优化** → 页脚 —— R-SHELL-15 〔test_section_order_and_footer_note, test_section_order_and_renames〕
 - C20.V7 body 卡片层级完整（`div` 闭合平衡） —— 模板架构 〔test_body_div_balance_cards_inside_wrap〕
 - C20.V8 **控件风格统一**：新控件必须复用既有形态（`.toolbar` 行 / `.tl-label` 标签 / `.objtree-strip` 树条 / `.tree-*` 树行 / 既有按钮）；**禁止引入新的容器底色或描边风格**；多栏布局只允许无样式 grid（先例 `.stage-split`/`.trace-cols`） —— 设计基调 〔test_control_style_consistency〕
 - C20.D1 正确性口径：总计=同桶按请求数加权平均、max 取最大、直方图全量合并、离群剔除口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕
