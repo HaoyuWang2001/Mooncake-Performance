@@ -11,6 +11,7 @@ GET /api/nodes/{name}/ports  节点监听端口（ss -tlnp 降级链）
 import json
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from ..common import ApiError, jpath, real_under
@@ -85,6 +86,31 @@ def _cluster_nodes(cluster):
             "ssh_key": spec.get("ssh_key") or "",
         })
     return out
+
+
+def _controller_node(cluster):
+    """从 cluster.controller 合成 controller 节点（k8s 控制面）。"""
+    ctrl = cluster.get("controller")
+    if not isinstance(ctrl, dict) or not ctrl.get("ip"):
+        return None
+    return {
+        "name": "controller",
+        "ip": ctrl.get("ip") or "",
+        "fabric_ip": "",
+        "ssh_user": ctrl.get("ssh_user") or "root",
+        "ssh_port": int(ctrl.get("ssh_port") or 22),
+        "ssh_key": ctrl.get("ssh_key") or "",
+        "is_controller": True,
+    }
+
+
+def _all_nodes(cluster):
+    """SSH 节点 +（若有）controller 节点。"""
+    nodes = _cluster_nodes(cluster)
+    cnode = _controller_node(cluster)
+    if cnode is not None:
+        nodes = nodes + [cnode]
+    return nodes
 
 
 # ------------------------------------------------------- global.json 角色/端口
@@ -249,20 +275,113 @@ def _proc_kind(cmd):
     return "other"
 
 
+# ------------------------------------------------------ k8s 跨命名空间套件探测
+
+_MOON_RE = re.compile(r"mooncake|kvtest|store|master|bench", re.I)
+
+# 在 controller 上执行的只读脚本：列出全部命名空间的 pod（JSON）。
+_K8S_SCRIPT_TMPL = """\
+{export}
+echo "@@K8S@@"
+{kubectl} get pods --all-namespaces -o json 2>/dev/null
+exit 0
+"""
+
+
+def _human_age(iso):
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        secs = (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return ""
+    if secs < 60:
+        return "{}s".format(int(secs))
+    if secs < 3600:
+        return "{}m".format(int(secs // 60))
+    if secs < 86400:
+        return "{}h".format(int(secs // 3600))
+    return "{}d".format(int(secs // 86400))
+
+
+def _parse_k8s_pods(text):
+    """kubectl get pods -A -o json -> (pods, namespaces)；仅保留 mooncake 相关。"""
+    if not text or not text.strip():
+        return [], []
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return [], []
+    items = (data.get("items") or []) if isinstance(data, dict) else []
+    pods = []
+    nss = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        md = it.get("metadata", {}) or {}
+        ns = md.get("namespace", "") or ""
+        name = md.get("name", "") or ""
+        if not (_MOON_RE.search(ns) or _MOON_RE.search(name)):
+            continue
+        st = it.get("status", {}) or {}
+        phase = st.get("phase", "") or ""
+        cstatuses = st.get("containerStatuses") or []
+        restarts = 0
+        images = []
+        for cs in cstatuses:
+            restarts += int(cs.get("restartCount", 0) or 0)
+            if cs.get("image"):
+                images.append(cs["image"])
+        spec = it.get("spec", {}) or {}
+        node_name = spec.get("nodeName", "") or ""
+        pods.append({
+            "namespace": ns, "name": name, "status": phase,
+            "node": node_name, "age": _human_age(st.get("startTime", "")),
+            "restarts": restarts, "images": images,
+        })
+        nss.add(ns)
+    pods.sort(key=lambda p: (p["namespace"], p["name"]))
+    return pods, sorted(nss)
+
+
+def api_node_k8s(handler, query, name):
+    cpath, cluster, gpath, glob = _context(query)
+    node = _find_node(cluster, name)
+    if node is None:
+        raise ApiError(404, "cluster {} 中没有节点 {}".format(cpath, name))
+    if not node.get("is_controller"):
+        raise ApiError(400, "节点 {} 不是 controller，无法查询 k8s 套件".format(name))
+    ctrl = cluster.get("controller") or {}
+    kubectl = ctrl.get("kubectl") or "kubectl"
+    kubeconfig = ctrl.get("kubeconfig") or ""
+    export = ('export KUBECONFIG="{}"\n'.format(kubeconfig)) if kubeconfig else ""
+    script = _K8S_SCRIPT_TMPL.format(export=export, kubectl=kubectl)
+    ok, text = _ssh_probe(name, node, script)
+    if not ok:
+        return {"ok": False, "detail": text, "current_namespace": "",
+                "pods": [], "namespaces": []}
+    sec = _parse_sections(text)
+    pods, nss = _parse_k8s_pods(sec.get("K8S", ""))
+    return {"ok": True, "detail": "",
+            "current_namespace": (cluster.get("k8s", {}) or {}).get("namespace", "") or "",
+            "pods": pods, "namespaces": nss}
+
+
 # ---------------------------------------------------------------- SSH 探测
 
 def _short(exc, limit=600):
     return " ".join(str(exc or "").split())[:limit]
 
 
-def _ssh_probe(name, node):
+def _ssh_probe(name, node, script=None):
     """在节点上执行只读组合脚本 -> (ok, text|detail)。"""
     try:
         from utils import ssh_check_output
     except ImportError as exc:                      # pragma: no cover - 环境缺失
         raise ApiError(503, "SSH 探测需要编排器 utils/paramiko：{}".format(exc))
     try:
-        text = ssh_check_output(name, node, _PROBE_SCRIPT, quiet=True, timeout=20)
+        text = ssh_check_output(name, node, script or _PROBE_SCRIPT, quiet=True, timeout=20)
         return True, text
     except RuntimeError as exc:
         msg = str(exc)
@@ -274,7 +393,7 @@ def _ssh_probe(name, node):
 
 
 def _find_node(cluster, name):
-    for n in _cluster_nodes(cluster):
+    for n in _all_nodes(cluster):
         if n["name"] == name:
             return n
     return None
@@ -284,17 +403,21 @@ def _find_node(cluster, name):
 
 def api_nodes(handler, query):
     cpath, cluster, gpath, glob = _context(query)
-    nodes = _cluster_nodes(cluster)
+    nodes = _all_nodes(cluster)
     roles = _role_map(nodes, glob)
     out = []
     for n in nodes:
         item = dict(n)
-        item["roles"] = roles.get(n["name"], [])
-        item["expected_ports"] = _expected_ports(n, glob)
+        if n.get("is_controller"):
+            item["roles"] = ["controller"]
+            item["expected_ports"] = []
+        else:
+            item["roles"] = roles.get(n["name"], [])
+            item["expected_ports"] = _expected_ports(n, glob)
         out.append(item)
-    if nodes:
+    if _cluster_nodes(cluster):
         mode = "ssh"
-    elif "controller" in cluster or "k8s" in cluster:
+    elif cluster.get("controller") or "k8s" in cluster:
         mode = "k8s"
     else:
         mode = "unknown"
@@ -351,4 +474,5 @@ ROUTES += [
     ("GET", r"^/api/nodes$", lambda h, q, m=None: api_nodes(h, q)),
     ("GET", r"^/api/nodes/(?P<name>[^/]+)/test$", api_node_test),
     ("GET", r"^/api/nodes/(?P<name>[^/]+)/ports$", api_node_ports),
+    ("GET", r"^/api/nodes/(?P<name>[^/]+)/k8s$", api_node_k8s),
 ]
