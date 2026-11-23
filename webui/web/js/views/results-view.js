@@ -519,8 +519,9 @@ const ResultsView = {
       // Vue.reactive：pane 必须从创建起即为代理对象——addPane 持有该引用做
       // 异步写入（_loadFiles），raw 对象的赋值不会触发响应式更新（首个
       // 结果框曾因此卡在 loading 且文件列表永不刷新）
-      let wrap = false;
-      try { wrap = localStorage.getItem("mcweb-wrap") === "1"; } catch (e) { /* ignore */ }
+      // 与实例详情日志页统一：未设置时默认开启换行（关闭后长行可横向滚动）
+      let wrap = true;
+      try { wrap = localStorage.getItem("mcweb-wrap") !== "0"; } catch (e) { /* ignore */ }
       return Vue.reactive({ uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
                             rawView: false, wrap: wrap, imgScale: "fit",
                             imgX: 0, imgY: 0,

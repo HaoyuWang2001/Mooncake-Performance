@@ -135,7 +135,7 @@ const PerfView = {
           <span class="spacer"></span>
           <el-tooltip content="刷新配置（重新拉取 cluster / global / profile 候选与配置树）" placement="top">
             <el-button size="small" circle :loading="cfgLoading"
-                       aria-label="刷新配置" @click="loadConfigs">
+                       aria-label="刷新配置" @click="refreshConfigs">
               <el-icon><component is="Refresh"/></el-icon>
             </el-button>
           </el-tooltip>
@@ -216,6 +216,17 @@ const PerfView = {
       <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row">
         <span class="rb-label">image</span>
         <span :title="clusterImage" class="rb-image">{{ clusterImage || "-" }}</span>
+      </div>
+      <div class="rb-params" v-loading="paramLoading">
+        <div class="rb-params-title">启动参数（选中配置的解析值，供核对）</div>
+        <div v-for="g in paramGroups" :key="g.title" class="rb-params-group">
+          <div v-if="paramGroups.length > 1" class="rb-params-sub">{{ g.title }}</div>
+          <el-descriptions :column="3" size="small" border>
+            <el-descriptions-item v-for="(row, i) in g.rows" :key="i" :label="row[0]">
+              <span class="mc-mono rb-param-v" :title="row[1]">{{ row[1] }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
+        </div>
       </div>
       <div class="rb-sel-head">
         <span class="rb-label">配置选择</span>
@@ -396,18 +407,52 @@ const PerfView = {
     </el-drawer>
   </div>`,
   setup() {
-    const mode = Vue.ref("ssh");
-    const launchMode = Vue.ref("single");
+    // ---- 表单持久化（刷新 / 重启 webui 后恢复上次的选项与配置）----
+    const FORM_KEY = "mcweb-perf-form";
+    function _loadPerfForm() {
+      try {
+        const v = JSON.parse(localStorage.getItem(FORM_KEY) || "null");
+        return (v && typeof v === "object") ? v : null;
+      } catch (e) { return null; }
+    }
+    const _savedForm = _loadPerfForm();
+    const _savedFlags = (_savedForm && _savedForm.flags
+                         && typeof _savedForm.flags === "object")
+      ? _savedForm.flags : null;
+    const mode = Vue.ref(_savedForm &&
+      (_savedForm.mode === "ssh" || _savedForm.mode === "k8s")
+      ? _savedForm.mode : "ssh");
+    const launchMode = Vue.ref(_savedForm && _savedForm.launchMode === "rank_recall"
+                               && mode.value === "k8s" ? "rank_recall" : "single");
     const cfgDialog = Vue.ref(false);
     const treeRoots = Vue.ref([]);
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
     const cfgLoading = Vue.ref(false);
-    const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
-                                 noReport: false,
-                                 verbose: false, protocol: "", cluster: "",
-                                 global: "", profile: "", rankCluster: "",
-                                 rankGlobal: "", recallCluster: "",
-                                 recallGlobal: "" });
+    const flags = Vue.reactive(Object.assign(
+      { dryRun: false, noWarmup: false, noPlot: false, noReport: false,
+        verbose: false, protocol: "", cluster: "",
+        global: "", profile: "", rankCluster: "",
+        rankGlobal: "", recallCluster: "", recallGlobal: "" },
+      _savedFlags || {}));
+    const _savedSel = (_savedForm && _savedForm.sel
+                       && typeof _savedForm.sel === "object")
+      ? _savedForm.sel : null;
+    let _selRestored = false;
+    let _saveTimer = null;
+    function _savePerfForm() {
+      try {
+        localStorage.setItem(FORM_KEY, JSON.stringify({
+          v: 1, mode: mode.value, launchMode: launchMode.value,
+          flags: { ...flags },
+          sel: { dirs: selected.value.dirs.slice(),
+                 files: selected.value.files.slice() },
+        }));
+      } catch (e) { /* ignore */ }
+    }
+    function _scheduleSave() {
+      clearTimeout(_saveTimer);
+      _saveTimer = setTimeout(_savePerfForm, 300);
+    }
     const warnings = Vue.ref([]);
     const creating = Vue.ref(false);
     const cleaning = Vue.ref(false);
@@ -451,7 +496,143 @@ const PerfView = {
       profile: _perfModeCandidates(candidates.value.profile, mode.value),
     }));
 
-    let servedDefaults = false;
+    // ---- 启动参数面板：解析所选 cluster / global / profile 的关键字段 ----
+    const paramDocs = Vue.reactive({});     // path -> 解析后的对象 | null
+    const paramLoading = Vue.ref(false);
+    async function _loadParamDoc(path) {
+      if (!path) return null;
+      if (Object.prototype.hasOwnProperty.call(paramDocs, path)) return paramDocs[path];
+      paramDocs[path] = null;
+      try {
+        const r = await api("GET", "/api/config?path=" + encodeURIComponent(path));
+        const obj = typeof r.content === "string" ? JSON.parse(r.content) : r.content;
+        paramDocs[path] = (obj && typeof obj === "object") ? obj : null;
+      } catch (e) { paramDocs[path] = null; }
+      return paramDocs[path];
+    }
+    async function loadParamDocs() {
+      const paths = launchMode.value === "rank_recall"
+        ? [flags.rankCluster, flags.rankGlobal, flags.recallCluster,
+           flags.recallGlobal, flags.profile]
+        : [flags.cluster, flags.global, flags.profile];
+      paramLoading.value = true;
+      try {
+        await Promise.all([...new Set(paths.filter(Boolean))].map(_loadParamDoc));
+      } finally { paramLoading.value = false; }
+    }
+    function _perfFmtBytes(n) {
+      if (n === "" || n === null || n === undefined) return "-";
+      const v = Number(n);
+      if (!isFinite(v) || v <= 0) return String(n);
+      if (v < 1024) return v + " B";
+      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + " KB";
+      if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + " MB";
+      return (v / 1024 / 1024 / 1024).toFixed(2) + " GB";
+    }
+    function _perfShortList(arr, n) {
+      const a = Array.isArray(arr) ? arr : [];
+      if (!a.length) return "-";
+      const head = a.slice(0, n).join("、");
+      return a.length > n ? head + " 等 " + a.length + " 项" : head;
+    }
+    function _perfEffectiveProto(glob) {
+      const p = String(flags.protocol || "").trim();
+      if (p) return p + "（命令行覆盖）";
+      const raw = glob && glob.protocol;
+      if (!raw) return "配置值";
+      if (typeof raw === "string") return raw;
+      const keys = Object.keys(raw);
+      if (!keys.length) return "配置值";
+      return keys.map(k => {
+        const v = raw[k] || {};
+        return v && v.device ? k + "（device=" + v.device + "）" : k;
+      }).join("、");
+    }
+    function _perfClusterRows(doc) {
+      if (!doc) return [["集群", "-"]];
+      if (doc.nodes && typeof doc.nodes === "object") {
+        const names = Object.keys(doc.nodes);
+        const head = names.slice(0, 4).map(n =>
+          n + "=" + ((doc.nodes[n] || {}).ip || "?")).join("、");
+        const venv = doc.venv || (doc.venvs ? Object.keys(doc.venvs).join("、") : "");
+        return [["cluster 节点", names.length ? names.length + " 节点 · " +
+                 head + (names.length > 4 ? " 等" : "") : "-"],
+                ["venv", venv || "-"]];
+      }
+      const k8s = doc.k8s || {};
+      const ctrl = doc.controller || {};
+      return [["controller", (ctrl.ssh_user || "?") + "@" + (ctrl.ip || "?")],
+              ["namespace", k8s.namespace || "-"],
+              ["镜像", k8s.image || "-"],
+              ["host 日志根", k8s.host_log_root || "-"]];
+    }
+    function _perfGlobalRows(doc) {
+      if (!doc) return [["global", "-"]];
+      return [["master", [doc.master_type, doc.master_addr].filter(Boolean)
+               .join(" · ") || "-"],
+              ["metadata", doc.metadata_server || "-"],
+              ["etcd", doc.etcd_endpoints || "-"],
+              ["store 节点", _perfShortList(doc.mooncake_store_nodes, 6)],
+              ["本地 buffer", _perfFmtBytes(doc.local_buffer_size)],
+              ["store 容量", doc.store_total_size || "-"],
+              ["remote_dir", doc.remote_dir || "-"]];
+    }
+    function _perfProfileRows(doc) {
+      if (!doc) return [["profile", "-"]];
+      const tools = doc.tools || {};
+      const on = Object.keys(tools).filter(k =>
+        tools[k] && tools[k].enabled !== false);
+      return [["trigger", doc.trigger || "-"],
+              ["监控项", on.length ? on.join("、") : "无"],
+              ["outliers", (doc.outliers || {}).threshold_ms != null
+                ? (doc.outliers || {}).threshold_ms + " ms" : "-"]];
+    }
+    const paramGroups = Vue.computed(() => {
+      const opt = [];
+      if (flags.dryRun) opt.push("dry-run");
+      if (flags.noWarmup) opt.push("no-warmup");
+      if (flags.noPlot) opt.push("no-plot");
+      if (flags.noReport) opt.push("no-report");
+      if (flags.verbose) opt.push("verbose");
+      const common = [
+        ["模式", mode.value === "k8s" ? "k8s" : "真机"],
+        ["启动方式", launchMode.value === "rank_recall" ? "Rank + Recall 并行" : "单任务"],
+        ["有效协议", _perfEffectiveProto(paramDocs[flags.global])],
+        ["已选配置", "目录 " + selected.value.dirs.length +
+         " / 文件 " + selected.value.files.length],
+        ["选项", opt.length ? opt.join("、") : "默认"],
+      ];
+      if (launchMode.value === "rank_recall") {
+        return [
+          { title: "rank", rows: [
+            ..._perfClusterRows(paramDocs[flags.rankCluster]),
+            ..._perfGlobalRows(paramDocs[flags.rankGlobal]),
+          ]},
+          { title: "recall", rows: [
+            ..._perfClusterRows(paramDocs[flags.recallCluster]),
+            ..._perfGlobalRows(paramDocs[flags.recallGlobal]),
+          ]},
+          { title: "公共", rows: [
+            ...common,
+            ..._perfProfileRows(paramDocs[flags.profile]),
+          ]},
+        ];
+      }
+      return [{ title: "启动参数", rows: [
+        ...common,
+        ..._perfClusterRows(paramDocs[flags.cluster]),
+        ..._perfGlobalRows(paramDocs[flags.global]),
+        ..._perfProfileRows(paramDocs[flags.profile]),
+      ]}];
+    });
+    Vue.watch([() => flags.cluster, () => flags.global, () => flags.profile,
+               () => flags.rankCluster, () => flags.rankGlobal,
+               () => flags.recallCluster, () => flags.recallGlobal,
+               () => launchMode.value], () => { loadParamDocs(); });
+    Vue.watch([mode, launchMode, () => flags, selected], _scheduleSave,
+              { deep: true });
+
+    let servedDefaults = !!_savedForm;
 
     // 仅首次加载 / 用户显式切换模式时调用；不触碰 mode 与选项开关
     function applyDefaults() {
@@ -506,18 +687,33 @@ const PerfView = {
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))
           .map(c => _toNode(c.tree));
         _perfApplyChecked(roots, checked);
+        // 首次加载：按存档回填上次勾选的目录 / 文件（路径不存在则忽略）
+        if (!_selRestored && _savedSel) {
+          const set = new Set([
+            ...(Array.isArray(_savedSel.dirs) ? _savedSel.dirs : []),
+            ...(Array.isArray(_savedSel.files) ? _savedSel.files : []),
+          ]);
+          if (set.size) _perfApplyChecked(roots, set);
+        }
+        _selRestored = true;
         treeRoots.value = roots;
         // 页签切换（onActivated）只刷新候选/树，绝不重置已选项；
-        // 只有首次成功加载才应用精确同名默认值。
+        // 只有首次成功加载（且无存档）才应用精确同名默认值。
         if (!servedDefaults) {
           applyDefaults();
           servedDefaults = true;
         }
+        loadParamDocs();
       } catch (e) {
         ElementPlus.ElMessage.error("加载配置失败: " + e.message);
       } finally {
         cfgLoading.value = false;
       }
+    }
+
+    function refreshConfigs() {
+      Object.keys(paramDocs).forEach(k => { delete paramDocs[k]; });
+      loadConfigs();
     }
 
     function clearSel() {
@@ -740,6 +936,7 @@ const PerfView = {
     });
 
     return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection,
+             paramDocs, paramGroups, paramLoading, refreshConfigs,
              modeCandidates, onModeChange, flags, warnings, creating, cleaning,
              clusterImage, clearSel, loadConfigs, cfgLoading, runHint, cleanupHint, schedulerBusy,
              statusType, statusText, fmtTimeRel, fmtTimeAbs,

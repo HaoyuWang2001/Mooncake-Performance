@@ -5,13 +5,26 @@
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from webui.backend import conflicts, runmgr
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runs_dir(tmp_path, monkeypatch):
+    """恢复逻辑会扫描 RUNS_DIR 里的 running 记录：每个用例用独立目录，
+    避免测试之间互相接管残留进程。"""
+    d = tmp_path / "runs"
+    d.mkdir()
+    monkeypatch.setattr(runmgr, "RUNS_DIR", str(d))
+    yield d
 
 
 def _sleep_argv(sec=30):
@@ -120,6 +133,78 @@ def test_scheduler_runs_task_and_waits_for_active_runs():
         content = open(out, encoding="utf-8").read()
         assert "scheduler-ok" in content
         assert "[task 1]" in content
+
+
+def _orphan_json(d, rid, status="running", meta=None):
+    with open(os.path.join(str(d), rid + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "kind": "benchmark", "cmd": "orphan",
+                   "argv": [], "status": status, "rc": None,
+                   "t0": time.time(), "meta": meta or {}}, f)
+
+
+def test_restart_recovers_orphan_run_and_stop(tmp_path, monkeypatch):
+    """webui 重启后：按 --stop-file 定位遗留进程并接管；stop 可正常触发。"""
+    d = tmp_path / "runs"
+    rid = "rORPHAN"
+    stop = d / (rid + ".stop")
+    _orphan_json(d, rid, meta={"instance": "i1", "request": {"flags": {}}})
+    (d / (rid + ".log")).write_text("[benchmark] running\n", encoding="utf-8")
+    # 模拟 runmgr 的拉起方式：独立会话（webui 重启后仍存活）
+    proc = subprocess.Popen([sys.executable, "-c",
+                             "import time; time.sleep(60)",
+                             "--stop-file", str(stop)],
+                            start_new_session=True)
+    try:
+        mgr = runmgr.RunManager()
+        assert rid in mgr.active, "orphan benchmark must be re-adopted"
+        assert mgr.active[rid].pid == proc.pid
+        assert mgr.active[rid].stop_path == str(stop)
+        run, err = mgr.stop_run(rid)
+        assert err is None and run.stopping
+        deadline = time.time() + 15
+        while time.time() < deadline and rid in mgr.active:
+            time.sleep(0.2)
+        assert rid not in mgr.active, "adopted run must finish after stop"
+        saved = json.load(open(d / (rid + ".json"), encoding="utf-8"))
+        assert saved["status"] == "stopped"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_restart_marks_processless_running_terminal(tmp_path, monkeypatch):
+    """running 记录无对应进程：按日志终态收敛（而不是永久卡运行中）。"""
+    d = tmp_path / "runs"
+    _orphan_json(d, "rDEAD1")
+    (d / "rDEAD1.log").write_text("[benchmark] no summary here\n",
+                                  encoding="utf-8")
+    _orphan_json(d, "rDEAD2")
+    (d / "rDEAD2.log").write_text(
+        "[benchmark] SUMMARY: all 1 scenarios OK\n", encoding="utf-8")
+    mgr = runmgr.RunManager()
+    assert not mgr.active
+    assert json.load(open(d / "rDEAD1.json"))["status"] == "aborted"
+    assert json.load(open(d / "rDEAD2.json"))["status"] == "done"
+
+
+def test_stop_orphan_without_pid_writes_stop_file(tmp_path, monkeypatch):
+    """定位不到 pid 时：写 stop 文件（benchmark hold 循环轮询它）+ 状态收敛。"""
+    d = tmp_path / "runs"
+    mgr = runmgr.RunManager()
+    rid = "rORPHAN2"
+    stop = d / (rid + ".stop")
+    run = runmgr.Run(rid, "benchmark", "orphan", [],
+                     str(d / (rid + ".log")),
+                     meta={}, stop_path=str(stop),
+                     state_path=str(d / (rid + ".state")))
+    run.status = "running"
+    run.save()
+    mgr.history.insert(0, run)
+    out, err = mgr.stop_orphan(rid)
+    assert err is None and out.stopping
+    assert stop.exists(), "stop file is the cooperative teardown channel"
+    assert out.status == "stopped"
 
 
 if __name__ == "__main__":

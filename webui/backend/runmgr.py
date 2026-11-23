@@ -107,6 +107,84 @@ def _kill(proc):
         pass
 
 
+def _proc_cmdline(pid):
+    """Linux: /proc/<pid>/cmdline -> argv list（其它平台返回空）。"""
+    try:
+        with open("/proc/{}/cmdline".format(pid), "rb") as f:
+            return [p.decode("utf-8", "replace")
+                    for p in f.read().split(b"\0") if p]
+    except OSError:
+        return []
+
+
+def _find_run_pid(stop_path):
+    """按 `--stop-file <精确路径>` 扫描 /proc 定位遗留 benchmark 进程。
+
+    仅 POSIX；路径精确匹配（run id 唯一），不会误认其它进程。
+    """
+    if IS_WIN or not stop_path:
+        return None
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        argv = _proc_cmdline(pid)
+        for i in range(len(argv) - 1):
+            if argv[i] == "--stop-file" and argv[i + 1] == stop_path:
+                return int(pid)
+    return None
+
+
+def _pid_alive(pid, stop_path=None):
+    """进程存活 + （可选）cmdline 仍带我方 stop-file（防 pid 复用误杀）。"""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if stop_path:
+        return any(a == stop_path for a in _proc_cmdline(pid))
+    return True
+
+
+def _signal_pid(pid, sig):
+    """给遗留 benchmark 的进程组（start_new_session 的会话首进程）发信号。
+
+    安全阀：若目标与本进程同组（理论上不该发生），只对单 pid 发信号，
+    绝不用 killpg 波及 webui 自身。"""
+    try:
+        pgid = os.getpgid(pid)
+        if pgid != os.getpgid(0):
+            os.killpg(pgid, sig)
+            return
+    except Exception:
+        pass
+    try:
+        os.kill(pid, sig)
+    except Exception:
+        pass
+
+
+def _terminal_status_from_log(log_path, stopping):
+    """无进程句柄（webui 重启接管）时按运行日志推断终态。"""
+    if stopping:
+        return "stopped"
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.read()[-200000:]
+    except OSError:
+        return "aborted"
+    if "SUMMARY: all " in tail:
+        return "done"
+    if "SUMMARY: " in tail and "FAILED" in tail:
+        return "failed"
+    return "aborted"
+
+
 def load_run_schedule():
     """schedule/ has no __init__.py -> import run_schedule.py by path."""
     path = os.path.join(ROOT, "schedule", "run_schedule.py")
@@ -131,6 +209,7 @@ class Run(object):
         self.identities = identities or []   # not persisted (frozensets)
         self.meta = meta or {}
         self.proc = None
+        self.pid = None               # 接管遗留进程时记录（webui 重启后）
         self.t0 = time.time()
         self.t1 = None
         self.rc = None
@@ -219,6 +298,7 @@ class RunManager(object):
         self.history = []             # Run objects, newest first
         self.scheduler = None         # Scheduler or None
         self._load_history()
+        self._recover_active()
         self._thread = threading.Thread(target=self._poll_loop)
         self._thread.daemon = True
         self._thread.start()
@@ -245,11 +325,49 @@ class RunManager(object):
                 run.t0 = d.get("t0", 0)
                 run.t1 = d.get("t1")
                 run.ts_dir = d.get("ts_dir")
+                # 重启后停止/接管需要这些路径（原先只活在启动进程的内存里）
+                run.stop_path = os.path.join(RUNS_DIR, run.id + ".stop")
+                run.state_path = os.path.join(RUNS_DIR, run.id + ".state")
+                try:
+                    req = (d.get("meta") or {}).get("request") or {}
+                    run.identities = conflicts.run_identities(
+                        ROOT, req.get("flags") or {})
+                except Exception:
+                    run.identities = []
                 self.history.append(run)
                 if len(self.history) >= 200:
                     break
             except Exception:
                 continue
+
+    def _recover_active(self):
+        """接管上一条 webui 进程遗留的 benchmark（start_new_session 使其在
+        webui 重启后仍存活，例如 k8s 失败后 hold 等 STOP 的 run）。
+
+        按 `--stop-file` 精确路径扫 /proc 找 pid；扫不到（进程已退出）的
+        running 残留按日志终态收敛，避免实例卡片永久卡「运行中」。
+        """
+        for run in list(self.history):
+            if run.kind != "benchmark" or run.status != "running":
+                continue
+            pid = _find_run_pid(run.stop_path)
+            if pid is not None:
+                run.pid = pid
+                run.parse_ts_dir()
+                self.active[run.id] = run
+                sys.stderr.write(
+                    "[webui] recovered active run {} (pid {})\n".format(
+                        run.id, pid))
+                continue
+            run.status = _terminal_status_from_log(run.log_path,
+                                                   run.stopping)
+            run.t1 = run.t1 or time.time()
+            try:
+                run.save()
+            except Exception:
+                pass
+            sys.stderr.write("[webui] stale run {} -> {}\n".format(
+                run.id, run.status))
 
     def get_run(self, rid):
         for r in self.history:
@@ -338,26 +456,78 @@ class RunManager(object):
             run = self.get_run(rid)
             if run is None:
                 return None, "no such run: {}".format(rid)
-            if run.status != "running" or run.proc is None:
+            if run.status != "running" or (run.proc is None and not run.pid):
                 return run, None  # already finished; not an error
             run.stopping = True
+            if not run.stop_path:
+                run.stop_path = os.path.join(RUNS_DIR, run.id + ".stop")
             _write_stop_file(run.stop_path)
-            _send_graceful_stop(run.proc)
+            if run.proc is not None:
+                _send_graceful_stop(run.proc)
+            elif run.pid:
+                _signal_pid(run.pid, signal.SIGINT)
             threading.Thread(target=self._stop_watch, args=(run,),
                              daemon=True).start()
             return run, None
 
+    def stop_orphan(self, rid):
+        """停止未接管的持久化 running run（webui 重启后遗留的 benchmark）。
+
+        仅写 stop 文件即可让 benchmark 的 hold/清理循环退出并删 k8s
+        namespace；能定位 pid 时再补发优雅信号并交给 _poll_loop 收敛终态。
+        """
+        with self.lock:
+            run = self.get_run(rid)
+            if run is None:
+                return None, "no such run: {}".format(rid)
+            if run.status != "running":
+                return run, None
+            if not run.stop_path:
+                run.stop_path = os.path.join(RUNS_DIR, run.id + ".stop")
+            if not run.state_path:
+                run.state_path = os.path.join(RUNS_DIR, run.id + ".state")
+            run.stopping = True
+            _write_stop_file(run.stop_path)
+            pid = run.pid or _find_run_pid(run.stop_path)
+            if pid:
+                run.pid = pid
+                run.parse_ts_dir()
+                self.active[run.id] = run
+                _signal_pid(pid, signal.SIGINT)
+                threading.Thread(target=self._stop_watch, args=(run,),
+                                 daemon=True).start()
+            else:
+                # 无 pid 可发信号：stop 文件是唯一通道（benchmark 自己轮询并
+                # 做远端清理）；先把卡片/实例状态收敛，stop 文件保留待下次
+                # 启动时清除。
+                run.status = "stopped"
+                run.t1 = run.t1 or time.time()
+                try:
+                    run.save()
+                except Exception:
+                    pass
+            return run, None
+
     def _stop_watch(self, run):
-        """Wait up to STOP_GRACE for cooperative cleanup, then force-kill."""
+        """Wait up to STOP_GRACE for cooperative cleanup, then force-kill。
+        兼容两种句柄：proc（本进程启动）与 pid（重启接管的遗留进程）。"""
         proc = run.proc
+
+        def _alive():
+            if proc is not None:
+                return proc.poll() is None
+            return bool(run.pid) and _pid_alive(run.pid, run.stop_path)
+
         deadline = time.time() + STOP_GRACE
-        while time.time() < deadline and proc is not None \
-                and proc.poll() is None:
+        while time.time() < deadline and _alive():
             time.sleep(0.5)
-        if proc is not None and proc.poll() is None:
+        if _alive():
             sys.stderr.write("[webui] stop grace {}s expired; force kill {}\n"
                              "".format(STOP_GRACE, run.id))
-            _kill(proc)
+            if proc is not None:
+                _kill(proc)
+            elif run.pid:
+                _signal_pid(run.pid, signal.SIGKILL)
         try:
             self._reap_remote_async(run)
         finally:
@@ -568,19 +738,32 @@ class RunManager(object):
             try:
                 with self.lock:
                     for rid, run in list(self.active.items()):
-                        if run.proc is None:
+                        if run.proc is not None:
+                            rc = run.proc.poll()
+                            if rc is None:
+                                run.parse_ts_dir()
+                                continue
+                        elif run.pid:
+                            # webui 重启接管的 run：无进程句柄，按 pid 存活判断
+                            if _pid_alive(run.pid, run.stop_path):
+                                run.parse_ts_dir()
+                                continue
+                            rc = None
+                        else:
                             self.active.pop(rid, None)
                             continue
-                        rc = run.proc.poll()
-                        if rc is not None:
-                            run.rc = rc
-                            run.t1 = time.time()
-                            run.status = "stopped" if run.stopping else \
-                                ("done" if rc == 0 else "failed")
-                            run.save()
-                            self.active.pop(rid, None)
+                        run.rc = rc
+                        run.t1 = time.time()
+                        if run.stopping:
+                            run.status = "stopped"
+                        elif rc is None:
+                            run.status = _terminal_status_from_log(
+                                run.log_path, False)
                         else:
-                            run.parse_ts_dir()
+                            run.status = "done" if rc == 0 else "failed"
+                        run.pid = None
+                        run.save()
+                        self.active.pop(rid, None)
             except Exception:
                 pass
             time.sleep(1)

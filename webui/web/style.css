@@ -314,6 +314,21 @@ html, body, #app {
   color: var(--el-text-color-regular);
 }
 .runbox .rb-label-inline { width: auto; margin-left: var(--mc-space-3); }
+/* 实例模板：启动参数面板（选中 cluster/global/profile 的解析值） */
+.runbox .rb-params { margin-top: var(--mc-space-3); }
+.runbox .rb-params-title {
+  font-size: 12px; color: var(--el-text-color-secondary);
+  margin-bottom: var(--mc-space-2);
+}
+.runbox .rb-params-group + .rb-params-group { margin-top: var(--mc-space-2); }
+.runbox .rb-params-sub {
+  font-size: 12px; font-weight: 600; color: var(--el-text-color-regular);
+  margin-bottom: var(--mc-space-1);
+}
+.runbox .rb-param-v {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.runbox .rb-params .el-descriptions__label { white-space: nowrap; }
 .runbox .rb-sel-col { min-width: 0; }
 .runbox .rb-sel-title {
   font-size: 13px; font-weight: 600; color: var(--el-text-color-secondary);
@@ -421,7 +436,7 @@ html, body, #app {
 /* 结果框：全局 2px 边框避免焦点切换抖动；焦点 = 主色边框 + 外发光 */
 .pane {
   border: 2px solid var(--el-border-color-lighter); border-radius: var(--el-border-radius-base);
-  padding: 10px 12px; background: var(--el-bg-color);
+  padding: 10px 12px; background: var(--el-bg-color); min-width: 0;
   transition: border-color .18s ease, box-shadow .18s ease;
 }
 .pane:hover { border-color: var(--el-color-primary-light-5); }
@@ -437,7 +452,7 @@ html, body, #app {
 .pane.focus .pane-head { border-bottom-color: var(--el-color-primary-light-7); }
 .pane-body {
   min-height: 200px;
-  overflow-y: auto;
+  overflow: auto;              /* 双向：不换行时长行可横向滚动（显式 x） */
   box-sizing: border-box;
 }
 /* 自动高度：内容少则自然高度（不小于 200），内容多则封顶 AUTO_MAX（< 手动最大值） */
@@ -499,7 +514,7 @@ html, body, #app {
 .pane-body .json {
   background: var(--el-fill-color-darker); border-radius: 6px; padding: 10px;
   font: 12px/1.5 var(--mc-font-mono);
-  white-space: pre; overflow: auto;
+  white-space: pre;             /* 不换行：由 .pane-body 横向滚动 */
 }
 
 /* CSV 预览：表头强制单行（列宽由 results-view 按表头长度估算 min-width） */
@@ -577,6 +592,8 @@ html, body, #app {
 }
 .inst-card:hover { border-color: var(--el-color-primary-light-5); }
 .inst-empty { padding: var(--mc-space-5) 0; }
+/* 实例卡片保底高度：空态约 280px；出现第一个实例时高度不坍缩，随内容自然增高 */
+.inst-empty, .inst-list { min-height: 280px; box-sizing: border-box; }
 .inst-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .inst-name {
   font-weight: 600; font-size: 14px; max-width: 40%;
@@ -613,7 +630,7 @@ html, body, #app {
   font-size: 12px; font-weight: 600;
   color: var(--el-text-color-secondary); margin-bottom: var(--mc-space-1);
 }
-.ilog-view { height: 300px; min-height: 220px; }
+.ilog-view { height: 300px; min-height: 220px; overflow-x: auto; min-width: 0; }
 .ilog-progress { font-size: 12px; }
 /* 日志全屏弹窗（SD 日志终端形态：操作行 + 搜索行 + 铺满剩余高度的终端区）。
    EP fullscreen 弹窗自带 100% 宽高，这里只把 header/body/终端区做成纵向弹性。 */

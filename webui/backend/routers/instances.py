@@ -115,6 +115,17 @@ def api_instance_stop(handler, query, iid):
     _load(iid)
     run = _active_run(iid)
     if run is None:
+        # webui 重启后遗留的孤儿 benchmark：active 只在内存里，重启即丢，
+        # 但持久化 run 记录仍是 running（例如 k8s 失败后 hold 等 STOP）。
+        # 回退到 stop_orphan：写 stop 文件即可让 hold/清理循环退出并删
+        # namespace（能定位 pid 时再补发信号）。
+        latest = instances.latest_run(iid)
+        if latest and latest.get("status") == "running":
+            run, err = runmgr.MGR.stop_orphan(latest.get("id"))
+            if err:
+                raise ApiError(404, err)
+            return {"ok": True,
+                    "run": run.to_dict() if run is not None else latest}
         raise ApiError(409, "实例未在运行")
     run, err = runmgr.MGR.stop_run(run.id)
     if err:

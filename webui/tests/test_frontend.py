@@ -196,6 +196,54 @@ def test_results_ms_bar_compact_no_wrap():
     assert ".ms-bar .spacer { flex: 1; min-width: 0; }" in css
 
 
+def test_perf_param_panel_from_selected_configs():
+    """性能测试：选中 cluster/global/profile 后直接展示关键启动参数。"""
+    src = open(os.path.join(JS_DIR, "views", "perf-view.js"),
+               encoding="utf-8").read()
+    assert "启动参数" in src
+    assert "paramGroups" in src and "paramDocs" in src
+    assert "function loadParamDocs" in src and "function _loadParamDoc" in src
+    assert "function _perfEffectiveProto" in src
+    assert "el-descriptions" in src and 'class="rb-params"' in src
+    # 刷新配置按钮清缓存后重载
+    assert "function refreshConfigs" in src and "@click=\"refreshConfigs\"" in src
+
+
+def test_perf_form_persisted_across_refresh_and_restart():
+    """性能测试页：mode/启动方式/选项/勾选配置 存 localStorage，刷新与重启后恢复。"""
+    src = open(os.path.join(JS_DIR, "views", "perf-view.js"),
+               encoding="utf-8").read()
+    assert 'const FORM_KEY = "mcweb-perf-form"' in src
+    assert "function _loadPerfForm" in src and "function _savePerfForm" in src
+    assert "function _scheduleSave" in src
+    assert "_selRestored" in src and "_savedSel" in src
+    assert "let servedDefaults = !!_savedForm;" in src
+
+
+def test_log_surfaces_scroll_horizontally():
+    """不自动换行时长行必须能横向滚动（结果页 / 实例日志 / 全屏弹窗）。"""
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    m = re.search(r"\.pane-body \{[^}]*\}", css)
+    assert m and "overflow: auto;" in m.group(0), \
+        "results pane-body must scroll both axes"
+    assert ".ilog-view { height: 300px; min-height: 220px; overflow-x: auto;" in css
+    # JSON 不再自建滚动容器（横向滚动条始终在 pane-body 边缘可达）
+    m = re.search(r"\.pane-body \.json \{[^}]*\}", css)
+    assert m and "overflow: auto" not in m.group(0)
+    results = open(os.path.join(JS_DIR, "views", "results-view.js"),
+                   encoding="utf-8").read()
+    # 默认换行（与实例详情页一致），关闭后才依赖横向滚动
+    assert 'localStorage.getItem("mcweb-wrap") !== "0"' in results
+
+
+def test_instances_card_keeps_min_height():
+    """实例卡片保底 280px：空态→1 个实例时不坍缩。"""
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    assert ".inst-empty, .inst-list { min-height: 280px;" in css
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()
