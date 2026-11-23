@@ -408,6 +408,10 @@ const ResultsView = {
               <div class="ri-sub">{{ r.mtime }} · {{ r.csv_count }} csv</div>
             </div>
             <div v-if="!multiSelect" class="ri-actions">
+              <el-button size="small" text :loading="rebuilding === r.ts"
+                         :disabled="!!rebuilding"
+                         title="仅用本地 stats/原始日志重出该 run 的 report.html + overview.html（不访问集群）"
+                         @click.stop="rebuildReport(r.ts)">重建报表</el-button>
               <el-button size="small" text @click.stop="renameRun(r.ts)" title="重命名">改名</el-button>
               <el-button size="small" text type="danger" @click.stop="deleteRun(r.ts)" title="删除">删除</el-button>
             </div>
@@ -578,6 +582,47 @@ const ResultsView = {
       }
     }
 
+    // ---- 重建报表：某 run 已有日志/产物但 report.html 缺失或过期时重出 ----
+    const rebuilding = Vue.ref("");
+    async function _waitRun(rid, timeoutMs) {
+      const deadline = Date.now() + (timeoutMs || 180000);
+      while (Date.now() < deadline) {
+        await new Promise(res => setTimeout(res, 1200));
+        try {
+          const d = await api("GET", "/api/runs/" + encodeURIComponent(rid));
+          if (d.status !== "running") return d;
+        } catch (e) { return null; }
+      }
+      return null;
+    }
+    async function rebuildReport(ts) {
+      if (rebuilding.value) return;
+      try {
+        await confirmDanger("将用本地 stats / 原始日志重建 " + ts +
+                            " 的 report.html 与 overview.html；不访问集群，" +
+                            "不会重新拉取远端产物。", "重建报表");
+      } catch (e) { return; }
+      rebuilding.value = ts;
+      try {
+        const r = await api("POST", "/api/runs/rebuild-report", { ts: ts });
+        const done = await _waitRun(r.run.id);
+        if (done && done.rc === 0) {
+          ElementPlus.ElMessage.success("报表已重建：" + ts);
+          await loadRuns();
+          for (const p of panes) if (p.ts === ts) _loadFiles(p, true);
+        } else if (done) {
+          ElementPlus.ElMessage.error(
+            "重建失败（rc=" + done.rc + "），日志见「性能测试 → 历史运行」");
+        } else {
+          ElementPlus.ElMessage.warning("重建仍在进行，稍后刷新查看结果");
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        rebuilding.value = "";
+      }
+    }
+
     async function _deleteNames(names, label) {
       try {
         await confirmDanger("将把" + label + "移入回收站（webui/backups/outputs-trash）。" +
@@ -658,9 +703,9 @@ const ResultsView = {
     });
 
     return { runs, loading, lockFile, activePane, fullscreenIdx, panes,
-             multiSelect, selected, allSelected,
+             multiSelect, selected, allSelected, rebuilding,
              loadRuns, addPane, removePane, pickRun, isActivePaneTs,
              isSelected, toggleSelect, onSelectAll, toggleMulti,
-             renameRun, deleteRun, deleteSelected };
+             rebuildReport, renameRun, deleteRun, deleteSelected };
   },
 };

@@ -867,6 +867,11 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   只存在于 summary 的 reader「值校验失败」与「队列等待均/峰」也被提升进
   reader 角色概要；节点日志体积取真实 `log+glog` 大小；Ctrl+C 的 STOP
   路径先发 `/stop` 落盘样本、再收集并出 `early_stop` 报表。
+  每配置的 CSV + 报表 map/reduce 由后台 worker 在场景返回后生成——它们只消费
+  已回拉的本地产物，因此与「本配置收尾 + 下一配置部署」重叠；run 级
+  `overview.html` 在全局收尾前渲染，PNG 点位图与 sweep-end remove / pod /
+  namespace 删除并行。`summary.json`/`samples.csv` 默认保留（`--rebuild-report`
+  的唯一输入），`MC_KVTEST_CLEAN_INTERMEDIATES=1` 才在成功 run 后清理。
 - **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
   渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
   `overview.html`（run 总览）。**`data.js` 必须与 report.html 同目录**：从磁盘双击打开时
@@ -894,8 +899,11 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   需重新 map，暂未自动实现。本地重算会从文件名/目录回填 `size/role/node`（如
   `<cfg>.<run>_8MB.dual_<node>_c0_p9301.reader.log`），因此多 data_size 与读写角色
   仍能正确分块。
-- **开关**：`--no-report`（`--no-plot` 同义）跳过；`--png` 保留旧 PNG 绘图流程
-  （会连带回拉原始日志，仅小 run 实用）。
+- **开关（两个独立开关）**：`--no-report` 只跳过 HTML 报表（per-unit `report.html`
+  与 run 级 `overview.html`，场景级报表、STOP/失败的部分报表、kvtest 的 map+reduce
+  一并生效）；`--no-plot` 只跳过 PNG 绘图（`plot_latency.py`，仅 `--png` 或 kvtest
+  samples 时才有）。两者互不影响，同时给出即两样都不产；`--dry-run` 仍全部跳过。
+  `--png` 保留旧 PNG 绘图流程（会连带回拉原始日志，仅小 run 实用）。
 - **待办（已记录）**：store 容量周期采样时间线（P3）、增量 map / 节点日志轮转上限、
   按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。
 - **产物版本标记**（旧 run 兼容）：`stats.json` 带 `meta.bucket_unit`（时间桶 t 恒为
@@ -987,7 +995,8 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
 `data/`（运行时状态，gitignored）+ `backups/`（编辑备份，gitignored）+ `tests/`，侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
 
 - **配置维护**：运行框（通栏最上方：选中文件展示【目录/文件分开，目录先执行】+ cluster/global/
-  profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-plot/protocol 选项 + 运行按钮）；
+  profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-plot/no-report/protocol
+  选项 + 运行按钮）；
   左列**通用配置**（configs 根下全部 `*.json`，过滤 `*.example.json` 模板）+ **运行配置**
   （configs 下所有非 `_` 目录的层级树）；右侧编辑器在线编辑（写入前自动校验——复用编排器自身
   的场景配置校验；自动备份到 `webui/backups/`）。树用**复选框**选择运行范围：勾目录=整目录

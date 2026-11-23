@@ -5,7 +5,7 @@ import sys
 
 from .. import conflicts, runmgr
 from ..common import ApiError, read_json_body
-from ..paths import MAX_TEXT_CHUNK, ROOT
+from ..paths import MAX_TEXT_CHUNK, OUTPUTS_DIR, ROOT, TS_RE
 
 ROUTES = []
 
@@ -74,7 +74,7 @@ def _build_run_argv(body):
                       "--recall-cluster", flags["recall_cluster"],
                       "--recall-global", flags["recall_global"],
                       "--profile", profile]
-        for flag in ("dry_run", "no_warmup", "no_plot"):
+        for flag in ("dry_run", "no_warmup", "no_plot", "no_report"):
             if flags.get(flag):
                 dual_argv.append("--" + flag.replace("_", "-"))
         protocol = flags.get("protocol")
@@ -98,7 +98,7 @@ def _build_run_argv(body):
                      "first".format(name, path, example, target))
     argv += ["--" + mode, "--cluster", cluster, "--global", global_cfg,
              "--profile", profile]
-    for flag in ("dry_run", "no_warmup", "no_plot"):
+    for flag in ("dry_run", "no_warmup", "no_plot", "no_report"):
         if flags.get(flag):
             argv.append("--" + flag.replace("_", "-"))
     protocol = flags.get("protocol")
@@ -171,6 +171,52 @@ def api_run_post(handler, query):
     except runmgr.SlotBusy as exc:
         raise ApiError(409, exc.reason)
     return {"run": run.to_dict(), "warnings": warnings}
+
+
+def _active_run_for_ts(ts):
+    """The id of a still-running benchmark that owns outputs/<ts>, or None."""
+    for rid, run in list(runmgr.MGR.active.items()):
+        if run.status == "running" and \
+                (run.ts_dir or "").rstrip("/").endswith("/" + ts):
+            return rid
+    return None
+
+
+def _build_rebuild_argv(body):
+    """Validate {ts} and return the argv for benchmark.py --rebuild-report."""
+    ts = (body.get("ts") or "").strip()
+    if not ts or ts in (".", "..") or not TS_RE.match(ts):
+        raise ApiError(400, "ts must be a run directory name under outputs/")
+    ts_dir = os.path.join(OUTPUTS_DIR, ts)
+    if not os.path.isdir(ts_dir):
+        raise ApiError(404, "no such run: {}".format(ts))
+    if not os.path.isdir(os.path.join(ts_dir, "logs")):
+        raise ApiError(400, "{} has no logs directory; nothing to "
+                            "rebuild".format(ts))
+    rid = _active_run_for_ts(ts)
+    if rid:
+        raise ApiError(409, "run {} is still writing {}; rebuild after it "
+                            "finishes".format(rid, ts))
+    return [sys.executable, runmgr.BENCH, "--rebuild-report", ts]
+
+
+def api_rebuild_report_post(handler, query):
+    """POST /api/runs/rebuild-report {"ts": ...}
+
+    Re-render one finished run's HTML reports from its LOCAL artifacts
+    (benchmark.py --rebuild-report): covers "the run finished but the report
+    step failed" without touching the cluster. Started as a normal managed
+    run, so its log/rc are visible in the run history.
+    """
+    body = read_json_body(handler)
+    argv = _build_rebuild_argv(body)
+    try:
+        run = runmgr.MGR.start_benchmark(
+            argv, meta={"action": "rebuild_report",
+                        "ts": (body.get("ts") or "").strip()})
+    except runmgr.SlotBusy as exc:
+        raise ApiError(409, exc.reason)
+    return {"run": run.to_dict()}
 
 
 def api_runs(handler, query):
@@ -255,6 +301,8 @@ def api_run_stop(handler, query, rid):
 ROUTES += [
     ("POST", r"^/api/run$", lambda h, q, m=None: api_run_post(h, q)),
     ("POST", r"^/api/cleanup$", lambda h, q, m=None: api_cleanup_post(h, q)),
+    ("POST", r"^/api/runs/rebuild-report$",
+     lambda h, q, m=None: api_rebuild_report_post(h, q)),
     ("GET", r"^/api/runs$", lambda h, q, m=None: api_runs(h, q)),
     ("GET", r"^/api/runs/(?P<rid>[^/]+)$", api_run_get),
     ("GET", r"^/api/runs/(?P<rid>[^/]+)/log$", api_run_log),

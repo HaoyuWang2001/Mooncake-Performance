@@ -243,7 +243,8 @@ const PerfView = {
         <span class="rb-label">选项</span>
         <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
         <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
-        <el-checkbox v-model="flags.noPlot">no-plot</el-checkbox>
+        <el-checkbox v-model="flags.noPlot" title="只跳过 PNG 绘图（plot_latency），HTML 报表照常生成">no-plot</el-checkbox>
+        <el-checkbox v-model="flags.noReport" title="只跳过 HTML 报表（report.html + overview.html），PNG 绘图不受影响">no-report</el-checkbox>
         <el-checkbox v-model="flags.verbose" title="详细日志：上传路径、逐文件拉取、kubectl 命令、pod 详情">verbose</el-checkbox>
         <span class="rb-label rb-label-inline">协议</span>
         <el-select v-model="flags.protocol" size="small" style="width: 130px">
@@ -402,6 +403,7 @@ const PerfView = {
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
     const cfgLoading = Vue.ref(false);
     const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
+                                 noReport: false,
                                  verbose: false, protocol: "", cluster: "",
                                  global: "", profile: "", rankCluster: "",
                                  rankGlobal: "", recallCluster: "",
@@ -567,7 +569,8 @@ const PerfView = {
     function _instFlags() {
       return { mode: mode.value, launch_mode: launchMode.value,
                dry_run: flags.dryRun, no_warmup: flags.noWarmup,
-               no_plot: flags.noPlot, verbose: flags.verbose,
+               no_plot: flags.noPlot, no_report: flags.noReport,
+               verbose: flags.verbose,
                protocol: flags.protocol || null,
                cluster: flags.cluster, global: flags.global,
                profile: flags.profile,

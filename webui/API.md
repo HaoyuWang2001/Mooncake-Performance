@@ -67,7 +67,9 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
   "flags": {
     "mode": "ssh",                         // ssh | k8s
     "launch_mode": "single",               // single | rank_recall（WebUI 仅 k8s）
-    "dry_run": false, "no_warmup": false, "no_plot": false,
+    "dry_run": false, "no_warmup": false,
+    "no_plot": false,                     // 只跳过 PNG 绘图（plot_latency）
+    "no_report": false,                   // 只跳过 HTML 报表（report.html + overview.html）
     "verbose": false,                     // 详细日志（上传路径/逐文件拉取/kubectl 命令/pod 详情）
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"
     "cluster": "configs/_ssh/cluster.json",
@@ -106,6 +108,18 @@ selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files
 - 同一实例已有活跃 run → 409；scheduler 任务执行中 → 409
 - 不同集群 + 不同栈（etcd/master）→ 可真正并行；每个 run 使用独立
   `webui/data/runs/<id>.state` 台账（Rank+Recall 子任务为 `<id>.state.rank|recall`）
+
+### POST /api/runs/rebuild-report
+用**本地**已有产物重建某次 run 的 HTML 报表（等价 `benchmark.py --rebuild-report <ts>`），
+用于「run 正常结束但报表阶段失败」或报表被 `--no-report` / `no_plot` 跳过后补出：
+```json
+{"ts": "20261112-1804"}   // outputs/ 下的时间戳目录名，不带 outputs/ 前缀
+```
+- 只读本地 `logs/<cfg>/` 下的 `*.stats.json` / `*.log` / kvtest `samples.csv`，不访问集群；
+- 产出 `report/<size>/report.html`(+`data.js`/`meta.json`) 与 run 级 `report/overview.html`；
+- 以普通 run 形式执行，日志/rc 进「历史运行」；
+- 404 无该 run；400 无 `logs/`；409 该 run 仍由活跃 run 写入或 scheduler 执行中；
+- → `{"run":{"id":"r...","status":"running",...}}`。
 
 ### POST /api/cleanup
 standalone clean-up（不跑场景；不需要 profile）：

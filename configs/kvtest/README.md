@@ -160,11 +160,12 @@ writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node
 
 ## 结果
 
-成功运行的最终目录按 Python 模式收敛，只保留每实例 `log`/`glog`、请求级
-PNG、**HTML 报表（map-reduce 产物，见下节）**，以及 run 级 `<cfg>.csv` 和
-`benchmark_detail.csv`。`summary.json` 和 `samples.csv` 仅作为汇总、作图、
-报表 map 的临时输入，成功后自动删除；失败或绘图失败时保留它们用于排障、
-重画与 `--rebuild-report`。注意：
+成功运行的最终目录保留每实例 `log`/`glog`、请求级 PNG、**HTML 报表
+（map-reduce 产物，见下节）**、run 级 `<cfg>.csv` 和 `benchmark_detail.csv`，
+以及 `summary.json` / `samples.csv`。后两者是 `--rebuild-report` 补跑 map 的
+**唯一输入**，因此默认保留；确认系统稳定后可设
+`MC_KVTEST_CLEAN_INTERMEDIATES=1`，在 run 全部成功且绘图成功后清掉它们
+（失败或绘图失败时该开关也不会删除）。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。配置 warmup 时，`/start` 先释放 warmup；到时后编排器依次执行
 `/pause`（停 writer 并排空出站通知）、`/drain`（排空 reader 入站队列）、
@@ -187,7 +188,7 @@ kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` �
 `<实例>.<operation>.latency.png`；`notify_queue_wait` 使用
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
 request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回窗口聚合数据；
-`--no-plot` 可关闭自动绘图。
+`--no-plot` 可关闭这份自动绘图（PNG），HTML 报表不受影响（由 `--no-report` 单独控制）。
 
 ## HTML 报表（map-reduce）
 
@@ -220,7 +221,7 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
 报表参数卡沿用 pipeline 字段（场景/协议/工作模式/QPS/notify/操作/节点数/客户端
 总数/KV 配置名等），并标记「运行模式 = kvtest」。注意：
 
-- `--no-plot` 同时关闭报表（与 pipeline 一致）；
+- `--no-report` 关闭 HTML 报表；`--no-plot` 只关 PNG 绘图（与 pipeline 一致，两者独立）；
 - 报表生成是 WARN-only，失败不影响压测结论；
 - 成功清理只删除 `summary.json`/`samples.csv`，`*.stats.json` 与
   `report/` 目录保留；

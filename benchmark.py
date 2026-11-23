@@ -20,6 +20,7 @@ import json
 import math
 import os
 import posixpath
+import queue
 import re
 import atexit
 import shutil
@@ -87,6 +88,87 @@ def _install_stop_handlers():
 def _check_stop():
     if stop_requested():
         raise StopRequested()
+
+
+# --- background per-config post-processing --------------------------------
+# CSV aggregation + report map/reduce only consume already-pulled LOCAL
+# artifacts, so they no longer sit on the critical path: main() queues them
+# and immediately proceeds to the finished config's teardown / the next
+# config's deployment. A single daemon worker preserves the historical order
+# (and keeps the run-level profiling ledger writers serialized); _bg_join() is
+# the barrier before assembly / overview. Daemon threads deliberately do not
+# block interpreter exit: a STOP must never be held hostage by a big map.
+_BG_LOCK = threading.Lock()
+_BG_JOBS = []          # [(name, threading.Event, result_box)]
+_BG_WORKER = None
+_BG_Q = queue.Queue()
+
+
+def _bg_loop():
+    while True:
+        item = _BG_Q.get()
+        if item is None:
+            _BG_Q.task_done()
+            return
+        name, fn, args, kwargs, done, box = item
+        try:
+            box["result"] = fn(*args, **kwargs)
+        except BaseException as exc:      # WARN-only; never kills the run
+            box["error"] = exc
+        finally:
+            done.set()
+            _BG_Q.task_done()
+
+
+def _bg_submit(name, fn, *args, **kwargs):
+    """Queue one local post-processing unit (per config, or run-level plots)."""
+    global _BG_WORKER
+    done = threading.Event()
+    box = {}
+    with _BG_LOCK:
+        if _BG_WORKER is None or not _BG_WORKER.is_alive():
+            _BG_WORKER = threading.Thread(target=_bg_loop,
+                                          name="mc-postproc", daemon=True)
+            _BG_WORKER.start()
+        _BG_JOBS.append((name, done, box))
+    _BG_Q.put((name, fn, args, kwargs, done, box))
+    return name
+
+
+def _bg_join(timeout_s=None):
+    """Wait for every queued unit; returns [(name, ok, result, error)] in
+    submission order. A timeout only WARNs: the daemon worker keeps finishing
+    in the background instead of blocking a STOP."""
+    with _BG_LOCK:
+        pending = list(_BG_JOBS)
+        _BG_JOBS.clear()
+    deadline = None if timeout_s is None else time.time() + float(timeout_s)
+    out = []
+    for name, done, box in pending:
+        wait = None if deadline is None else max(0.0, deadline - time.time())
+        if not done.wait(wait):
+            log("[WARN] post-processing {} is still running after {}s; "
+                "continuing without it".format(name, timeout_s))
+            out.append((name, False, None,
+                        "timed out after {}s".format(timeout_s)))
+            continue
+        if box.get("error") is not None:
+            out.append((name, False, None, box["error"]))
+        else:
+            out.append((name, True, box.get("result"), None))
+    return out
+
+
+def _cluster_snapshot(cluster):
+    """Shallow snapshot handed to the background post-processing worker.
+
+    The main thread keeps adding k8s pod entries to cluster["nodes"] while
+    the next scenario deploys; iterating that live dict from the worker would
+    raise "dictionary changed size during iteration". Node value dicts are
+    frozen once their config finishes, so sharing them is safe."""
+    snap = dict(cluster or {})
+    snap["nodes"] = dict((cluster or {}).get("nodes") or {})
+    return snap
 
 
 _PARALLEL_READY_TIMEOUT_S = 600
@@ -2841,7 +2923,7 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
                       qps_target=0, launch_mode="single", mode="pipeline",
                       nodes=0):
     """WARN-only wrapper around the unit-based report generation."""
-    if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
+    if getattr(args, "no_report", False) or getattr(args, "dry_run", False):
         return None
     try:
         written = _generate_report_units(
@@ -2862,7 +2944,9 @@ def _render_run_overview(ts_dir, mode=""):
     rp = _report_module()
     ov_dir = os.path.join(ts_dir, "report")
     scenarios = []
-    for acc in _REPORT_ACC:
+    # snapshot: a STOP can race a background post-processing unit that is
+    # still appending to the accumulator
+    for acc in list(_REPORT_ACC):
         rel = os.path.relpath(acc["report_html"], ov_dir)
         sc = dict(acc["data"], report_rel=rel.replace(os.sep, "/"))
         sc["unit"] = acc.get("unit") or ""
@@ -2900,7 +2984,7 @@ def _stop_reports():
         log_detail("[STOP] partial report disabled (MC_STOP_REPORT=0)")
         return
     args = _STOP_CTX.get("args")
-    if args is not None and (getattr(args, "no_plot", False)
+    if args is not None and (getattr(args, "no_report", False)
                              or getattr(args, "dry_run", False)):
         return
     cluster = _STOP_CTX.get("cluster")
@@ -2908,6 +2992,13 @@ def _stop_reports():
     if not cluster or not ctx:
         log_detail("[STOP] no scenario in flight; nothing to report")
         return
+    # Settle per-config post-processing still running in the background so the
+    # partial overview is assembled from a consistent accumulator. Bounded: a
+    # STOP must never wait on a big map (the daemon worker dies with us).
+    try:
+        _bg_join(os.environ.get("MC_BG_JOIN_TIMEOUT", "45"))
+    except Exception as exc:
+        log("[WARN] [STOP] joining background reports: {}".format(exc))
     clear_stop()          # the pull must be allowed to run
     mode = ctx.get("mode", "pipeline")
     if ctx.get("skip_pull"):
@@ -4123,11 +4214,14 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
-        # config's node; hand it this config's coordinates.
-        _generate_reports(cfg, local_log_dir, args, nodes=len(involved_nodes),
-                          qps_target=total_target_qps, mode="basic")
+        # config's node; hand it this config's coordinates. The report is
+        # local post-processing: main() queues it on the background worker so
+        # it overlaps the next config's deployment (kwargs ride along).
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
-                "remote_log_dir": remote_log_dir}
+                "remote_log_dir": remote_log_dir,
+                "_report_kwargs": {"nodes": len(involved_nodes),
+                                   "qps_target": total_target_qps,
+                                   "mode": "basic"}}
     except Exception:
         # FAIL path: preserve the remote logs for diagnosis, then re-raise.
         # Basic clients may have been orphaned mid-run -> reap the ledger.
@@ -5327,13 +5421,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
         # Sweep-end remove-all is issued by main() on the last successful
-        # config's node; hand it this config's coordinates.
-        _generate_reports(cfg, local_log_dir, args, nodes=len(involved_nodes),
-                          qps_target=plan["total_qps"],
-                          launch_mode="rank_recall" if plan.get("dual") else "single",
-                          mode="pipeline")
+        # config's node; hand it this config's coordinates. The report is
+        # local post-processing: main() queues it on the background worker so
+        # it overlaps the next config's deployment (kwargs ride along).
         return {"host": host, "node": primary_node_name, "runner": remote_runner,
-                "remote_log_dir": remote_log_dir}
+                "remote_log_dir": remote_log_dir,
+                "_report_kwargs": {
+                    "nodes": len(involved_nodes),
+                    "qps_target": plan["total_qps"],
+                    "launch_mode": ("rank_recall" if plan.get("dual")
+                                    else "single"),
+                    "mode": "pipeline"}}
     except Exception:
         # FAIL path: preserve every remote log (reader SUMMARY/RESULT is only
         # flushed on exit) and free ports, then re-raise for main's [FAIL]
@@ -5688,6 +5786,27 @@ def _cleanup_kvtest_success_intermediates(log_dir):
     return removed
 
 
+def _maybe_cleanup_kvtest_intermediates(log_dir, failed_scenarios,
+                                        plot_succeeded):
+    """kvtest summary.json/samples.csv are the ONLY inputs of --rebuild-report
+    (the map stage): keep them by default so a report that was missed or
+    failed can always be rebuilt without re-running the benchmark. Cleanup is
+    opt-in (MC_KVTEST_CLEAN_INTERMEDIATES=1) and still requires a fully
+    successful run + plots."""
+    if os.environ.get("MC_KVTEST_CLEAN_INTERMEDIATES", "0") != "1":
+        if glob.glob(os.path.join(log_dir, "**", "*.kvtest_*.samples.csv"),
+                     recursive=True):
+            log("kvtest samples/summary kept for --rebuild-report "
+                "(set MC_KVTEST_CLEAN_INTERMEDIATES=1 to remove them)")
+        return 0
+    if failed_scenarios or not plot_succeeded:
+        return 0
+    removed = _cleanup_kvtest_success_intermediates(log_dir)
+    if removed:
+        log("kvtest intermediate artifacts removed: {}".format(removed))
+    return removed
+
+
 def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                         cfg_name, local_log_dir, remove_host=None,
                         remove_node=None, remove_runner=None, globals_cfg=None):
@@ -5960,7 +6079,7 @@ def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False):
     reduce: stats.json -> one HTML report per data_size (report.py), plus the
             run overview accumulated by the caller.
     WARN-only: a report failure must never fail the benchmark."""
-    if getattr(args, "no_plot", False) or getattr(args, "dry_run", False):
+    if getattr(args, "no_report", False) or getattr(args, "dry_run", False):
         return None
     try:
         mapped = _kvtest_map_stats(local_log_dir, cfg)
@@ -8174,9 +8293,14 @@ def parse_arguments(argv=None):
                         help="cooperative stop flag file (WebUI stop); a "
                              "SIGINT/SIGTERM/SIGBREAK also requests stop")
     parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--no-plot", "--no-report", action="store_true",
-                        help="skip the automatic report/plotting of this run's "
-                             "logs (default: generated after the sweep)")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="skip the PNG plots only (legacy plot_latency "
+                             "charts written with --png / for kvtest samples); "
+                             "the HTML reports are still generated")
+    parser.add_argument("--no-report", action="store_true",
+                        help="skip the HTML reports of this run (per-unit "
+                             "report.html + the run-level overview.html); "
+                             "plotting is controlled separately by --no-plot")
     parser.add_argument("--png", action="store_true",
                         help="compat switch: also pull the RAW client logs and "
                              "generate the legacy PNG plots (plot_latency.py); "
@@ -8485,6 +8609,39 @@ def rebuild_reports(ts):
     return 0
 
 
+def _post_process_config(cfg, cfg_name, scenario, ts, ts_dir,
+                         cluster_snapshot, store_nodes, report_kwargs, args):
+    """Local per-config post-processing: CSV aggregation -> HTML report map/
+    reduce -> profiling outliers.
+
+    Runs on the background worker (see _bg_submit) while the orchestrator
+    tears the finished config down and deploys the next one. It only touches
+    already-pulled LOCAL artifacts plus a cluster SNAPSHOT (the live
+    cluster["nodes"] is still appended to by the next k8s scenario).
+    Returns (category, rows) for the run-level detail CSV; raising here marks
+    only this config failed — the report wrappers themselves stay WARN-only,
+    exactly like the old inline path."""
+    log_dir = os.path.join(ts_dir, "logs", cfg_name)
+    rows = write_scenario_csv(log_dir, cfg, ts,
+                              cfg.get("__cfg_path__") or "",
+                              cluster_snapshot, store_nodes, result_dir=ts_dir)
+    if scenario == "kvtest":
+        # map (samples -> per-role stats.json) + reduce, same chain as
+        # pipeline/basic; no extra kwargs (derived inside from cfg)
+        _kvtest_generate_reports(cfg, log_dir, args)
+    else:
+        _generate_reports(cfg, log_dir, args, **report_kwargs)
+    matrix = getattr(args, "_matrix", None)
+    if matrix and matrix.get("outliers", {}).get("auto") and prof_core:
+        # run-level outlier ledger: safe because the single background worker
+        # serializes every config's post-processing (no read-modify-write race)
+        try:
+            _profile_outliers(matrix, ts_dir, cfg_name)
+        except Exception as exc:
+            log("[WARN] [profile] outlier extraction: {}".format(exc))
+    return scenario, rows
+
+
 def main(args, cfg_paths):
     if getattr(args, "rebuild_report", None):
         sys.exit(rebuild_reports(args.rebuild_report))
@@ -8636,33 +8793,22 @@ def main(args, cfg_paths):
             else:
                 sweep_remove = run_basic_scenario(cluster, globals_cfg, cfg, ts, args)
             if not args.dry_run:
+                scenario = cfg.get("scenario")
+                if scenario not in ("pipeline", "kvtest"):
+                    scenario = "basic"
                 store_nodes = (globals_cfg.get("mooncake_store_nodes", []) or []) \
                     if args.mode != "k8s" else []
-                rows = write_scenario_csv(
-                    os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
-                    cluster, store_nodes, result_dir=ts_dir)
-                if cfg.get("scenario") == "pipeline":
-                    categories.add("pipeline")
-                    # detail keeps only the aggregated writer/reader TOTAL rows
-                    all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
-                elif cfg.get("scenario") == "kvtest":
-                    categories.add("kvtest")
-                    # detail keeps only the aggregated writer/reader TOTAL rows
-                    all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
-                    # map-reduce HTML report (same product as pipeline/basic):
-                    # samples -> per-role stats.json -> per-size report.html
-                    _kvtest_generate_reports(
-                        cfg, os.path.join(ts_dir, "logs", name), args)
-                else:
-                    categories.add("basic")
-                    all_rows.extend(rows)
-                # profiling outliers: auto-extract RESULT rows above the
-                # matrix threshold and write the per-run outlier report
-                if matrix and matrix.get("outliers", {}).get("auto") and prof_core:
-                    try:
-                        _profile_outliers(matrix, ts_dir, name)
-                    except Exception as exc:
-                        log("[WARN] [profile] outlier extraction: {}".format(exc))
+                # CSV + report map/reduce only read already-pulled LOCAL
+                # artifacts: dispatch them to the background worker so they
+                # overlap this config's teardown and the next one's
+                # deployment. The snapshot keeps the worker out of the live
+                # cluster["nodes"] dict the next k8s scenario keeps appending
+                # to ("dictionary changed size during iteration" otherwise).
+                _bg_submit(name, _post_process_config,
+                           cfg, name, scenario, ts, ts_dir,
+                           _cluster_snapshot(cluster), store_nodes,
+                           (sweep_remove or {}).get("_report_kwargs") or {},
+                           args)
         except Exception as exc:
             log("[FAIL] scenario {}: {}".format(name, exc))
             failed_scenarios.append(name)
@@ -8671,36 +8817,24 @@ def main(args, cfg_paths):
         if failed_scenarios:
             sys.exit(1)
         return
-    # Sweep end: remove-all on the last successful config's primary node.
-    # Failed configs never reach their own end-remove, so this final pass is
-    # what guarantees the store ends the sweep empty. Removing from an empty
-    # store is a no-op (safe), and failure here must not fail the whole sweep
-    # — hence WARN-only. The log is scp'd out because it does not match the
-    # per-config glob used by pull_logs.
-    if sweep_remove:
-        try:
-            nd = get_node(cluster, sweep_remove["node"])
-            run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
-                      sweep_remove["remote_log_dir"], "final",
-                      extra="--scope full", dry_run=False,
-                      cfg_name="final", node_name=sweep_remove["node"])
-            scp_pull(sweep_remove["host"], nd,
-                     "{}*".format(_pod_base("{}/final".format(
-                         sweep_remove["remote_log_dir"]), nd)
-                         + ".remove-keys.log"),
-                     os.path.join(ts_dir, "logs"), dry_run=False)
-            _verify_store_clean(cluster, globals_cfg, "final", "sweep end")
-            log("sweep-end remove-keys -> {}".format(
-                os.path.join(ts_dir, "logs", "final.remove-keys.log")))
-        except Exception as exc:
-            log("[WARN] sweep-end remove-keys failed: {}".format(exc))
-        finally:
-            # k8s: the sweep-end needed the last config's pods alive —
-            # delete them only now (store-side keys are already cleared)
-            try:
-                cleanup_pods(cluster, [sweep_remove["node"]], False)
-            except Exception as exc:
-                log("[WARN] k8s pod cleanup after sweep-end: {}".format(exc))
+    # Settle every background unit (CSV + report + profiling outliers) before
+    # the run-level assembly. A failing CSV marks that scenario failed; the
+    # report wrappers are WARN-only (same contract as the old inline path).
+    for name, ok, payload, err in _bg_join():
+        if not ok:
+            log("[FAIL] scenario {}: {}".format(name, err))
+            failed_scenarios.append(name)
+            continue
+        scenario, rows = payload
+        categories.add(scenario)
+        if scenario in ("pipeline", "kvtest"):
+            # detail keeps only the aggregated writer/reader TOTAL rows
+            all_rows.extend([r for r in rows if r.get("instance") == "TOTAL"])
+        else:
+            all_rows.extend(rows)
+    # --- run-level assembly (local, fast) — done BEFORE the global teardown
+    # so the detail CSV / overview are available immediately and the PNG plots
+    # (also purely local) can run in parallel with the cluster teardown.
     if categories == {"pipeline"}:
         detail_header = PIPELINE_CSV_HEADER
         detail_rows = collapse_config_name(all_rows)
@@ -8731,24 +8865,18 @@ def main(args, cfg_paths):
             ", ".join(failed_scenarios)))
     else:
         log("SUMMARY: all {} scenarios OK".format(len(cfg_paths)))
-    if args.mode == "k8s" and not args.dry_run:
-        if cluster.get("_k8s_keep_ns"):
-            log("[k8s] namespace {} kept for troubleshooting; teardown "
-                "deferred until STOP/Ctrl+C".format(
-                    k8s_settings(cluster)["namespace"]))
-        else:
-            cleanup_k8s_namespace(cluster, dry_run=False)
-    log("done. results in {}".format(ts_dir))
     # Reports + optional PNG: everything runs on the ORCHESTRATOR (local
     # sys.executable, local logs dir), never on remote nodes.
-    #   - scenario reports were rendered during the run (stats reduce)
-    #   - the run-level overview is rendered here
-    #   - the legacy PNG plots are generated only with --png (compat switch)
-    #   - kvtest has no HTML report (it emits summary/samples, not stats), so
-    #     its request-level samples are always plotted on the orchestrator
+    #   - per-config reports were rendered by the background worker
+    #   - the run-level overview is rendered here             [--no-report]
+    #   - the legacy PNG plots run on the background worker while the global
+    #     teardown below proceeds                            [--no-plot]
+    #   - kvtest has no per-unit HTML of its own: its request samples go
+    #     through the same map+reduce chain (report.py)
+    # The two switches are independent: --no-report keeps PNG plots, and
+    # --no-plot keeps the HTML reports.
     log_dir = os.path.join(ts_dir, "logs")
-    plot_succeeded = bool(args.no_plot)
-    if not args.no_plot:
+    if not args.no_report:
         if _REPORT_ACC:
             try:
                 ov = _render_run_overview(ts_dir, args.mode)
@@ -8756,27 +8884,74 @@ def main(args, cfg_paths):
                     os.path.relpath(ov, ROOT)))
             except Exception as exc:
                 log("[WARN] overview report failed: {}".format(exc))
+    plot_succeeded = bool(args.no_plot)
+    plot_job = None
+    if not args.no_plot:
         has_logs = bool(glob.glob(os.path.join(log_dir, "**", "*.log"),
                                   recursive=True))
         has_samples = bool(glob.glob(os.path.join(log_dir, "**", "*.samples.csv"),
                                    recursive=True))
         # --png keeps the legacy behaviour (needs RESULT logs); kvtest samples
-        # are plotted unconditionally because PNG is its only per-request view.
+        # are plotted whenever plotting is enabled because PNG is its only
+        # per-request view.
         want_plot = (args.png and has_logs) or has_samples
         if args.png and not has_logs and not has_samples:
             log("[WARN] --png: no raw *.log under {} (raw logs are only "
                 "pulled for small runs / failures / --pull-raw-logs)"
                 "".format(log_dir))
         if want_plot:
-            plot_succeeded = _run_legacy_plots(log_dir)
-    # kvtest's summary/samples are implementation details needed only until
-    # the normal CSV and PNG outputs exist. Match the Python/basic result
-    # layout by removing them after a completely successful run. On any
-    # scenario or plotting failure, preserve them for diagnosis/replotting.
-    if not failed_scenarios and plot_succeeded:
-        removed = _cleanup_kvtest_success_intermediates(log_dir)
-        if removed:
-            log("kvtest intermediate artifacts removed: {}".format(removed))
+            plot_job = _bg_submit("plots", _run_legacy_plots, log_dir)
+    # Sweep end: remove-all on the last successful config's primary node.
+    # Failed configs never reach their own end-remove, so this final pass is
+    # what guarantees the store ends the sweep empty. Removing from an empty
+    # store is a no-op (safe), and failure here must not fail the whole sweep
+    # — hence WARN-only. The log is scp'd out because it does not match the
+    # per-config glob used by pull_logs.
+    if sweep_remove:
+        try:
+            nd = get_node(cluster, sweep_remove["node"])
+            run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
+                      sweep_remove["remote_log_dir"], "final",
+                      extra="--scope full", dry_run=False,
+                      cfg_name="final", node_name=sweep_remove["node"])
+            scp_pull(sweep_remove["host"], nd,
+                     "{}*".format(_pod_base("{}/final".format(
+                         sweep_remove["remote_log_dir"]), nd)
+                         + ".remove-keys.log"),
+                     os.path.join(ts_dir, "logs"), dry_run=False)
+            _verify_store_clean(cluster, globals_cfg, "final", "sweep end")
+            log("sweep-end remove-keys -> {}".format(
+                os.path.join(ts_dir, "logs", "final.remove-keys.log")))
+        except Exception as exc:
+            log("[WARN] sweep-end remove-keys failed: {}".format(exc))
+        finally:
+            # k8s: the sweep-end needed the last config's pods alive —
+            # delete them only now (store-side keys are already cleared)
+            try:
+                cleanup_pods(cluster, [sweep_remove["node"]], False)
+            except Exception as exc:
+                log("[WARN] k8s pod cleanup after sweep-end: {}".format(exc))
+    if args.mode == "k8s" and not args.dry_run:
+        if cluster.get("_k8s_keep_ns"):
+            log("[k8s] namespace {} kept for troubleshooting; teardown "
+                "deferred until STOP/Ctrl+C".format(
+                    k8s_settings(cluster)["namespace"]))
+        else:
+            cleanup_k8s_namespace(cluster, dry_run=False)
+    # Join the run-level PNG job started before the teardown; it is purely
+    # local, so the cluster teardown above ran in parallel with it.
+    if plot_job is not None:
+        for name, ok, result, err in _bg_join():
+            if name != "plots":
+                continue
+            plot_succeeded = bool(ok and result)
+            if not ok:
+                log("[WARN] auto-plot failed: {}".format(err))
+    # kvtest summary/samples are the ONLY --rebuild-report inputs: keep them
+    # by default (cleanup is opt-in; see _maybe_cleanup_kvtest_intermediates).
+    _maybe_cleanup_kvtest_intermediates(log_dir, failed_scenarios,
+                                        plot_succeeded)
+    log("done. results in {}".format(ts_dir))
     if args.clean_up:
         # reap first: recorded processes must be killed before their
         # scripts/binaries vanish with the remote directory

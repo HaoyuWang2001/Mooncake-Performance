@@ -35,6 +35,10 @@ import time
 # per-pod/per-command line, so the WebUI console stays short while every
 # detail remains locatable on disk.
 _DETAIL_FH = None
+# Per-config CSV/report post-processing runs on a background thread while the
+# main thread drives the next scenario; keep every log line atomic so the
+# console/file streams never interleave mid-line.
+_LOG_LOCK = threading.Lock()
 
 
 def set_detail_log(path):
@@ -59,19 +63,26 @@ def close_detail_log():
 
 
 def _detail_write(msg):
-    if _DETAIL_FH is not None:
-        try:
-            _DETAIL_FH.write("[{}] [benchmark] {}\n".format(
-                time.strftime("%H:%M:%S"), msg))
-            _DETAIL_FH.flush()
-        except Exception:
-            pass
+    line = "[{}] [benchmark] {}\n".format(time.strftime("%H:%M:%S"), msg)
+    with _LOG_LOCK:
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write(line)
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
 
 
 def log(msg):
-    print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
-          flush=True)
-    _detail_write(msg)
+    line = "[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg)
+    with _LOG_LOCK:
+        print(line, flush=True)
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write(line + "\n")
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
 
 
 # --- verbose logging (CLI --verbose / env MC_BENCH_VERBOSE / WebUI toggle) ---
@@ -89,10 +100,18 @@ def verbose_enabled():
 
 def log_detail(msg):
     """Full-detail line: always to benchmark.log, console only when verbose."""
-    _detail_write(msg)
-    if _VERBOSE:
-        print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
-              flush=True)
+    if not _VERBOSE:
+        _detail_write(msg)
+        return
+    line = "[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg)
+    with _LOG_LOCK:
+        print(line, flush=True)
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write(line + "\n")
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
 
 
 # --- cooperative stop (WebUI stop file / Ctrl+C signals) -------------------

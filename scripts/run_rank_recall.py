@@ -81,6 +81,7 @@ def _child_argv(args, work_mode, files, parent, ready_dir):
     for enabled, flag in ((args.dry_run, "--dry-run"),
                           (args.no_warmup, "--no-warmup"),
                           (args.no_plot, "--no-plot"),
+                          (getattr(args, "no_report", False), "--no-report"),
                           (args.verbose, "--verbose")):
         if enabled:
             argv.append(flag)
@@ -150,6 +151,7 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--no-report", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-file")
     return parser.parse_args(argv)

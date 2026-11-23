@@ -446,7 +446,22 @@ def test_kvtest_cleanup_keeps_stats_and_report(tmp_path):
     assert (logs / "report" / "8MB" / "report.html").is_file()
 
 
-def test_kvtest_report_disabled_with_no_plot(tmp_path):
+def test_kvtest_report_disabled_with_no_report(tmp_path):
+    logs = tmp_path / "logs" / "kvtest_noreport"
+    logs.mkdir(parents=True)
+    _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0],
+                    cfg_name="kvtest_noreport")
+    cfg = _cfg()
+    cfg["__cfg_path__"] = str(tmp_path / "kvtest_noreport.json")
+    args = _args()
+    args.no_report = True
+    assert bm._kvtest_generate_reports(cfg, str(logs), args) is None
+    assert not (logs / "report").exists()
+    assert not list(logs.glob("*.stats.json"))
+
+
+def test_kvtest_report_survives_no_plot(tmp_path):
+    """--no-plot only drops PNG drawing; the HTML report is unaffected."""
     logs = tmp_path / "logs" / "kvtest_noplot"
     logs.mkdir(parents=True)
     _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0],
@@ -455,9 +470,9 @@ def test_kvtest_report_disabled_with_no_plot(tmp_path):
     cfg["__cfg_path__"] = str(tmp_path / "kvtest_noplot.json")
     args = _args()
     args.no_plot = True
-    assert bm._kvtest_generate_reports(cfg, str(logs), args) is None
-    assert not (logs / "report").exists()
-    assert not list(logs.glob("*.stats.json"))
+    written = bm._kvtest_generate_reports(cfg, str(logs), args)
+    assert written and (logs / "report" / "8MB" / "report.html").is_file()
+    assert list(logs.glob("*.stats.json"))
 
 
 def test_kvtest_report_is_warn_only_on_bad_samples(tmp_path):
