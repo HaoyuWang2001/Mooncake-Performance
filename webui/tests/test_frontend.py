@@ -148,6 +148,54 @@ def test_reports_in_results_and_instance_detail():
     assert "report\\/report\\.html" in inst   # regex form in openReport
 
 
+def test_results_run_list_collapse_and_width():
+    """统计结果左列：可收起/展开 + 可拖宽（持久化）+ 完整文件名 tooltip。"""
+    results = open(os.path.join(JS_DIR, "views", "results-view.js"),
+                   encoding="utf-8").read()
+    app = open(os.path.join(JS_DIR, "app.js"), encoding="utf-8").read()
+    assert "function toggleList" in results and "toggleList" in results
+    assert "listOpen ? 'Fold' : 'Expand'" in results
+    assert "mcweb-results-list-open" in results
+    assert '<hdrag-handle v-show="listOpen" v-model="listW"' in results
+    assert 'persist="mcweb-results-list-w"' in results
+    assert "const listW = Vue.ref(" in results
+    assert ':title="r.ts"' in results
+    # 水平拖拽手柄组件在 app.js 定义并注册
+    assert "const HDragHandle = {" in app
+    assert 'app.component("hdrag-handle", HDragHandle)' in app
+
+
+def test_results_run_more_menu():
+    """运行结果行尾「…」菜单（重建报表/改名/删除），不再 hover 直出三按钮。"""
+    results = open(os.path.join(JS_DIR, "views", "results-view.js"),
+                   encoding="utf-8").read()
+    assert 'aria-label="更多操作"' in results
+    assert "MoreFilled" in results
+    assert 'popper-class="ri-more-menu"' in results
+    assert "function onRunCommand" in results
+    for cmd in ('command="rebuild"', 'command="rename"', 'command="delete"'):
+        assert cmd in results, "missing menu command {}".format(cmd)
+    assert "ri-actions" not in results            # hover 三按钮已移除
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    assert ".run-item:hover .ri-actions" not in css
+    assert ".ri-more-menu .danger-item" in css    # 删除项危险色（teleport 后全局类）
+
+
+def test_results_ms_bar_compact_no_wrap():
+    """多选条：已选计数 12px 等宽数字，整行不换行。"""
+    results = open(os.path.join(JS_DIR, "views", "results-view.js"),
+                   encoding="utf-8").read()
+    assert '<span class="hint mc-num">已选 {{ selected.length }}</span>' in results
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    m = re.search(r"\.ms-bar \{[^}]*\}", css)
+    assert m, ".ms-bar rule missing"
+    assert "flex-wrap: nowrap" in m.group(0)
+    assert ".ms-bar .hint { font-size: 12px" in css
+    assert ".ms-bar .spacer { flex: 1; min-width: 0; }" in css
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()

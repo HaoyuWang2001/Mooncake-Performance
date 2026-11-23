@@ -365,24 +365,58 @@ html, body, #app {
 .run-item.selected { border-color: var(--el-color-danger); background: var(--el-color-danger-light-9); }
 .run-item .ri-check { margin-top: 2px; flex: none; }
 .run-item .ri-body { flex: 1; min-width: 0; }
-.run-item .ri-title { font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
-.run-item .ri-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.run-item .ri-sub { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 2px; }
-.run-item .ri-actions {
-  position: absolute; right: 6px; top: 6px; display: none; gap: 2px;
-  padding: 0 2px; background: var(--el-bg-color); border-radius: 6px;
-  box-shadow: var(--el-box-shadow-light);
+.run-item .ri-title {
+  font-size: 13px; font-weight: 600;
+  display: flex; align-items: center; gap: var(--mc-space-2); min-width: 0;
 }
-.run-item:hover .ri-actions { display: inline-flex; }
-.run-item:hover .ri-tag { visibility: hidden; }
-.run-list-card { display: flex; flex-direction: column; max-height: calc(100vh - 170px); }
+.run-item .ri-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.run-item .ri-tag { flex: none; }
+.run-item .ri-sub { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 2px; }
+/* 行尾「…」：常驻小图标，点击弹菜单（替代 hover 直出三按钮，防误触） */
+.run-item .ri-more-wrap { flex: none; display: inline-flex; }
+.run-item .ri-more { color: var(--el-text-color-secondary); padding: 0 2px; height: 20px; }
+.run-item .ri-more:hover { color: var(--el-color-primary); }
+/* 下拉菜单（teleport 到 body）：删除项用危险色（破坏性操作） */
+.ri-more-menu .danger-item { color: var(--el-color-danger); }
+.ri-more-menu .danger-item:hover,
+.ri-more-menu .danger-item:focus { background: var(--el-color-danger-light-9); color: var(--el-color-danger); }
+
+/* 统计结果布局：左列（可收起/拖宽）+ 拖拽手柄 + 右侧结果区 */
+.results-layout { display: flex; align-items: flex-start; gap: var(--mc-space-2); min-width: 0; }
+.results-main {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column; gap: var(--mc-space-4);
+}
+.run-list-card {
+  flex: none;
+  display: flex; flex-direction: column; max-height: calc(100vh - 170px);
+}
 .run-list-card .el-card__body { display: flex; flex-direction: column; min-height: 0; }
 .run-list { flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
-.ms-bar {
-  display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
-  padding: 6px 8px; background: var(--el-fill-color-light); border-radius: 6px;
+/* 水平拖拽手柄（左右分栏宽度） */
+.hdrag {
+  width: 6px; flex: none; align-self: stretch; cursor: col-resize;
+  display: flex; align-items: center; justify-content: center;
 }
-.ms-bar .spacer { flex: 1; }
+.hdrag span {
+  width: 2px; height: 32px; border-radius: 1px;
+  background: var(--el-border-color);
+}
+.hdrag:hover span, .hdrag:active span { background: var(--el-color-primary); }
+/* 多选条：已选计数用小号等宽数字，整行不换行（卡片拖窄也不折行） */
+.ms-bar {
+  display: flex; align-items: center; gap: var(--mc-space-2);
+  margin-bottom: var(--mc-space-2); padding: var(--mc-space-1) var(--mc-space-2);
+  background: var(--el-fill-color-light); border-radius: var(--mc-radius);
+  flex-wrap: nowrap; white-space: nowrap;
+}
+.ms-bar .hint { font-size: 12px; white-space: nowrap; }
+.ms-bar .el-checkbox { flex: none; }
+.ms-bar .el-button { flex: none; }
+.ms-bar .spacer { flex: 1; min-width: 0; }
 
 /* 结果框：全局 2px 边框避免焦点切换抖动；焦点 = 主色边框 + 外发光 */
 .pane {

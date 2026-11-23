@@ -159,6 +159,41 @@ const DragHandle = {
   },
 };
 
+/* ---------------- 通用水平拖拽手柄（左右分栏宽度；v-model = 左手侧宽度） ----------------
+   统计结果页左列运行列表用：拖动改宽，双击不可用（保持鼠标语义与 vdrag 一致），
+   高频拖拽零动效。 */
+const HDragHandle = {
+  name: "HDragHandle",
+  props: { modelValue: { type: Number, default: 300 },
+           min: { type: Number, default: 240 },
+           max: { type: Number, default: 560 },
+           persist: { type: String, default: "" } },
+  emits: ["update:modelValue"],
+  template: `<div class="hdrag" title="拖动调节宽度" @mousedown.prevent="down"><span></span></div>`,
+  setup(props, { emit }) {
+    const down = (e) => {
+      const startX = e.clientX;
+      const startW = Number(props.modelValue) || 300;
+      const move = (ev) => {
+        const w = Math.min(props.max, Math.max(props.min, startW + (ev.clientX - startX)));
+        emit("update:modelValue", w);
+        if (props.persist) saveHeight(props.persist, w);
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    };
+    return { down };
+  },
+};
+
 
 /* ---------------- 根组件 ---------------- */
 const App = {
@@ -277,4 +312,5 @@ app.component("schedule-view", ScheduleView);
 app.component("spdiag-tree", SpdiagTree);
 app.component("sdt-node", SdtNode);
 app.component("drag-handle", DragHandle);
+app.component("hdrag-handle", HDragHandle);
 app.mount("#app");

@@ -356,6 +356,12 @@ const ResultsView = {
         <p class="desc">点击左侧 run 分配到焦点框（主色描边 = 焦点）；同文件锁定便于跨 run 对比 CSV 与图片。</p>
       </div>
       <div class="actions">
+        <el-tooltip :content="listOpen ? '收起运行结果列表' : '展开运行结果列表'" placement="top">
+          <el-button size="small" circle @click="toggleList"
+                     :aria-label="listOpen ? '收起运行结果列表' : '展开运行结果列表'">
+            <el-icon><component :is="listOpen ? 'Fold' : 'Expand'"/></el-icon>
+          </el-button>
+        </el-tooltip>
         <template v-if="panes.length >= 2">
           <span class="mc-label">同文件锁定</span>
           <el-switch v-model="lockFile"></el-switch>
@@ -370,10 +376,10 @@ const ResultsView = {
       </div>
     </div>
 
-    <el-row :gutter="14">
-      <el-col :span="6">
-        <el-card shadow="never" class="run-list-card">
-          <template #header>
+    <div class="results-layout">
+      <el-card v-show="listOpen" shadow="never" class="run-list-card"
+               :style="{ width: listW + 'px' }">
+        <template #header>
             <div class="mc-toolbar">
               <b>运行结果（{{ runs.length }}）</b>
               <span class="spacer"></span>
@@ -384,7 +390,7 @@ const ResultsView = {
           </template>
           <div v-if="multiSelect" class="ms-bar">
             <el-checkbox :model-value="allSelected" @change="onSelectAll">全选</el-checkbox>
-            <span class="hint">已选 {{ selected.length }}</span>
+            <span class="hint mc-num">已选 {{ selected.length }}</span>
             <span class="spacer"></span>
             <el-button size="small" type="danger" :disabled="!selected.length"
                        title="先多选勾选要删除的运行结果"
@@ -400,27 +406,42 @@ const ResultsView = {
                          @click.stop @change="toggleSelect(r.ts)"></el-checkbox>
             <div class="ri-body">
               <div class="ri-title">
-                <span class="ri-name">{{ r.ts }}</span>
+                <span class="ri-name" :title="r.ts">{{ r.ts }}</span>
                 <el-tag class="ri-tag" :type="r.has_detail ? 'success' : 'info'" size="small">
                   {{ r.has_detail ? "detail" : "无 detail" }}
                 </el-tag>
               </div>
               <div class="ri-sub">{{ r.mtime }} · {{ r.csv_count }} csv</div>
             </div>
-            <div v-if="!multiSelect" class="ri-actions">
-              <el-button size="small" text :loading="rebuilding === r.ts"
-                         :disabled="!!rebuilding"
-                         title="仅用本地 stats/原始日志重出该 run 的 report.html + overview.html（不访问集群）"
-                         @click.stop="rebuildReport(r.ts)">重建报表</el-button>
-              <el-button size="small" text @click.stop="renameRun(r.ts)" title="重命名">改名</el-button>
-              <el-button size="small" text type="danger" @click.stop="deleteRun(r.ts)" title="删除">删除</el-button>
-            </div>
+            <span class="ri-more-wrap" @click.stop>
+              <el-dropdown trigger="click" placement="bottom-end"
+                           popper-class="ri-more-menu"
+                           @command="cmd => onRunCommand(cmd, r.ts)">
+                <el-button size="small" text circle class="ri-more"
+                           :loading="rebuilding === r.ts"
+                           :disabled="!!rebuilding && rebuilding !== r.ts"
+                           aria-label="更多操作"
+                           :title="rebuilding && rebuilding !== r.ts
+                                   ? '另一运行结果正在重建报表，完成后再试' : '更多操作'"
+                           @click.stop>
+                  <el-icon v-if="rebuilding !== r.ts"><component is="MoreFilled"/></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="rebuild">重建报表</el-dropdown-item>
+                    <el-dropdown-item command="rename">改名</el-dropdown-item>
+                    <el-dropdown-item command="delete" class="danger-item">删除</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </span>
           </div>
           </div>
         </el-card>
-      </el-col>
+      <hdrag-handle v-show="listOpen" v-model="listW" :min="240" :max="560"
+                    persist="mcweb-results-list-w"></hdrag-handle>
 
-      <el-col :span="18">
+      <div class="results-main">
         <div v-if="!panes.length" class="pane pane-empty">
           <div class="hint hint-pad">
             尚无结果框——点击左侧 run 或「＋ 添加结果框」开始查看
@@ -432,8 +453,8 @@ const ResultsView = {
                   @focus="activePane = i"
                   @close="removePane(i)"
                   @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"></res-pane>
-      </el-col>
-    </el-row>
+      </div>
+    </div>
 
     <teleport to="body">
       <div v-if="fullscreenIdx >= 0 && panes[fullscreenIdx]" class="fs-mask"
@@ -453,6 +474,32 @@ const ResultsView = {
     const activePane = Vue.ref(0);
     const fullscreenIdx = Vue.ref(-1);
     const panes = Vue.reactive([]);
+
+    // 左列运行结果：可收起（整体隐藏）+ 可拖宽（240–560px），两者都持久化
+    const LIST_W_KEY = "mcweb-results-list-w";
+    const LIST_OPEN_KEY = "mcweb-results-list-open";
+    function _loadListW() {
+      try {
+        const v = parseInt(localStorage.getItem(LIST_W_KEY), 10);
+        return Number.isFinite(v) && v >= 240 && v <= 560 ? v : 300;
+      } catch (e) { return 300; }
+    }
+    function _loadListOpen() {
+      try { return localStorage.getItem(LIST_OPEN_KEY) !== "0"; }
+      catch (e) { return true; }
+    }
+    const listW = Vue.ref(_loadListW());
+    const listOpen = Vue.ref(_loadListOpen());
+    Vue.watch(listW, v => {
+      try { localStorage.setItem(LIST_W_KEY, String(Math.round(v))); } catch (e) { /* ignore */ }
+    });
+    Vue.watch(listOpen, v => {
+      try { localStorage.setItem(LIST_OPEN_KEY, v ? "1" : "0"); } catch (e) { /* ignore */ }
+    });
+    function toggleList() {
+      listOpen.value = !listOpen.value;
+      Vue.nextTick(fitRunList);
+    }
 
     // 左侧结果列表精确贴合可用高度（不依赖固定 magic number）
     function fitRunList() {
@@ -553,6 +600,12 @@ const ResultsView = {
       if (store.resultsTarget === oldName) store.resultsTarget = newName;
       const i = selected.value.indexOf(oldName);
       if (i >= 0) selected.value.splice(i, 1);
+    }
+
+    function onRunCommand(cmd, ts) {
+      if (cmd === "rebuild") return rebuildReport(ts);
+      if (cmd === "rename") return renameRun(ts);
+      if (cmd === "delete") return deleteRun(ts);
     }
 
     async function renameRun(ts) {
@@ -703,9 +756,11 @@ const ResultsView = {
     });
 
     return { runs, loading, lockFile, activePane, fullscreenIdx, panes,
+             listW, listOpen, toggleList,
              multiSelect, selected, allSelected, rebuilding,
              loadRuns, addPane, removePane, pickRun, isActivePaneTs,
              isSelected, toggleSelect, onSelectAll, toggleMulti,
-             rebuildReport, renameRun, deleteRun, deleteSelected };
+             rebuildReport, renameRun, deleteRun, deleteSelected,
+             onRunCommand };
   },
 };
