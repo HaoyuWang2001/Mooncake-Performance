@@ -182,6 +182,10 @@ def test_restart_marks_processless_running_terminal(tmp_path, monkeypatch):
     _orphan_json(d, "rDEAD2")
     (d / "rDEAD2.log").write_text(
         "[benchmark] SUMMARY: all 1 scenarios OK\n", encoding="utf-8")
+    # 日志置为过期（新鲜日志会被「不误判」保护保持 running，见下一个用例）
+    old = time.time() - 3600
+    os.utime(str(d / "rDEAD1.log"), (old, old))
+    os.utime(str(d / "rDEAD2.log"), (old, old))
     mgr = runmgr.RunManager()
     assert not mgr.active
     assert json.load(open(d / "rDEAD1.json"))["status"] == "aborted"
@@ -205,6 +209,77 @@ def test_stop_orphan_without_pid_writes_stop_file(tmp_path, monkeypatch):
     assert err is None and out.stopping
     assert stop.exists(), "stop file is the cooperative teardown channel"
     assert out.status == "stopped"
+
+
+def _run_json(d, rid, status, pid=None, meta=None, t0=None):
+    with open(os.path.join(str(d), rid + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "kind": "benchmark", "cmd": "x", "argv": [],
+                   "status": status, "rc": None, "pid": pid,
+                   "t0": t0 or time.time(), "meta": meta or {}}, f)
+
+
+def test_reattach_repairs_wrongly_finalized_run(tmp_path, monkeypatch):
+    """被误判成 stopped 的 run：进程仍在 → reattach 修回 running 并可停止。"""
+    d = tmp_path / "runs"
+    monkeypatch.setattr(runmgr, "RUNS_DIR", str(d))
+    rid = "rREATTACH"
+    stop = d / (rid + ".stop")
+    _run_json(d, rid, "stopped", meta={"instance": "i1",
+                                      "request": {"flags": {}}})
+    (d / (rid + ".log")).write_text("[benchmark] running\n", encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, "-c",
+                             "import time; time.sleep(60)",
+                             "--stop-file", str(stop)],
+                            start_new_session=True)
+    try:
+        mgr = runmgr.RunManager()
+        assert rid not in mgr.active              # 终态记录启动时不接管
+        run, err = mgr.reattach(rid)
+        assert err is None and run.status == "running"
+        assert rid in mgr.active and run.pid == proc.pid
+        assert json.load(open(d / (rid + ".json")))["status"] == "running"
+        # 幂等
+        run2, err = mgr.reattach(rid)
+        assert err is None and run2.status == "running"
+        # 停止仍然可用
+        mgr.stop_run(rid)
+        deadline = time.time() + 15
+        while time.time() < deadline and rid in mgr.active:
+            time.sleep(0.2)
+        assert json.load(open(d / (rid + ".json")))["status"] == "stopped"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_reattach_without_process_keeps_status(tmp_path, monkeypatch):
+    d = tmp_path / "runs"
+    monkeypatch.setattr(runmgr, "RUNS_DIR", str(d))
+    _run_json(d, "rGONE", "stopped")
+    mgr = runmgr.RunManager()
+    run, err = mgr.reattach("rGONE")
+    assert err is None and run.status == "stopped"
+    assert "rGONE" not in mgr.active
+    assert json.load(open(d / "rGONE.json"))["status"] == "stopped"
+
+
+def test_recover_keeps_fresh_log_running_then_finalizes_stale(tmp_path, monkeypatch):
+    """启动恢复：无 pid 但日志仍新鲜 → 保持 running（不误判）；日志过期 → 终态。"""
+    d = tmp_path / "runs"
+    monkeypatch.setattr(runmgr, "RUNS_DIR", str(d))
+    fresh = d / "rFRESH.log"
+    stale = d / "rSTALE.log"
+    fresh.write_text("[benchmark] ticking\n", encoding="utf-8")
+    stale.write_text("[benchmark] no summary\n", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(str(stale), (old, old))
+    _run_json(d, "rFRESH", "running")
+    _run_json(d, "rSTALE", "running")
+    mgr = runmgr.RunManager()
+    assert not mgr.active
+    assert json.load(open(d / "rFRESH.json"))["status"] == "running"
+    assert json.load(open(d / "rSTALE.json"))["status"] == "aborted"
 
 
 if __name__ == "__main__":

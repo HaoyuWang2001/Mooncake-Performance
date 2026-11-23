@@ -187,6 +187,10 @@ standalone clean-up（不跑场景；不需要 profile）：
 `stream=rank|recall` 只返回组合实例（Rank+Recall 并行）对应子任务的行并剥离
 `[rank] `/`[recall] ` 前缀；分页始终停在行边界（跨块残行留到下一页），默认 `all` 为原始日志。
 
+### POST /api/runs/{id}/reattach
+与实例级重连同语义（幂等）：确认进程仍存活后修复状态并重新纳入 active。
+→ `{"ok":true,"reattached":true|false,"status":"running","run":{...}}`
+
 ### POST /api/runs/{id}/stop
 **优雅停止**：写 `webui/data/runs/<id>.stop` 并向进程组发送 SIGINT/CTRL_BREAK，
 benchmark 先进入清理阶段（k8s 删除 namespace/pods；SSH 按 `.state` 台账 kill
@@ -223,6 +227,12 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 
 ### POST /api/instances/{iid}/stop
 停止该实例当前的活跃 run（优雅停止语义同 `POST /api/runs/{id}/stop`）；未在运行 → 409。
+
+### POST /api/instances/{iid}/reattach
+重新连接仍在运行的实例（webui 重启 / 网络中断后的「重连」）。后端按落盘 pid
+（校验存活）或 `--stop-file` 扫描确认进程仍在后，把被误判为终态的 run 修回
+`running`、重新纳入 active（恢复并发守卫）；找不到进程则**不改状态**。
+→ `{"ok":true,"reattached":true|false,"status":"running","run":{...}}`
 
 ### POST /api/instances/{iid}/rename
 ```json

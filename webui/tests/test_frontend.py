@@ -267,6 +267,21 @@ def test_config_chain_dialog():
     assert ".cfg-editor-pane .editor .el-textarea__inner" in css
 
 
+def test_instance_reconnect_after_webui_restart():
+    """实例详情：重连运行（reattach）+ 日志断线续接（resync / 连接断开提示）。"""
+    src = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+               encoding="utf-8").read()
+    assert "重连运行" in src and "/reattach" in src
+    assert "function reconnectRun" in src and "function autoReattach" in src
+    assert ":resync=\"syncTick\"" in src and ":resync=\"resync\"" in src
+    assert "function reconnect()" in src and "connLost" in src
+    assert "连接断开" in src
+    assert 'Vue.watch(() => props.live' in src      # 状态回到 running 自动续接
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    assert ".ilog-conn" in css
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()

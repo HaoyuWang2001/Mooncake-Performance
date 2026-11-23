@@ -26,6 +26,8 @@ from .paths import ROOT, RUNS_DIR
 BENCH = os.path.join(ROOT, "benchmark.py")
 IS_WIN = os.name == "nt"
 STOP_GRACE = float(os.environ.get("MCWEB_STOP_GRACE", "60"))
+# 启动恢复：找不到 pid 但日志在该窗口内仍在增长 → 不判死（交给重连/停止）
+RECOVER_FRESH_LOG_S = float(os.environ.get("MCWEB_RECOVER_FRESH_LOG_S", "120"))
 
 
 def _write_stop_file(path):
@@ -57,6 +59,15 @@ def _send_graceful_stop(proc):
             os.killpg(os.getpgid(proc.pid), signal.SIGINT)
     except Exception:
         pass
+
+
+def _utf8_stdio_env(env):
+    """The run log is a byte stream read back as UTF-8: force Python children
+    (benchmark.py / run_rank_recall.py) to emit UTF-8 on Windows too, where
+    redirected stdio otherwise uses the ANSI code page (CP936/GBK)."""
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def _popen(argv_or_cmd, log_fh, shell=False, env=None):
@@ -136,10 +147,23 @@ def _find_run_pid(stop_path):
     return None
 
 
+def _win_pid_alive(pid):
+    """Windows：tasklist 判定 pid 是否存在（拿不到 cmdline，退化为存在性）。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "PID eq {}".format(pid), "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5)
+        return str(pid) in (out.stdout or "")
+    except Exception:
+        return True       # 无法判定时按存活处理，避免把在跑的 run 误判为停止
+
+
 def _pid_alive(pid, stop_path=None):
-    """进程存活 + （可选）cmdline 仍带我方 stop-file（防 pid 复用误杀）。"""
+    """进程存活 + （POSIX）cmdline 仍带我方 stop-file（防 pid 复用误杀）。"""
     if not pid:
         return False
+    if IS_WIN:
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -209,7 +233,7 @@ class Run(object):
         self.identities = identities or []   # not persisted (frozensets)
         self.meta = meta or {}
         self.proc = None
-        self.pid = None               # 接管遗留进程时记录（webui 重启后）
+        self.pid = None               # 进程 pid（落盘：webui 重启后按 pid 接管）
         self.t0 = time.time()
         self.t1 = None
         self.rc = None
@@ -219,7 +243,8 @@ class Run(object):
 
     def to_dict(self):
         return {"id": self.id, "kind": self.kind, "cmd": self.cmd,
-                "argv": self.argv, "log": os.path.relpath(self.log_path, ROOT),
+                "argv": self.argv, "pid": self.pid,
+                "log": os.path.relpath(self.log_path, ROOT),
                 "status": self.status, "rc": self.rc,
                 "stopping": self.stopping,
                 "t0": self.t0, "t1": self.t1,
@@ -325,6 +350,7 @@ class RunManager(object):
                 run.t0 = d.get("t0", 0)
                 run.t1 = d.get("t1")
                 run.ts_dir = d.get("ts_dir")
+                run.pid = d.get("pid")
                 # 重启后停止/接管需要这些路径（原先只活在启动进程的内存里）
                 run.stop_path = os.path.join(RUNS_DIR, run.id + ".stop")
                 run.state_path = os.path.join(RUNS_DIR, run.id + ".state")
@@ -350,7 +376,11 @@ class RunManager(object):
         for run in list(self.history):
             if run.kind != "benchmark" or run.status != "running":
                 continue
-            pid = _find_run_pid(run.stop_path)
+            pid = None
+            if run.pid and _pid_alive(run.pid, run.stop_path):
+                pid = run.pid
+            if pid is None:
+                pid = _find_run_pid(run.stop_path)
             if pid is not None:
                 run.pid = pid
                 run.parse_ts_dir()
@@ -358,6 +388,19 @@ class RunManager(object):
                 sys.stderr.write(
                     "[webui] recovered active run {} (pid {})\n".format(
                         run.id, pid))
+                continue
+            # 找不到进程：日志仍新鲜（近期还在写）→ 可能只是识别失败，
+            # 保持 running 交给「重连 / 停止」处理，绝不误判为已停止
+            age = None
+            try:
+                age = time.time() - os.path.getmtime(run.log_path)
+            except OSError:
+                age = None
+            if age is not None and age <= RECOVER_FRESH_LOG_S:
+                sys.stderr.write(
+                    "[webui] WARN run {}: no pid but log active "
+                    "({:.0f}s ago); leaving running (use 重连/停止)\n".format(
+                        run.id, age))
                 continue
             run.status = _terminal_status_from_log(run.log_path,
                                                    run.stopping)
@@ -430,7 +473,7 @@ class RunManager(object):
             run = Run(rid, "benchmark", " ".join(argv), list(argv), log_path,
                       meta, stop_path=stop_path, state_path=state_path,
                       identities=identities)
-            env = dict(os.environ)
+            env = _utf8_stdio_env(dict(os.environ))
             env["MC_BENCH_STATE_FILE"] = state_path
             try:
                 fh = open(log_path, "wb")
@@ -445,6 +488,7 @@ class RunManager(object):
                 run.rc = -1
                 run.save()
                 raise SlotBusy("spawn failed: {}".format(exc))
+            run.pid = run.proc.pid
             self.run = run
             self.active[rid] = run
             self.history.insert(0, run)
@@ -506,6 +550,58 @@ class RunManager(object):
                     run.save()
                 except Exception:
                     pass
+            return run, None
+
+    def reattach(self, rid):
+        """重新吸附一个仍存活但未被本进程跟踪的 run（webui 重启/断线后）。
+
+        - 已在 active：直接返回（幂等）
+        - 用落盘 pid（校验存活）或 `--stop-file` 扫描定位进程：
+          找到 → 修复被误判的终态（running），恢复 identities/ts_dir、
+          放回 active 并落盘；若 stop 文件已存在（停止中）则继续完成停止
+        - 找不到 → 不改状态，返回 reattached=False
+        """
+        with self.lock:
+            run = self.get_run(rid)
+            if run is None:
+                return None, "no such run: {}".format(rid)
+            tracked = self.active.get(rid)
+            if tracked is not None and tracked.status == "running":
+                return tracked, None
+            if not run.stop_path:
+                run.stop_path = os.path.join(RUNS_DIR, rid + ".stop")
+            if not run.state_path:
+                run.state_path = os.path.join(RUNS_DIR, rid + ".state")
+            pid = None
+            if run.pid and _pid_alive(run.pid, run.stop_path):
+                pid = run.pid
+            if pid is None:
+                pid = _find_run_pid(run.stop_path)
+            if not pid:
+                return run, None
+            run.pid = pid
+            run.status = "running"
+            run.rc = None
+            run.t1 = None
+            run.stopping = os.path.exists(run.stop_path)
+            run.parse_ts_dir()
+            if not run.identities:
+                try:
+                    req = (run.meta or {}).get("request") or {}
+                    run.identities = conflicts.run_identities(
+                        ROOT, req.get("flags") or {})
+                except Exception:
+                    pass
+            try:
+                run.save()
+            except Exception:
+                pass
+            self.active[rid] = run
+            if run.stopping:
+                # 停止流程在重启前已发起：继续完成（信号 + 宽限强杀）
+                _signal_pid(pid, signal.SIGINT)
+                threading.Thread(target=self._stop_watch, args=(run,),
+                                 daemon=True).start()
             return run, None
 
     def _stop_watch(self, run):
@@ -694,7 +790,7 @@ class RunManager(object):
                     stop_path = os.path.join(
                         RUNS_DIR, "{}.task{}.stop".format(sch.id, idx))
                     _remove_stop_file(stop_path)
-                    env = dict(os.environ)
+                    env = _utf8_stdio_env(dict(os.environ))
                     env["BENCH_STOP_FILE"] = stop_path
                     proc = _popen(task["command"], f, shell=True, env=env)
                     sch.task_stop_path = stop_path

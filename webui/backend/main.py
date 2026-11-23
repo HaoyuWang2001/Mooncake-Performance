@@ -171,6 +171,8 @@ def _generate_openapi():
         _q("offset", "integer", False, 0),
         _q("stream", default="all")]
     paths["/api/runs/{id}/stop"] = _post("Stop a run (cross-platform kill + remote reap)")
+    paths["/api/runs/{id}/reattach"] = _post(
+        "Re-attach a still-running run (idempotent; repairs wrongly finalized status)")
     paths["/api/instances"] = _p("List instances (instance = reusable form snapshot)")
     paths["/api/instances"].update(_post("Create instance (does NOT start it)"))
     paths["/api/instances"]["post"]["responses"]["409"] = {"description": "Conflict"}
@@ -180,6 +182,8 @@ def _generate_openapi():
     paths["/api/instances/{iid}/run"]["post"]["responses"]["409"] = {
         "description": "Running or shared resource conflict"}
     paths["/api/instances/{iid}/stop"] = _post("Stop this instance's active run")
+    paths["/api/instances/{iid}/reattach"] = _post(
+        "Re-attach a still-running instance after WebUI restart/network loss")
     paths["/api/instances/{iid}/rename"] = _post("Rename instance")
     paths["/api/nodes"] = _p("Cluster nodes from cluster.json + roles from global.json")
     paths["/api/nodes"]["get"]["parameters"] = [_q("cluster"), _q("global")]

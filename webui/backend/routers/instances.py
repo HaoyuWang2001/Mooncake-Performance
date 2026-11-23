@@ -142,6 +142,29 @@ def api_instance_delete(handler, query, iid):
     return {"ok": True, "deleted": iid}
 
 
+def api_instance_reattach(handler, query, iid):
+    """重新吸附仍在运行的实例（webui 重启 / 网络中断后的「重连」）。
+
+    后端按落盘 pid / --stop-file 扫描确认进程仍存活后，把 run 修回 running
+    并重新纳入 active（恢复并发守卫）；找不到进程则不改状态。
+    """
+    _load(iid)
+    active = _active_run(iid)
+    if active is not None:
+        return {"ok": True, "reattached": True, "status": active.status,
+                "run": active.to_dict()}
+    latest = instances.latest_run(iid)
+    if latest is None:
+        raise ApiError(409, "实例还没有运行记录")
+    run, err = runmgr.MGR.reattach(latest.get("id"))
+    if err:
+        raise ApiError(404, err)
+    ok = bool(run and run.status == "running")
+    return {"ok": True, "reattached": ok,
+            "status": run.status if run else latest.get("status"),
+            "run": run.to_dict() if run else latest}
+
+
 def api_instance_rename(handler, query, iid):
     _load(iid)
     body = read_json_body(handler)
@@ -158,5 +181,6 @@ ROUTES += [
     ("DELETE", r"^/api/instances/(?P<iid>[^/]+)$", api_instance_delete),
     ("POST", r"^/api/instances/(?P<iid>[^/]+)/run$", api_instance_run),
     ("POST", r"^/api/instances/(?P<iid>[^/]+)/stop$", api_instance_stop),
+    ("POST", r"^/api/instances/(?P<iid>[^/]+)/reattach$", api_instance_reattach),
     ("POST", r"^/api/instances/(?P<iid>[^/]+)/rename$", api_instance_rename),
 ]

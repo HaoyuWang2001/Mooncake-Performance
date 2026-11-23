@@ -20,6 +20,7 @@ const InstanceLogPane = {
            title: { type: String, default: "" },
            live: { type: Boolean, default: false },
            ticket: { type: Number, default: 0 },
+           resync: { type: Number, default: 0 },
            fs: { type: Boolean, default: false } },
   template: `
   <div class="ilog-pane" :class="{ 'ilog-fs': fs }">
@@ -28,6 +29,11 @@ const InstanceLogPane = {
     <!-- 行内紧凑工具栏 -->
     <div v-if="!fs" class="log-toolbar">
       <el-button size="small" @click="copyLog">复制</el-button>
+      <el-tooltip placement="top" content="重新连接日志（webui 重启 / 断网后从当前进度续接）">
+        <el-button size="small" :disabled="!rid" @click="reconnect">重连</el-button>
+      </el-tooltip>
+      <el-tag v-if="connLost" size="small" type="danger" effect="plain"
+              class="ilog-conn" title="日志连接中断：可点「重连」继续">连接断开</el-tag>
       <span class="log-wrap-toggle">
         <el-switch v-model="logWrap" size="small" />
         <span class="log-wrap-label" @click="logWrap = !logWrap">自动换行</span>
@@ -55,6 +61,11 @@ const InstanceLogPane = {
       <div class="log-toolbar">
         <el-button size="small" @click="copyLog">复制</el-button>
         <el-button size="small" @click="downloadLog">下载</el-button>
+        <el-tooltip placement="top" content="重新连接日志（webui 重启 / 断网后从当前进度续接）">
+          <el-button size="small" :disabled="!rid" @click="reconnect">重连</el-button>
+        </el-tooltip>
+        <el-tag v-if="connLost" size="small" type="danger" effect="plain"
+                class="ilog-conn" title="日志连接中断：可点「重连」继续">连接断开</el-tag>
         <el-button size="small" @click="clearLog">清屏</el-button>
         <span class="log-wrap-toggle">
           <el-switch v-model="autoScroll" size="small" />
@@ -105,7 +116,7 @@ const InstanceLogPane = {
     <el-dialog v-if="!fs" v-model="fsOpen" fullscreen destroy-on-close append-to-body
                :close-on-click-modal="false" class="ilog-fs-dialog" :title="fsTitle">
       <instance-log-pane v-if="fsOpen" fs :rid="rid" :stream="stream"
-                         :live="live" :ticket="ticket"></instance-log-pane>
+                         :live="live" :ticket="ticket" :resync="resync"></instance-log-pane>
     </el-dialog>
   </div>`,
   setup(props) {
@@ -115,6 +126,7 @@ const InstanceLogPane = {
     const rem = Vue.ref("");
     const eof = Vue.ref(true);
     const loading = Vue.ref(false);
+    const connLost = Vue.ref(false);    // 轮询失败/断线（可点「重连」续接）
     const logEl = Vue.ref(null);
     let wrap = true;
     try { wrap = localStorage.getItem("mcweb-wrap") !== "0"; } catch (e) { /* ignore */ }
@@ -167,6 +179,11 @@ const InstanceLogPane = {
       if (!props.rid) return false;
       const r = await api("GET", "/api/runs/" + encodeURIComponent(props.rid) +
         "/log?offset=" + offset.value + "&stream=" + encodeURIComponent(props.stream));
+      // 日志文件被重建/回绕（size 变小）：重置后从头续接
+      if (Number(r.size || 0) < offset.value) {
+        reset();
+        return true;
+      }
       if (r.content) append(r.content);
       offset.value = r.offset;
       size.value = r.size;
@@ -182,8 +199,17 @@ const InstanceLogPane = {
           const more = await pullOnce();
           if (!more) break;
         }
-      } catch (e) { /* run pruned / transient */ }
-      finally { loading.value = false; }
+        connLost.value = false;
+      } catch (e) {
+        connLost.value = true;      // 断线/服务重启：显示状态，允许手动重连
+      } finally { loading.value = false; }
+    }
+
+    // 「重连」：从当前 offset 续接（不重置已读位置），并恢复轮询
+    function reconnect() {
+      connLost.value = false;
+      eof.value = false;
+      poll();
     }
 
     const matchLines = Vue.computed(() => {
@@ -290,6 +316,10 @@ const InstanceLogPane = {
     Vue.watch(() => props.rid, () => { reset(); poll(); });
     Vue.watch(() => props.stream, () => { reset(); poll(); });
     Vue.watch(() => props.ticket, () => { reset(); poll(); });
+    // 实例详情「重连运行」/自动重连：只续接，不重置已读进度
+    Vue.watch(() => props.resync, () => { reconnect(); });
+    // 状态从终态回到 running（被 reattach 修复）时自动恢复轮询
+    Vue.watch(() => props.live, (now) => { if (now) { eof.value = false; poll(); } });
     Vue.watch(logWrap, v => {
       try { localStorage.setItem("mcweb-wrap", v ? "1" : "0"); } catch (e) { /* ignore */ }
     });
@@ -328,7 +358,7 @@ const InstanceLogPane = {
              matchCount, curMatchLine, displayLines, hasHit, lineSegs,
              nextMatch, prevMatch, firstMatch, lastMatch,
              autoScroll, filterOnly, fsOpen, fsTitle, clearLog, downloadLog,
-             copyLog, fmtBytes };
+             connLost, reconnect, copyLog, fmtBytes };
   },
 };
 
@@ -409,6 +439,13 @@ const InstanceView = {
           </el-tooltip>
           <el-button size="small" type="warning" plain v-if="detail.instance.status === 'running'"
                      :loading="busyStop" :disabled="busyStop" @click="stop">停止</el-button>
+          <el-tooltip placement="top"
+                      content="重新连接仍在运行的实例（webui 重启或网络中断后：修复状态并续接日志）">
+            <span>
+              <el-button size="small" :loading="reconnecting" :disabled="!latestRun"
+                         @click="reconnectRun">重连运行</el-button>
+            </span>
+          </el-tooltip>
           <el-button size="small" type="danger" plain
                      :disabled="detail.instance.status === 'running'" @click="remove">删除</el-button>
           <el-button size="small" @click="rename">改名</el-button>
@@ -428,14 +465,14 @@ const InstanceView = {
         <div v-if="isCombined && !merged" class="ilog-split">
           <instance-log-pane :rid="latestRun.id" stream="rank" title="rank"
                              :live="detail.instance.status === 'running'"
-                             :ticket="ticket"></instance-log-pane>
+                             :ticket="ticket" :resync="syncTick"></instance-log-pane>
           <instance-log-pane :rid="latestRun.id" stream="recall" title="recall"
                              :live="detail.instance.status === 'running'"
-                             :ticket="ticket"></instance-log-pane>
+                             :ticket="ticket" :resync="syncTick"></instance-log-pane>
         </div>
         <instance-log-pane v-else :rid="latestRun.id" stream="all"
                            :live="detail.instance.status === 'running'"
-                           :ticket="ticket"></instance-log-pane>
+                           :ticket="ticket" :resync="syncTick"></instance-log-pane>
       </el-card>
       <el-card v-else shadow="never">
         <el-empty description="该实例尚未运行" :image-size="72">
@@ -458,6 +495,8 @@ const InstanceView = {
     const busyStop = Vue.ref(false);
     const merged = Vue.ref(false);
     const ticket = Vue.ref(0);
+    const resync = Vue.ref(0);         // 「重连运行」/自动重连：日志续接信号
+    const reconnecting = Vue.ref(false);
     const missing = Vue.ref(false);   // 实例已被删除（API 操作后仍开着页签）
     let timer = null;
 
@@ -537,7 +576,42 @@ const InstanceView = {
       store.instancesTarget = iid;
       detail.value = null;
       missing.value = false;
+      autoReattach(iid);
       load();
+    }
+
+    // 「重连运行」：webui 重启/断网后重新吸附仍在跑的 run（修复被误判的状态）
+    async function reconnectRun() {
+      const iid = active.value; if (!iid) return;
+      reconnecting.value = true;
+      try {
+        const r = await api("POST", "/api/instances/" + encodeURIComponent(iid) +
+                            "/reattach");
+        if (r.reattached) {
+          ElementPlus.ElMessage.success("已重连运行中的实例，日志继续续接");
+        } else {
+          ElementPlus.ElMessage.info("未检测到存活进程：运行可能已结束");
+        }
+        await load();
+        resync.value++;
+      } catch (e) {
+        ElementPlus.ElMessage.error("重连失败: " + e.message);
+      } finally {
+        reconnecting.value = false;
+      }
+    }
+
+    // 打开/切回实例页时静默尝试一次（后端仅在确实找到存活进程时才改状态）
+    async function autoReattach(iid) {
+      if (!iid) return;
+      try {
+        const r = await api("POST", "/api/instances/" + encodeURIComponent(iid) +
+                            "/reattach");
+        if (r.reattached) {
+          await load();
+          resync.value++;
+        }
+      } catch (e) { /* 静默：正常无运行记录/服务不可用时不打扰 */ }
     }
     function closeTab(iid) {
       const open = (store.instancesOpen || []).filter(x => x !== iid);
@@ -647,15 +721,17 @@ const InstanceView = {
 
     Vue.watch(active, () => { merged.value = false; });
     Vue.onActivated(() => {
+      autoReattach(active.value);
       load();
       timer = setInterval(load, 2000);
     });
     Vue.onDeactivated(() => { clearInterval(timer); });
 
-    return { tabs, active, detail, loading, busyRun, busyStop, merged, ticket, missing,
+    return { tabs, active, detail, loading, busyRun, busyStop, merged, ticket,
+             resync, reconnecting, missing,
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, closeMissingTab, activate, closeTab,
              statusType, statusText, run, stop, remove, rename,
-             gotoResults, openReport };
+             reconnectRun, gotoResults, openReport };
   },
 };

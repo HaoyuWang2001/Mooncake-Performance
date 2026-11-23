@@ -291,6 +291,17 @@ def api_run_log(handler, query, rid):
     return _read_log_page(run.log_path, offset, stream)
 
 
+def api_run_reattach(handler, query, rid):
+    """重新吸附仍存活的 run（webui 重启/断线后的重连，幂等）。"""
+    run, err = runmgr.MGR.reattach(rid)
+    if err:
+        raise ApiError(404, err)
+    return {"ok": True,
+            "reattached": bool(run and run.status == "running"),
+            "status": run.status if run else None,
+            "run": run.to_dict() if run else None}
+
+
 def api_run_stop(handler, query, rid):
     run, err = runmgr.MGR.stop_run(rid)
     if err:
@@ -306,5 +317,6 @@ ROUTES += [
     ("GET", r"^/api/runs$", lambda h, q, m=None: api_runs(h, q)),
     ("GET", r"^/api/runs/(?P<rid>[^/]+)$", api_run_get),
     ("GET", r"^/api/runs/(?P<rid>[^/]+)/log$", api_run_log),
+    ("POST", r"^/api/runs/(?P<rid>[^/]+)/reattach$", api_run_reattach),
     ("POST", r"^/api/runs/(?P<rid>[^/]+)/stop$", api_run_stop),
 ]
