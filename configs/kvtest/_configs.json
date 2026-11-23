@@ -11,6 +11,6 @@
     "key_pool_size": "auto",
     "notify_queue_max": 65536,
     "verify_level": "size",
-    "metrics_interval_ms": 3000
+    "metrics_interval_ms": 0
   }
 }

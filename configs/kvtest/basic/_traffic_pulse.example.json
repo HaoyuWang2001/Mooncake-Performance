@@ -1,0 +1,7 @@
+{
+  "operation": "get",
+  "traffic_mode": "pulse",
+  "kvtest": {
+    "pulse_window_ms": 1000
+  }
+}
