@@ -581,6 +581,18 @@ html, body, #app {
 }
 .ilog-view { height: 300px; min-height: 220px; }
 .ilog-progress { font-size: 12px; }
+/* 日志全屏弹窗（SD 日志终端形态：操作行 + 搜索行 + 铺满剩余高度的终端区）。
+   EP fullscreen 弹窗自带 100% 宽高，这里只把 header/body/终端区做成纵向弹性。 */
+.ilog-fs-dialog { display: flex; flex-direction: column; }
+.ilog-fs-dialog .el-dialog__header { flex-shrink: 0; }
+.ilog-fs-dialog .el-dialog__body {
+  flex: 1; min-height: 0; overflow: hidden;
+  display: flex; flex-direction: column;
+  padding: 0 var(--mc-space-4) var(--mc-space-4);
+}
+.ilog-fs-dialog .ilog-pane { flex: 1; min-height: 0; }
+.ilog-fs-dialog .ilog-view { flex: 1; height: auto; min-height: 0; }
+.ilog-fs-dialog .log-toolbar { flex-wrap: wrap; }
 
 /* 结果页 HTML 报表面板（报表独立打开，WebUI 只做入口） */
 .report-pane {

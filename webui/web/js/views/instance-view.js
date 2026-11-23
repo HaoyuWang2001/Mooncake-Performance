@@ -7,18 +7,26 @@ function _instResultsTarget(tsDir) {
   return rel.split("/")[0];
 }
 
-/* 单个日志流面板（rank / recall / all 各一份），自带分页、搜索、换行。 */
+/* 单个日志流面板（rank / recall / all 各一份），自带分页、搜索、换行。
+   两种形态（同一组件，fs prop 切换，参考结果页 res-pane 先例）：
+   - 行内：300px 高、紧凑工具栏（复制 / 换行 / 搜索 ↑↓）
+   - 全屏弹窗（fs=true）：SD 日志终端布局——操作行（复制/下载/清屏/
+     自动滚动/换行）+ 搜索行（计数/首个/上一个/下一个/最后一个/仅显示匹配行）
+     + 铺满剩余高度的终端区。行内形态的「全屏」按钮打开独立弹窗实例。 */
 const InstanceLogPane = {
   name: "InstanceLogPane",
   props: { rid: { type: String, default: "" },
            stream: { type: String, default: "all" },
            title: { type: String, default: "" },
            live: { type: Boolean, default: false },
-           ticket: { type: Number, default: 0 } },
+           ticket: { type: Number, default: 0 },
+           fs: { type: Boolean, default: false } },
   template: `
-  <div class="ilog-pane">
+  <div class="ilog-pane" :class="{ 'ilog-fs': fs }">
     <div class="ilog-head" v-if="title">{{ title }}</div>
-    <div class="log-toolbar">
+
+    <!-- 行内紧凑工具栏 -->
+    <div v-if="!fs" class="log-toolbar">
       <el-button size="small" @click="copyLog">复制</el-button>
       <span class="log-wrap-toggle">
         <el-switch v-model="logWrap" size="small" />
@@ -31,20 +39,74 @@ const InstanceLogPane = {
       <el-button size="small" :disabled="!matchCount" @click="prevMatch">↑</el-button>
       <el-button size="small" :disabled="!matchCount" @click="nextMatch">↓</el-button>
       <span v-if="searchQ" class="log-match-count mc-num">{{ matchCount ? (matchIdx + 1) + "/" + matchCount : "0/0" }}</span>
+      <el-tooltip placement="top"
+                  :content="rid ? '全屏查看日志' : '该实例尚未运行，无日志可全屏查看'">
+        <span>
+          <el-button size="small" circle :disabled="!rid" aria-label="全屏查看日志"
+                     @click="fsOpen = true">
+            <el-icon><component is="FullScreen"/></el-icon>
+          </el-button>
+        </span>
+      </el-tooltip>
     </div>
+
+    <!-- 全屏形态：操作行 + 搜索行（SD 日志终端那一套） -->
+    <template v-else>
+      <div class="log-toolbar">
+        <el-button size="small" @click="copyLog">复制</el-button>
+        <el-button size="small" @click="downloadLog">下载</el-button>
+        <el-button size="small" @click="clearLog">清屏</el-button>
+        <span class="log-wrap-toggle">
+          <el-switch v-model="autoScroll" size="small" />
+          <span class="log-wrap-label" @click="autoScroll = !autoScroll">自动滚动</span>
+        </span>
+        <span class="log-wrap-toggle">
+          <el-switch v-model="logWrap" size="small" />
+          <span class="log-wrap-label" @click="logWrap = !logWrap">自动换行</span>
+        </span>
+        <span class="hint ilog-progress" v-if="offset">已加载 {{ fmtBytes(offset) }} / {{ fmtBytes(size) }}</span>
+        <span class="spacer"></span>
+      </div>
+      <div class="log-toolbar">
+        <el-input v-model="searchQ" size="small" placeholder="搜索日志（忽略大小写，Enter 下一个）"
+                  clearable style="width: 260px" @keyup.enter="nextMatch" />
+        <span class="log-match-count mc-num">{{ matchCount ? (matchIdx + 1) + "/" + matchCount : "0/0" }}</span>
+        <el-button size="small" :disabled="!matchCount"
+                   :title="matchCount ? '' : '无匹配行：先输入搜索词'" @click="firstMatch">首个</el-button>
+        <el-button size="small" :disabled="!matchCount"
+                   :title="matchCount ? '' : '无匹配行：先输入搜索词'" @click="prevMatch">上一个</el-button>
+        <el-button size="small" :disabled="!matchCount"
+                   :title="matchCount ? '' : '无匹配行：先输入搜索词'" @click="nextMatch">下一个</el-button>
+        <el-button size="small" :disabled="!matchCount"
+                   :title="matchCount ? '' : '无匹配行：先输入搜索词'" @click="lastMatch">最后一个</el-button>
+        <span class="log-wrap-toggle" :title="searchQ ? '' : '先输入搜索词再过滤'">
+          <el-switch v-model="filterOnly" size="small" :disabled="!searchQ" />
+          <span class="log-wrap-label" @click="searchQ && (filterOnly = !filterOnly)">仅显示匹配行</span>
+        </span>
+        <span class="spacer"></span>
+      </div>
+    </template>
+
     <div class="logview ilog-view" ref="logEl" :class="{ 'log-nowrap': !logWrap }">
-      <div v-for="(ln, i) in lines" :key="i"
-           :class="[ln.cls, { 'ln-cur-match': i === curMatchLine }]">
-        <template v-if="searchQ && hasHit(ln.text)">
-          <span v-for="(seg, j) in lineSegs(ln.text)" :key="j"
+      <div v-for="item in displayLines" :key="item.idx"
+           :class="[item.ln.cls, { 'ln-cur-match': item.idx === curMatchLine }]">
+        <template v-if="searchQ && hasHit(item.ln.text)">
+          <span v-for="(seg, j) in lineSegs(item.ln.text)" :key="j"
                 :class="{ 'ln-mark': seg.hit }">{{ seg.t }}</span>
         </template>
-        <template v-else>{{ ln.text }}</template>
+        <template v-else>{{ item.ln.text }}</template>
       </div>
-      <div v-if="!lines.length" class="hint hint-pad">
-        {{ rid ? (loading ? "加载中…" : "（本流暂无日志）") : "该实例尚未运行" }}
+      <div v-if="!displayLines.length" class="hint hint-pad">
+        {{ rid ? (loading ? "加载中…" : (filterOnly && searchQ ? "（无匹配行）" : "（本流暂无日志）")) : "该实例尚未运行" }}
       </div>
     </div>
+
+    <!-- 全屏弹窗：独立实例（关闭即销毁轮询），仅行内形态有入口 -->
+    <el-dialog v-if="!fs" v-model="fsOpen" fullscreen destroy-on-close append-to-body
+               :close-on-click-modal="false" class="ilog-fs-dialog" :title="fsTitle">
+      <instance-log-pane v-if="fsOpen" fs :rid="rid" :stream="stream"
+                         :live="live" :ticket="ticket"></instance-log-pane>
+    </el-dialog>
   </div>`,
   setup(props) {
     const lines = Vue.ref([]);
@@ -59,7 +121,15 @@ const InstanceLogPane = {
     const logWrap = Vue.ref(wrap);
     const searchQ = Vue.ref("");
     const matchIdx = Vue.ref(0);
+    const autoScroll = Vue.ref(true);     // 全屏形态：新内容始终跟随到底部
+    const filterOnly = Vue.ref(false);    // 全屏形态：仅显示匹配行
+    const fsOpen = Vue.ref(false);
     let timer = null;
+
+    const fsTitle = Vue.computed(() => {
+      const left = props.title || "日志";
+      return props.rid ? left + " ｜ " + props.rid : left;
+    });
 
     function classify(ln) {
       if (/\bFAIL\b|\bERROR\b/.test(ln)) return "ln-err";
@@ -77,13 +147,15 @@ const InstanceLogPane = {
     function append(text) {
       if (!text) return;
       const el = logEl.value;
-      const wasBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 60);
+      const nearBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 60);
+      // 行内：接近底部才跟随；全屏：由「自动滚动」开关显式决定
+      const follow = props.fs ? autoScroll.value : nearBottom;
       const parts = (rem.value + text).split("\n");
       rem.value = parts.pop();
       for (const ln of parts) lines.value.push({ text: ln, cls: classify(ln) });
       if (lines.value.length > 20000)
         lines.value.splice(0, lines.value.length - 20000);
-      if (wasBottom) Vue.nextTick(() => {
+      if (follow) Vue.nextTick(() => {
         if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
       });
     }
@@ -126,6 +198,23 @@ const InstanceLogPane = {
     const matchCount = Vue.computed(() => matchLines.value.length);
     const curMatchLine = Vue.computed(() =>
       matchCount.value ? matchLines.value[matchIdx.value % matchCount.value] : -1);
+    const displayLines = Vue.computed(() => {
+      const filter = props.fs && filterOnly.value && !!searchQ.value.trim();
+      const out = [];
+      for (let i = 0; i < lines.value.length; i++) {
+        const ln = lines.value[i];
+        if (filter && !hasHit(ln.text)) continue;
+        out.push({ ln, idx: i });
+      }
+      return out;
+    });
+    const curDisplayIdx = Vue.computed(() => {
+      const cur = curMatchLine.value;
+      if (cur < 0) return -1;
+      const list = displayLines.value;
+      for (let i = 0; i < list.length; i++) if (list[i].idx === cur) return i;
+      return -1;
+    });
     function hasHit(text) {
       const q = searchQ.value.trim().toLowerCase();
       return !!q && text.toLowerCase().includes(q);
@@ -150,7 +239,7 @@ const InstanceLogPane = {
     }
     function scrollToCurMatch() {
       Vue.nextTick(() => {
-        const el = logEl.value, idx = curMatchLine.value;
+        const el = logEl.value, idx = curDisplayIdx.value;
         if (!el || idx < 0 || !el.children[idx]) return;
         el.children[idx].scrollIntoView({ block: "center" });
       });
@@ -165,12 +254,49 @@ const InstanceLogPane = {
       matchIdx.value = (matchIdx.value - 1 + matchCount.value) % matchCount.value;
       scrollToCurMatch();
     }
+    function firstMatch() {
+      if (!matchCount.value) return;
+      matchIdx.value = 0;
+      scrollToCurMatch();
+    }
+    function lastMatch() {
+      if (!matchCount.value) return;
+      matchIdx.value = matchCount.value - 1;
+      scrollToCurMatch();
+    }
+    function clearLog() {
+      lines.value = [];
+      matchIdx.value = 0;
+    }
+    function downloadLog() {
+      const text = lines.value.map(l => l.text).join("\n");
+      if (!text) { ElementPlus.ElMessage.warning("暂无已加载日志可下载"); return; }
+      const suffix = props.stream && props.stream !== "all" ? "." + props.stream : "";
+      try {
+        const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = (props.rid || "log") + suffix + ".log";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        ElementPlus.ElMessage.error("下载失败: " + e.message);
+      }
+    }
     Vue.watch(searchQ, () => { matchIdx.value = 0; scrollToCurMatch(); });
     Vue.watch(() => props.rid, () => { reset(); poll(); });
+    Vue.watch(() => props.stream, () => { reset(); poll(); });
     Vue.watch(() => props.ticket, () => { reset(); poll(); });
     Vue.watch(logWrap, v => {
       try { localStorage.setItem("mcweb-wrap", v ? "1" : "0"); } catch (e) { /* ignore */ }
     });
+    Vue.watch(autoScroll, v => {
+      if (v && logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
+    });
+    Vue.watch(filterOnly, () => { matchIdx.value = 0; scrollToCurMatch(); });
     async function copyLog() {
       const text = lines.value.map(l => l.text).join("\n");
       try {
@@ -199,7 +325,9 @@ const InstanceLogPane = {
     Vue.onUnmounted(() => clearInterval(timer));
 
     return { lines, offset, size, loading, logEl, logWrap, searchQ, matchIdx,
-             matchCount, curMatchLine, hasHit, lineSegs, nextMatch, prevMatch,
+             matchCount, curMatchLine, displayLines, hasHit, lineSegs,
+             nextMatch, prevMatch, firstMatch, lastMatch,
+             autoScroll, filterOnly, fsOpen, fsTitle, clearLog, downloadLog,
              copyLog, fmtBytes };
   },
 };

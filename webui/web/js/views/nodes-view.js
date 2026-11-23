@@ -128,7 +128,7 @@ const NodesView = {
     <!-- 集群 mooncake 套件（跨命名空间，controller kubectl） -->
     <el-card shadow="never" v-if="controllerName" class="mt-3">
       <template #header>
-        <div class="mc-page-head" style="margin:0">
+        <div class="mc-page-head">
           <div>
             <h3 class="title" style="font-size:15px">集群 mooncake 套件（多命名空间）</h3>
             <p class="desc">从 controller 用 kubectl 列出所有命名空间下的 mooncake 套件；非本部署命名空间标「他人套件」</p>

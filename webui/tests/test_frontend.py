@@ -63,6 +63,32 @@ def test_log_wrap_uses_switch():
     assert ">自动换行</el-button>" not in src
 
 
+def test_instance_log_fullscreen_dialog():
+    """实例日志：行内「全屏」按钮 -> fullscreen 弹窗，内含 SD 日志终端那套
+    （工具栏 + 搜索 + 自动滚动 + 换行），关闭即销毁轮询。"""
+    src = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+               encoding="utf-8").read()
+    # 行内入口：图标按钮（仅图标 -> aria-label）+ 未运行禁用的解释 tooltip
+    assert 'aria-label="全屏查看日志"' in src
+    assert "该实例尚未运行，无日志可全屏查看" in src
+    # EP 原生全屏弹窗，关闭释放组件（停止轮询）
+    assert " fullscreen destroy-on-close append-to-body" in src
+    assert 'class="ilog-fs-dialog"' in src
+    # 同一组件复用：弹窗内是 fs 形态的 instance-log-pane
+    assert "fs: { type: Boolean, default: false }" in src
+    assert '<instance-log-pane v-if="fsOpen" fs :rid="rid" :stream="stream"' in src
+    # SD 日志终端功能集：清屏 / 下载 / 自动滚动 / 仅显示匹配行 / 首个 / 最后一个
+    for t in ("清屏", "下载", "自动滚动", "仅显示匹配行", "首个", "最后一个"):
+        assert t in src, "missing fullscreen log control {}".format(t)
+    assert "autoScroll" in src and "filterOnly" in src
+    assert "function firstMatch" in src and "function lastMatch" in src
+
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    assert ".ilog-fs-dialog .el-dialog__body" in css
+    assert ".ilog-fs-dialog .ilog-view" in css
+
+
 def test_perf_page_is_instance_management():
     """性能测试页：运行框只剩「创建实例」+ CLEAN-UP，下方是实例卡片列表。"""
     src = open(os.path.join(JS_DIR, "views", "perf-view.js"),

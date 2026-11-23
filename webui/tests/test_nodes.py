@@ -74,11 +74,16 @@ def test_nodes_list_and_roles():
         assert isinstance(n["expected_ports"], list)
 
 
-def test_nodes_k8s_cluster_has_no_ssh_nodes():
+def test_nodes_k8s_cluster_exposes_controller():
+    """k8s 型配置：无 SSH 节点，但把 controller 作为节点暴露（SSH 探测/套件）。"""
     code, d = _req("GET", "/api/nodes?cluster=configs/_k8s/cluster.json")
     assert code == 200
     assert d["mode"] == "k8s"
-    assert d["nodes"] == []
+    names = [n["name"] for n in d["nodes"]]
+    assert names == ["controller"]
+    ctrl = d["nodes"][0]
+    assert ctrl["roles"] == ["controller"]
+    assert ctrl["ip"] and ctrl["expected_ports"] == []
 
 
 def test_nodes_reject_unknown_node_and_path_escape():
