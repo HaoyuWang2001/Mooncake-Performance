@@ -155,6 +155,9 @@ def _generate_openapi():
     paths["/api/configs"] = _p("Config inventory (general + trees + candidates)")
     paths["/api/config"] = _p("Read a config file")
     paths["/api/config"]["get"]["parameters"] = [_q("path", required=True)]
+    paths["/api/config/chain"] = _p(
+        "Inheritance chain (_configs.json levels + self + effective merged)")
+    paths["/api/config/chain"]["get"]["parameters"] = [_q("path", required=True)]
     paths["/api/config"].update(_put("Save config (validate + atomic write, no backup)"))
     paths["/api/config/validate"] = _post("Validate config content without saving")
     paths["/api/run"] = _post("Launch benchmark run (mode: ssh/k8s)")

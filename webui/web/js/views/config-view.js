@@ -40,7 +40,7 @@ const ConfigView = {
     <div class="mc-page-head">
       <div>
         <h1 class="title">配置维护</h1>
-        <p class="desc">编辑 cluster/global/profile 与测试场景配置；点击文件名在弹窗中编辑，保存前自动校验并备份，运行框的配置选择来自此处。</p>
+        <p class="desc">编辑 cluster/global/profile 与测试场景配置；打开运行配置即可看到各级 _configs.json 继承链与合并后的生效配置，每级 _configs.json 需点「编辑」才进入修改。</p>
       </div>
     </div>
     <el-row :gutter="14">
@@ -81,16 +81,75 @@ const ConfigView = {
       </el-col>
     </el-row>
 
-    <el-dialog v-model="dlgOpen" width="72%" top="6vh" class="cfg-dlg"
+    <el-dialog v-model="dlgOpen" width="92%" top="4vh" class="cfg-dlg"
                :close-on-click-modal="false" :before-close="askClose">
       <template #header>
-        <b>编辑配置</b>
-        <span v-if="editPath" class="cfg-dlg-path">{{ editPath }}</span>
-        <el-tag v-if="isNew" size="small" type="warning">新文件（未保存）</el-tag>
+        <div class="cfg-dlg-head">
+          <b>配置</b>
+          <span v-if="editPath" class="cfg-dlg-path">{{ editPath }}</span>
+          <el-tag v-if="editingFragment" size="small" type="warning">编辑 _configs.json</el-tag>
+          <el-tag v-if="isNew" size="small" type="warning">新文件（未保存）</el-tag>
+          <span class="spacer"></span>
+          <el-button v-if="editingFragment" size="small" @click="backToRoot">
+            返回 {{ shortName(chainRoot) }}
+          </el-button>
+        </div>
       </template>
-      <el-input type="textarea" :rows="22" v-model="editContent" class="editor" ref="editInput"></el-input>
-      <el-alert v-if="editMsg.text" :type="editMsg.ok ? 'success' : 'error'"
-                :title="editMsg.text" :closable="false" show-icon class="mt-2" />
+      <div class="cfg-dlg-body" :class="{ 'has-chain': chain.inherits }">
+        <div v-if="chain.inherits" class="cfg-chain" v-loading="chain.loading">
+          <div class="cfg-chain-title">
+            配置继承链（自上而下共 {{ chain.levels.length }} 层；各级 _configs.json 依次合并到本文件）
+          </div>
+          <div v-for="(lv, i) in chain.levels" :key="lv.kind + ':' + lv.path"
+               class="cfg-chain-item" :class="{ self: lv.kind === 'self' }">
+            <div class="cfg-chain-head">
+              <el-tag size="small" :type="lv.kind === 'self' ? 'primary' : 'info'">
+                {{ lv.kind === 'self' ? '本文件' : ('L' + (i + 1)) }}
+              </el-tag>
+              <span class="cfg-chain-path" :title="lv.path">{{ lv.path }}</span>
+              <el-tag v-if="lv.kind !== 'self' && !lv.exists" size="small"
+                      type="warning" effect="plain">无</el-tag>
+              <span class="spacer"></span>
+              <template v-if="lv.kind !== 'self'">
+                <el-button size="small" text @click="toggleLevel(lv)">
+                  {{ openLevels[lv.path] ? '收起' : '展开' }}
+                </el-button>
+                <el-tooltip :disabled="!dirty" placement="top"
+                            content="先保存或取消当前修改，再切换编辑目标">
+                  <span>
+                    <el-button size="small" link type="primary" :disabled="dirty"
+                               @click="editChainLevel(lv)">
+                      {{ lv.exists ? '编辑' : '新建' }}
+                    </el-button>
+                  </span>
+                </el-tooltip>
+              </template>
+            </div>
+            <div v-if="lv.kind !== 'self' && openLevels[lv.path]">
+              <pre v-if="lv.exists && !lv.error" class="cfg-chain-pre">{{ lv.content }}</pre>
+              <div v-else-if="!lv.exists" class="cfg-chain-none">该级没有 _configs.json</div>
+              <el-alert v-if="lv.error" :title="lv.error" type="error"
+                        :closable="false" show-icon class="mt-2"></el-alert>
+            </div>
+          </div>
+          <div class="cfg-chain-item">
+            <div class="cfg-chain-head">
+              <el-tag size="small" type="success" effect="plain">生效</el-tag>
+              <span class="cfg-chain-path">合并后（各级 _configs.json → 本文件）</span>
+              <span class="spacer"></span>
+              <el-button size="small" text @click="effOpen = !effOpen">
+                {{ effOpen ? '收起' : '展开' }}
+              </el-button>
+            </div>
+            <pre v-if="effOpen" class="cfg-chain-pre">{{ chain.effective || '（无可合并内容）' }}</pre>
+          </div>
+        </div>
+        <div class="cfg-editor-pane">
+          <el-input type="textarea" :rows="22" v-model="editContent" class="editor" ref="editInput"></el-input>
+          <el-alert v-if="editMsg.text" :type="editMsg.ok ? 'success' : 'error'"
+                    :title="editMsg.text" :closable="false" show-icon class="mt-2" />
+        </div>
+      </div>
       <template #footer>
         <el-button size="small" @click="askClose">取消</el-button>
         <el-button size="small" :disabled="!editPath" @click="validate">校验</el-button>
@@ -120,6 +179,60 @@ const ConfigView = {
     const dirty = Vue.computed(() =>
       !!editPath.value && editContent.value !== editSnapshot.value);
     const isNew = Vue.computed(() => newSession.value);
+
+    // ---- 继承链：各级 _configs.json（默认展开，一次性看全）+ 生效配置 ----
+    const chain = Vue.reactive({ inherits: false, levels: [], effective: "",
+                                 loading: false });
+    const chainRoot = Vue.ref("");       // 场景配置本身（返回目标）
+    const openLevels = Vue.reactive({}); // path -> 预览是否展开
+    const effOpen = Vue.ref(true);
+    const editingFragment = Vue.computed(() =>
+      chain.inherits && !!chainRoot.value && editPath.value !== chainRoot.value);
+
+    function shortName(p) { return (p || "").split("/").pop(); }
+    function toggleLevel(lv) { openLevels[lv.path] = !openLevels[lv.path]; }
+
+    async function _loadChain(path) {
+      chain.loading = true;
+      try {
+        const r = await api("GET", "/api/config/chain?path=" +
+                            encodeURIComponent(path));
+        chain.inherits = !!r.inherits;
+        chain.levels = r.levels || [];
+        chain.effective = r.effective || "";
+        for (const lv of chain.levels) {
+          if (!(lv.path in openLevels)) openLevels[lv.path] = true;
+        }
+        return r;
+      } finally {
+        chain.loading = false;
+      }
+    }
+
+    // 显式入口：只有点该级「编辑/新建」才进入 _configs.json 修改
+    function editChainLevel(lv) {
+      if (lv.kind === "self") return;
+      if (dirty.value) {
+        ElementPlus.ElMessage.warning(
+          "当前有未保存的修改：先保存或取消后再切换编辑目标");
+        return;
+      }
+      editPath.value = lv.path;
+      editContent.value = lv.exists ? lv.content : "{\n\n}";
+      editSnapshot.value = editContent.value;
+      editMsg.text = "";
+      newSession.value = !lv.exists;
+      Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
+    }
+
+    async function backToRoot() {
+      if (!chainRoot.value) return;
+      if (dirty.value) {
+        ElementPlus.ElMessage.warning("当前有未保存的修改：先保存或取消");
+        return;
+      }
+      await openFile(chainRoot.value);
+    }
 
     function toNode(treeNode) {
       const children = [
@@ -157,18 +270,23 @@ const ConfigView = {
     }
 
     async function openFile(path) {
+      let r;
       try {
-        const r = await api("GET", "/api/config?path=" + encodeURIComponent(path));
-        editPath.value = path;
-        editContent.value = r.content;
-        editSnapshot.value = r.content;
-        editMsg.text = "";
-        newSession.value = false;
-        dlgOpen.value = true;
-        Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
+        r = await _loadChain(path);
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
+        return;
       }
+      const self = (r.levels || []).find(lv => lv.kind === "self") ||
+                   { content: "" };
+      chainRoot.value = r.inherits ? path : "";
+      editPath.value = path;
+      editContent.value = self.content;
+      editSnapshot.value = self.content;
+      editMsg.text = "";
+      newSession.value = false;
+      dlgOpen.value = true;
+      Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
     }
 
     // 未保存关闭 -> 丢弃确认（破坏性丢弃未保存内容，确认键 danger）
@@ -228,14 +346,24 @@ const ConfigView = {
     async function save() {
       saving.value = true;
       try {
-        const r = await api("PUT", "/api/config",
-                            { path: editPath.value, content: editContent.value });
+        const savedPath = editPath.value;
+        await api("PUT", "/api/config",
+                  { path: savedPath, content: editContent.value });
         ElementPlus.ElMessage.success("已保存");
         editMsg.text = "";
         editSnapshot.value = editContent.value;
         newSession.value = false;
-        dlgOpen.value = false;
         await loadAll();
+        if (chain.inherits && chainRoot.value) {
+          if (savedPath !== chainRoot.value) {
+            // 保存的是某级 _configs.json：回到本文件，立即看到新链与生效值
+            await openFile(chainRoot.value);
+          } else {
+            await _loadChain(chainRoot.value);   // 本文件保存：刷新链预览
+          }
+        } else {
+          dlgOpen.value = false;                 // 普通配置保持原行为
+        }
       } catch (e) {
         editMsg.ok = false; editMsg.text = e.message;
       } finally {
@@ -262,6 +390,8 @@ const ConfigView = {
 
     return { treeRoots, general, openFile, newCfgName, newCfgSource, newCfgSources,
              newConfig, dlgOpen, editInput, editPath, editContent, editMsg, saving, dirty,
-             isNew, askClose, validate, save, loadAll };
+             isNew, askClose, validate, save, loadAll,
+             chain, chainRoot, openLevels, effOpen, editingFragment,
+             shortName, toggleLevel, editChainLevel, backToRoot };
   },
 };

@@ -244,6 +244,25 @@ def test_instances_card_keeps_min_height():
     assert ".inst-empty, .inst-list { min-height: 280px;" in css
 
 
+def test_config_chain_dialog():
+    """配置维护：打开配置展示各级 _configs.json + 生效配置；_configs.json 需显式编辑。"""
+    src = open(os.path.join(JS_DIR, "views", "config-view.js"),
+               encoding="utf-8").read()
+    assert "/api/config/chain" in src
+    assert "配置继承链" in src and "生效" in src
+    assert "function _loadChain" in src and "function editChainLevel" in src
+    assert "function backToRoot" in src and "editingFragment" in src
+    assert "cfg-chain-pre" in src and "cfg-dlg-body" in src
+    # 未保存修改时禁止切换编辑目标（disabled 有 tooltip 解释）
+    assert ':disabled="dirty"' in src
+    assert "先保存或取消当前修改，再切换编辑目标" in src
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    for cls in (".cfg-dlg-body", ".cfg-chain", ".cfg-chain-item.self",
+                ".cfg-chain-pre", ".cfg-editor-pane"):
+        assert cls in css, "missing style {}".format(cls)
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()

@@ -90,6 +90,51 @@ def test_config_get_put_validate():
             os.remove(tmp)
 
 
+def test_config_chain_inheritance():
+    """配置继承链：各级 _configs.json（含缺失级）+ 本文件 + 合并后的生效配置。"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tmp = "configs/basic/zz-chain-test.json"
+    fp = os.path.join(root, tmp)
+    try:
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"scenario": "basic", "operation": "put",
+                       "data_size": ["64KB"],
+                       "params": [{"num_clients": 1, "num_threads": 1}]}, f)
+        code, d = _req("GET", "/api/config/chain?path=" + tmp)
+        assert code == 200 and d["inherits"] is True
+        assert d["category"] == "basic"
+        paths = [lv["path"] for lv in d["levels"]]
+        assert paths[0] == "configs/basic/_configs.json"
+        assert paths[-1] == tmp
+        assert d["levels"][-1]["kind"] == "self"
+        assert all(lv["exists"] for lv in d["levels"])
+        eff = json.loads(d["effective"])
+        assert eff["scenario"] == "basic" and "data_size" in eff
+        # 已有多级链：pipeline 根 + rank 子目录两级都存在
+        code, d = _req("GET",
+            "/api/config/chain?path=configs/pipeline/rank/rank_balanced_1w10r_1x.json")
+        assert code == 200 and d["inherits"] is True
+        assert [lv["exists"] for lv in d["levels"]][:2] == [True, True]
+        # 子目录缺失的 _configs.json 也列出（exists=False）
+        code, d = _req("GET",
+            "/api/config/chain?path=configs/pipeline/smoke/rank_smoke.json")
+        assert code == 200 and d["inherits"] is True
+        assert [lv["exists"] for lv in d["levels"]][:2] == [True, False]
+        # 非继承配置：只有 self，无 effective
+        code, d = _req("GET", "/api/config/chain?path=configs/cluster.json")
+        assert code == 200 and d["inherits"] is False
+        assert [lv["kind"] for lv in d["levels"]] == ["self"]
+        assert d["effective"] == ""
+        # 不存在 / 越界
+        code, _ = _req("GET", "/api/config/chain?path=configs/basic/nope.json")
+        assert code == 404
+        code, _ = _req("GET", "/api/config/chain?path=../etc/passwd")
+        assert code == 404
+    finally:
+        if os.path.isfile(fp):
+            os.remove(fp)
+
+
 def test_run_selector_validation():
     code, d = _req("POST", "/api/run", {"selector": {"type": "file", "path": "x"}})
     assert code == 400 and "legacy" in d["error"]

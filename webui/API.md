@@ -42,6 +42,23 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
 ### GET /api/config?path=configs/basic/put.json
 → `{"path":"...","content":"<原文>"}`
 
+### GET /api/config/chain?path=configs/pipeline/rank/rank_smoke.json
+返回该配置的**完整继承链**（供配置维护弹窗一次性展示）：
+```json
+{"path":"configs/pipeline/rank/rank_smoke.json","inherits":true,
+ "category":"pipeline",
+ "levels":[{"kind":"defaults","path":"configs/pipeline/_configs.json",
+            "exists":true,"content":"{...}","bytes":123},
+           {"kind":"defaults","path":"configs/pipeline/rank/_configs.json",
+            "exists":true,"content":"{...}","bytes":456},
+           {"kind":"self","path":"configs/pipeline/rank/rank_smoke.json",
+            "exists":true,"content":"{...}","bytes":789}],
+ "effective":"<各级 _configs.json → 本文件 依次深度合并后的 JSON 文本>"}
+```
+- 仅 `configs/{basic,pipeline,kvtest}` 参与继承；其它配置（cluster/global/profile、`_ssh`/`_k8s` 等）
+  `inherits=false`、`levels` 只含 `self`、`effective` 为空串
+- 缺失的级别也会列出（`exists:false`），便于在 UI 里「新建」该级 `_configs.json`
+
 ### PUT /api/config
 请求体：`{"path":"configs/basic/put.json","content":"{...}"}`
 - 先校验：JSON 语法 + 场景配置语义（复用编排器自身的 `data_size_list`/`pipeline_plan`/`_configs.json` 继承合并）
