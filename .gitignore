@@ -26,7 +26,6 @@ schedule/plan.json
 mock/cluster.json
 
 webui/data/
-webui/backups/
 configs/_ssh/cluster.json
 configs/_ssh/global.json
 configs/_ssh/profile.json

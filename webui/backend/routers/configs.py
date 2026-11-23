@@ -2,16 +2,17 @@
 """configs router：/api/configs、/api/config（读/写/校验）。
 
 写入前校验复用编排器自身的 loader/validator（benchmark.data_size_list /
-pipeline_plan / _configs.json 继承合并），保存自动备份到 webui/backups/。"""
+pipeline_plan / _configs.json 继承合并）；校验通过后**原子写回、不保留备份**。"""
 import json
 import os
+import tempfile
 
 import benchmark as bm
 
 from .. import runmgr
-from ..common import (ApiError, atomic_write, backup_file, jpath,
-                      read_json_body, real_under)
-from ..paths import BACKUP_DIR, CONF_ROOTS, ROOT
+from ..common import (ApiError, atomic_write, jpath, read_json_body,
+                      real_under)
+from ..paths import CONF_ROOTS, ROOT
 
 ROUTES = []
 
@@ -90,10 +91,9 @@ def validate_config_content(path, content):
 def validate_plan_content(content):
     """-> list of error strings, using run_schedule's own loaders."""
     errors = []
-    tmp = os.path.join(BACKUP_DIR, "plan-validate.tmp.json")
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="plan-validate-", suffix=".json")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         rs = runmgr.load_run_schedule()
         try:
@@ -205,11 +205,8 @@ def api_config_put(handler, query):
     errors = validate_config_content(full, content)
     if errors:
         raise ApiError(422, "; ".join(errors))
-    backup = None
-    if os.path.isfile(full):
-        backup = backup_file(full)
     atomic_write(full, content)
-    return {"ok": True, "path": path, "backup": backup}
+    return {"ok": True, "path": path}
 
 
 def api_config_validate(handler, query):

@@ -3,12 +3,12 @@
 import csv
 import json
 import os
-import shutil
 import time
 
 from ..common import ApiError, jpath, read_json_body, real_under
-from ..paths import (MAX_TEXT_CHUNK, OUTPUTS_DIR, OUTPUTS_TRASH_DIR,
-                     READ_ROOTS, ROOT, RUNS_DIR, TS_RE)
+from ..discard import discard_path
+from ..paths import (MAX_TEXT_CHUNK, OUTPUTS_DIR, READ_ROOTS, ROOT,
+                     RUNS_DIR, TS_RE)
 
 ROUTES = []
 
@@ -66,21 +66,6 @@ def _output_dir(ts):
     return d
 
 
-def _move_to_trash(src, ts):
-    """把结果目录移入回收站（webui/backups/outputs-trash/），返回相对路径。"""
-    os.makedirs(OUTPUTS_TRASH_DIR, exist_ok=True)
-    dst = os.path.join(OUTPUTS_TRASH_DIR, ts)
-    if os.path.exists(dst):
-        base = dst + "." + time.strftime("%Y%m%d-%H%M%S")
-        dst = base
-        n = 1
-        while os.path.exists(dst):
-            dst = "{}-{}".format(base, n)
-            n += 1
-    shutil.move(src, dst)
-    return os.path.relpath(dst, ROOT).replace("\\", "/")
-
-
 def _update_run_ts_dir(old_ts, new_ts):
     """同步 run 历史中的 ts_dir 引用（new_ts=None 表示结果已删除）。"""
     old_rel = "outputs/" + old_ts
@@ -110,9 +95,10 @@ def _update_run_ts_dir(old_ts, new_ts):
 
 def api_output_delete(handler, query, ts):
     d = _output_dir(ts)
-    trash = _move_to_trash(d, ts)
+    # Windows 原生 → 系统回收站；WSL/Linux → 永久删除（无隐藏副本）
+    discard_path(d)
     _update_run_ts_dir(ts, None)
-    return {"ok": True, "ts": ts, "trash": trash}
+    return {"ok": True, "ts": ts}
 
 
 def api_outputs_batch_delete(handler, query):
@@ -124,12 +110,12 @@ def api_outputs_batch_delete(handler, query):
     for ts in names:
         try:
             d = _output_dir(ts)
-            _move_to_trash(d, ts)
+            discard_path(d)
             _update_run_ts_dir(ts, None)
             deleted.append(ts)
         except ApiError as exc:
             failed.append({"ts": ts, "error": exc.message})
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             failed.append({"ts": ts, "error": str(exc)})
     return {"deleted": deleted, "failed": failed}
 

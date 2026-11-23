@@ -678,8 +678,12 @@ const ResultsView = {
     }
 
     async function _deleteNames(names, label) {
+      // Windows 原生 = 系统回收站（可恢复）；WSL/Linux = 永久删除
+      const win = (store.status && store.status.platform) === "windows";
+      const action = win ? "移入 Windows 回收站（可从资源管理器恢复）"
+                         : "永久删除（不可恢复）";
       try {
-        await confirmDanger("将把" + label + "移入回收站（webui/backups/outputs-trash）。" +
+        await confirmDanger("将把" + label + " " + action + "。" +
                             (names.length > 1 ? "目标：" + names.slice(0, 5).join("、") +
                              (names.length > 5 ? " 等 " + names.length + " 个" : "") : ""),
                             "删除运行结果");
@@ -690,7 +694,9 @@ const ResultsView = {
           ElementPlus.ElMessage.warning("部分删除失败：" +
             r.failed.map(f => f.ts + "（" + f.error + "）").join("；"));
         } else {
-          ElementPlus.ElMessage.success("已删除 " + r.deleted.length + " 项（已移入回收站）");
+          ElementPlus.ElMessage.success(
+            (win ? "已移入 Windows 回收站：" : "已永久删除 ") +
+            r.deleted.length + " 项");
         }
         selected.value = selected.value.filter(t => !names.includes(t));
         await loadRuns();

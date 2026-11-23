@@ -72,15 +72,14 @@ def test_config_get_put_validate():
             "content": json.dumps({"scenario": "basic", "protocol": "tcp",
                                    "data_size": ["64KB"],
                                    "params": [{"num_clients": 1, "num_threads": 2}]})})
-        assert code == 200
-        assert d["backup"] is None or d["backup"].startswith("webui/backups/")
-        # 二次保存已有文件 -> 必有备份
+        assert code == 200 and "backup" not in d
+        # 二次保存已有文件 -> 仍然不备份（WebUI 不留隐藏副本）
         code, d = _req("PUT", "/api/config", {
             "path": tmp,
             "content": json.dumps({"scenario": "basic", "protocol": "tcp",
                                    "data_size": ["64KB"],
                                    "params": [{"num_clients": 1, "num_threads": 2}]})})
-        assert code == 200 and d["backup"].startswith("webui/backups/")
+        assert code == 200 and "backup" not in d
         code, d = _req("GET", "/api/config?path=" + tmp)
         assert code == 200 and json.loads(d["content"])["scenario"] == "basic"
         # 白名单外 -> 400/404
@@ -124,7 +123,6 @@ def test_output_rename_delete():
     new = old + "-renamed"
     src = os.path.join(out, old)
     dst = os.path.join(out, new)
-    trash = []
     os.makedirs(src)
     try:
         with open(os.path.join(src, "benchmark_detail.csv"), "w") as f:
@@ -147,11 +145,11 @@ def test_output_rename_delete():
         code, d = _req("GET", "/api/outputs/{}/tree".format(new))
         assert code == 200
 
-        # 单删（移入回收站）
+        # 单删（WSL/Linux 下永久删除；无 trash/backup 副本）
         code, d = _req("DELETE", "/api/outputs/{}".format(new))
-        assert code == 200 and d["trash"].startswith("webui/backups/outputs-trash/")
-        trash.append(os.path.join(root, d["trash"]))
-        assert not os.path.isdir(dst) and os.path.isdir(trash[-1])
+        assert code == 200 and "trash" not in d
+        assert not os.path.isdir(dst)
+        assert not os.path.isdir(os.path.join(root, "webui", "backups"))
     finally:
         for p in (src, dst):
             if os.path.isdir(p):
@@ -170,13 +168,6 @@ def test_output_rename_delete():
     finally:
         for t in names:
             shutil.rmtree(os.path.join(out, t), ignore_errors=True)
-        trash_dir = os.path.join(root, "webui/backups/outputs-trash")
-        for p in trash:
-            shutil.rmtree(p, ignore_errors=True)
-        if os.path.isdir(trash_dir):
-            for name in os.listdir(trash_dir):
-                if any(name == t or name.startswith(t + ".") for t in names):
-                    shutil.rmtree(os.path.join(trash_dir, name), ignore_errors=True)
     code, _ = _req("POST", "/api/outputs/delete", {"names": []})
     assert code == 400
 

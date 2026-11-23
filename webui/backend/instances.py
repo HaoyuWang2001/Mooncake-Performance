@@ -8,11 +8,10 @@
 import json
 import os
 import re
-import shutil
 import threading
 import time
 
-from .paths import INSTANCES_DIR, INSTANCES_TRASH_DIR, RUNS_DIR
+from .paths import INSTANCES_DIR, RUNS_DIR
 
 ID_RE = re.compile(r"^i[0-9A-Za-z._-]+$")
 _seq_lock = threading.Lock()
@@ -101,14 +100,14 @@ def rename(iid, name):
 
 
 def delete(iid):
-    """Move the instance record to the trash (runs/logs/outputs are kept)."""
+    """Remove the instance definition outright (runs/logs/outputs are kept).
+
+    实例只是表单快照，定义直接删除、不进任何回收站。
+    """
     path = _path(iid)
     if not path or not os.path.isfile(path):
         return False
-    os.makedirs(INSTANCES_TRASH_DIR, exist_ok=True)
-    dst = os.path.join(INSTANCES_TRASH_DIR, "{}-{}.json".format(
-        time.strftime("%Y%m%d-%H%M%S"), iid))
-    shutil.move(path, dst)
+    os.remove(path)
     return True
 
 

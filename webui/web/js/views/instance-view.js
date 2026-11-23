@@ -574,7 +574,7 @@ const InstanceView = {
     async function remove() {
       const iid = active.value; if (!iid) return;
       try {
-        await confirmDanger("删除实例？运行记录、日志与 outputs 保留，仅实例记录移入回收站。",
+        await confirmDanger("删除实例？实例定义将被直接删除；运行记录、日志与 outputs 保留。",
                             "删除实例");
       } catch (e) { return; }
       try {

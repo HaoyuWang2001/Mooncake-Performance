@@ -25,12 +25,10 @@ class _H(object):
 
 def _ctx(tmp_path, monkeypatch):
     inst_dir = tmp_path / "instances"
-    trash = tmp_path / "trash"
     runs = tmp_path / "runs"
     inst_dir.mkdir()
     runs.mkdir()
     monkeypatch.setattr(instances, "INSTANCES_DIR", str(inst_dir))
-    monkeypatch.setattr(instances, "INSTANCES_TRASH_DIR", str(trash))
     monkeypatch.setattr(instances, "RUNS_DIR", str(runs))
     return inst_dir, runs
 
@@ -67,8 +65,8 @@ def test_store_crud(tmp_path, monkeypatch):
     assert r["name"] == "A2"
     assert instances.delete(a["id"]) is True
     assert instances.load(a["id"]) is None
-    assert os.path.isdir(str(tmp_path / "trash"))
-    assert os.listdir(str(tmp_path / "trash"))
+    # 定义直接删除：不进任何回收站，也不残留副本
+    assert not (tmp_path / "trash").exists()
     # bad ids never touch the filesystem
     assert instances.load("../../etc/passwd") is None
     assert instances.delete("bad id") is False

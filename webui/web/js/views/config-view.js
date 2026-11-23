@@ -188,7 +188,7 @@ const ConfigView = {
     }
 
     // 新建配置：拉取复制源内容，以新文件名打开未保存的编辑会话；
-    // 保存走现有 PUT /api/config（新文件 backup=None）
+    // 保存走现有 PUT /api/config（校验后原子写回，不备份）
     async function newConfig() {
       const name = newCfgName.value.trim();
       if (!name.endsWith(".json")) {
@@ -230,8 +230,7 @@ const ConfigView = {
       try {
         const r = await api("PUT", "/api/config",
                             { path: editPath.value, content: editContent.value });
-        ElementPlus.ElMessage.success(
-          "已保存" + (r.backup ? "（备份 " + r.backup + "）" : ""));
+        ElementPlus.ElMessage.success("已保存");
         editMsg.text = "";
         editSnapshot.value = editContent.value;
         newSession.value = false;

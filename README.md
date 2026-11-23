@@ -992,14 +992,14 @@ python -m pytest webui/tests -q                     # 测试（亦可 python web
 
 目录结构学习 Services-Deployment：`backend/`（routers 按域拆分）+ `web/`（前端成品，
 vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL 前缀 /static/）+
-`data/`（运行时状态，gitignored）+ `backups/`（编辑备份，gitignored）+ `tests/`，侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
+`data/`（运行时状态，gitignored）+ `tests/`，侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
 
 - **配置维护**：运行框（通栏最上方：选中文件展示【目录/文件分开，目录先执行】+ cluster/global/
   profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-plot/no-report/protocol
   选项 + 运行按钮）；
   左列**通用配置**（configs 根下全部 `*.json`，过滤 `*.example.json` 模板）+ **运行配置**
   （configs 下所有非 `_` 目录的层级树）；右侧编辑器在线编辑（写入前自动校验——复用编排器自身
-  的场景配置校验；自动备份到 `webui/backups/`）。树用**复选框**选择运行范围：勾目录=整目录
+  的场景配置校验；校验通过原子写回、不备份）。树用**复选框**选择运行范围：勾目录=整目录
   收编（子孙不可单独取消）、勾文件=独立选中（父目录半选）、目录选中后其下已独立选中的文件
   自动去重（取消目录后恢复独立选中）；提交为 `--config-dir a,b` + `-f x,y` 多值形式，目录先执行
 - **性能测试（实例管理）**：运行框保留为**创建模板**——选择 mode/启动方式/cluster/global/
@@ -1038,7 +1038,7 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   （Rank+Recall 组合实例正是如此）。共享资源同时被占用时硬并行会互相摧毁：namespace 创建失败、
   端口/`value.bin` 冲突、`mcbench/` 被互清、store 被双方同时打爆
 - 运行历史与日志持久化于 `webui/data/runs/`；实例定义持久化于 `webui/data/instances/`
-  （均 gitignore），删除实例仅移除定义（runs/日志/outputs 保留，定义入 backups 回收站）
+  （均 gitignore），删除实例直接移除定义（runs/日志/outputs 保留）；删除结果在 Windows 原生进系统回收站、WSL/Linux 永久删除
 - **界面规范（webui-design skill）**：设计 token 化（`--mc-space/font/radius/term-*`，深青主色亮
   `#0e7490`/暗 `#27b3c9`）；日志/终端亮暗双主题恒深底；状态文案中文化（运行中/停止中/已完成/
   失败/已停止/未运行）；危险操作统一 `confirmDanger`（确认键 danger）；每页至多一个 primary 实心

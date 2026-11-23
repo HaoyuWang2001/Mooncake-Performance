@@ -45,8 +45,8 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
 ### PUT /api/config
 请求体：`{"path":"configs/basic/put.json","content":"{...}"}`
 - 先校验：JSON 语法 + 场景配置语义（复用编排器自身的 `data_size_list`/`pipeline_plan`/`_configs.json` 继承合并）
-- 通过后：旧文件备份到 `webui/backups/` → 原子写回
-- → `{"ok":true,"path":"...","backup":"webui/backups/..."}`
+- 校验通过后**原子写回**（不保留旧文件备份——WebUI 不做隐藏副本）
+- → `{"ok":true,"path":"..."}`
 - 校验失败 → 422 `{"error":"data_size must be ..."}`
 
 ### POST /api/config/validate
@@ -214,7 +214,7 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 → `{"instance":<summary>}`。
 
 ### DELETE /api/instances/{iid}
-删除实例记录（移入 `webui/backups/instances-trash/`）；运行记录/日志/outputs **保留**。
+删除实例记录（**直接删除定义文件**，不进任何回收站）；运行记录/日志/outputs **保留**。
 运行中 → 409。
 
 ---
@@ -274,12 +274,13 @@ paramiko 不可用 → 503。
 - → `{"ok":true,"ts":"新名","from":"旧名","renamed":true}`（同名时 `renamed:false`）
 
 ### DELETE /api/outputs/{ts}
-把结果目录**移入回收站** `webui/backups/outputs-trash/<ts>`（重名自动追加时间戳），
+按运行平台删除结果目录：**Windows 原生** → 送入系统回收站（资源管理器可恢复）；
+**WSL / Linux** → 永久删除（不可恢复），WebUI 不留隐藏副本。
 并把指向它的 run 历史 `ts_dir` 置空。
-→ `{"ok":true,"ts":"...","trash":"webui/backups/outputs-trash/..."}`
+→ `{"ok":true,"ts":"..."}`
 
 ### POST /api/outputs/delete
-请求体：`{"names":["20261029-2230","..."]}`（批量删除，同样移入回收站）
+请求体：`{"names":["20261029-2230","..."]}`（批量删除，语义同单个删除）
 → `{"deleted":["..."],"failed":[{"ts":"...","error":"..."}]}`
 
 ### GET /api/file?path=outputs/.../xxx.log&mode=text&offset=0
@@ -300,7 +301,7 @@ paramiko 不可用 → 503。
 
 ### GET /api/schedule/plan/{name} / PUT /api/schedule/plan/{name}
 - GET → `{"name":"...","content":"..."}`
-- PUT 请求体 `{"content":"..."}`：用 run_schedule 自身的 `load_plan`/`parse_trigger` 校验（首任务必须有 date+time）→ 备份 → 写入
+- PUT 请求体 `{"content":"..."}`：用 run_schedule 自身的 `load_plan`/`parse_trigger` 校验（首任务必须有 date+time）→ 原子写入（不备份）
 - `plan.example.json` 只读（400）
 
 ### POST /api/schedule/start
@@ -365,4 +366,4 @@ curl -s $BASE/api/schedule/status
 - **停止残留**：强制停止后远端进程可能残留，`.state` 台账会在下次 run 启动时自动 reap（既有机制）
 - **dry-run**：无 `ts_dir`、不产生 outputs
 - **并发规则**：单 benchmark 槽 + 单 scheduler；scheduler 等待期手动 run 允许（带 warning），任务执行期互斥
-- **备份**：所有 PUT 写入前自动备份到 `webui/backups/`（含原相对路径与时间戳）
+- **无隐藏备份/回收站**：配置与计划保存不备份；实例定义直接删除；结果删除按平台进 Windows 回收站或永久删除

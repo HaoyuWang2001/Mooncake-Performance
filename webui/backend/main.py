@@ -155,7 +155,7 @@ def _generate_openapi():
     paths["/api/configs"] = _p("Config inventory (general + trees + candidates)")
     paths["/api/config"] = _p("Read a config file")
     paths["/api/config"]["get"]["parameters"] = [_q("path", required=True)]
-    paths["/api/config"].update(_put("Save config (backup + validate)"))
+    paths["/api/config"].update(_put("Save config (validate + atomic write, no backup)"))
     paths["/api/config/validate"] = _post("Validate config content without saving")
     paths["/api/run"] = _post("Launch benchmark run (mode: ssh/k8s)")
     paths["/api/run"]["post"]["responses"]["409"] = {"description": "Shared resource conflict / same instance running / scheduler executing"}
@@ -186,9 +186,9 @@ def _generate_openapi():
     paths["/api/nodes/{name}/ports"]["get"]["parameters"] = [_q("cluster")]
     paths["/api/outputs"] = _p("List output runs")
     paths["/api/outputs/{ts}/tree"] = _p("File tree of one output run")
-    paths["/api/outputs/{ts}"] = _delete("Delete run result (moved to trash)")
+    paths["/api/outputs/{ts}"] = _delete("Delete run result (Windows: recycle bin; WSL/Linux: permanent)")
     paths["/api/outputs/{ts}/rename"] = _post("Rename run result directory")
-    paths["/api/outputs/delete"] = _post("Batch delete run results (moved to trash)")
+    paths["/api/outputs/delete"] = _post("Batch delete run results (same discard semantics as single delete)")
     paths["/api/file"] = _p("Read file (text/raw/tail)")
     paths["/api/file"]["get"]["parameters"] = [
         _q("path", required=True), _q("mode", default="text"),
@@ -197,7 +197,7 @@ def _generate_openapi():
     paths["/api/csv"]["get"]["parameters"] = [_q("path", required=True), _q("max_rows", "integer", False, 5000)]
     paths["/api/schedule/plans"] = _p("List schedule plans")
     paths["/api/schedule/plan/{name}"] = _p("Read one schedule plan")
-    paths["/api/schedule/plan/{name}"].update(_put("Create/overwrite plan (validate + backup)"))
+    paths["/api/schedule/plan/{name}"].update(_put("Create/overwrite plan (validate + atomic write, no backup)"))
     paths["/api/schedule/start"] = _post("Start scheduler")
     paths["/api/schedule/stop"] = _post("Stop scheduler")
     paths["/api/schedule/status"] = _p("Scheduler status")

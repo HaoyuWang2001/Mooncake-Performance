@@ -185,7 +185,7 @@ const ScheduleView = {
       try {
         const r = await api("PUT", "/api/schedule/plan/" + encodeURIComponent(currentPlan.value),
                             { content: planContent.value });
-        ElementPlus.ElMessage.success("已保存" + (r.backup ? "（备份 " + r.backup + "）" : ""));
+        ElementPlus.ElMessage.success("已保存");
         msg.text = "";
         planSnapshot.value = planContent.value;
         dlgOpen.value = false;

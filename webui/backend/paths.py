@@ -5,8 +5,10 @@
   backend/  Python 后端（main.py 装配 + routers/ 按域拆分 + runmgr 进程管理）
   web/      前端成品（无构建步骤；URL 前缀保持 /static/）
   data/     运行时状态（gitignored）：runs/ 运行记录与日志
-  backups/  配置编辑备份（gitignored）
   tests/    可重跑测试（pytest 风格，亦可直接 python 执行）
+
+删除语义：不再有 webui/backups 隐藏回收站——Windows 原生运行时统计结果
+进系统回收站，WSL/Linux 永久删除；配置保存不备份；实例定义直接删除。
 """
 import os
 import re
@@ -20,9 +22,6 @@ if ROOT not in sys.path:
 DATA_DIR = os.path.join(WEBUI_DIR, "data")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INSTANCES_DIR = os.path.join(DATA_DIR, "instances")
-BACKUP_DIR = os.path.join(WEBUI_DIR, "backups")
-# 删除的实例记录进回收站（与 outputs 回收站同处 gitignored backups/）
-INSTANCES_TRASH_DIR = os.path.join(BACKUP_DIR, "instances-trash")
 STATIC_DIR = os.path.join(WEBUI_DIR, "web")        # 磁盘目录 web/，URL 前缀 /static/
 SCHED_DIR = os.path.join(ROOT, "schedule")
 API_MD = os.path.join(WEBUI_DIR, "API.md")
@@ -30,8 +29,6 @@ API_MD = os.path.join(WEBUI_DIR, "API.md")
 OUTPUTS_DIR = os.path.join(ROOT, "outputs")
 # 文件读取白名单（/api/file、/api/csv）
 READ_ROOTS = [OUTPUTS_DIR, RUNS_DIR]
-# 运行结果删除后的回收站（位于已 gitignore 的 backups/ 下）
-OUTPUTS_TRASH_DIR = os.path.join(BACKUP_DIR, "outputs-trash")
 # 配置读写白名单（/api/config*、schedule 计划）
 CONF_ROOTS = [os.path.join(ROOT, "configs"), SCHED_DIR]
 
@@ -40,4 +37,3 @@ TS_RE = re.compile(r"^[0-9A-Za-z._-]+$")
 
 os.makedirs(RUNS_DIR, exist_ok=True)
 os.makedirs(INSTANCES_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
