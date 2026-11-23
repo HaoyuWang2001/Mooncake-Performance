@@ -12,8 +12,11 @@ spec:
   # {{MC_RUN_LABEL}} {{MC_ROLE_LABEL}} {{MC_CONFIGMAP_NAME}}
   # {{MC_SCRIPTS_MOUNT}} {{MC_WORKDIR_MOUNT}}
   # 其余段落（securityContext/resources/imagePullPolicy/UB device plugin）
-  # 按你的集群环境自行维护。默认不设 nodeSelector（使用全部可用节点）；
+  # 按你的集群环境自行维护。当前通过 nodeSelector 固定到 worker03
+  # （kubernetes.io/hostname 的值 = kubectl get nodes 中的 NAME）；
   # 注意 resources 中的 UB device request 会限制到装有 device plugin 的节点。
+  nodeSelector:
+    kubernetes.io/hostname: worker03
   terminationGracePeriodSeconds: 5
   volumes:
   - name: scripts

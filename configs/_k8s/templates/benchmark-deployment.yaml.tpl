@@ -38,6 +38,10 @@ spec:
             app: mooncake-benchmark
             run: {{MC_RUN_LABEL}}
             role: {{MC_ROLE_LABEL}}
+      # 固定调度节点：所有副本调度到 worker03（kubernetes.io/hostname 的
+      # 值 = kubectl get nodes 中的 NAME）。
+      nodeSelector:
+        kubernetes.io/hostname: worker03
       # 占位符由 benchmark.py 渲染：{{MC_DEPLOY_NAME}} {{MC_NAMESPACE}}
       # {{MC_REPLICAS}} {{MC_RUN_LABEL}} {{MC_ROLE_LABEL}} {{MC_IMAGE}}
       # {{MC_CONFIGMAP_NAME}} {{MC_SCRIPTS_MOUNT}} {{MC_WORKDIR_MOUNT}}
