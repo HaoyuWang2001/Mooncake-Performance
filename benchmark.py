@@ -6717,8 +6717,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             else:
                 ssh_check_output(
                     n["ip"], n,
-                    "printf '%s' '{b}' | base64 -d > '{f}'".format(
-                        b=payload, f=cfg_file), quiet=True)
+                    "mkdir -p '{d}' && printf '%s' '{b}' | base64 -d > '{f}'"
+                    .format(d=_kvtest_pod_dir(remote_log_dir, n),
+                            b=payload, f=cfg_file), quiet=True)
             entry["_role"] = role
             entry["_ccmd"] = ("nohup {p}bash {runner} {log} {cfgf} {bin} "
                               "> {nohup} 2>&1 & echo $!").format(
