@@ -6659,8 +6659,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             # ssh 模式保持平铺。现场四件套同目录：.log/.log.glog/.ylt.log/.exitrc
             entry["_pod_dir"] = _kvtest_pod_dir(remote_log_dir, n)
             log_base = _kvtest_pod_base(remote_log_dir, base, n)
-            entry["_out_dir"] = _pod_base(
-                "{}/kvtest_out/{}".format(remote_log_dir.rstrip("/"), base), n)
+            # kvtest_out 也收进 pod 目录：<pod_dir>/kvtest_out/<base>（一个
+            # pod 一个目录，现场不出现平铺的共享 kvtest_out 树）
+            entry["_out_dir"] = "{}/kvtest_out/{}".format(
+                _kvtest_pod_dir(remote_log_dir, n).rstrip("/"), base)
             cfg_file = log_base + ".json"
             log_file = log_base + ".log"
             nohup_log = log_base + ".nohup"
