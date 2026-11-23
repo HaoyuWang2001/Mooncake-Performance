@@ -256,11 +256,15 @@ def test_config_chain_dialog():
     # 未保存修改时禁止切换编辑目标（disabled 有 tooltip 解释）
     assert ':disabled="dirty"' in src
     assert "先保存或取消当前修改，再切换编辑目标" in src
+    # 近全屏弹窗（保留 24px 边距）
+    assert 'width="96%" top="24px"' in src
     css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
                encoding="utf-8").read()
     for cls in (".cfg-dlg-body", ".cfg-chain", ".cfg-chain-item.self",
                 ".cfg-chain-pre", ".cfg-editor-pane"):
         assert cls in css, "missing style {}".format(cls)
+    assert ".cfg-dlg {" in css and "height: calc(100vh - 48px)" in css
+    assert ".cfg-editor-pane .editor .el-textarea__inner" in css
 
 
 def test_shared_status_module():

@@ -81,7 +81,7 @@ const ConfigView = {
       </el-col>
     </el-row>
 
-    <el-dialog v-model="dlgOpen" width="92%" top="4vh" class="cfg-dlg"
+    <el-dialog v-model="dlgOpen" width="96%" top="24px" class="cfg-dlg"
                :close-on-click-modal="false" :before-close="askClose">
       <template #header>
         <div class="cfg-dlg-head">

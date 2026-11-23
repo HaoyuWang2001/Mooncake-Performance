@@ -366,16 +366,26 @@ html, body, #app {
   margin-left: var(--mc-space-2); font-size: 13px;
   color: var(--el-text-color-secondary); word-break: break-all;
 }
-/* 配置弹窗：左「继承链」（各级 _configs.json 预览 + 生效配置），右编辑器 */
+/* 配置弹窗：近全屏（保留 24px 边距表明是窗口）；左「继承链」右编辑器 */
+.cfg-dlg {
+  height: calc(100vh - 48px);
+  display: flex; flex-direction: column;
+}
+.cfg-dlg .el-dialog__header { flex-shrink: 0; }
+.cfg-dlg .el-dialog__body {
+  flex: 1; min-height: 0; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.cfg-dlg .el-dialog__footer { flex-shrink: 0; }
 .cfg-dlg-head { display: flex; align-items: center; gap: var(--mc-space-2);
                 flex-wrap: wrap; min-width: 0; }
 .cfg-dlg-head .spacer { flex: 1; }
 .cfg-dlg-body { display: flex; gap: var(--mc-space-3); align-items: stretch;
-                min-height: 0; }
+                flex: 1; min-height: 0; }
 .cfg-dlg-body.has-chain .cfg-editor-pane { flex: 1; min-width: 0; }
 .cfg-chain {
-  width: 45%; min-width: 320px; max-height: 64vh; overflow-y: auto;
-  padding-right: var(--mc-space-3);
+  width: 45%; min-width: 320px; height: 100%; max-height: none;
+  overflow-y: auto; padding-right: var(--mc-space-3);
   border-right: 1px solid var(--el-border-color-lighter);
 }
 .cfg-chain-title { font-size: 12px; color: var(--el-text-color-secondary);
@@ -400,10 +410,16 @@ html, body, #app {
 }
 .cfg-chain-none { font-size: 12px; color: var(--el-text-color-placeholder);
                   margin-top: var(--mc-space-1); }
-.cfg-editor-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.cfg-editor-pane { flex: 1; min-width: 0; min-height: 0;
+                   display: flex; flex-direction: column; }
+/* 编辑器占满剩余高度（近全屏弹窗） */
+.cfg-editor-pane .editor { flex: 1; min-height: 0; display: flex; }
+.cfg-editor-pane .editor .el-textarea__inner {
+  height: 100% !important; min-height: 0 !important; resize: none;
+}
 @media (max-width: 1100px) {
   .cfg-dlg-body { flex-direction: column; }
-  .cfg-chain { width: auto; max-height: 30vh; border-right: none;
+  .cfg-chain { width: auto; height: 30vh; flex: none; border-right: none;
                padding-right: 0; }
 }
 
