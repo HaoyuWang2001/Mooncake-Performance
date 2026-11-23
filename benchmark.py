@@ -362,6 +362,33 @@ def remote_log_path_pod(remote_log_dir, scenario, name, node):
     return _pod_base(base, node) + ".log"
 
 
+def _kvtest_pod_dir(remote_log_dir, node):
+    """kvtest 远端日志根目录：k8s 每 pod 独立子目录（与 pipeline 现场结构一致），
+    ssh 模式保持平铺（无 pod 概念）。该目录同时容纳 .log/.log.glog/.ylt.log/
+    .exitrc/.summary.json/.samples.csv/.log.glog.trace.json，ssh 现场可整体查看。"""
+    if node is not None and node.get("_pod"):
+        return "{}/{}".format(remote_log_dir.rstrip("/"), node["_pod"])
+    return remote_log_dir
+
+
+def _kvtest_pod_base(remote_log_dir, base, node):
+    """kvtest 单个实例的远端路径前缀（<pod_dir>/<base>，带 pod 子目录）。"""
+    return _pod_base("{}/{}".format(remote_log_dir.rstrip("/"), base), node)
+
+
+def _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s):
+    """报表「现场索引」所需的运行上下文（host 目录 + run id + 登录提示）。"""
+    ctx = {"run_id": ts, "remote_log_dir": remote_log_dir}
+    if is_k8s:
+        try:
+            ks = k8s_settings(cluster)
+            ctx["host_log_root"] = ks.get("host_log_root") or ""
+            ctx["k8s_namespace"] = ks.get("namespace") or ""
+        except Exception:
+            pass
+    return ctx
+
+
 def data_size_list(cfg):
     """Validate and return the scenario's data_size entries.
 
@@ -2895,6 +2922,13 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
             "unit_clients": u["c"],
             "unit_threads": u["t"],
         }
+        # kvtest 现场索引：host 日志根目录 / run_id / namespace（来自侧车）
+        if mode == "kvtest":
+            _side = _kvtest_read_report_meta(local_log_dir)
+            for _k in ("run_id", "remote_log_dir", "host_log_root",
+                       "k8s_namespace"):
+                if _side.get(_k):
+                    meta[_k] = _side[_k]
         meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
         data = rp.reduce_scenario(
             loaded, meta,
@@ -2964,6 +2998,14 @@ def _render_run_overview(ts_dir, mode=""):
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "nodes": sorted(by_node.values(), key=lambda x: -(x.get("bytes") or 0)),
     }
+    # 现场索引：从场景 meta 里取 host 日志根目录 / run_id / namespace
+    for _sc in scenarios:
+        _m = _sc.get("meta") or {}
+        for _k in ("host_log_root", "remote_log_dir", "run_id",
+                   "k8s_namespace"):
+            if _m.get(_k) and not run_meta.get(_k):
+                run_meta[_k] = _m[_k]
+    run_meta.setdefault("run_id", os.path.basename(ts_dir))
     return rp.render_overview(run_meta, scenarios, ov_dir,
                                rel_base=os.path.relpath(
                                    ov_dir, ROOT).replace(os.sep, "/"))
@@ -5741,14 +5783,17 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
     """
     n = get_node(cluster, entry["node"])
     base = entry["_base"]
+    # 收编到该 pod 自己的日志目录（<pod_dir>/<base>.*），现场即一目录全量
+    tgt = _kvtest_pod_base(remote_log_dir, base, n)
+    pod_dir = _kvtest_pod_dir(remote_log_dir, n)
     command = (
-        "summary=OK; samples=MISSING; "
-        "cp '{o}/summary.json' '{d}/{b}.summary.json' 2>/dev/null || "
+        "mkdir -p '{d}'; summary=OK; samples=MISSING; "
+        "cp '{o}/summary.json' '{t}.summary.json' 2>/dev/null || "
         "summary=MISSING; "
-        "cp '{o}/latency_samples.csv' '{d}/{b}.samples.csv' 2>/dev/null "
+        "cp '{o}/latency_samples.csv' '{t}.samples.csv' 2>/dev/null "
         "&& samples=OK; "
         "printf 'summary=%s samples=%s' \"$summary\" \"$samples\""
-    ).format(o=entry["_out_dir"], d=remote_log_dir, b=base)
+    ).format(o=entry["_out_dir"], d=pod_dir, t=tgt)
     last = "not attempted"
     for attempt in range(max(1, int(attempts))):
         try:
@@ -5762,6 +5807,56 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
         if attempt + 1 < attempts and retry_s:
             time.sleep(retry_s)
     return False, last
+
+
+def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
+                             globals_cfg, best_effort=True):
+    """pod 内 tracestats：glog -> <glog>.trace.json（只回传统计，glog 不传输）。
+
+    与 pipeline 的 map 阶段完全一致：--node 由 run_tracestats_map 内部经
+    _node_display 解析（k8s=宿主节点 IP），--pod 自动带 pod 名，因此报表
+    的节点归属是 IP 而不是 pod 名。返回可回传的 trace 路径列表（失败为空）。"""
+    n = get_node(cluster, entry["node"])
+    glog = _kvtest_pod_base(remote_log_dir, entry["_base"], n) + ".log.glog"
+    role = entry.get("_role")
+    if role in ("dual", "", None):
+        role = None
+    try:
+        return run_tracestats_map(
+            cluster, n, [glog], remote_scripts, globals_cfg,
+            node_name=entry["node"], role=role, size=entry.get("_ds"),
+            sample_rate=_hifreq_sample_rate())
+    except Exception as exc:
+        if not best_effort:
+            raise
+        log_detail("[report] kvtest remote trace failed for i{}: {}".format(
+            entry.get("iid"), exc))
+        return []
+
+
+def _kvtest_small_log_bytes(cluster, entry, remote_log_dir):
+    """该实例 .log/.ylt.log/.nohup 的远端字节数（glog 走 trace meta.bytes）。
+
+    只 stat 不传内容；失败按 0 处理（这几个文件通常为空/极小）。"""
+    n = get_node(cluster, entry["node"])
+    pbase = _kvtest_pod_base(remote_log_dir, entry["_base"], n)
+    cmd = ("stat -c %s '{a}.log' '{a}.ylt.log' '{a}.nohup' 2>/dev/null "
+           "| awk '{{s+=$1}} END{{print s+0}}'").format(a=pbase)
+    try:
+        out = ssh_check_output(n["ip"], n, cmd, quiet=True)
+        return int((out or "").strip() or 0)
+    except Exception:
+        return 0
+
+
+def _kvtest_trace_bytes(local_log_dir, base):
+    """本地 trace 产物里的 glog 真实字节数（trace meta.bytes）。"""
+    path = os.path.join(local_log_dir, base + ".log.glog.trace.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int((json.load(f).get("meta") or {}).get("bytes") or 0)
+    except (OSError, ValueError):
+        return 0
 
 
 def _cleanup_kvtest_success_intermediates(log_dir):
@@ -5809,13 +5904,15 @@ def _maybe_cleanup_kvtest_intermediates(log_dir, failed_scenarios,
 
 def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                         cfg_name, local_log_dir, remove_host=None,
-                        remove_node=None, remove_runner=None, globals_cfg=None):
+                        remove_node=None, remove_runner=None, globals_cfg=None,
+                        remote_scripts=None, ts=None, is_k8s=False):
     """Best-effort cleanup after a kvtest scenario failure: graceful /stop
     (flushes summary.json) -> short exit wait -> tree-kill stragglers ->
-    flatten + store remove-all -> pull logs. Mirrors fail_cleanup_pipeline
-    minus the etcd rendezvous wipe (kvtest keeps no rendezvous state)."""
-    log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ..."
-        "".format(cfg_name))
+    flatten + store remove-all -> pull compact artifacts only。原始 log/glog/
+    ylt 一律不传输，留在各节点 hostPath 现场（[FAIL] 给出 ssh 指引）。
+    Mirrors fail_cleanup_pipeline minus the etcd rendezvous wipe."""
+    log("[FAIL] scenario {} failed; collecting compact artifacts "
+        "(raw logs stay on nodes)".format(cfg_name))
     # 1. graceful /stop so summary.json is flushed where still possible
     items = []
     for entry, pid in instance_pids:
@@ -5873,16 +5970,43 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                                     "fail cleanup")
         except Exception as exc:
             log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
-    # 6. Pull stage logs (full cfg prefix) and compact instance artifacts.
-    # Keep these separate: one missing wildcard must not hide the other set.
-    for prefix, label in ((cfg_name, "stage"),
-                          (_kvtest_artifact_prefix(cfg_name), "instance")):
+    # 6. Compact artifacts only（summary/samples/trace）。原始日志不传输：
+    #    k8s 留存于 <host_log_root>/<run_id>/<pod>/，ssh 模式在 remote_log_dir。
+    for entry, _pid in instance_pids:
+        if "node" not in entry:
+            continue
         try:
-            pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name,
-                      local_log_dir, False, remote_prefix=prefix)
+            n = get_node(cluster, entry["node"])
+            pbase = _kvtest_pod_base(remote_log_dir, entry["_base"], n)
+            files = [pbase + ".summary.json", pbase + ".samples.csv"]
+            if remote_scripts and globals_cfg is not None:
+                files.extend(_kvtest_remote_trace_map(
+                    cluster, entry, remote_log_dir, remote_scripts,
+                    globals_cfg, best_effort=True))
+            _pipeline_pull_parallel(
+                cluster, [(n, files, "kvtest i{}".format(entry["iid"]))],
+                local_log_dir, False)
         except Exception as exc:
-            log("[WARN] fail-cleanup: {} log pull failed: {}".format(
-                label, exc))
+            log("[WARN] fail-cleanup: kvtest i{} compact pull failed: {}"
+                .format(entry.get("iid", "?"), exc))
+    # 7. 现场指引：原始日志目录（log/glog/ylt/exitrc 同目录，每 pod 一目录）
+    try:
+        host_root = ""
+        if is_k8s:
+            host_root = (k8s_settings(cluster).get("host_log_root") or "")
+        for node_name in involved_nodes:
+            n = get_node(cluster, node_name)
+            if is_k8s and host_root and ts:
+                where = "{}/{}/{}/".format(host_root.rstrip("/"), ts,
+                                           n.get("_pod") or "<pod>")
+                ssh_to = n.get("host_ip") or n.get("ip") or node_name
+                log("[FAIL] 原始日志现场: ssh {} -> {}".format(ssh_to, where))
+            else:
+                log("[FAIL] 原始日志现场: ssh {} -> {}/".format(
+                    n.get("ip") or node_name,
+                    _kvtest_pod_dir(remote_log_dir, n)))
+    except Exception as exc:
+        log_detail("[FAIL] 现场目录提示失败: {}".format(exc))
 
 
 # kvtest map/reduce: the C++ binary emits request-level samples, so the same
@@ -5900,20 +6024,26 @@ _KVTEST_SAMPLES_RE = re.compile(
 KVTEST_REPORT_META = "kvtest_report_meta.json"
 
 
-def _kvtest_write_report_meta(local_log_dir, cfg):
+def _kvtest_write_report_meta(local_log_dir, cfg, context=None):
     """Persist the run context the report and --rebuild-report need.
 
     Artifact filenames are deliberately compact (no node/pod names) and the
     /start epoch only lives in the orchestrator's memory, so a failed run
-    would otherwise lose node attribution and the sample timeline."""
+    would otherwise lose node attribution and the sample timeline.
+    ``context`` carries the 现场索引 data（run_id / remote_log_dir /
+    host_log_root / k8s_namespace）so the report can point at the on-node
+    log directories without pulling them."""
     payload = {
         "format": "kvtest_report_meta",
         "nodes": cfg.get("_kvtest_nodes"),
         "iid_nodes": cfg.get("_kvtest_iid_nodes") or {},
+        "iid_pods": cfg.get("_kvtest_iid_pods") or {},
         "start_epochs": cfg.get("_kvtest_start_epochs") or {},
         "writer_operation": _kvtest_writer_operation(cfg),
         "reader_operation": _kvtest_reader_operation(cfg),
     }
+    if context:
+        payload.update({k: v for k, v in context.items() if v})
     path = os.path.join(local_log_dir, KVTEST_REPORT_META)
     try:
         tmp = path + ".tmp"
@@ -6024,7 +6154,12 @@ def _kvtest_map_stats(local_log_dir, cfg):
         cfg = dict(cfg, _kvtest_start_epochs=side["start_epochs"])
     if not cfg.get("_kvtest_iid_nodes") and side.get("iid_nodes"):
         cfg = dict(cfg, _kvtest_iid_nodes=side["iid_nodes"])
+    if not cfg.get("_kvtest_iid_pods") and side.get("iid_pods"):
+        cfg = dict(cfg, _kvtest_iid_pods=side["iid_pods"])
     iid_nodes = cfg.get("_kvtest_iid_nodes") or {}
+    iid_pods = cfg.get("_kvtest_iid_pods") or {}
+    remote_log_root = side.get("remote_log_dir") or ""
+    extra_bytes = cfg.get("_kvtest_extra_bytes") or {}
     written = []
     for path in sorted(glob.glob(os.path.join(
             local_log_dir, "*.kvtest_*.samples.csv"))):
@@ -6034,7 +6169,17 @@ def _kvtest_map_stats(local_log_dir, cfg):
         iid = int(match.group("iid"))
         ds = match.group("ds")
         node = iid_nodes.get(str(iid), "i{}".format(iid))
+        pod = iid_pods.get(str(iid), "")
         base = os.path.basename(path)[:-len(".samples.csv")]
+        # 远程路径指向节点现场（不是本地拉回路径）：k8s 为 <pod_dir>/<base>...
+        if remote_log_root:
+            remote_path = ("{}/{}/{}".format(remote_log_root, pod,
+                                             os.path.basename(path))
+                           if pod else
+                           "{}/{}".format(remote_log_root,
+                                          os.path.basename(path)))
+        else:
+            remote_path = path
         summary_path = path[:-len(".samples.csv")] + ".summary.json"
         start = _kvtest_start_epoch(cfg, ds, path, summary_path)
         for role, ops in (("writer", KVTEST_WRITE_OPS),
@@ -6044,8 +6189,8 @@ def _kvtest_map_stats(local_log_dir, cfg):
             if payload is not None:
                 summaries.append(("summary", payload))
             stats = ls.compute_stats(
-                path, top_n=100, context=20, node=node, pod="", role=role,
-                remote_path=path, size=ds,
+                path, top_n=100, context=20, node=node, pod=pod, role=role,
+                remote_path=remote_path, size=ds,
                 rows_factory=lambda p, _ops=ops, _start=start:
                     ls.iter_kvtest_rows(p, _start, _ops),
                 summaries=summaries,
@@ -6061,7 +6206,15 @@ def _kvtest_map_stats(local_log_dir, cfg):
             raw_bytes = _kvtest_instance_log_bytes(local_log_dir, base)
             stats["meta"]["samples_bytes"] = stats["meta"]["bytes"]
             if raw_bytes:
+                # 旧产物 / --rebuild-report 现场有原始日志时以实测为准
                 stats["meta"]["bytes"] = raw_bytes
+            else:
+                # stats-only：glog 真实字节取自 trace meta.bytes（原始 glog
+                # 未拉回），再补 .log/.ylt/.nohup 的远端 stat 字节
+                tbytes = _kvtest_trace_bytes(local_log_dir, base)
+                extra = int(extra_bytes.get(base) or 0)
+                if tbytes or extra:
+                    stats["meta"]["bytes"] = tbytes + extra
             out = "{}.{}.stats.json".format(path, role)
             tmp = out + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -6101,7 +6254,9 @@ def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False):
 
 
 def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
-                         local_log_dir, result_dir, instance_pids, items):
+                         local_log_dir, result_dir, instance_pids, items,
+                         remote_scripts=None, globals_cfg=None, ts=None,
+                         is_k8s=False):
     """Graceful artifact collection for a STOPped kvtest run.
 
     The C++ binary writes latency_samples.csv only while handling /stop, so a
@@ -6134,22 +6289,30 @@ def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
         if not ok:
             log_detail("[STOP] kvtest i{} artifacts: {}".format(
                 entry["iid"], status))
-        files = ["{}/{}.log".format(remote_log_dir, base),
-                 "{}/{}.log.glog".format(remote_log_dir, base),
-                 "{}/{}.summary.json".format(remote_log_dir, base)]
-        if ok:
-            files.append("{}/{}.samples.csv".format(remote_log_dir, base))
         try:
             node_entry = get_node(cluster, entry["node"])
         except Exception:
             node_entry = entry
+        pbase = _kvtest_pod_base(remote_log_dir, base, node_entry)
+        # STOP 与成功路径同策略：只拉 compact（summary/samples/trace），
+        # 原始 log/glog/ylt 留在节点现场（ssh <节点IP> 查看）。
+        files = [pbase + ".summary.json"]
+        if ok:
+            files.append(pbase + ".samples.csv")
+        if remote_scripts and globals_cfg is not None:
+            files.extend(_kvtest_remote_trace_map(
+                cluster, entry, remote_log_dir, remote_scripts,
+                globals_cfg, best_effort=True))
         groups.append((node_entry, files,
                        "kvtest i{}".format(entry["iid"])))
     try:
         _pipeline_pull_parallel(cluster, groups, local_log_dir, False)
     except Exception as exc:
         log("[WARN] [STOP] kvtest artifact pull failed: {}".format(exc))
-    _kvtest_write_report_meta(local_log_dir, cfg)
+    _kvtest_write_report_meta(
+        local_log_dir, cfg,
+        _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s)
+        if ts else None)
     _STOP_CTX["report"] = {
         "cfg": cfg, "cfg_name": cfg_name, "result_dir": result_dir,
         "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
@@ -6366,8 +6529,21 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # the iid -> real node mapping in the in-memory scenario config so CSV
         # aggregation can still resolve node IP/topology after files are
         # pulled into the per-config local directory.
+        def _iid_display_node(entry):
+            """节点显示名 = 节点 IP（k8s=宿主 hostIP）；pod 名单列保存。"""
+            try:
+                n = get_node(cluster, entry["node"])
+                return _node_display(cluster, n, entry["node"])
+            except Exception:
+                return entry["node"]
+
         cfg["_kvtest_iid_nodes"] = {
-            str(entry["iid"]): entry["node"]
+            str(entry["iid"]): _iid_display_node(entry)
+            for entry in plan["writers"] + plan["readers"]
+        }
+        cfg["_kvtest_iid_pods"] = {
+            str(entry["iid"]): (
+                (get_node(cluster, entry["node"]) or {}).get("_pod") or "")
             for entry in plan["writers"] + plan["readers"]
         }
         # report context: node count drives the params card, and the /start
@@ -6478,10 +6654,16 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             base = _kvtest_artifact_base(
                 cfg_name, entry["iid"], entry["port"], ds)
             entry["_base"] = base
-            entry["_out_dir"] = "{}/kvtest_out/{}".format(remote_log_dir, base)
-            cfg_file = "{}/{}.json".format(remote_log_dir, base)
-            log_file = "{}/{}.log".format(remote_log_dir, base)
-            nohup_log = "{}/{}.nohup".format(remote_log_dir, base)
+            entry["_ds"] = ds
+            # 每 pod 独立目录（k8s）：<remote_log_dir>/<pod>/<base>.*；
+            # ssh 模式保持平铺。现场四件套同目录：.log/.log.glog/.ylt.log/.exitrc
+            entry["_pod_dir"] = _kvtest_pod_dir(remote_log_dir, n)
+            log_base = _kvtest_pod_base(remote_log_dir, base, n)
+            entry["_out_dir"] = _pod_base(
+                "{}/kvtest_out/{}".format(remote_log_dir.rstrip("/"), base), n)
+            cfg_file = log_base + ".json"
+            log_file = log_base + ".log"
+            nohup_log = log_base + ".nohup"
             # unique local_hostname port per node (tcp protocol binds it)
             cnt = lhost_counter.get(entry["node"], 0)
             lhost_counter[entry["node"]] = cnt + 1
@@ -6703,7 +6885,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # only there, and the partial HTML report is built from them
                 _kvtest_stop_collect(
                     cluster, cfg, cfg_name, remote_log_dir,
-                    local_log_dir, local_result_dir, instance_pids, items)
+                    local_log_dir, local_result_dir, instance_pids, items,
+                    remote_scripts=remote_scripts,
+                    globals_cfg=globals_cfg, ts=ts, is_k8s=is_k8s)
                 raise
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
@@ -6751,10 +6935,11 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             _exited = sum(1 for exited in _exit_results if exited)
             for (entry, pid), exited in zip(instance_pids, _exit_results):
                 if not dry and pid and exited:
+                    _n = get_node(cluster, entry["node"])
                     _check_exitrc(
                         cluster, entry["node"],
-                        "{}/{}.log.exitrc".format(remote_log_dir,
-                                                  entry["_base"]),
+                        _kvtest_pod_base(remote_log_dir, entry["_base"], _n)
+                        + ".log.exitrc",
                         "kvtest i{}".format(entry["iid"]))
             if not dry:
                 log("kvtest instances exited: {}/{} ({:.1f}s)".format(
@@ -6766,11 +6951,16 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     raise RuntimeError(
                         "kvtest shutdown timed out after two /stop attempts; "
                         "still alive: {}".format(", ".join(_alive)))
-            # ---- flatten artifacts to unique names + pull ----
+            # ---- flatten artifacts + remote trace map + compact pull ----
+            # 对齐 pipeline 的 stats-only 策略：原始 .log（空）与 .log.glog
+            # （可达数百 MB/实例）一律不传输，留在各节点 hostPath 现场；
+            # glog 的 trace 统计在 pod 内算好后只回传小 trace.json。
+            _extra_bytes = {}
             _groups = []
             for entry, _pid in instance_pids:
                 n = get_node(cluster, entry["node"])
                 base = entry["_base"]
+                pbase = _kvtest_pod_base(remote_log_dir, base, n)
                 status = ""
                 if not dry:
                     ok, status = _kvtest_flatten_artifacts(
@@ -6782,13 +6972,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                             "both available after retries: {} in {}"
                             "".format(entry["iid"], status,
                                       entry["_out_dir"]))
-                _files = [
-                    "{}/{}.log".format(remote_log_dir, base),
-                    "{}/{}.log.glog".format(remote_log_dir, base),
-                    "{}/{}.summary.json".format(remote_log_dir, base)]
+                    _trace_files = _kvtest_remote_trace_map(
+                        cluster, entry, remote_log_dir, remote_scripts,
+                        globals_cfg)
+                    _extra_bytes[base] = _kvtest_small_log_bytes(
+                        cluster, entry, remote_log_dir)
+                else:
+                    _trace_files = []
+                # 只请求确实存在的文件（trace map 失败时不拉、不因此判失败）
+                _files = [pbase + ".summary.json"] + list(_trace_files)
                 if dry or "samples=OK" in status:
-                    _files.append("{}/{}.samples.csv".format(
-                        remote_log_dir, base))
+                    _files.append(pbase + ".samples.csv")
                 elif not dry:
                     log("[WARN] kvtest i{} uses an older binary without "
                         "latency_samples.csv; request-level plot unavailable"
@@ -6799,18 +6993,24 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             if not dry:
                 # keep node mapping + this size's /start epoch local for the
                 # report map and for --rebuild-report after a later failure
-                _kvtest_write_report_meta(local_log_dir, cfg)
-            log("logs: {} files / {} instances pulled".format(
-                sum(len(f) for _n, f, _l in _groups), len(_groups)))
+                cfg["_kvtest_extra_bytes"] = _extra_bytes
+                _kvtest_write_report_meta(
+                    local_log_dir, cfg,
+                    _kvtest_report_context(cluster, ts, remote_log_dir,
+                                           is_k8s))
+            log("logs: {} files / {} instances pulled (raw logs stay on "
+                "nodes)".format(sum(len(f) for _n, f, _l in _groups),
+                                len(_groups)))
             # remove empty .nohup redirect files (non-empty kept for
-            # diagnostics and pulled by the {cfg}.* glob)
+            # diagnostics on the node)
             if not dry:
                 for node_name in involved_nodes:
                     n = get_node(cluster, node_name)
-                    nohup_files = ["{}/{}.nohup".format(remote_log_dir,
-                                                        e["_base"])
-                                   for e, _p in instance_pids
-                                   if e["node"] == node_name]
+                    nohup_files = [
+                        _kvtest_pod_base(remote_log_dir, e["_base"], n)
+                        + ".nohup"
+                        for e, _p in instance_pids
+                        if e["node"] == node_name]
                     if nohup_files:
                         cleanup_cmd = ("for f in {}; do [ -s \"$f\" ] || "
                                        "rm -f \"$f\"; done").format(
@@ -6844,7 +7044,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                 remove_host=locals().get("host"),
                                 remove_node=locals().get("primary_node_name"),
                                 remove_runner=locals().get("remote_runner_pipeline"),
-                                globals_cfg=globals_cfg)
+                                globals_cfg=globals_cfg,
+                                remote_scripts=locals().get("remote_scripts"),
+                                ts=locals().get("ts"), is_k8s=is_k8s)
             reap_state_entries(cluster)
             if is_k8s:
                 cluster["_k8s_keep_ns"] = True

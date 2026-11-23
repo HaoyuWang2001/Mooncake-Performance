@@ -369,13 +369,58 @@ def test_kvtest_report_meta_roundtrip(tmp_path):
     assert bm._kvtest_read_report_meta(str(logs)) == {}
     bm._kvtest_write_report_meta(str(logs), {
         "_kvtest_nodes": 3, "_kvtest_iid_nodes": {"1": "nodeB"},
+        "_kvtest_iid_pods": {"1": "pod-b"},
         "_kvtest_start_epochs": {"8MB": START},
-        "writer": {"operation": "upsert"}})
+        "writer": {"operation": "upsert"}},
+        {"run_id": "20261121-1244", "remote_log_dir": "/logs/ts",
+         "host_log_root": "/var/lib/mooncake-bench",
+         "k8s_namespace": "mc-ns"})
     meta = bm._kvtest_read_report_meta(str(logs))
     assert meta["nodes"] == 3
     assert meta["iid_nodes"] == {"1": "nodeB"}
+    assert meta["iid_pods"] == {"1": "pod-b"}
     assert meta["start_epochs"] == {"8MB": START}
     assert meta["writer_operation"] == "upsert"
+    # 现场索引上下文（host 日志根目录 / run id / namespace）
+    assert meta["run_id"] == "20261121-1244"
+    assert meta["remote_log_dir"] == "/logs/ts"
+    assert meta["host_log_root"] == "/var/lib/mooncake-bench"
+    assert meta["k8s_namespace"] == "mc-ns"
+
+
+def test_kvtest_report_field_index_uses_real_host_dir(tmp_path):
+    """现场索引：报告给出逐 pod 的真实现场目录（ssh IP + host 路径），
+    不再输出 <host_log_root>/<run_id> 占位符。"""
+    root = tmp_path / "run"
+    logs = root / "logs" / "kvtest_demo"
+    logs.mkdir(parents=True)
+    _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0])
+    cfg = _cfg(_kvtest_iid_pods={"0": "pod-x"})
+    cfg["__cfg_path__"] = str(tmp_path / "kvtest_demo.json")
+    bm._kvtest_write_report_meta(str(logs), cfg, {
+        "run_id": "20261121-1244",
+        "remote_log_dir": "/workspace/logs/20261121-1244",
+        "host_log_root": "/var/lib/mooncake-bench",
+        "k8s_namespace": "mc-ns"})
+    bm._kvtest_generate_reports(cfg, str(logs), _args())
+    out = logs / "report" / "8MB"
+    meta = json.load(open(out / "meta.json", encoding="utf-8"))
+    assert meta["host_log_root"] == "/var/lib/mooncake-bench"
+    assert meta["run_id"] == "20261121-1244"
+    # 现场目录由报表 JS 依据 D.meta + D.sources 在浏览器端拼接：
+    # data.js 必须带真值（host_log_root / run_id），JS 必须带拼接与登录提示
+    datajs = (out / "data.js").read_text(encoding="utf-8")
+    assert "host_log_root" in datajs and "/var/lib/mooncake-bench" in datajs
+    assert "20261121-1244" in datajs
+    html = (out / "report.html").read_text(encoding="utf-8")
+    assert "现场日志（原始 log/glog/ylt 不拉回" in html
+    assert "kubectl exec -it" in html
+    assert "每个 pod 一个独立目录" in html
+    # overview 的节点日志量说明由 Python 渲染真值
+    overview = bm._render_run_overview(str(root), "kvtest")
+    ov = open(overview, encoding="utf-8").read()
+    assert "/var/lib/mooncake-bench/20261121-1244/" in ov
+    assert "每 pod 一目录" in ov
 
 
 def test_kvtest_map_uses_sidecar_when_cfg_is_gone(tmp_path):

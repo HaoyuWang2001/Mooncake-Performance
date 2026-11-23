@@ -4074,6 +4074,9 @@ function renderErrors(){
 function renderSources(){
   const box=document.getElementById('sources'); box.innerHTML='';
   const nodes=D.nodes||[]; const srcs=D.sources||[];
+  const M=D.meta||{};
+  const hostRoot=M.host_log_root||''; const runId=M.run_id||'';
+  const ns=M.k8s_namespace||''; const remoteDir=M.remote_log_dir||'';
   if(nodes.length){
     const t=el('table'); const thead=el('thead'); const hr=el('tr');
     ['节点','客户端数','日志量'].forEach(function(h,i){
@@ -4085,9 +4088,46 @@ function renderSources(){
       tr.appendChild(el('td','n',String(n.pods)));
       tr.appendChild(el('td','n',fmtBytes(n.bytes))); tb.appendChild(tr);});
     t.appendChild(tb); box.appendChild(t);
-    box.appendChild(el('div','note',
-      '宿主机日志：<host_log_root>/<run_id>/<pod>/（CLEAN-UP 不删除）。'+
-      '登录节点 ssh <node>；进入 pod：kubectl exec -it <pod> -n <ns> -- bash'));
+  }
+  /* 现场日志目录：原始 log/glog/ylt/exitrc 留在节点上（不拉回），
+     这里给出逐 pod 的目录与登录方式（k8s=宿主 IP；ssh=管理 IP）。 */
+  const seen={}; const locs=[];
+  (srcs||[]).forEach(function(x){
+    if(!x||!x.node) return;
+    const key=String(x.node)+'|'+String(x.pod||'');
+    if(seen[key]) return; seen[key]=1; locs.push(x);});
+  if(locs.length){
+    let dir0='';
+    if(hostRoot&&runId) dir0=hostRoot.replace(/\/+$/,'')+'/'+runId;
+    else if(remoteDir) dir0=remoteDir.replace(/\/+$/,'');
+    if(dir0){
+      const t=el('table'); const thead=el('thead'); const hr=el('tr');
+      ['节点(IP)','pod','现场日志目录（log/glog/ylt/exitrc 同目录）','查看']
+        .forEach(function(h,i){hr.appendChild(el('th',i===3?'':'mono',h));});
+      thead.appendChild(hr); t.appendChild(thead); const tb=el('tbody');
+      locs.forEach(function(x){
+        const tr=el('tr');
+        const dir=dir0+(x.pod?('/'+x.pod):'')+'/';
+        const view=x.pod&&ns
+          ? ('ssh '+x.node+'  ⏎  kubectl exec -it '+x.pod+' -n '+ns+' -- bash')
+          : ('ssh '+x.node);
+        tr.appendChild(el('td','mono',String(x.node)));
+        tr.appendChild(el('td','mono',String(x.pod||'-')));
+        tr.appendChild(el('td','mono',dir));
+        tr.appendChild(el('td','mono',view));
+        tb.appendChild(tr);});
+      t.appendChild(tb);
+      const wrapx=el('div','wrapx'); wrapx.appendChild(t);
+      box.appendChild(el('div','note',
+        '现场日志（原始 log/glog/ylt 不拉回，CLEAN-UP 不删除）：'));
+      box.appendChild(wrapx);
+      box.appendChild(el('div','note',
+        '每个 pod 一个独立目录；同目录含 .log/.log.glog/.ylt.log/.exitrc。'));
+    } else {
+      box.appendChild(el('div','note',
+        '宿主机日志：<host_log_root>/<run_id>/<pod>/（CLEAN-UP 不删除）。'+
+        '登录节点 ssh <node>；进入 pod：kubectl exec -it <pod> -n <ns> -- bash'));
+    }
   }
   /* 客户端日志文件已在实例树中给出；这里只保留非客户端产物（trace 等） */
   const others=(srcs||[]).filter(function(x){
@@ -6733,12 +6773,30 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
         for n in nodes)
     body = "".join(cards)
     if node_rows:
+        _root = str(run_meta.get("host_log_root") or "").rstrip("/")
+        _run = str(run_meta.get("run_id") or run_meta.get("run") or "")
+        _rdir = str(run_meta.get("remote_log_dir") or "").rstrip("/")
+        _ns = html.escape(str(run_meta.get("k8s_namespace") or ""), quote=True)
+        if _root and _run:
+            _where = html.escape("{}/{}/<pod>/".format(_root, _run),
+                                 quote=True)
+            _note = ("现场日志（原始 log/glog/ylt 不拉回，每 pod 一目录，"
+                     "同目录含 .log/.log.glog/.ylt.log/.exitrc；"
+                     "CLEAN-UP 不删除）：{}。登录节点 ssh &lt;节点IP&gt;；"
+                     "进入 pod：kubectl exec -it &lt;pod&gt; -n {} -- bash"
+                     .format(_where, _ns or "&lt;ns&gt;"))
+        elif _rdir:
+            _where = html.escape(_rdir + "/", quote=True)
+            _note = ("远端现场日志（原始 log/glog/ylt 不拉回）：{}。"
+                     "登录节点 ssh &lt;节点IP&gt; 查看".format(_where))
+        else:
+            _note = ("宿主机日志：&lt;host_log_root&gt;/&lt;run_id&gt;/&lt;pod&gt;/"
+                     "（CLEAN-UP 不删除）。")
         body += ("<div class='card'><h2>节点日志量</h2><div class='wrapx'>"
                  "<table><thead><tr><th>节点</th><th class='n'>客户端数</th>"
                  "<th class='n'>日志量</th></tr></thead><tbody>" + node_rows +
-                 "</tbody></table></div><div class='note'>宿主机日志："
-                 "&lt;host_log_root&gt;/&lt;run_id&gt;/&lt;pod&gt;/"
-                 "（CLEAN-UP 不删除）。</div></div>")
+                 "</tbody></table></div><div class='note'>" + _note +
+                 "</div></div>")
     subtitle = " · ".join(filter(None, [
         run_meta.get("run"), run_meta.get("mode"),
         ("开始 " + run_meta["started"]) if run_meta.get("started") else "",
