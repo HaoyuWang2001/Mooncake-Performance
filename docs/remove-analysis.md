@@ -102,9 +102,16 @@ benchmark.py main()
 
 `scripts/mooncake_benchmark_client.py`：
 
-- `--scope full` → `store.remove_all(force=True)`；返回 `<0` 判失败 `exit 1`；成功打印 `remove-keys done (scope=full, cleared=N)`（`:401-412`）。
+- `--scope full` → `_remove_all_checked()`：循环 `store.remove_all(force=True)` **直到某轮
+  `cleared==0`**。原因：单次 `remove_all` 只入队 master oplog 放行窗口内的对象
+  （`--oplog_batch_max_entries`，默认 1024），背压下 `TASK_PENDING_LIMIT_EXCEEDED` 的对象被
+  `RemoveTenantObjects` 静默跳过（不重试、不报错、对象元数据保留），因此“RPC 成功”≠“已清空”。
+  默认最多 32 轮、轮间 1s（`--remove-all-max-passes` / `--remove-all-pass-delay`，或 env
+  `MC_REMOVE_ALL_MAX_PASSES` / `MC_REMOVE_ALL_PASS_DELAY`；≤1 = 单次 legacy）。每轮打印
+  `remove-all pass n: cleared=X (total=Y)`；`ret<0` 或超限未收敛 → `exit 1`；收敛后打印
+  `remove-keys done (scope=full, cleared={total}, passes={n})`，META 增加 `passes`。
 - `--scope key-prefix` → `batch_is_exist` + `batch_remove` 按 `key_prefix+scenario+key_count`；结果长度不符或存在失败键 → 打印样本并 `exit 1`（`:413-441`）。
-- `prepare-store` → 先 `store.remove_all(force=True)`，再逐键预填（`:442+`）。
+- `prepare-store` → 先以同一 drain 原语清空（此前是未检查返回值的裸 `remove_all`，两个缺陷一并修复），再逐键预填（`:442+`）。
 
 ---
 

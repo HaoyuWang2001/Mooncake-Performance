@@ -429,17 +429,93 @@ def cmd_generate_data(args):
     emit("META", {"mode": "generate-data", "scenario": args.scenario,
                   "key_count": len(keys), "data_size_bytes": data_size,
                   "value_file": vpath, "keys_file": kpath, "seed": args.data_seed})
+
+
+def _remove_all_settings(args):
+    """(max_passes, pass_delay_s) with env fallbacks for ops-side tuning."""
+    passes = getattr(args, "remove_all_max_passes", None)
+    if passes is None:
+        passes = os.environ.get("MC_REMOVE_ALL_MAX_PASSES", 32)
+    try:
+        passes = int(passes)
+    except (TypeError, ValueError):
+        passes = 32
+    delay = getattr(args, "remove_all_pass_delay", None)
+    if delay is None:
+        delay = os.environ.get("MC_REMOVE_ALL_PASS_DELAY", 1.0)
+    try:
+        delay = float(delay)
+    except (TypeError, ValueError):
+        delay = 1.0
+    return max(1, passes), max(0.0, delay)
+
+
+def _remove_all_until_drained(store, max_passes, pass_delay_s):
+    """Repeat remove_all until a pass clears 0 objects (drained).
+
+    A single remove_all only ENQUEUES the removals admitted by the master's
+    oplog window (``--oplog_batch_max_entries``, default 1024; under
+    backpressure the overflow is skipped internally with no retry and no
+    error). "Success" therefore means "this pass enqueued N removals", not
+    "the store is empty", so we repeat until a pass reports 0.
+
+    Returns ``(passes, total_cleared)``. ``(-1, ret)`` reports a failed RPC;
+    ``(-passes, total)`` reports "still not drained after max_passes"."""
+    passes = 0
+    total = 0
+    while True:
+        ret = store.remove_all(force=True)
+        if ret < 0:
+            return -1, ret
+        passes += 1
+        total += max(ret, 0)
+        log("remove-all pass {}: cleared={} (total={})".format(
+            passes, max(ret, 0), total))
+        if ret == 0:
+            return passes, total
+        if passes >= max_passes:
+            return -passes, total
+        if pass_delay_s > 0:
+            time.sleep(pass_delay_s)
+
+
+def _remove_all_checked(store, args, what):
+    """Drain the whole store or exit 1 (single remove_all is not enough).
+
+    ``max_passes <= 1`` restores the legacy single-call behaviour (accept the
+    first pass's result); the default repeats until a pass clears 0."""
+    max_passes, pass_delay = _remove_all_settings(args)
+    if max_passes <= 1:
+        ret = store.remove_all(force=True)
+        if ret < 0:
+            print("[ERROR] {}: remove_all returned {}".format(what, ret))
+            sys.exit(1)
+        log("remove-all pass 1: cleared={} (total={})".format(
+            max(ret, 0), max(ret, 0)))
+        return 1, max(ret, 0)
+    passes, total = _remove_all_until_drained(store, max_passes, pass_delay)
+    if passes < 0 and total < 0:
+        print("[ERROR] {}: remove_all returned {}".format(what, total))
+        sys.exit(1)
+    if passes < 0:
+        print("[ERROR] {}: store not drained after {} passes ({} objects "
+              "cleared); raise --remove-all-max-passes / "
+              "MC_REMOVE_ALL_MAX_PASSES, or speed up etcd / raise "
+              "--oplog_batch_max_entries".format(what, -passes, total))
+        sys.exit(1)
+    return passes, total
+
+
 def cmd_remove_keys(args, store):
     log("remove-keys start (scope={}, scenario={})".format(args.scope, args.scenario))
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     scope = args.scope
     if scope == "full":
-        ret = store.remove_all(force=True)
-        if ret < 0:
-            print("[ERROR] remove-keys full failed: remove_all returned {}".format(ret))
-            sys.exit(1)
-        log("remove-keys done (scope=full, cleared={})".format(max(ret, 0)))
-        emit("META", {"mode": "remove-keys", "scope": "full", "cleared": max(ret, 0)})
+        passes, total = _remove_all_checked(store, args, "remove-keys full")
+        log("remove-keys done (scope=full, cleared={}, passes={})".format(
+            total, passes))
+        emit("META", {"mode": "remove-keys", "scope": "full",
+                      "cleared": total, "passes": passes})
         return
     existence = store.batch_is_exist(keys)
     statuses = store.batch_remove(keys, force=True)
@@ -472,8 +548,12 @@ def cmd_remove_keys(args, store):
         sys.exit(1)
 def cmd_prepare_store(args, store):
     log("prepare-store start (scenario={})".format(args.scenario))
-    # Force release all segment space before preparing new data
-    store.remove_all(force=True)
+    # Force release all segment space before preparing new data. A single
+    # remove_all can silently skip objects under oplog backpressure, and the
+    # leftover keys would pollute the get-family baseline, so drain fully.
+    _passes, _total = _remove_all_checked(store, args, "prepare-store remove-all")
+    log("prepare-store remove-all done (cleared={}, passes={})".format(
+        _total, _passes))
     value = load_value(args.remote_data_dir, args.scenario)
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     existence = store.batch_is_exist(keys)
@@ -2511,6 +2591,13 @@ def main():
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
     parser.add_argument("--mode", required=True, choices=["generate-data", "remove-keys", "prepare-store", "benchmark", "pipeline"])
     parser.add_argument("--scope", default="key-prefix", choices=["key-prefix", "full"])
+    parser.add_argument("--remove-all-max-passes", type=int, default=None,
+                        help="max remove_all passes until drained (0/1 = legacy "
+                             "single call); env MC_REMOVE_ALL_MAX_PASSES, "
+                             "default 32")
+    parser.add_argument("--remove-all-pass-delay", type=float, default=None,
+                        help="seconds between remove_all passes (0 = none); "
+                             "env MC_REMOVE_ALL_PASS_DELAY, default 1.0")
     parser.add_argument("--client-id", type=int, default=1,
                         help="process instance id within this test run "
                              "(basic: 1..num-clients; pipeline writer: global writer id; "

@@ -674,8 +674,8 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 ### 7.5 测试阶段（--mode）
 
 - `generate-data`：按固定种子生成数据文件并持久化
-- `remove-keys`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`，失败即报错退出，无回退
-- `prepare-store`：`batch_is_exist` 检查存在性，仅对缺失 key 执行 `put_batch` 补写
+- `remove-keys`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`——**单次调用只入队 master oplog 放行窗口内的对象**（`--oplog_batch_max_entries` 默认 1024；背压下溢出对象被静默跳过、不报错），因此客户端**重复调用直到某轮 cleared==0** 才算收敛（默认最多 32 轮、轮间 1s；超限即 `exit 1`）。轮数/间隔可用 `--remove-all-max-passes` / `--remove-all-pass-delay` 或环境变量 `MC_REMOVE_ALL_MAX_PASSES` / `MC_REMOVE_ALL_PASS_DELAY` 调整（≤1 = 单次 legacy 行为）
+- `prepare-store`：先以同一 drain 原语清空（`remove_all` 循环至 cleared==0，失败/未收敛 `exit 1`），再 `batch_is_exist` 检查存在性，仅对缺失 key 执行 `put_batch` 补写
 - `benchmark`：`--warmup true|false`，预热在正式测量前执行小规模运行
 - `pipeline`：生产-消费 pipeline 模式（精排/召排，按 `--role writer|reader` 分派）
 
