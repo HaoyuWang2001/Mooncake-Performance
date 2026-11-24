@@ -37,6 +37,7 @@ SSH 直连裸机节点之外的第二种运行形态：**编排器创建 k8s pod
 | venv | cluster.json `venvs` 直接指向容器内 python（如 `python3`） |
 | reader 健康检查 | 编排机直连 `http://<PodIP>:port/{health,shutdown}`（确认可直连）；SSH 节点保持原 curl 路径 |
 | 进程管理 | `.state` 台账 + reap 走同一传输层（exec kill）；pod 删除是终极兜底 |
+| 节点监控 | profile.json 启用 mem/urma 时额外建 **monitor DaemonSet**（每节点 1 pod，hostPID+privileged，随 run namespace 创建/删除）：宿主内存/进程 + 经 `nsenter`（缺则 `chroot /host`）借用宿主机 mdcli 采 UBPU 端口流量；模板 `configs/_k8s/templates/monitor-daemonset.yaml.tpl`，见 `profiling/README.md` |
 | ub 设备 | **编排器不感知**——按 `templates/benchmark-pod.yaml.tpl` 占位段自行修改（device plugin / privileged+hostNetwork / 镜像内置三选一） |
 
 ## 手动运行（无编排器 / P0 验证）

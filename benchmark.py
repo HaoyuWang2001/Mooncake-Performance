@@ -23,6 +23,7 @@ import posixpath
 import queue
 import re
 import atexit
+import copy
 import shutil
 import signal
 import shlex
@@ -4399,7 +4400,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if matrix and not dry and prof_core:
             try:
                 profile_sess = prof_core.start_profiling(
-                    cluster, matrix, involved_nodes, cfg_name,
+                    cluster, matrix,
+                    _profiling_targets(cluster, matrix, involved_nodes, ts,
+                                       cfg_name, dry),
+                    cfg_name,
                     remote_profiling_dir(remote_log_dir, cfg_name))
             except Exception as exc:
                 log("[WARN] [profile] start failed: {}".format(exc))
@@ -4534,8 +4538,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         echo_cpu_bindings(cfg_name, local_log_dir)
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
-            prof_core.stop_and_collect(cluster, profile_sess,
-                                       os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+            _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
+                            dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -4561,8 +4565,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             else:
                 # profiling collect BEFORE the report so monitor CSVs reach it
                 if profile_sess is not None:
-                    prof_core.stop_and_collect(cluster, profile_sess,
-                                               os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+                    _stop_profiling(cluster, profile_sess, local_result_dir,
+                                    cfg_name, dry=dry)
                 _generate_reports(cfg, local_log_dir, args, early_stop=True,
                                   nodes=len(involved_nodes),
                                   qps_target=total_target_qps, mode="basic")
@@ -4923,6 +4927,268 @@ def _k8s_deployment_pods(cluster, run_label, role):
         raise RuntimeError("cannot list pods (run={}, role={}): {}".format(
             run_label, role, out.strip()[:200]))
     return sorted(p for p in out.split() if p)
+
+
+# --------------------------------------------------------------------------
+# node-level monitors (k8s): per-run monitor DaemonSet
+# --------------------------------------------------------------------------
+# start_profiling targets "nodes". In k8s mode the run's nodes are PODS, so
+# the mem/urma samplers would run once per pod inside containers: host memory
+# numbers survive (container /proc + /sys are host views) but process
+# visibility is per-pod and mdcli (installed on the NODE, never in the
+# benchmark image) is unreachable. This DaemonSet gives every node exactly one
+# monitor pod that
+#   - runs with hostPID (mem.proc sees every host process)
+#   - is privileged and borrows the node-installed tools via nsenter/chroot
+#     (`_host_exec` prefix, default "nsenter -t 1 -m -n --")
+#   - mounts the same per-run hostPath log root as the benchmark pods, so the
+#     sampler scripts and CSVs land on node disk and the existing collect /
+#     report.reduce_monitors path works unchanged.
+# The sampler loop itself stays INSIDE the container (only each mdcli call
+# crosses into the host), so pod deletion / namespace teardown always kills
+# it — no orphan host process to reap.
+_K8S_MONITOR_TIMEOUT_S = 60
+
+
+def _monitor_template_path(cluster):
+    k8s = cluster.get("k8s") or {}
+    return k8s.get("monitor_template") or os.path.join(
+        CONFIGS_DIR, "_k8s", "templates", "monitor-daemonset.yaml.tpl")
+
+
+def _render_monitor_daemonset_yaml(cluster, ts, cfg_name):
+    k8s = k8s_settings(cluster)
+    run_label = k8s_run_label(ts, cfg_name)
+    name = (k8s_pod_name(ts, cfg_name) + "-monitor")[:63].strip("-")
+    with open(_monitor_template_path(cluster), "r", encoding="utf-8") as f:
+        text = f.read()
+    repl = {
+        "{{MC_MONITOR_NAME}}": name,
+        "{{MC_NAMESPACE}}": k8s["namespace"],
+        "{{MC_RUN_LABEL}}": run_label,
+        "{{MC_IMAGE}}": k8s["image"],
+        "{{MC_HOST_LOG_DIR}}": host_log_dir(cluster, ts),
+        "{{MC_LOG_MOUNT}}": k8s["pod_workspace"] + "/logs/" + ts,
+    }
+    for key, val in repl.items():
+        text = text.replace(key, val)
+    if "{{MC_" in text:
+        raise RuntimeError("monitor DaemonSet template has unresolved "
+                           "{{MC_*}} placeholders")
+    return name, run_label, text
+
+
+def _k8s_monitor_pods(cluster, run_label):
+    """[(pod, phase, podIP, hostIP, nodeName)] of the monitor DaemonSet."""
+    c = cluster["_controller"]
+    ns = k8s_settings(cluster)["namespace"]
+    out, rc = controller_run(
+        c, ["-n", ns, "get", "pods", "-l",
+            "app=mooncake-bench-monitor,run={}".format(run_label), "-o",
+            "jsonpath={range .items[*]}{.metadata.name}{'|'}"
+            "{.status.phase}{'|'}{.status.podIP}{'|'}{.status.hostIP}{'|'}"
+            "{.spec.nodeName}{'\\n'}{end}"], check=False)
+    if rc != 0:
+        raise RuntimeError("cannot list monitor pods (run={}): {}".format(
+            run_label, out.strip()[:200]))
+    pods = []
+    for line in out.strip().splitlines():
+        parts = line.split("|")
+        if len(parts) >= 5 and parts[0]:
+            pods.append(tuple(parts[:5]))
+    return pods
+
+
+def _wait_monitor_daemonset_ready(cluster, name, ns, timeout=None,
+                                  poll=2.0):
+    """Poll the DaemonSet until numberReady == desiredNumberScheduled."""
+    if timeout is None:
+        timeout = _K8S_MONITOR_TIMEOUT_S
+    c = cluster["_controller"]
+    deadline = time.time() + timeout
+    ready, want = 0, 0
+    while True:
+        out, _ = controller_run(
+            c, ["-n", ns, "get", "daemonset", name, "-o",
+                "jsonpath={.status.numberReady} {.status.desiredNumberScheduled}"],
+            check=False)
+        toks = out.split()
+        try:
+            ready, want = int(toks[0]), int(toks[1])
+        except (IndexError, ValueError):
+            ready, want = 0, 0
+        if want and ready >= want:
+            return
+        if time.time() >= deadline:
+            tail = ""
+            try:
+                pods = controller_run(
+                    c, ["-n", ns, "get", "pods", "-l",
+                        "app=mooncake-bench-monitor",
+                        "-o", "wide"], check=False)[0]
+                tail = pods.strip()[-1200:]
+                events = _k8s_all_events(c, ns)
+                if events:
+                    tail += "\n" + "\n".join(events[-15:])
+            except Exception:
+                pass
+            raise RuntimeError(
+                "monitor DaemonSet {} not ready in {}s ({}/{} pods ready)\n{}"
+                .format(name, int(timeout), ready, want, tail))
+        time.sleep(poll)
+
+
+def ensure_k8s_monitor_daemonset(cluster, ts, cfg_name, involved_nodes,
+                                 dry_run=False):
+    """Create the per-config node-monitor DaemonSet and return its pseudo-node
+    names (one per host, so start_profiling gets node-level targets)."""
+    cache = cluster.setdefault("_k8s_monitor_by_cfg", {})
+    if cfg_name in cache:
+        return list(cache[cfg_name])
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    ns = k8s["namespace"]
+    name, run_label, yaml_text = _render_monitor_daemonset_yaml(
+        cluster, ts, cfg_name)
+    ds_names = cluster.setdefault("_k8s_monitor_ds", [])
+    if name not in ds_names:
+        ds_names.append(name)
+    involved_nodes = list(involved_nodes or [])
+    if dry_run:
+        log("[k8s] (dry-run) would create monitor DaemonSet {} (ns={})"
+            .format(name, ns))
+        cache[cfg_name] = involved_nodes
+        return involved_nodes
+    # one monitor per DISTINCT host: this is the whole point (pod-level
+    # fallback still works if the DaemonSet cannot start)
+    hosts = set()
+    for node_name in involved_nodes:
+        try:
+            n = get_node(cluster, node_name)
+        except Exception:
+            continue
+        if n.get("host_ip"):
+            hosts.add(n["host_ip"])
+    import tempfile
+    local_dir = tempfile.mkdtemp(prefix="mc-monitor-")
+    local_yaml = os.path.join(local_dir, name + ".yaml")
+    try:
+        with open(local_yaml, "w", encoding="utf-8", newline="\n") as f:
+            f.write(yaml_text)
+        yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
+        controller_put(c, [local_yaml], yaml_dir)
+        remote_yaml = posixpath.join(yaml_dir, name + ".yaml")
+        log_detail("[k8s] monitor DaemonSet manifest: template={} -> {}:{}"
+                   .format(os.path.relpath(_monitor_template_path(cluster),
+                                           ROOT),
+                           controller_desc(c), remote_yaml))
+        out, rc = controller_run(
+            c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
+        if rc != 0:
+            raise RuntimeError("kubectl apply failed for monitor DaemonSet "
+                               "{}: {}".format(name, out.strip()[:400]))
+    finally:
+        shutil.rmtree(local_dir, ignore_errors=True)
+    t0 = time.time()
+    _wait_monitor_daemonset_ready(cluster, name, ns)
+    # host-side tool wrapper: nsenter borrows the node binaries/libs/devices
+    # (chroot /host is the lower-privilege fallback; "" = pod-only)
+    host_exec = str(k8s.get("monitor_host_exec",
+                            "nsenter -t 1 -m -n --") or "").strip()
+    nodes = []
+    for pod, phase, pod_ip, host_ip, node_name in _k8s_monitor_pods(
+            cluster, run_label):
+        if phase != "Running":
+            continue
+        if hosts and host_ip and host_ip not in hosts:
+            continue
+        cluster.setdefault("nodes", {})[pod] = {
+            "kind": "k8s-pod", "_pod": pod, "_ns": ns,
+            "_ctx": c.get("_ctx", ""), "_controller": c,
+            "_controller_workspace": k8s.get("controller_workspace", ""),
+            "_run_label": run_label, "_role": "monitor", "_monitor": True,
+            "_node_name": node_name, "_host_exec": host_exec,
+            "ip": pod_ip or host_ip, "fabric_ip": pod_ip or "",
+            "host_ip": host_ip}
+        nodes.append(pod)
+    if not nodes:
+        raise RuntimeError(
+            "monitor DaemonSet {} has no Running pods".format(name))
+    cache[cfg_name] = list(nodes)
+    log("[k8s] 节点级监控 DaemonSet {} 就绪: {} Pod / {} 节点 @{:.1f}s{}"
+        .format(name, len(nodes),
+                len({(cluster["nodes"].get(p) or {}).get("host_ip")
+                     for p in nodes}),
+                time.time() - t0,
+                "（宿主工具经 {!r} 借用）".format(host_exec)
+                if host_exec else "（仅容器内工具）"))
+    return list(nodes)
+
+
+def _delete_monitor_daemonset(cluster, dry_run=False):
+    """Delete the per-config monitor DaemonSet(s) and drop their pseudo-nodes.
+    Never raises (profiling must not affect the measurement path)."""
+    names = cluster.pop("_k8s_monitor_ds", None) or []
+    cluster.pop("_k8s_monitor_by_cfg", None)
+    c = cluster.get("_controller")
+    if c is not None and names:
+        try:
+            ns = k8s_settings(cluster)["namespace"]
+        except Exception:
+            ns = ""
+        for name in names:
+            if dry_run:
+                log("[k8s] (dry-run) would delete DaemonSet {} (ns={})"
+                    .format(name, ns))
+                continue
+            controller_run(c, ["-n", ns, "delete", "daemonset", name,
+                               "--ignore-not-found=true"], check=False)
+            log("[k8s] delete DaemonSet {} (ns={})".format(name, ns))
+    for key in [k for k, v in (cluster.get("nodes") or {}).items()
+                if (v or {}).get("_monitor")]:
+        cluster["nodes"].pop(key, None)
+
+
+def _profiling_targets(cluster, matrix, involved_nodes, ts, cfg_name,
+                       dry=False):
+    """Pick the nodes start_profiling should target.
+
+    ssh mode: unchanged involved nodes.
+    k8s mode: one monitor DaemonSet pod per HOST (node-level mem + host
+    mdcli); falls back to the involved pods (pod-level) when the DaemonSet
+    cannot be created — profiling must never fail the scenario."""
+    if not matrix or prof_core is None:
+        return involved_nodes
+    tools = matrix.get("tools") or {}
+    if not any((tools.get(t) or {}).get("enabled")
+               for t in prof_core.MONITOR_ARTIFACTS):
+        return involved_nodes
+    if cluster.get("_controller") is None:
+        return involved_nodes
+    try:
+        return ensure_k8s_monitor_daemonset(
+            cluster, ts, cfg_name, involved_nodes, dry)
+    except Exception as exc:
+        log("[WARN] [profile] monitor DaemonSet unavailable -> falling back "
+            "to pod-level monitors: {}".format(exc))
+        return involved_nodes
+
+
+def _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
+                    dry=False):
+    """Stop samplers, collect artifacts, then tear down the monitor DaemonSet.
+    Never raises (same WARN-only contract as prof_core itself)."""
+    try:
+        if profile_sess is not None and prof_core is not None:
+            prof_core.stop_and_collect(
+                cluster, profile_sess,
+                os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+    except Exception as exc:
+        log("[WARN] [profile] stop/collect failed: {}".format(exc))
+    try:
+        _delete_monitor_daemonset(cluster, dry_run=dry)
+    except Exception as exc:
+        log("[WARN] [profile] monitor DaemonSet teardown failed: {}".format(exc))
 
 
 def _pipeline_reader_launch_cmd(launch_prefix, remote_runner, merged_log,
@@ -5308,7 +5574,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 if matrix.get("trigger", "whole_run") == "whole_run":
                     try:
                         profile_sess = prof_core.start_profiling(
-                            cluster, matrix, involved_nodes, cfg_name,
+                            cluster, matrix,
+                            _profiling_targets(cluster, matrix,
+                                               involved_nodes, ts, cfg_name,
+                                               dry),
+                            cfg_name,
                             remote_profiling_dir(remote_log_dir, cfg_name))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
@@ -5539,7 +5809,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     # per_stage trigger: profiling starts at the measurement window
                     try:
                         profile_sess = prof_core.start_profiling(
-                            cluster, matrix, involved_nodes, cfg_name,
+                            cluster, matrix,
+                            _profiling_targets(cluster, matrix,
+                                               involved_nodes, ts, cfg_name,
+                                               dry),
+                            cfg_name,
                             remote_profiling_dir(remote_log_dir, cfg_name))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
@@ -5769,8 +6043,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             state_remove_cfg(cfg_name)
         # profiling: stop sampling + spdiag show + collect (never raises)
         if profile_sess is not None:
-            prof_core.stop_and_collect(cluster, profile_sess,
-                                       os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+            _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
+                            dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -5809,8 +6083,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       failed_stage=stage)
                 # profiling collect BEFORE the report so monitor CSVs reach it
                 if profile_sess is not None:
-                    prof_core.stop_and_collect(cluster, profile_sess,
-                                               os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+                    _stop_profiling(cluster, profile_sess, local_result_dir,
+                                    cfg_name, dry=dry)
                 _generate_reports(cfg, local_log_dir, args, early_stop=True,
                                   nodes=len(involved_nodes),
                                   qps_target=plan["total_qps"],
@@ -6954,6 +7228,24 @@ def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
         os.path.relpath(local_log_dir, ROOT)))
 
 
+def _kvtest_monitor_matrix(matrix, kv_binary):
+    """kvtest runs mooncake_kvtest, not the python benchmark client: when the
+    profile keeps the monitor default, retarget process-memory sampling at the
+    kvtest binary (an explicit proc_pattern always wins).
+
+    Returns a COPY: args._matrix is shared by every config in a multi-config
+    run, so a kvtest retarget must never leak into a later basic/pipeline
+    config."""
+    if not matrix:
+        return matrix
+    out = copy.deepcopy(matrix)
+    mem_cfg = (out.get("tools") or {}).get("mem")
+    if mem_cfg is not None and str(mem_cfg.get("proc_pattern") or "") \
+            in ("", "mooncake_benchmark_client"):
+        mem_cfg["proc_pattern"] = os.path.basename(str(kv_binary))
+    return out
+
+
 def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     """kvtest orchestration: deploy the C++ mooncake_kvtest instances with
     either a dual process per client pod, a co-located split writer/reader
@@ -6979,6 +7271,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     dry = args.dry_run
     work_mode = cfg.get("work_mode", cfg.get("mode", ""))
     is_k8s = cluster.get("_controller") is not None
+    matrix = getattr(args, "_matrix", None)
+    profile_sess = None  # profiling session (node monitors; started below)
     # ---- cluster-oriented node set (same as pipeline) ----
     if is_k8s:
         k8s_nodes = _k8s_pipeline_nodes(cluster, dry)
@@ -7030,6 +7324,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         raise RuntimeError("kvtest reader operation must be one of {} (got {})"
                            "".format(sorted(KVTEST_READER_OPS), reader_op))
     kv_binary = (cfg.get("kvtest", {}) or {}).get("binary", "mooncake_kvtest")
+    matrix = _kvtest_monitor_matrix(matrix, kv_binary)
     # health gate budget: covers the C++ store client setup (ub can take
     # tens of seconds); same knob as the pipeline rendezvous timeout
     health_timeout_s = int(globals_cfg.get("rendezvous_timeout_s", 120) or 120)
@@ -7444,6 +7739,19 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             all_instances = _instance_view()
             lhost_counter = {}
             log_phase("启动实例", level=2)
+            # profiling lifecycle: whole_run covers instance boot + health
+            # gates; per_stage starts at the measurement window (below)
+            if (matrix and not dry and prof_core and profile_sess is None
+                    and matrix.get("trigger", "whole_run") == "whole_run"):
+                try:
+                    profile_sess = prof_core.start_profiling(
+                        cluster, matrix,
+                        _profiling_targets(cluster, matrix, involved_nodes,
+                                           ts, cfg_name, dry),
+                        cfg_name,
+                        remote_profiling_dir(remote_log_dir, cfg_name))
+                except Exception as exc:
+                    log("[WARN] [profile] start failed: {}".format(exc))
             if plan.get("dual"):
                 stage = "launch dual instances ({})".format(ds)
                 # one process hosts writer+reader: prepare all configs (and
@@ -7520,6 +7828,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         1.0, max(0.05, seconds - (time.time() - started))))
 
             log_phase("测量", level=2)
+            if matrix and not dry and prof_core and profile_sess is None:
+                # per_stage trigger: profiling starts at the measurement window
+                try:
+                    profile_sess = prof_core.start_profiling(
+                        cluster, matrix,
+                        _profiling_targets(cluster, matrix, involved_nodes,
+                                           ts, cfg_name, dry),
+                        cfg_name,
+                        remote_profiling_dir(remote_log_dir, cfg_name))
+                except Exception as exc:
+                    log("[WARN] [profile] start failed: {}".format(exc))
             stage = "/start ({})".format(ds)
             try:
                 _parallel_start_barrier(args)
@@ -7570,6 +7889,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     local_log_dir, local_result_dir, instance_pids, items,
                     remote_scripts=remote_scripts,
                     globals_cfg=globals_cfg, ts=ts, is_k8s=is_k8s)
+                # node monitors: stop + collect so the STOP partial report
+                # (reduce_monitors) sees the samples too
+                if profile_sess is not None:
+                    _stop_profiling(cluster, profile_sess, local_result_dir,
+                                    cfg_name, dry=dry)
+                    profile_sess = None
                 raise
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
@@ -7778,6 +8103,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                        "rm -f \"$f\"; done").format(
                                            " ".join(nohup_files))
                         ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
+        # profiling: stop sampling + collect (never raises); also tears down
+        # the node-monitor DaemonSet
+        if profile_sess is not None:
+            _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
+                            dry=dry)
+            profile_sess = None
         # Config end: remove-all — clears everything this config's writers
         # wrote (kvtest keys share the store with nothing else here)
         stage = "remove-keys (config end)"
@@ -7817,6 +8148,11 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                     remote_scripts=locals().get("remote_scripts"),
                                     ts=locals().get("ts"), is_k8s=is_k8s,
                                     failed_stage=stage)
+                # profiling collect BEFORE the report chain so monitor CSVs
+                # reach reduce_monitors (same contract as pipeline/basic)
+                if profile_sess is not None:
+                    _stop_profiling(cluster, profile_sess, local_result_dir,
+                                    cfg_name, dry=dry)
                 reap_state_entries(cluster)
             if is_k8s:
                 cluster["_k8s_keep_ns"] = True
@@ -7948,6 +8284,8 @@ def cleanup_pods(cluster, involved_nodes, dry_run):
     c = cluster.get("_controller")
     if c is None:
         return
+    # safety net: the monitor DaemonSet normally goes away in _stop_profiling
+    _delete_monitor_daemonset(cluster, dry_run=dry_run)
     k8s = k8s_settings(cluster)
     ns = k8s["namespace"]
     # pipeline Deployments must be deleted AS OBJECTS (deleting their pods

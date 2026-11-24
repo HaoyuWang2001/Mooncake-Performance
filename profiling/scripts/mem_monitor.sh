@@ -62,7 +62,19 @@ while true; do
   fi
 
   # ---- per-process memory (benchmark clients by default) ----
-  for pid in $(pgrep -f "$PROC_PATTERN" 2>/dev/null); do
+  # pgrep 来自 procps；精简镜像（k8s 监控 pod）缺失时回退扫描 /proc/*/cmdline
+  if command -v pgrep >/dev/null 2>&1; then
+    pids=$(pgrep -f "$PROC_PATTERN" 2>/dev/null)
+  else
+    pids=""
+    for _d in /proc/[0-9]*; do
+      [ -r "$_d/cmdline" ] || continue
+      if tr '\0' ' ' < "$_d/cmdline" 2>/dev/null | grep -qF -- "$PROC_PATTERN"; then
+        pids="$pids ${_d#/proc/}"
+      fi
+    done
+  fi
+  for pid in $pids; do
     [ -r "/proc/$pid/smaps_rollup" ] || continue
     comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
     rss=0; pss=0; pd=0; pc=0; sw=0

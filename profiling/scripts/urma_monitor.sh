@@ -11,13 +11,17 @@
 # URMA monitoring silently stays off on hosts without the tool.
 #
 # env: OUT_DIR (required), INTERVAL_S (default 1), SLOT (default 2),
-#      UBPUS (space-separated, default "0 1")
+#      UBPUS (space-separated, default "0 1"),
+#      MDCLI_BIN (default "mdcli"; k8s 节点级监控设成
+#                 "nsenter -t 1 -m -n -- mdcli" / "chroot /host mdcli"
+#                 以借用宿主机安装的 mdcli——镜像里不装同名工具)
 set -u
 
 OUT_DIR="${OUT_DIR:?OUT_DIR required}"
 INTERVAL_S="${INTERVAL_S:-1}"
 SLOT="${SLOT:-2}"
 UBPUS="${UBPUS:-0 1}"
+MDCLI_BIN="${MDCLI_BIN:-mdcli}"
 
 CSV="$OUT_DIR/urma.flits.csv"
 ERR_LOG="$OUT_DIR/urma.err.log"
@@ -28,7 +32,7 @@ mkdir -p "$OUT_DIR"
 while true; do
   for UBPU in $UBPUS; do
     CMD="display diagnose/forward-enp-informations/forward-enp-information[slot=\"$SLOT\"][ubpu=$UBPU][enp-name=\"get port statistic all\"]"
-    OUTPUT=$(echo "$CMD" | mdcli 2>&1)
+    OUTPUT=$(echo "$CMD" | $MDCLI_BIN 2>&1)
     DATA=$(echo "$OUTPUT" | awk 'NF == 7 && $1 ~ /^[0-9]+$/ {print $1, $4, $5}')
     ts_ns=$(date +%s%N)
 

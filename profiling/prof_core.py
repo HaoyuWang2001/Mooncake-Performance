@@ -107,7 +107,17 @@ def _profiling_nodes(cluster, matrix, involved_nodes):
         return list(involved_nodes)
     names = spec if isinstance(spec, list) else [spec]
     known = cluster.get("nodes") or {}
-    return [n for n in names if n in known] or list(involved_nodes)
+
+    def _matches(name):
+        if name in names:
+            return True
+        n = known.get(name) or {}
+        return any(want in (name, n.get("ip"), n.get("host_ip"),
+                            n.get("_node_name"))
+                   for want in names)
+
+    picked = [name for name in known if _matches(name)]
+    return picked or list(involved_nodes)
 
 
 def _ledger_row(ip, node_name, pid, label, marker, cfg_name):
@@ -161,9 +171,19 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
             if not tcfg.get("enabled"):
                 continue
             try:
-                # presence probe (absolute bin path checked directly)
+                # presence probe (absolute bin path checked directly).
+                # Monitor-DaemonSet pseudo-nodes (_host_exec) probe the HOST
+                # binary through the nsenter/chroot wrapper: mdcli is installed
+                # on the node, never in the benchmark image.
                 probe = tcfg.get("bin", "")
-                if probe.startswith("/"):
+                host_exec = str(n.get("_host_exec") or "").strip()
+                if host_exec:
+                    present = _run(
+                        ip, n,
+                        "{} bash -c {} >/dev/null 2>&1 && echo OK || echo MISSING"
+                        .format(host_exec,
+                                shlex.quote("command -v {}".format(probe))))
+                elif probe.startswith("/"):
                     present = _run(ip, n, "test -x {} && echo OK || echo MISSING".format(probe))
                 else:
                     present = _run(ip, n, "command -v {} >/dev/null 2>&1 && echo OK || echo MISSING".format(probe))
@@ -218,6 +238,12 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                         if isinstance(ubpus, (list, tuple)):
                             ubpus = " ".join(str(u) for u in ubpus)
                         envs.append("UBPUS={}".format(shlex.quote(str(ubpus))))
+                        if host_exec:
+                            # borrow the node-installed mdcli through the
+                            # nsenter/chroot wrapper (image has no mdcli)
+                            envs.append("MDCLI_BIN={}".format(shlex.quote(
+                                "{} {}".format(host_exec,
+                                               tcfg.get("bin", "mdcli")))))
                     out_file = "{}/{}.err.log".format(remote_out_dir, tool)
                     sudo_prefix = "sudo -n " if tcfg.get("sudo") else ""
                     cmd = "nohup {}env {} bash {} > {} 2>&1 & echo $!".format(
