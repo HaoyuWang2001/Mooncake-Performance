@@ -915,6 +915,39 @@ def _wait_store_released(cluster, globals_cfg, cfg_name, when):
     return _verify_store_clean(cluster, globals_cfg, cfg_name, when)
 
 
+def _remove_keys_stage(cluster, globals_cfg, host, node, runner,
+                       remote_log_dir, cfg_name, log_name, scope, when,
+                       dry=False, pull_to=None, node_name=None, label=None):
+    """The single orchestrator entry for every remove-keys execution.
+
+    Wraps the gates around the one execution path:
+      1. pre-check skip: store already clean -> skip outright (both scopes;
+         never skipped when the metrics probe is unavailable).
+      2. run_stage: one command/log composition for every call site.
+      3. oplog release wait + terminal verify: full scope only — key-prefix
+         names keys in a potentially shared store and can never drain it to
+         zero, so it gets the pre-check but no wait.
+
+    ``globals_cfg=None`` (fail-cleanup without a metrics config) degrades to
+    a plain ungated stage. Returns True when the stage ran, False when the
+    pre-check skipped it.
+    """
+    if dry:
+        run_stage(host, node, runner, "remove-keys", remote_log_dir, log_name,
+                  extra="--scope " + scope, dry_run=True, pull_to=pull_to,
+                  cfg_name=cfg_name, node_name=node_name, label=label)
+        return True
+    if globals_cfg is not None and _remove_keys_precheck(
+            cluster, globals_cfg, cfg_name, when):
+        return False
+    run_stage(host, node, runner, "remove-keys", remote_log_dir, log_name,
+              extra="--scope " + scope, dry_run=False, pull_to=pull_to,
+              cfg_name=cfg_name, node_name=node_name, label=label)
+    if scope == "full" and globals_cfg is not None:
+        _wait_store_released(cluster, globals_cfg, cfg_name, when)
+    return True
+
+
 def _basic_store_check(globals_cfg, cfg):
     """basic mode: total key space (key_count x data_size, shared across
     clients) must be strictly smaller than store_total_size when that is
@@ -3800,22 +3833,19 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
         if str(failed_stage).startswith("remove-keys"):
             log("[FAIL] store remove-all skipped (failing stage was {})"
                 .format(failed_stage))
-        elif globals_cfg is not None and _remove_keys_precheck(
-                cluster, globals_cfg, cfg_name, "fail cleanup"):
-            log("[FAIL] fail-cleanup: store already clean — "
-                "remove-all skipped")
         else:
             try:
-                run_stage(remove_host, get_node(cluster, remove_node),
-                          remove_runner, "remove-keys", remote_log_dir,
-                          cfg_name, extra="--scope full", dry_run=False,
-                          node_name=remove_node,
-                          label="{} (fail-cleanup remove-all)".format(
-                              cfg_name))
-                log("[FAIL] fail-cleanup: store remove-all issued")
-                if globals_cfg is not None:
-                    _wait_store_released(cluster, globals_cfg, cfg_name,
-                                         "fail cleanup")
+                ran = _remove_keys_stage(
+                    cluster, globals_cfg, remove_host,
+                    get_node(cluster, remove_node), remove_runner,
+                    remote_log_dir, cfg_name, cfg_name, "full", "fail cleanup",
+                    dry=False, node_name=remove_node,
+                    label="{} (fail-cleanup remove-all)".format(cfg_name))
+                if ran:
+                    log("[FAIL] fail-cleanup: store remove-all issued")
+                else:
+                    log("[FAIL] fail-cleanup: store already clean — "
+                        "remove-all skipped")
             except Exception as exc:
                 log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
     # 5. wipe this run's etcd rendezvous prefix
@@ -4209,15 +4239,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             "involved_nodes": involved_nodes, "mode": "basic",
         }
         stage = "remove-keys (pre-run)"
-        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
-                                            "pre-run"):
-            run_stage(host, node, remote_runner,
-                      "remove-keys", remote_log_dir, cfg_name,
-                      extra="--scope full", dry_run=dry, pull_to=local_log_dir,
-                      node_name=primary_node_name)
-            if not dry:
-                _wait_store_released(cluster, globals_cfg, cfg_name,
-                                     "pre-run")
+        _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
+                           remote_log_dir, cfg_name, cfg_name, "full",
+                           "pre-run", dry=dry, pull_to=local_log_dir,
+                           node_name=primary_node_name)
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_remove_before_run = op in PIPELINE_PUT_IFACES or "/" in op
@@ -4297,16 +4322,11 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 current_ds = ds
             if need_remove_before_run:
                 stage = "remove-keys (run {}, {})".format(c, ds)
-                if dry or not _remove_keys_precheck(
-                        cluster, globals_cfg, cfg_name, stage):
-                    run_stage(host, node, remote_runner,
-                              "remove-keys", remote_log_dir, cfg_name,
-                              extra="--scope full", dry_run=dry,
-                              pull_to=local_log_dir,
-                              node_name=primary_node_name)
-                    if not dry:
-                        _wait_store_released(cluster, globals_cfg, cfg_name,
-                                             stage)
+                _remove_keys_stage(cluster, globals_cfg, host, node,
+                                   remote_runner, remote_log_dir, cfg_name,
+                                   cfg_name, "full", stage, dry=dry,
+                                   pull_to=local_log_dir,
+                                   node_name=primary_node_name)
             # data_size is always part of the run file name, so different
             # sizes under the same (c, t) never collide
             name = "benchmark_c{}_t{}_{}".format(c, t, ds)
@@ -4392,12 +4412,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # name is distinct (<cfg>.remove-keys-end.log) so it sits next to the
         # config-start remove-keys log instead of overwriting it.
         stage = "remove-keys (config end)"
-        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
-                                            "config end"):
-            remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
-                                             "remove-keys-end", node)
-            command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
-            run_ssh(host, node, command, dry_run=dry)
+        _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
+                           remote_log_dir, cfg_name, "remove-keys-end",
+                           "key-prefix", "config end", dry=dry)
         # raw-log full pull only on explicit request (stats already pulled
         # per run combo; failure paths pull raw for diagnosis separately)
         if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
@@ -5161,16 +5178,11 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             kc = _caps[ds]
             kc_arg = " --key-count {}".format(kc)
             stage = "remove-keys (pre-run, {})".format(ds)
-            if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
-                                                stage):
-                run_stage(host, node, remote_runner,
-                          "remove-keys", remote_log_dir, cfg_name,
-                          extra="--scope full", dry_run=dry,
-                          pull_to=local_log_dir,
-                          node_name=primary_node_name)
-                if not dry:
-                    _wait_store_released(cluster, globals_cfg, cfg_name,
-                                         "{} start".format(ds))
+            _remove_keys_stage(cluster, globals_cfg, host, node,
+                               remote_runner, remote_log_dir, cfg_name,
+                               cfg_name, "full", "{} start".format(ds),
+                               dry=dry, pull_to=local_log_dir,
+                               node_name=primary_node_name)
             # fresh rendezvous state per size iteration (stale registrations
             # from a previous size must never leak into this one)
             reader_pids = []
@@ -5623,15 +5635,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # enough. The log name is distinct (<cfg>.remove-keys-end.log) so it
         # sits next to the config-start remove-keys log.
         stage = "remove-keys (config end)"
-        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
-                                            "config end"):
-            remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
-                                             "remove-keys-end", node)
-            command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
-            run_ssh(host, node, command, dry_run=dry)
-            if not dry:
-                _wait_store_released(cluster, globals_cfg, cfg_name,
-                                     "config end")
+        _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
+                           remote_log_dir, cfg_name, "remove-keys-end",
+                           "full", "config end", dry=dry)
         # raw-log full pull only on explicit request (per-role stats were
         # pulled right after each role exited; failure paths pull raw)
         if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
@@ -6139,22 +6145,19 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
         if str(failed_stage).startswith("remove-keys"):
             log("[FAIL] store remove-all skipped (failing stage was {})"
                 .format(failed_stage))
-        elif globals_cfg is not None and _remove_keys_precheck(
-                cluster, globals_cfg, cfg_name, "fail cleanup"):
-            log("[FAIL] fail-cleanup: store already clean — "
-                "remove-all skipped")
         else:
             try:
-                run_stage(remove_host, get_node(cluster, remove_node),
-                          remove_runner, "remove-keys", remote_log_dir,
-                          cfg_name, extra="--scope full", dry_run=False,
-                          node_name=remove_node,
-                          label="{} (fail-cleanup remove-all)".format(
-                              cfg_name))
-                log("[FAIL] fail-cleanup: store remove-all issued")
-                if globals_cfg is not None:
-                    _wait_store_released(cluster, globals_cfg, cfg_name,
-                                         "fail cleanup")
+                ran = _remove_keys_stage(
+                    cluster, globals_cfg, remove_host,
+                    get_node(cluster, remove_node), remove_runner,
+                    remote_log_dir, cfg_name, cfg_name, "full", "fail cleanup",
+                    dry=False, node_name=remove_node,
+                    label="{} (fail-cleanup remove-all)".format(cfg_name))
+                if ran:
+                    log("[FAIL] fail-cleanup: store remove-all issued")
+                else:
+                    log("[FAIL] fail-cleanup: store already clean — "
+                        "remove-all skipped")
             except Exception as exc:
                 log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
 
@@ -6928,16 +6931,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             # fresh store per size: full remove-all (kvtest keys use the
             # hardcoded mooncake_kvtest_ prefix, but scope=full clears them)
             stage = "remove-keys (pre-run, {})".format(ds)
-            if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
-                                                stage):
-                run_stage(host, node, remote_runner_pipeline,
-                          "remove-keys", remote_log_dir, cfg_name,
-                          extra="--scope full", dry_run=dry,
-                          pull_to=local_log_dir,
-                          node_name=primary_node_name)
-                if not dry:
-                    _wait_store_released(cluster, globals_cfg, cfg_name,
-                                         "{} start".format(ds))
+            _remove_keys_stage(cluster, globals_cfg, host, node,
+                               remote_runner_pipeline, remote_log_dir,
+                               cfg_name, cfg_name, "full",
+                               "{} start".format(ds), dry=dry,
+                               pull_to=local_log_dir,
+                               node_name=primary_node_name)
             current_ds = ds
             instance_pids = []
             key_pool = pools[ds]
@@ -7196,16 +7195,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # Config end: remove-all — clears everything this config's writers
         # wrote (kvtest keys share the store with nothing else here)
         stage = "remove-keys (config end)"
-        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
-                                            "config end"):
-            remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
-            command = "bash {} remove-keys {} --scope full".format(
-                remote_runner_pipeline, remove_log)
-            run_ssh(host, node, command, dry_run=dry)
-            pull_stage_logs(host, node, [remove_log], local_log_dir, dry)
-            if not dry:
-                _wait_store_released(cluster, globals_cfg, cfg_name,
-                                     "config end")
+        _remove_keys_stage(cluster, globals_cfg, host, node,
+                           remote_runner_pipeline, remote_log_dir, cfg_name,
+                           "remove-keys-end", "full", "config end",
+                           dry=dry, pull_to=local_log_dir)
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
@@ -9334,21 +9327,19 @@ def main(args, cfg_paths):
     if sweep_remove:
         try:
             nd = get_node(cluster, sweep_remove["node"])
-            if _remove_keys_precheck(cluster, globals_cfg, "final",
-                                     "sweep end"):
+            ran = _remove_keys_stage(
+                cluster, globals_cfg, sweep_remove["host"], nd,
+                sweep_remove["runner"], sweep_remove["remote_log_dir"],
+                "final", "final", "full", "sweep end", dry=False,
+                node_name=sweep_remove["node"])
+            if not ran:
                 log("sweep-end remove-keys skipped (store already clean)")
             else:
-                run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
-                          sweep_remove["remote_log_dir"], "final",
-                          extra="--scope full", dry_run=False,
-                          cfg_name="final", node_name=sweep_remove["node"])
                 scp_pull(sweep_remove["host"], nd,
                          "{}*".format(_pod_base("{}/final".format(
                              sweep_remove["remote_log_dir"]), nd)
                              + ".remove-keys.log"),
                          os.path.join(ts_dir, "logs"), dry_run=False)
-                _wait_store_released(cluster, globals_cfg, "final",
-                                     "sweep end")
                 log("sweep-end remove-keys -> {}".format(
                     os.path.join(ts_dir, "logs", "final.remove-keys.log")))
         except Exception as exc:

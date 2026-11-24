@@ -98,6 +98,13 @@ benchmark.py main()
   `_verify_store_clean` 按 `require_clean_store` 决定 WARN/FAIL。**仅 `--scope full` 做释放等待**：
   key-prefix 在共享 store 上等不到归零，只做预检。
 
+两道闸与执行统一封装在 `_remove_keys_stage()`：它是编排侧**唯一**的 remove-keys 入口，
+所有站点（basic pre-run/combo/config-end、pipeline pre-run/config-end、kvtest
+pre-run/config-end、sweep-end、fail-cleanup ×2）都经它执行，命令/日志路径统一由
+`run_stage` 组合（此前 config-end 三处手拼 `run_ssh` 命令串，已删除）。副作用：kvtest
+config-end 的 remove 日志从扁平路径移入 pod 子目录，与 pre-run / `pull_logs` 的 per-pod
+glob 布局一致。`globals_cfg=None`（无 metrics 配置的失败清理）退化为无闸门直跑。
+
 ### 2.4 客户端语义（所有 remove 的最终执行体）
 
 `scripts/mooncake_benchmark_client.py`：

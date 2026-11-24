@@ -703,6 +703,11 @@ get 家族循环读取预填数据直至到时；put 家族与 mixed 以"完整�
   到时后仍按 `require_clean_store` 决定 WARN/FAIL（等待使严格模式不再被 oplog 延迟误伤）。
   仅 `--scope full` 做释放等待；`key-prefix` 只做跳过预检（共享 store 等不到归零）。
 
+以上闸门与执行统一收敛在编排侧唯一入口 `_remove_keys_stage()`（precheck → `run_stage` →
+释放等待），所有站点（basic/pipeline/kvtest/sweep/fail-cleanup）都经它执行；命令与日志
+路径由 `run_stage` 统一组合。**kvtest config-end 的 remove 日志随之从扁平路径移入 pod
+子目录**（与 pre-run / `pull_logs` 的 per-pod glob 布局一致）。
+
 basic 场景：
 
 | 时机 | 动作 | 日志 |

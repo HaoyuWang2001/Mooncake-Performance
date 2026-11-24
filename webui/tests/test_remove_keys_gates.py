@@ -147,3 +147,83 @@ def test_wait_timeout_warns_by_default(monkeypatch, capsys):
     assert snap is not None
     out = capsys.readouterr().out
     assert "not fully empty" in out and "[WARN]" in out
+
+
+def _stage_calls(monkeypatch):
+    calls = {"run": [], "wait": [], "precheck": []}
+    monkeypatch.setattr(
+        bm, "run_stage",
+        lambda *a, **k: calls["run"].append((a, k)))
+    monkeypatch.setattr(
+        bm, "_wait_store_released",
+        lambda *a: calls["wait"].append(a))
+    return calls
+
+
+def test_stage_skips_when_precheck_true(monkeypatch):
+    calls = _stage_calls(monkeypatch)
+    monkeypatch.setattr(bm, "_remove_keys_precheck",
+                        lambda *a: calls["precheck"].append(a) or True)
+    ran = bm._remove_keys_stage(
+        None, {"pipeline": {}}, "h", None, "runner", "/r", "cfg", "cfg",
+        "full", "pre-run", dry=False)
+    assert ran is False
+    assert calls["run"] == [] and calls["wait"] == []
+
+
+def test_stage_executes_full_then_waits(monkeypatch):
+    calls = _stage_calls(monkeypatch)
+    monkeypatch.setattr(bm, "_remove_keys_precheck",
+                        lambda *a: calls["precheck"].append(a) or False)
+    ran = bm._remove_keys_stage(
+        None, {"pipeline": {}}, "h", "node", "runner", "/r", "cfg",
+        "remove-keys-end", "full", "config end", dry=False,
+        pull_to="/local", node_name="pod-1", label="L")
+    assert ran is True
+    (args, kwargs), = calls["run"]
+    assert args[2:6] == ("runner", "remove-keys", "/r", "remove-keys-end")
+    assert kwargs["extra"] == "--scope full"
+    assert kwargs["pull_to"] == "/local"
+    assert kwargs["cfg_name"] == "cfg"
+    assert kwargs["node_name"] == "pod-1"
+    assert kwargs["label"] == "L"
+    assert kwargs["dry_run"] is False
+    assert calls["wait"], "full scope must wait for oplog release"
+
+
+def test_stage_key_prefix_never_waits(monkeypatch):
+    calls = _stage_calls(monkeypatch)
+    monkeypatch.setattr(bm, "_remove_keys_precheck",
+                        lambda *a: calls["precheck"].append(a) or False)
+    ran = bm._remove_keys_stage(
+        None, {"pipeline": {}}, "h", "node", "runner", "/r", "cfg", "cfg",
+        "key-prefix", "config end", dry=False)
+    assert ran is True
+    assert calls["run"] and calls["wait"] == []
+    # pre-check still applies to key-prefix
+    assert calls["precheck"]
+
+
+def test_stage_dry_runs_without_gates(monkeypatch):
+    calls = _stage_calls(monkeypatch)
+    monkeypatch.setattr(bm, "_remove_keys_precheck",
+                        lambda *a: calls["precheck"].append(a) or True)
+    ran = bm._remove_keys_stage(
+        None, {}, "h", "node", "runner", "/r", "cfg", "cfg", "full",
+        "pre-run", dry=True, pull_to="/local")
+    assert ran is True
+    assert calls["precheck"] == [] and calls["wait"] == []
+    (args, kwargs), = calls["run"]
+    assert kwargs["dry_run"] is True
+
+
+def test_stage_without_globals_is_ungated(monkeypatch):
+    calls = _stage_calls(monkeypatch)
+    monkeypatch.setattr(bm, "_remove_keys_precheck",
+                        lambda *a: calls["precheck"].append(a) or True)
+    ran = bm._remove_keys_stage(
+        None, None, "h", "node", "runner", "/r", "cfg", "cfg", "full",
+        "fail cleanup", dry=False)
+    assert ran is True
+    assert calls["precheck"] == [] and calls["wait"] == []
+    assert calls["run"]
