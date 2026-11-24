@@ -6028,15 +6028,15 @@ def _kvtest_launch_split_roles(plan, split, prepare, fire, gate):
     grouping — the caller's closures keep the scenario's `stage`
     attribution and the dry-run skip in sync."""
     if split:
-        prepare("readers", plan["readers"])
+        prepare("reader", plan["readers"])
         fire(plan["readers"])
         gate(plan["readers"], "readers")
-        prepare("writers", plan["writers"])
+        prepare("writer", plan["writers"])
         fire(plan["writers"])
         gate(plan["writers"], "writers")
     else:
-        prepare("readers", plan["readers"])
-        prepare("writers", plan["writers"])
+        prepare("reader", plan["readers"])
+        prepare("writer", plan["writers"])
         fire(plan["readers"] + plan["writers"])
         gate(plan["readers"] + plan["writers"], "instances")
 
