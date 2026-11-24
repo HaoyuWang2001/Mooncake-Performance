@@ -21,6 +21,7 @@
 {"version":"1.0","platform":"posix","python":"3.12.3","root":"/path/Mooncake-Performance",
  "paths":{"outputs":"outputs","runs":"webui/data/runs"},
  "active_run":{"id":"r20261029-223001-001","status":"running",...} | null,
+ "active_runs":[{"id":"r...","status":"running",...}, ...],   // 所有活跃 run（多实例并发）
  "scheduler":{"id":"s20261029-223005-002","state":"waiting",...} | null}
 ```
 
@@ -41,11 +42,28 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
 ### GET /api/config?path=configs/basic/put.json
 → `{"path":"...","content":"<原文>"}`
 
+### GET /api/config/chain?path=configs/pipeline/rank/rank_smoke.json
+返回该配置的**完整继承链**（供配置维护弹窗一次性展示）：
+```json
+{"path":"configs/pipeline/rank/rank_smoke.json","inherits":true,
+ "category":"pipeline",
+ "levels":[{"kind":"defaults","path":"configs/pipeline/_configs.json",
+            "exists":true,"content":"{...}","bytes":123},
+           {"kind":"defaults","path":"configs/pipeline/rank/_configs.json",
+            "exists":true,"content":"{...}","bytes":456},
+           {"kind":"self","path":"configs/pipeline/rank/rank_smoke.json",
+            "exists":true,"content":"{...}","bytes":789}],
+ "effective":"<各级 _configs.json → 本文件 依次深度合并后的 JSON 文本>"}
+```
+- 仅 `configs/{basic,pipeline,kvtest}` 参与继承；其它配置（cluster/global/profile、`_ssh`/`_k8s` 等）
+  `inherits=false`、`levels` 只含 `self`、`effective` 为空串
+- 缺失的级别也会列出（`exists:false`），便于在 UI 里「新建」该级 `_configs.json`
+
 ### PUT /api/config
 请求体：`{"path":"configs/basic/put.json","content":"{...}"}`
 - 先校验：JSON 语法 + 场景配置语义（复用编排器自身的 `data_size_list`/`pipeline_plan`/`_configs.json` 继承合并）
-- 通过后：旧文件备份到 `webui/backups/` → 原子写回
-- → `{"ok":true,"path":"...","backup":"webui/backups/..."}`
+- 校验通过后**原子写回**（不保留旧文件备份——WebUI 不做隐藏副本）
+- → `{"ok":true,"path":"..."}`
 - 校验失败 → 422 `{"error":"data_size must be ..."}`
 
 ### POST /api/config/validate
@@ -66,7 +84,9 @@ cluster/global/profile 及任意其他通用文件）；`categories` = configs �
   "flags": {
     "mode": "ssh",                         // ssh | k8s
     "launch_mode": "single",               // single | rank_recall（WebUI 仅 k8s）
-    "dry_run": false, "no_warmup": false, "no_plot": false,
+    "dry_run": false, "no_warmup": false,
+    "no_plot": false,                     // 只跳过 PNG 绘图（plot_latency）
+    "no_report": false,                   // 只跳过 HTML 报表（report.html + overview.html）
     "verbose": false,                     // 详细日志（上传路径/逐文件拉取/kubectl 命令/pod 详情）
     "protocol": null,                     // null | "tcp"|"rdma"|"ub"
     "cluster": "configs/_ssh/cluster.json",
@@ -91,7 +111,32 @@ selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files
 任一为空、或包含其他 work_mode，父任务即失败。两个 benchmark 并发执行，日志带角色前缀，
 结果写入同一 `outputs/<run>/rank` 与 `outputs/<run>/recall`；共享 `profile` 与通用运行选项。
 → `201` 意义上返回 `{"run":{"id":"r...","status":"running","cmd":"..."},"warnings":[]}`
-槽位被占 → `409 {"error":"benchmark run r... is still active ..."}`
+共享资源冲突 → `409 {"error":"shared resource in use by instance ..."}`（见「实例管理」并发规则）。
+
+> WebUI 性能测试页不再直接调用 /api/run：它先「创建实例」（`POST /api/instances`，
+> 只存表单快照不运行），再由实例卡片/详情页触发运行。`/api/run` 保留给脚本/CLI 式调用。
+
+### 并发规则（多实例）
+多个实例可同时运行，但共享资源的组合会被拒绝（409，错误信息标明占用实例与资源）：
+- k8s：`(controller.ip, kubecontext, namespace)` 相同 → 冲突（同一批 pod/Deployment）
+- SSH：节点 IP 集合相交 → 冲突（端口段 9101/9201/9301+ 与共享 value.bin）
+- global：etcd 端点相交、`master_addr` 相同、`master_metrics_url` host 相同 → 冲突
+  （rendezvous `mcbench/` 前缀会被互清；同 store 容量会被双方同时按 0.9× 预算打爆）
+- 同一实例已有活跃 run → 409；scheduler 任务执行中 → 409
+- 不同集群 + 不同栈（etcd/master）→ 可真正并行；每个 run 使用独立
+  `webui/data/runs/<id>.state` 台账（Rank+Recall 子任务为 `<id>.state.rank|recall`）
+
+### POST /api/runs/rebuild-report
+用**本地**已有产物重建某次 run 的 HTML 报表（等价 `benchmark.py --rebuild-report <ts>`），
+用于「run 正常结束但报表阶段失败」或报表被 `--no-report` / `no_plot` 跳过后补出：
+```json
+{"ts": "20261112-1804"}   // outputs/ 下的时间戳目录名，不带 outputs/ 前缀
+```
+- 只读本地 `logs/<cfg>/` 下的 `*.stats.json` / `*.log` / kvtest `samples.csv`，不访问集群；
+- 产出 `report/<size>/report.html`(+`data.js`/`meta.json`) 与 run 级 `report/overview.html`；
+- 以普通 run 形式执行，日志/rc 进「历史运行」；
+- 404 无该 run；400 无 `logs/`；409 该 run 仍由活跃 run 写入或 scheduler 执行中；
+- → `{"run":{"id":"r...","status":"running",...}}`。
 
 ### POST /api/cleanup
 standalone clean-up（不跑场景；不需要 profile）：
@@ -102,7 +147,7 @@ standalone clean-up（不跑场景；不需要 profile）：
 - k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
 - SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
 - 本地 `outputs/` 与 run 日志保留；不可恢复；
-- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- 受并发守卫约束：与活跃 run 共享集群/等栈时 409；scheduler 任务执行中 → 409；
 - → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
 ### GET /api/runs
@@ -118,7 +163,7 @@ standalone clean-up（不跑场景；不需要 profile）：
 - k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
 - SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
 - 本地 `outputs/` 与 run 日志保留；不可恢复；
-- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- 受并发守卫约束：与活跃 run 共享集群/等栈时 409；scheduler 任务执行中 → 409；
 - → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
 ### GET /api/runs/{id}
@@ -133,12 +178,18 @@ standalone clean-up（不跑场景；不需要 profile）：
 - k8s：删除该 cluster 配置的 namespace（级联 pods/configmaps）与 controller workspace；
 - SSH：`rm -rf remote_dir`（cluster.json 所有节点）；
 - 本地 `outputs/` 与 run 日志保留；不可恢复；
-- 复用单执行槽：benchmark/scheduler 执行中 → 409；
+- 受并发守卫约束：与活跃 run 共享集群/等栈时 409；scheduler 任务执行中 → 409；
 - → `{"run":{"id":"r...","status":"running",...},"warnings":[]}`，清理过程写入该 run 的日志。
 
-### GET /api/runs/{id}/log?offset=0
+### GET /api/runs/{id}/log?offset=0&stream=all|rank|recall
 增量日志：`{"offset":<新字节偏移>,"size":<总字节>,"content":"<新增文本>","eof":bool}`
 单次最多 512KB；`offset` 为字节偏移（首次传 0，之后传上次返回值）。
+`stream=rank|recall` 只返回组合实例（Rank+Recall 并行）对应子任务的行并剥离
+`[rank] `/`[recall] ` 前缀；分页始终停在行边界（跨块残行留到下一页），默认 `all` 为原始日志。
+
+### POST /api/runs/{id}/reattach
+与实例级重连同语义（幂等）：确认进程仍存活后修复状态并重新纳入 active。
+→ `{"ok":true,"reattached":true|false,"status":"running","run":{...}}`
 
 ### POST /api/runs/{id}/stop
 **优雅停止**：写 `webui/data/runs/<id>.stop` 并向进程组发送 SIGINT/CTRL_BREAK，
@@ -147,6 +198,91 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 （环境变量 `MCWEB_STOP_GRACE` 可调），超时后强制 kill；后台线程再做一次兜底清理。
 停止期间 `status` 仍为 `running` 且 `stopping=true`，完成后变 `stopped`。
 → `{"ok":true,"run":{...stopping:true}}`（已结束的 run 调用也返回 ok）
+
+---
+
+## 实例管理（instances）
+
+实例 = 一份表单快照（`selector` + `flags`，与 POST /api/run 同构）构成的可复用测试定义；
+创建本身**不运行**。每次运行产生一个 run（`meta.instance` 指回实例），日志/停止/守卫沿用 run 机制。
+
+### POST /api/instances
+```json
+{"name": "rank-8mb（可空=自动命名）", "selector": {...}, "flags": {...}}
+```
+校验与 POST /api/run 相同（配置存在性、launch_mode 规则），但不占用运行槽。
+→ `{"instance":{"id":"i...","name":...,"status":"created","launch_mode":"single","mode":"k8s",
+   "flags":{...},"selection":{"dirs":[],"files":[]},"last_run":null}}`
+
+### GET /api/instances
+`{"instances":[<instance summary>, ...]}`（新→旧）。`status` 派生自活跃 run 或最近持久化 run
+（`created|running|stopping|done|failed|stopped`），`last_run` 含 `id/status/rc/elapsed/ts_dir/cmd`。
+
+### GET /api/instances/{iid}
+`{"instance":<summary>,"runs":[<run meta>, ...]}`（该实例全部运行记录）。
+
+### POST /api/instances/{iid}/run
+启动该实例的一次运行（表单快照 → benchmark argv）。守卫/冲突语义同 `POST /api/run`。
+→ `{"run":{...},"warnings":[]}`；同实例已在运行或共享资源冲突 → 409。
+
+### POST /api/instances/{iid}/stop
+停止该实例当前的活跃 run（优雅停止语义同 `POST /api/runs/{id}/stop`）；未在运行 → 409。
+
+### POST /api/instances/{iid}/reattach
+重新连接仍在运行的实例（webui 重启 / 网络中断后的「重连」）。后端按落盘 pid
+（校验存活）或 `--stop-file` 扫描确认进程仍在后，把被误判为终态的 run 修回
+`running`、重新纳入 active（恢复并发守卫）；找不到进程则**不改状态**。
+→ `{"ok":true,"reattached":true|false,"status":"running","run":{...}}`
+
+### POST /api/instances/{iid}/rename
+```json
+{"name": "新名称"}
+```
+→ `{"instance":<summary>}`。
+
+### DELETE /api/instances/{iid}
+删除实例记录（**直接删除定义文件**，不进任何回收站）；运行记录/日志/outputs **保留**。
+运行中 → 409。
+
+---
+
+## 集群节点（nodes）
+
+探测端点共用参数：`cluster`（默认 `configs/cluster.json`）、`global`（默认 `configs/global.json`，
+仅用于角色/端口推导）。SSH 传输复用编排器 `utils.py`（paramiko，连接缓存），只执行只读命令
+（uname / ss / ps）；`{name}` 必须是所选 cluster 配置中的节点名，否则 404。
+
+### GET /api/nodes?cluster=configs/cluster.json&global=configs/global.json
+```json
+{"cluster":"configs/cluster.json","global":"configs/global.json","mode":"ssh",
+ "venv":"/home/haoyu/venvs/mooncake-benchmark/bin/python",
+ "nodes":[{"name":"store1","ip":"192.168.137.11","fabric_ip":"...","ssh_user":"haoyu",
+           "ssh_port":22,"ssh_key":"","roles":["store"],
+           "expected_ports":[{"purpose":"master RPC","port":50051}]}]}
+```
+- `roles`：`store`（global `mooncake_store_nodes`）、`master`（`master_addr` 的 host 匹配 ip/fabric_ip）、
+  `metadata`（`metadata_server` host）、`etcd`（`etcd_endpoints` host）；都没有则 `client`
+- `mode`：有 nodes → `ssh`；k8s 型 cluster（`controller`/`k8s`）→ `k8s` 且 nodes 为空
+- `expected_ports`：该节点按 global.json 应有暴露的端口（master RPC / 元数据 HTTP / etcd）
+
+### GET /api/nodes/{name}/test?cluster=...&global=...
+一次 SSH 探测：连通性、环境、mooncake 进程、应有端口监听核对。
+```json
+{"ok":true,"detail":"","kernel":"Linux 6.8.0","arch":"x86_64",
+ "processes":[{"pid":1234,"cmd":".../mooncake_master ...","kind":"master"}],
+ "ports":[{"purpose":"master RPC","port":50051,"listening":true}]}
+```
+`kind`：`master | store | benchmark | other`；SSH 失败 → `{"ok":false,"detail":"...","processes":[],"ports":[]}`（200）；
+paramiko 不可用 → 503。
+
+### GET /api/nodes/{name}/ports?cluster=...
+节点监听端口（`sudo -n ss -tlnp` → `ss -tlnp` → `ss -tln` 降级链，netstat 兜底）：
+```json
+{"ok":true,"ports":[{"proto":"tcp","state":"LISTEN","local_addr":"0.0.0.0","port":22,
+                     "processes":[{"pid":1234,"process":"sshd","user":"root"}]}],
+ "warning":null}
+```
+无权限读进程信息时 `warning` 给出说明；SSH 失败 → `{"ok":false,"detail":"...","ports":[]}`（200）。
 
 ---
 
@@ -165,12 +301,13 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 - → `{"ok":true,"ts":"新名","from":"旧名","renamed":true}`（同名时 `renamed:false`）
 
 ### DELETE /api/outputs/{ts}
-把结果目录**移入回收站** `webui/backups/outputs-trash/<ts>`（重名自动追加时间戳），
+按运行平台删除结果目录：**Windows 原生** → 送入系统回收站（资源管理器可恢复）；
+**WSL / Linux** → 永久删除（不可恢复），WebUI 不留隐藏副本。
 并把指向它的 run 历史 `ts_dir` 置空。
-→ `{"ok":true,"ts":"...","trash":"webui/backups/outputs-trash/..."}`
+→ `{"ok":true,"ts":"..."}`
 
 ### POST /api/outputs/delete
-请求体：`{"names":["20261029-2230","..."]}`（批量删除，同样移入回收站）
+请求体：`{"names":["20261029-2230","..."]}`（批量删除，语义同单个删除）
 → `{"deleted":["..."],"failed":[{"ts":"...","error":"..."}]}`
 
 ### GET /api/file?path=outputs/.../xxx.log&mode=text&offset=0
@@ -191,7 +328,7 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 
 ### GET /api/schedule/plan/{name} / PUT /api/schedule/plan/{name}
 - GET → `{"name":"...","content":"..."}`
-- PUT 请求体 `{"content":"..."}`：用 run_schedule 自身的 `load_plan`/`parse_trigger` 校验（首任务必须有 date+time）→ 备份 → 写入
+- PUT 请求体 `{"content":"..."}`：用 run_schedule 自身的 `load_plan`/`parse_trigger` 校验（首任务必须有 date+time）→ 原子写入（不备份）
 - `plan.example.json` 只读（400）
 
 ### POST /api/schedule/start
@@ -256,4 +393,4 @@ curl -s $BASE/api/schedule/status
 - **停止残留**：强制停止后远端进程可能残留，`.state` 台账会在下次 run 启动时自动 reap（既有机制）
 - **dry-run**：无 `ts_dir`、不产生 outputs
 - **并发规则**：单 benchmark 槽 + 单 scheduler；scheduler 等待期手动 run 允许（带 warning），任务执行期互斥
-- **备份**：所有 PUT 写入前自动备份到 `webui/backups/`（含原相对路径与时间戳）
+- **无隐藏备份/回收站**：配置与计划保存不备份；实例定义直接删除；结果删除按平台进 Windows 回收站或永久删除

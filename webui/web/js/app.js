@@ -1,7 +1,10 @@
 "use strict";
 /* Mooncake-Performance WebUI — 根应用（Vue3 global build + Element Plus，无构建步骤）
-   各视图组件在 views/*.js 中定义为全局常量（ConfigView / RunView / ResultsView /
-   ScheduleView / ApiView），由本文件注册并按侧边栏菜单切换（KeepAlive 保状态）。 */
+   各视图组件在 views/*.js 中定义为全局常量（PerfView / InstanceView /
+   NodesView / ResultsView / ConfigView / ScheduleView），由本文件注册并按
+   侧边栏菜单切换（KeepAlive 保状态）。
+   全局轮询 /api/status、/api/instances（3s）与 /api/runs（8s）：任意页签下
+   agent 经 API 创建实例 / 改变实例状态都能立刻在共享 store 与侧边栏徽标看到。 */
 
 const { createApp, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated,
         watch, nextTick } = Vue;
@@ -17,23 +20,52 @@ async function api(method, url, body) {
   return data;
 }
 
+/* ---------------- 全局共享数据刷新（API 操作的统一观察窗口） ---------------- */
+/* 任何视图（无论当前激活与否）都读 store.instances / store.runs；
+   视图在变更操作后调用这两个函数做即时刷新。 */
+async function refreshInstances() {
+  store.instances = (await api("GET", "/api/instances")).instances || [];
+  return store.instances;
+}
+async function refreshRuns() {
+  store.runs = (await api("GET", "/api/runs")).runs || [];
+  return store.runs;
+}
+
 /* ---------------- 全局共享状态 ---------------- */
 /* ---------------- 视图页签持久化（浏览器刷新后停留在当前页签） ---------------- */
-const VIEW_KEYS = ["perf", "results", "config", "schedule"];
+const VIEW_KEYS = ["perf", "instances", "nodes", "results", "config", "schedule"];
 function loadInitialView() {
   try {
     const v = localStorage.getItem("mcweb-view");
     if (VIEW_KEYS.includes(v)) return v;
   } catch (e) { /* ignore */ }
-  return "config";
+  return "perf";
+}
+
+function _loadInstanceTabs() {
+  try {
+    const raw = sessionStorage.getItem("mcweb-instance-tabs");
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter(x => typeof x === "string") : [];
+  } catch (e) { return []; }
 }
 
 const store = reactive({
-  view: loadInitialView(),       // 当前视图：config | run | results | schedule | api
-  status: { active_run: null, scheduler: null },   // /api/status 轮询结果
+  view: loadInitialView(),       // 当前视图：perf | instances | nodes | results | config | schedule
+  status: { active_run: null, active_runs: [], scheduler: null },  // /api/status 轮询结果
+  instances: [],                // /api/instances 全局轮询结果（统一 API 操作显示）
+  runs: [],                     // /api/runs 全局轮询结果（历史运行）
   resultsTarget: null,          // 跳转 results 时聚焦的 outputs/<ts>
+  instancesOpen: _loadInstanceTabs(),   // 实例详情页已打开的实例（浏览器式页签）
+  instancesTarget: null,        // 当前激活的实例详情
   cfgTree: null,                // /api/configs 缓存（config 视图刷新）
 });
+
+watch(() => store.instancesOpen, v => {
+  try { sessionStorage.setItem("mcweb-instance-tabs", JSON.stringify(v)); }
+  catch (e) { /* ignore */ }
+}, { deep: true });
 
 watch(() => store.view, v => {
   try { localStorage.setItem("mcweb-view", v); } catch (e) { /* ignore */ }
@@ -127,33 +159,83 @@ const DragHandle = {
   },
 };
 
+/* ---------------- 通用水平拖拽手柄（左右分栏宽度；v-model = 左手侧宽度） ----------------
+   统计结果页左列运行列表用：拖动改宽，双击不可用（保持鼠标语义与 vdrag 一致），
+   高频拖拽零动效。 */
+const HDragHandle = {
+  name: "HDragHandle",
+  props: { modelValue: { type: Number, default: 300 },
+           min: { type: Number, default: 240 },
+           max: { type: Number, default: 560 },
+           persist: { type: String, default: "" } },
+  emits: ["update:modelValue"],
+  template: `<div class="hdrag" title="拖动调节宽度" @mousedown.prevent="down"><span></span></div>`,
+  setup(props, { emit }) {
+    const down = (e) => {
+      const startX = e.clientX;
+      const startW = Number(props.modelValue) || 300;
+      const move = (ev) => {
+        const w = Math.min(props.max, Math.max(props.min, startW + (ev.clientX - startX)));
+        emit("update:modelValue", w);
+        if (props.persist) saveHeight(props.persist, w);
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    };
+    return { down };
+  },
+};
+
 
 /* ---------------- 根组件 ---------------- */
 const App = {
   template: `
   <el-container class="layout">
     <el-aside width="210px" class="aside">
-      <div class="brand">Mooncake<span>-Performance</span></div>
-      <div class="badges">
-        <div class="badge-line" title="benchmark 执行槽">
-          <span class="badge-dot" :class="runDot"></span>
-          <span>{{ runText }}</span>
-        </div>
-        <div class="badge-line" title="scheduler 状态">
-          <span class="badge-dot" :class="schDot"></span>
-          <span>{{ schText }}</span>
-        </div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-text">Mooncake<span>Performance</span></span>
       </div>
       <el-menu :default-active="store.view" class="menu" @select="go">
-        <el-menu-item index="perf">性能测试</el-menu-item>
-        <el-menu-item index="results">统计结果</el-menu-item>
-        <el-menu-item index="config">配置维护</el-menu-item>
-        <el-menu-item index="schedule">定时任务</el-menu-item>
+        <el-menu-item index="perf">
+          <el-icon><component is="Monitor"/></el-icon><span>性能测试</span>
+          <span v-if="instTotal" class="menu-badge" :class="{ on: instRunning > 0 }"
+                :title="'实例 ' + instTotal + ' 个，其中运行中 ' + instRunning + ' 个'">
+            {{ instTotal }}<template v-if="instRunning"> · 运行 {{ instRunning }}</template>
+          </span>
+        </el-menu-item>
+        <el-menu-item index="instances">
+          <el-icon><component is="List"/></el-icon><span>实例详情</span>
+        </el-menu-item>
+        <el-menu-item index="nodes">
+          <el-icon><component is="Odometer"/></el-icon><span>集群节点</span>
+        </el-menu-item>
+        <el-menu-item index="results">
+          <el-icon><component is="DataAnalysis"/></el-icon><span>统计结果</span>
+        </el-menu-item>
+        <el-menu-item index="config">
+          <el-icon><component is="Setting"/></el-icon><span>配置维护</span>
+        </el-menu-item>
+        <el-menu-item index="schedule">
+          <el-icon><component is="Clock"/></el-icon><span>定时任务</span>
+          <span v-if="schedState" class="menu-badge" :class="schedBadgeClass"
+                :title="'调度状态：' + schedulerText(schedState)">{{ schedulerText(schedState) }}</span>
+        </el-menu-item>
       </el-menu>
       <div class="aside-footer">
-        <el-button size="small" circle @click="toggleDark" :title="theme.dark ? '切换到亮色' : '切换到暗色'">
-          <el-icon><component :is="theme.dark ? 'Sunny' : 'Moon'"/></el-icon>
-        </el-button>
+        <el-tooltip :content="theme.dark ? '切换到亮色' : '切换到暗色'" placement="top">
+          <el-button size="small" circle aria-label="切换主题" @click="toggleDark">
+            <el-icon><component :is="theme.dark ? 'Sunny' : 'Moon'"/></el-icon>
+          </el-button>
+        </el-tooltip>
         <el-link type="primary" :underline="false" href="/docs" target="_blank">API 文档</el-link>
       </div>
     </el-aside>
@@ -164,7 +246,8 @@ const App = {
     </el-main>
   </el-container>`,
   setup() {
-    const VIEWS = { perf: "perf-view", results: "results-view",
+    const VIEWS = { perf: "perf-view", instances: "instance-view",
+                    nodes: "nodes-view", results: "results-view",
                     config: "config-view", schedule: "schedule-view" };
     const viewComp = computed(() => VIEWS[store.view] || "config-view");
     function go(v) {
@@ -175,36 +258,38 @@ const App = {
       });
     }
 
-    const runDot = computed(() => store.status.active_run ? "on" : "");
-    const runText = computed(() => {
-      const r = store.status.active_run;
-      return r ? "run: " + r.id + " (" + Math.round(r.elapsed) + "s)" : "run: 空闲";
-    });
-    const schDot = computed(() => {
-      const s = store.status.scheduler;
-      if (!s) return "";
-      if (s.state === "executing") return "exec";
-      if (["waiting", "waiting_slot"].includes(s.state)) return "on";
-      return "";
-    });
-    const schText = computed(() => {
-      const s = store.status.scheduler;
-      if (!s) return "scheduler: 关闭";
-      let t = "scheduler: " + s.state;
-      if (s.next_trigger && ["waiting", "waiting_slot"].includes(s.state))
-        t += " @" + s.next_trigger.slice(-8);
-      return t;
-    });
-
-    let timer = null;
     async function pollStatus() {
       try { Object.assign(store.status, await api("GET", "/api/status")); }
       catch (e) { /* server down */ }
     }
-    onMounted(() => { pollStatus(); timer = setInterval(pollStatus, 3000); });
+
+    /* 实例/运行状态全局轮询（与 status 同拍，runs 每 3 拍 ~9s 一次）：
+       任意页签都能实时反映 agent 经 API 创建实例 / 启动 / 停止 / 结束。 */
+    let timer = null;
+    let runsTick = 0;
+    function tick() {
+      pollStatus();
+      refreshInstances().catch(() => { /* server down */ });
+      if (runsTick++ % 3 === 0) refreshRuns().catch(() => { /* ignore */ });
+    }
+
+    /* 侧边栏徽标（全局可见的 API 操作观察点） */
+    const instTotal = computed(() => (store.instances || []).length);
+    const instRunning = computed(() =>
+      (store.instances || []).filter(it => it.status === "running").length);
+    const ACTIVE_SCHED = ["waiting", "waiting_slot", "executing", "stopping"];
+    const schedState = computed(() => {
+      const sch = store.status.scheduler;
+      return (sch && ACTIVE_SCHED.includes(sch.state)) ? sch.state : "";
+    });
+    const schedBadgeClass = computed(() =>
+      (schedState.value === "executing" || schedState.value === "stopping") ? "warn" : "on");
+
+    onMounted(() => { tick(); timer = setInterval(tick, 3000); });
     onUnmounted(() => clearInterval(timer));
 
-    return { store, theme, toggleDark, go, viewComp, runDot, runText, schDot, schText };
+    return { store, theme, toggleDark, go, viewComp,
+             instTotal, instRunning, schedState, schedBadgeClass, schedulerText };
   },
 };
 
@@ -216,6 +301,9 @@ for (const [iconName, iconComp] of Object.entries(ElementPlusIconsVue || {})) {
 }
 app.component("perf-view", PerfView);
 app.component("sel-node", SelNode);
+app.component("instance-view", InstanceView);
+app.component("instance-log-pane", InstanceLogPane);
+app.component("nodes-view", NodesView);
 app.component("config-view", ConfigView);
 app.component("cfg-node", CfgNode);
 app.component("results-view", ResultsView);
@@ -224,4 +312,5 @@ app.component("schedule-view", ScheduleView);
 app.component("spdiag-tree", SpdiagTree);
 app.component("sdt-node", SdtNode);
 app.component("drag-handle", DragHandle);
+app.component("hdrag-handle", HDragHandle);
 app.mount("#app");

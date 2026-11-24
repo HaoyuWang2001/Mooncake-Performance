@@ -37,12 +37,22 @@ def test_children_have_isolated_namespace_ledgers():
     assert rank_env["PYTHONIOENCODING"] == "utf-8"
 
 
+def test_children_derive_ledger_from_parent_run(monkeypatch):
+    """WebUI-managed combined run: child ledgers keyed off the run's state
+    file so two concurrent combined runs never share a ledger."""
+    monkeypatch.setenv("MC_BENCH_STATE_FILE", "/tmp/runs/r1.state")
+    rank = _child_env("rank")["MC_BENCH_STATE_FILE"]
+    recall = _child_env("recall")["MC_BENCH_STATE_FILE"]
+    assert rank == "/tmp/runs/r1.state.rank"
+    assert recall == "/tmp/runs/r1.state.recall"
+
+
 def test_children_share_ready_dir_with_distinct_roles(tmp_path):
     args = SimpleNamespace(
         rank_cluster="rank-cluster.json", rank_global="rank-global.json",
         recall_cluster="recall-cluster.json", recall_global="recall-global.json",
         profile="profile.json", dry_run=False, no_warmup=False,
-        no_plot=False, verbose=False, protocol=None, stop_file=None)
+        verbose=False, protocol=None, stop_file=None)
     ready_dir = str(tmp_path / "ready")
 
     rank = _child_argv(args, "rank", ["rank.json"], "parent", ready_dir)
@@ -61,7 +71,7 @@ def test_children_support_bare_metal_ssh_mode(tmp_path):
         rank_cluster="rank-cluster.json", rank_global="rank-global.json",
         recall_cluster="recall-cluster.json",
         recall_global="recall-global.json", profile="profile.json",
-        dry_run=False, no_warmup=False, no_plot=False, verbose=False,
+        dry_run=False, no_warmup=False, verbose=False,
         protocol=None, stop_file=None)
     argv = _child_argv(args, "rank", ["rank.json"], "parent",
                        str(tmp_path / "ready"))

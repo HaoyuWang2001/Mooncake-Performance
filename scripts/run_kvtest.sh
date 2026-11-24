@@ -88,7 +88,10 @@ if [ -n "${KVTEST_NUMA_NODE:-}" ]; then
 fi
 
 # stdout (kvtest narrative) and stderr (C++ glog, FLAGS_logtostderr=1) are
-# kept in SEPARATE files, mirroring run_benchmark_pipeline.sh.
+# kept in SEPARATE files, mirroring run_benchmark_pipeline.sh. The ylt
+# easylog (coro_rpc) also stays beside them so the on-node 现场 has
+# log/glog/ylt in ONE directory (same contract as the pipeline runner).
+MC_YLT_LOG_PATH="$LOG_FILE.ylt.log" \
 "${LAUNCH_CMD[@]}" "$BINARY" "$FINAL_CONFIG" \
   > "$LOG_FILE" 2> "$LOG_FILE.glog"
 rc=$?

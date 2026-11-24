@@ -3,7 +3,7 @@
 import os
 
 from .. import runmgr
-from ..common import ApiError, atomic_write, backup_file, read_json_body
+from ..common import ApiError, atomic_write, read_json_body
 from ..paths import SCHED_DIR
 
 ROUTES = []
@@ -56,9 +56,8 @@ def api_schedule_plan_put(handler, query, name):
     if errors:
         raise ApiError(422, "; ".join(errors))
     full = os.path.join(SCHED_DIR, name)
-    backup = backup_file(full) if os.path.isfile(full) else None
     atomic_write(full, content)
-    return {"ok": True, "name": name, "backup": backup}
+    return {"ok": True, "name": name}
 
 
 def api_schedule_start(handler, query):

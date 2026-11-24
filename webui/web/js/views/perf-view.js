@@ -54,8 +54,9 @@ function _perfSetSubtree(node, v) {
   (node.children || []).forEach(c => _perfSetSubtree(c, v));
 }
 
-/* 是否需要拉取日志：running 必拉；从 running 变为终态的那一次也必须拉，
-   否则快速结束的 run 会因首次空日志把 logEof 置 true 而永远跳过。 */
+/* 是否需要拉取日志（实例详情页共用）：running 必拉；从 running 变为终态
+   的那一次也必须拉，否则快速结束的 run 会因首次空日志把 logEof 置 true
+   而永远跳过。 */
 function _perfShouldFetchLog(prevStatus, status, logEof) {
   if (status === "running") return true;
   return prevStatus === "running" || !logEof;
@@ -118,14 +119,34 @@ function _perfCollectSel(node, acc) {
 const PerfView = {
   template: `
   <div class="page">
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">性能测试</h1>
+        <p class="desc">配置后创建实例（创建不运行）；在下方卡片单独运行、停止、删除，日志与产物在「实例详情」查看。实例可反复运行。</p>
+      </div>
+      <div class="actions">
+        <el-button size="small" @click="drawerOpen = true">历史运行</el-button>
+      </div>
+    </div>
     <el-card shadow="never" class="runbox">
-      <template #header><b>运行</b></template>
+      <template #header>
+        <div class="mc-toolbar">
+          <b>实例模板</b>
+          <span class="spacer"></span>
+          <el-tooltip content="刷新配置（重新拉取 cluster / global / profile 候选与配置树）" placement="top">
+            <el-button size="small" circle :loading="cfgLoading"
+                       aria-label="刷新配置" @click="refreshConfigs">
+              <el-icon><component is="Refresh"/></el-icon>
+            </el-button>
+          </el-tooltip>
+        </div>
+      </template>
       <div class="rb-row">
         <el-radio-group v-model="mode" size="small" @change="onModeChange">
           <el-radio-button value="ssh">真机</el-radio-button>
           <el-radio-button value="k8s">k8s</el-radio-button>
         </el-radio-group>
-        <span class="rb-label" style="margin-left: 20px">启动方式</span>
+        <span class="rb-label rb-group">启动方式</span>
         <el-radio-group v-model="launchMode" size="small">
           <el-radio-button value="single">单任务</el-radio-button>
           <el-radio-button value="rank_recall" :disabled="mode !== 'k8s'">Rank + Recall 并行</el-radio-button>
@@ -138,13 +159,13 @@ const PerfView = {
           <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
                      :label="c.path || c" :value="c.path || c"></el-option>
         </el-select>
-        <span class="rb-label" style="margin-left: 16px">global</span>
+        <span class="rb-label rb-group">global</span>
         <el-select v-model="flags.global" size="small" style="width: 280px" filterable
                    placeholder="选择 global 配置">
           <el-option v-for="g in modeCandidates.global" :key="g.path || g"
                      :label="g.path || g" :value="g.path || g"></el-option>
         </el-select>
-        <span class="rb-label" style="margin-left: 16px">profile</span>
+        <span class="rb-label rb-group">profile</span>
         <el-select v-model="flags.profile" size="small" style="width: 240px"
                    placeholder="选择 profile 配置">
           <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
@@ -160,7 +181,7 @@ const PerfView = {
             <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
                        :label="c.path || c" :value="c.path || c"></el-option>
           </el-select>
-          <span class="rb-label" style="margin-left: 12px">global</span>
+          <span class="rb-label rb-label-inline">global</span>
           <el-select v-model="flags.rankGlobal" size="small" style="width: 300px" filterable
                      placeholder="选择 rank global">
             <el-option v-for="g in modeCandidates.global" :key="g.path || g"
@@ -175,7 +196,7 @@ const PerfView = {
             <el-option v-for="c in modeCandidates.cluster" :key="c.path || c"
                        :label="c.path || c" :value="c.path || c"></el-option>
           </el-select>
-          <span class="rb-label" style="margin-left: 12px">global</span>
+          <span class="rb-label rb-label-inline">global</span>
           <el-select v-model="flags.recallGlobal" size="small" style="width: 300px" filterable
                      placeholder="选择 recall global">
             <el-option v-for="g in modeCandidates.global" :key="g.path || g"
@@ -189,12 +210,23 @@ const PerfView = {
             <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
                        :label="m.path || m" :value="m.path || m"></el-option>
           </el-select>
-          <span class="rb-sel-note" style="margin-left: 12px">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
+          <span class="rb-sel-note">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
         </div>
       </template>
-      <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row" style="margin-top: 2px">
+      <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row">
         <span class="rb-label">image</span>
         <span :title="clusterImage" class="rb-image">{{ clusterImage || "-" }}</span>
+      </div>
+      <div class="rb-params" v-loading="paramLoading">
+        <div class="rb-params-title">启动参数（选中配置的解析值，供核对）</div>
+        <div v-for="g in paramGroups" :key="g.title" class="rb-params-group">
+          <div v-if="paramGroups.length > 1" class="rb-params-sub">{{ g.title }}</div>
+          <el-descriptions :column="3" size="small" border>
+            <el-descriptions-item v-for="(row, i) in g.rows" :key="i" :label="row[0]">
+              <span class="mc-mono rb-param-v" :title="row[1]">{{ row[1] }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
+        </div>
       </div>
       <div class="rb-sel-head">
         <span class="rb-label">配置选择</span>
@@ -222,7 +254,16 @@ const PerfView = {
         <span class="rb-label">选项</span>
         <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
         <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
-        <el-checkbox v-model="flags.noPlot">no-plot</el-checkbox>
+        <el-checkbox v-model="flags.noReport" title="只跳过 HTML 报表（report.html + overview.html），不影响绘图与原始日志">no-report</el-checkbox>
+        <span class="rb-opt">
+          <el-checkbox v-model="flags.png" title="生成旧版 PNG 散点图（plot_latency）；默认不绘图，且必须同时开启『拉取原始日志』">PNG 绘图</el-checkbox>
+          <span class="rb-opt-hint">必须与「拉取原始日志」同时开启</span>
+        </span>
+        <span class="rb-opt">
+          <el-checkbox v-model="flags.pullRawLogs" title="把原始客户端日志也拉回本地（默认只拉远端产出的紧凑 stats.json）">拉取原始日志</el-checkbox>
+          <span class="rb-opt-hint">可能导致拉取数据量过大</span>
+        </span>
+        <el-checkbox v-model="flags.keepIntermediates" title="报表成功生成后仍保留全部中间产物（stats/原始日志/kvtest 样本）；默认清理，report/ 与 profiling/ 始终保留">保留中间产物</el-checkbox>
         <el-checkbox v-model="flags.verbose" title="详细日志：上传路径、逐文件拉取、kubectl 命令、pod 详情">verbose</el-checkbox>
         <span class="rb-label rb-label-inline">协议</span>
         <el-select v-model="flags.protocol" size="small" style="width: 130px">
@@ -233,19 +274,22 @@ const PerfView = {
         </el-select>
       </div>
       <div class="rb-row rb-btn-row">
-        <el-button type="primary" size="default" style="width: 110px" :loading="starting"
-                   :disabled="!!runHint || busy || cleaning || starting"
-                   @click="startRun">RUN</el-button>
-        <el-button type="warning" size="default" style="width: 110px"
-                   :loading="stopLoading"
-                   :disabled="meta.status !== 'running' || stopLoading"
-                   @click="stop">{{ stopLoading ? "STOP..." : "STOP" }}</el-button>
+        <el-tooltip :disabled="!runHint" :content="runHint" placement="top">
+          <span>
+            <el-button type="primary" size="default" :loading="creating"
+                       :disabled="!!runHint || creating || cleaning"
+                       @click="createInstance">创建实例</el-button>
+          </span>
+        </el-tooltip>
         <span class="spacer"></span>
-        <el-button type="danger" plain size="default" style="width: 110px"
-                   :loading="cleaning"
-                   :disabled="busy || cleaning || starting || launchMode === 'rank_recall'"
-                   :title="launchMode === 'rank_recall' ? '并行模式请切回单任务后按 namespace 分别清理' : ''"
-                   @click="cleanup">CLEAN-UP</el-button>
+        <el-tooltip :disabled="!cleanupHint" :content="cleanupHint" placement="top">
+          <span>
+            <el-button type="danger" plain size="default"
+                       :loading="cleaning"
+                       :disabled="cleaning || creating || schedulerBusy || launchMode === 'rank_recall'"
+                       @click="cleanup">清理远端</el-button>
+          </span>
+        </el-tooltip>
       </div>
       <div v-if="runHint" class="rb-run-hint">{{ runHint }}</div>
       <div class="rb-clean-hint">
@@ -253,87 +297,96 @@ const PerfView = {
         与 controller workspace；SSH：cluster.json 所有节点的 remote_dir；
         本地 outputs/日志保留，操作不可恢复。
       </div>
-      <el-alert v-if="warnings.length" type="warning" :closable="false" style="margin-top: 8px"
+      <el-alert v-if="warnings.length" type="warning" :closable="false"
                 :title="warnings.join('；')"></el-alert>
     </el-card>
 
-    <el-card shadow="never" style="margin-top: 14px">
+    <el-card shadow="never">
       <template #header>
-        <div class="header-row" style="margin: 0">
-          <b>当前 RUN</b>
+        <div class="mc-toolbar">
+          <b>实例（{{ instances.length }}）</b>
           <span class="spacer"></span>
-          <el-button v-if="meta.ts_dir && meta.status !== 'running'" size="small" type="primary"
-                     @click="gotoResults">查看运行结果</el-button>
-          <el-button size="small" @click="drawerOpen = true">历史</el-button>
+          <el-tooltip content="刷新实例列表" placement="top">
+            <el-button size="small" circle :loading="instLoading"
+                       aria-label="刷新实例列表" @click="loadInstances">
+              <el-icon><component is="Refresh"/></el-icon>
+            </el-button>
+          </el-tooltip>
         </div>
       </template>
-      <div class="cur-run">
-        <div class="cr-row">
-          <span class="cr-item cr-grow">
-            <span class="cr-k">id:</span>
-            <span class="cr-v mono" :title="meta.id || ''">{{ meta.id || "-" }}</span>
-          </span>
-          <span class="cr-item cr-w-status">
-            <span class="cr-k">状态:</span>
-            <span class="cr-v">
-              <el-tag v-if="meta.stopping && meta.status === 'running'" type="warning" size="small">stopping（清理中）</el-tag>
-              <el-tag v-else-if="meta.status" :type="statusType(meta.status)" size="small">{{ meta.status }}</el-tag>
-              <span v-else>-</span>
+      <div v-if="!instances.length" class="inst-empty">
+        <el-empty description="还没有实例" :image-size="72">
+          <el-button type="primary" size="small" @click="scrollToForm">打开选择配置</el-button>
+        </el-empty>
+      </div>
+      <div v-else v-loading="instLoading" class="inst-list">
+        <div v-for="it in instances" :key="it.id" class="inst-card">
+          <div class="inst-head">
+            <span class="inst-name" :title="it.name">{{ it.name }}</span>
+            <el-tag size="small" :type="it.launch_mode === 'rank_recall' ? 'warning' : 'info'">
+              {{ it.launch_mode === 'rank_recall' ? 'Rank+Recall' : '单任务' }}
+            </el-tag>
+            <el-popover v-if="it.status === 'running' && it.stopping" placement="top"
+                        :width="300" trigger="hover" :show-after="150"
+                        content="正在优雅停止：先通知客户端清理并回收远端进程，宽限期内完成；超时后才会强制结束。">
+              <template #reference>
+                <el-tag size="small" type="warning">停止中</el-tag>
+              </template>
+            </el-popover>
+            <el-tag v-else size="small" :type="statusType(it.status)">{{ statusText(it.status) }}</el-tag>
+            <span class="spacer"></span>
+            <span class="inst-id mono">{{ it.id }}</span>
+          </div>
+          <div class="inst-meta">
+            <span><b>创建</b> <span :title="fmtTimeAbs(it.created)">{{ fmtTimeRel(it.created) }}</span></span>
+            <span><b>模式</b> {{ it.mode === 'k8s' ? 'k8s' : '真机' }}</span>
+            <template v-if="it.launch_mode !== 'rank_recall'">
+              <span><b>cluster</b> {{ it.flags.cluster || "-" }}</span>
+              <span><b>global</b> {{ it.flags.global || "-" }}</span>
+            </template>
+            <template v-else>
+              <span><b>rank</b> {{ it.flags.rank_cluster || "-" }} / {{ it.flags.rank_global || "-" }}</span>
+              <span><b>recall</b> {{ it.flags.recall_cluster || "-" }} / {{ it.flags.recall_global || "-" }}</span>
+            </template>
+            <span><b>配置</b> 目录 {{ it.selection.dirs.length }} / 文件 {{ it.selection.files.length }}</span>
+          </div>
+          <div v-if="it.last_run" class="inst-meta">
+            <span><b>最近运行</b> <span class="mc-mono">{{ it.last_run.id }}</span></span>
+            <span><b>耗时</b> <span class="mc-num">{{ Math.round(it.last_run.elapsed || 0) }}s</span></span>
+            <span><b>rc</b> <span class="mc-num">{{ (it.last_run.rc === null || it.last_run.rc === undefined) ? "-" : it.last_run.rc }}</span></span>
+            <span v-if="it.last_run.ts_dir">
+              <b>产物</b>
+              <a href="#" class="mono inst-link" @click.prevent="openResults(it.last_run.ts_dir)">{{ it.last_run.ts_dir }}</a>
             </span>
-          </span>
-          <span class="cr-item cr-w-elapsed">
-            <span class="cr-k">耗时:</span>
-            <span class="cr-v">{{ meta.id && meta.elapsed !== undefined ? Math.round(meta.elapsed) + "s" : "-" }}</span>
-          </span>
-          <span class="cr-item cr-w-rc">
-            <span class="cr-k">rc:</span>
-            <span class="cr-v">{{ (meta.rc === null || meta.rc === undefined) ? "-" : meta.rc }}</span>
-          </span>
-        </div>
-        <div class="cr-row">
-          <span class="cr-item cr-w-cmd">
-            <span class="cr-k">命令:</span>
-            <span class="cr-v mono" :title="meta.cmd || ''">{{ meta.cmd || "-" }}</span>
-          </span>
-          <span class="cr-item cr-w-out">
-            <span class="cr-k">产物:</span>
-            <span class="cr-v mono" :title="meta.ts_dir || ''">{{ meta.ts_dir || "-" }}</span>
-          </span>
-        </div>
-      </div>
-      <div class="log-toolbar">
-        <el-button size="small" @click="copyLog">复制</el-button>
-        <span class="log-wrap-toggle">
-          <el-switch v-model="logWrap" size="small" />
-          <span class="log-wrap-label" @click="logWrap = !logWrap">自动换行</span>
-        </span>
-        <span class="spacer"></span>
-        <el-input v-model="searchQ" size="small" placeholder="搜索日志（高亮+跳转）"
-                  clearable style="width: 230px" @keyup.enter="nextMatch" />
-        <el-button size="small" :disabled="!matchCount" @click="prevMatch">↑</el-button>
-        <el-button size="small" :disabled="!matchCount" @click="nextMatch">↓</el-button>
-        <span v-if="searchQ" class="log-match-count">{{ matchCount ? (matchIdx + 1) + "/" + matchCount : "0/0" }}</span>
-      </div>
-      <div class="logview log-fixed" ref="logEl" :class="{ 'log-nowrap': !logWrap }">
-        <div v-for="(ln, i) in logLines" :key="i"
-             :class="[ln.cls, { 'ln-cur-match': i === curMatchLine }]">
-          <template v-if="searchQ && hasHit(ln.text)">
-            <span v-for="(seg, j) in lineSegs(ln.text)" :key="j"
-                  :class="{ 'ln-mark': seg.hit }">{{ seg.t }}</span>
-          </template>
-          <template v-else>{{ ln.text }}</template>
-        </div>
-        <div v-if="!logLines.length && !meta.id" class="hint" style="padding: 40px; text-align: center">
-          尚未运行——配置完成后点击 RUN
+          </div>
+          <div class="inst-actions">
+            <el-tooltip :disabled="!instanceRunHint(it)" :content="instanceRunHint(it)" placement="top">
+              <span>
+                <el-button size="small" link type="primary"
+                           :loading="busy[it.id] === 'run'"
+                           :disabled="it.status === 'running' || schedulerBusy"
+                           @click="runInstance(it)">运行</el-button>
+              </span>
+            </el-tooltip>
+            <el-button size="small" link type="warning" v-if="it.status === 'running'"
+                       :loading="busy[it.id] === 'stop'"
+                       :disabled="busy[it.id] === 'stop'"
+                       @click="stopInstance(it)">停止</el-button>
+            <el-button size="small" link type="danger"
+                       :disabled="it.status === 'running'"
+                       @click="deleteInstance(it)">删除</el-button>
+            <span class="spacer"></span>
+            <el-button size="small" link type="primary" @click="openInstance(it)">详情</el-button>
+          </div>
         </div>
       </div>
     </el-card>
 
     <!-- 配置选择弹窗 -->
     <el-dialog v-model="cfgDialog" title="选择测试配置" width="560px">
-      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px"
+      <el-alert type="info" :closable="false" show-icon class="mb-2"
                 title="勾选文件或目录（勾选目录 = 递归该目录全部配置）" />
-      <div style="max-height: 400px; overflow-y: auto; border: 1px solid var(--el-border-color-lighter); border-radius: 6px; padding: 8px">
+      <div class="dlg-tree-box">
         <sel-node v-for="root in treeRoots" :key="root.path" :node="root" :depth="0"></sel-node>
       </div>
       <template #footer>
@@ -345,16 +398,16 @@ const PerfView = {
     </el-dialog>
 
     <!-- 历史抽屉 -->
-    <el-drawer v-model="drawerOpen" title="历史 Runs" size="560px" direction="rtl">
+    <el-drawer v-model="drawerOpen" title="历史运行" size="560px" direction="rtl">
       <el-table :data="runs" size="small" highlight-current-row @row-click="onHistoryClick">
         <el-table-column prop="id" label="id" width="180" show-overflow-tooltip></el-table-column>
         <el-table-column label="状态" width="88">
           <template #default="scope">
-            <el-tag :type="statusType(scope.row.status)" size="small">{{ scope.row.status }}</el-tag>
+            <el-tag :type="statusType(scope.row.status)" size="small">{{ statusText(scope.row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="rc" label="rc" width="56"></el-table-column>
-        <el-table-column label="耗时" width="72">
+        <el-table-column prop="rc" label="rc" width="56" class-name="mc-num"></el-table-column>
+        <el-table-column label="耗时" width="72" class-name="mc-num">
           <template #default="scope">{{ Math.round(scope.row.elapsed) + "s" }}</template>
         </el-table-column>
         <el-table-column prop="cmd" label="命令" show-overflow-tooltip></el-table-column>
@@ -362,20 +415,62 @@ const PerfView = {
     </el-drawer>
   </div>`,
   setup() {
-    const mode = Vue.ref("ssh");
-    const launchMode = Vue.ref("single");
+    // ---- 表单持久化（刷新 / 重启 webui 后恢复上次的选项与配置）----
+    const FORM_KEY = "mcweb-perf-form";
+    function _loadPerfForm() {
+      try {
+        const v = JSON.parse(localStorage.getItem(FORM_KEY) || "null");
+        return (v && typeof v === "object") ? v : null;
+      } catch (e) { return null; }
+    }
+    const _savedForm = _loadPerfForm();
+    const _savedFlags = (_savedForm && _savedForm.flags
+                         && typeof _savedForm.flags === "object")
+      ? _savedForm.flags : null;
+    const mode = Vue.ref(_savedForm &&
+      (_savedForm.mode === "ssh" || _savedForm.mode === "k8s")
+      ? _savedForm.mode : "ssh");
+    const launchMode = Vue.ref(_savedForm && _savedForm.launchMode === "rank_recall"
+                               && mode.value === "k8s" ? "rank_recall" : "single");
     const cfgDialog = Vue.ref(false);
     const treeRoots = Vue.ref([]);
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
-    const flags = Vue.reactive({ dryRun: false, noWarmup: false, noPlot: false,
-                                 verbose: false, protocol: "", cluster: "",
-                                 global: "", profile: "", rankCluster: "",
-                                 rankGlobal: "", recallCluster: "",
-                                 recallGlobal: "" });
+    const cfgLoading = Vue.ref(false);
+    const flags = Vue.reactive(Object.assign(
+      { dryRun: false, noWarmup: false, noReport: false, png: false,
+        pullRawLogs: false, keepIntermediates: false,
+        verbose: false, protocol: "", cluster: "",
+        global: "", profile: "", rankCluster: "",
+        rankGlobal: "", recallCluster: "", recallGlobal: "" },
+      _savedFlags || {}));
+    const _savedSel = (_savedForm && _savedForm.sel
+                       && typeof _savedForm.sel === "object")
+      ? _savedForm.sel : null;
+    let _selRestored = false;
+    let _saveTimer = null;
+    function _savePerfForm() {
+      try {
+        localStorage.setItem(FORM_KEY, JSON.stringify({
+          v: 1, mode: mode.value, launchMode: launchMode.value,
+          flags: { ...flags },
+          sel: { dirs: selected.value.dirs.slice(),
+                 files: selected.value.files.slice() },
+        }));
+      } catch (e) { /* ignore */ }
+    }
+    function _scheduleSave() {
+      clearTimeout(_saveTimer);
+      _saveTimer = setTimeout(_savePerfForm, 300);
+    }
     const warnings = Vue.ref([]);
-    const starting = Vue.ref(false);
+    const creating = Vue.ref(false);
     const cleaning = Vue.ref(false);
     const clusterImage = Vue.ref("");
+    const instances = Vue.computed(() => store.instances || []);
+    const instLoading = Vue.ref(false);
+    const busy = Vue.reactive({});     // 卡片按钮忙态（id -> "run" | "stop"）
+    const runs = Vue.computed(() => store.runs || []);   // 历史抽屉（/api/runs）
+    const drawerOpen = Vue.ref(false);
 
     // 配置树手风琴约束：同一时刻仅保留「根→当前展开目录」一条展开链。
     // 展开某目录 -> 集合替换为其全部前缀级（兄弟、父辈兄弟随之回收）；
@@ -396,7 +491,7 @@ const PerfView = {
     }
     Vue.provide("cfgTreeNav", { expandedPaths, toggleDir });
 
-    // 最终选择（与 startRun 提交内容一致）：勾目录=收编该目录并停止下钻
+    // 最终选择（创建实例时提交的内容）：勾目录=收编该目录并停止下钻
     const selected = Vue.computed(() => {
       const acc = { dirs: [], files: [] };
       treeRoots.value.forEach(r => _perfCollectSel(r, acc));
@@ -410,7 +505,145 @@ const PerfView = {
       profile: _perfModeCandidates(candidates.value.profile, mode.value),
     }));
 
-    let servedDefaults = false;
+    // ---- 启动参数面板：解析所选 cluster / global / profile 的关键字段 ----
+    const paramDocs = Vue.reactive({});     // path -> 解析后的对象 | null
+    const paramLoading = Vue.ref(false);
+    async function _loadParamDoc(path) {
+      if (!path) return null;
+      if (Object.prototype.hasOwnProperty.call(paramDocs, path)) return paramDocs[path];
+      paramDocs[path] = null;
+      try {
+        const r = await api("GET", "/api/config?path=" + encodeURIComponent(path));
+        const obj = typeof r.content === "string" ? JSON.parse(r.content) : r.content;
+        paramDocs[path] = (obj && typeof obj === "object") ? obj : null;
+      } catch (e) { paramDocs[path] = null; }
+      return paramDocs[path];
+    }
+    async function loadParamDocs() {
+      const paths = launchMode.value === "rank_recall"
+        ? [flags.rankCluster, flags.rankGlobal, flags.recallCluster,
+           flags.recallGlobal, flags.profile]
+        : [flags.cluster, flags.global, flags.profile];
+      paramLoading.value = true;
+      try {
+        await Promise.all([...new Set(paths.filter(Boolean))].map(_loadParamDoc));
+      } finally { paramLoading.value = false; }
+    }
+    function _perfFmtBytes(n) {
+      if (n === "" || n === null || n === undefined) return "-";
+      const v = Number(n);
+      if (!isFinite(v) || v <= 0) return String(n);
+      if (v < 1024) return v + " B";
+      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + " KB";
+      if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + " MB";
+      return (v / 1024 / 1024 / 1024).toFixed(2) + " GB";
+    }
+    function _perfShortList(arr, n) {
+      const a = Array.isArray(arr) ? arr : [];
+      if (!a.length) return "-";
+      const head = a.slice(0, n).join("、");
+      return a.length > n ? head + " 等 " + a.length + " 项" : head;
+    }
+    function _perfEffectiveProto(glob) {
+      const p = String(flags.protocol || "").trim();
+      if (p) return p + "（命令行覆盖）";
+      const raw = glob && glob.protocol;
+      if (!raw) return "配置值";
+      if (typeof raw === "string") return raw;
+      const keys = Object.keys(raw);
+      if (!keys.length) return "配置值";
+      return keys.map(k => {
+        const v = raw[k] || {};
+        return v && v.device ? k + "（device=" + v.device + "）" : k;
+      }).join("、");
+    }
+    function _perfClusterRows(doc) {
+      if (!doc) return [["集群", "-"]];
+      if (doc.nodes && typeof doc.nodes === "object") {
+        const names = Object.keys(doc.nodes);
+        const head = names.slice(0, 4).map(n =>
+          n + "=" + ((doc.nodes[n] || {}).ip || "?")).join("、");
+        const venv = doc.venv || (doc.venvs ? Object.keys(doc.venvs).join("、") : "");
+        return [["cluster 节点", names.length ? names.length + " 节点 · " +
+                 head + (names.length > 4 ? " 等" : "") : "-"],
+                ["venv", venv || "-"]];
+      }
+      const k8s = doc.k8s || {};
+      const ctrl = doc.controller || {};
+      return [["controller", (ctrl.ssh_user || "?") + "@" + (ctrl.ip || "?")],
+              ["namespace", k8s.namespace || "-"],
+              ["镜像", k8s.image || "-"],
+              ["host 日志根", k8s.host_log_root || "-"]];
+    }
+    function _perfGlobalRows(doc) {
+      if (!doc) return [["global", "-"]];
+      return [["master", [doc.master_type, doc.master_addr].filter(Boolean)
+               .join(" · ") || "-"],
+              ["metadata", doc.metadata_server || "-"],
+              ["etcd", doc.etcd_endpoints || "-"],
+              ["store 节点", _perfShortList(doc.mooncake_store_nodes, 6)],
+              ["本地 buffer", _perfFmtBytes(doc.local_buffer_size)],
+              ["store 容量", doc.store_total_size || "-"],
+              ["remote_dir", doc.remote_dir || "-"]];
+    }
+    function _perfProfileRows(doc) {
+      if (!doc) return [["profile", "-"]];
+      const tools = doc.tools || {};
+      const on = Object.keys(tools).filter(k =>
+        tools[k] && tools[k].enabled !== false);
+      return [["trigger", doc.trigger || "-"],
+              ["监控项", on.length ? on.join("、") : "无"],
+              ["outliers", (doc.outliers || {}).threshold_ms != null
+                ? (doc.outliers || {}).threshold_ms + " ms" : "-"]];
+    }
+    const paramGroups = Vue.computed(() => {
+      const opt = [];
+      if (flags.dryRun) opt.push("dry-run");
+      if (flags.noWarmup) opt.push("no-warmup");
+      if (flags.noReport) opt.push("no-report");
+      if (flags.png) opt.push("png");
+      if (flags.pullRawLogs) opt.push("pull-raw-logs");
+      if (flags.keepIntermediates) opt.push("keep-intermediates");
+      if (flags.verbose) opt.push("verbose");
+      const common = [
+        ["模式", mode.value === "k8s" ? "k8s" : "真机"],
+        ["启动方式", launchMode.value === "rank_recall" ? "Rank + Recall 并行" : "单任务"],
+        ["有效协议", _perfEffectiveProto(paramDocs[flags.global])],
+        ["已选配置", "目录 " + selected.value.dirs.length +
+         " / 文件 " + selected.value.files.length],
+        ["选项", opt.length ? opt.join("、") : "默认"],
+      ];
+      if (launchMode.value === "rank_recall") {
+        return [
+          { title: "rank", rows: [
+            ..._perfClusterRows(paramDocs[flags.rankCluster]),
+            ..._perfGlobalRows(paramDocs[flags.rankGlobal]),
+          ]},
+          { title: "recall", rows: [
+            ..._perfClusterRows(paramDocs[flags.recallCluster]),
+            ..._perfGlobalRows(paramDocs[flags.recallGlobal]),
+          ]},
+          { title: "公共", rows: [
+            ...common,
+            ..._perfProfileRows(paramDocs[flags.profile]),
+          ]},
+        ];
+      }
+      return [{ title: "启动参数", rows: [
+        ...common,
+        ..._perfClusterRows(paramDocs[flags.cluster]),
+        ..._perfGlobalRows(paramDocs[flags.global]),
+        ..._perfProfileRows(paramDocs[flags.profile]),
+      ]}];
+    });
+    Vue.watch([() => flags.cluster, () => flags.global, () => flags.profile,
+               () => flags.rankCluster, () => flags.rankGlobal,
+               () => flags.recallCluster, () => flags.recallGlobal,
+               () => launchMode.value], () => { loadParamDocs(); });
+    Vue.watch([mode, launchMode, () => flags, selected], _scheduleSave,
+              { deep: true });
+
+    let servedDefaults = !!_savedForm;
 
     // 仅首次加载 / 用户显式切换模式时调用；不触碰 mode 与选项开关
     function applyDefaults() {
@@ -452,6 +685,7 @@ const PerfView = {
     Vue.watch([() => flags.cluster, () => mode.value], loadClusterImage);
 
     async function loadConfigs() {
+      cfgLoading.value = true;
       try {
         const checked = _perfCheckedPaths(treeRoots.value);
         const cfg = await api("GET", "/api/configs");
@@ -464,16 +698,33 @@ const PerfView = {
           .sort((a, b) => a.tree.path.localeCompare(b.tree.path))
           .map(c => _toNode(c.tree));
         _perfApplyChecked(roots, checked);
+        // 首次加载：按存档回填上次勾选的目录 / 文件（路径不存在则忽略）
+        if (!_selRestored && _savedSel) {
+          const set = new Set([
+            ...(Array.isArray(_savedSel.dirs) ? _savedSel.dirs : []),
+            ...(Array.isArray(_savedSel.files) ? _savedSel.files : []),
+          ]);
+          if (set.size) _perfApplyChecked(roots, set);
+        }
+        _selRestored = true;
         treeRoots.value = roots;
         // 页签切换（onActivated）只刷新候选/树，绝不重置已选项；
-        // 只有首次成功加载才应用精确同名默认值。
+        // 只有首次成功加载（且无存档）才应用精确同名默认值。
         if (!servedDefaults) {
           applyDefaults();
           servedDefaults = true;
         }
+        loadParamDocs();
       } catch (e) {
         ElementPlus.ElMessage.error("加载配置失败: " + e.message);
+      } finally {
+        cfgLoading.value = false;
       }
+    }
+
+    function refreshConfigs() {
+      Object.keys(paramDocs).forEach(k => { delete paramDocs[k]; });
+      loadConfigs();
     }
 
     function clearSel() {
@@ -481,66 +732,34 @@ const PerfView = {
       treeRoots.value.forEach(walk);
     }
 
-    async function startRun() {
-      const acc = { dirs: selected.value.dirs.slice(),
-                    files: selected.value.files.slice() };
-      if (!acc.dirs.length && !acc.files.length) {
-        ElementPlus.ElMessage.warning("先选择配置文件或目录");
-        return;
-      }
-      starting.value = true;
-      warnings.value = [];
-      try {
-        const r = await api("POST", "/api/run", {
-          selector: { dirs: acc.dirs, files: acc.files },
-          flags: { mode: mode.value, launch_mode: launchMode.value,
-                   dry_run: flags.dryRun, no_warmup: flags.noWarmup,
-                   no_plot: flags.noPlot, verbose: flags.verbose,
-                   protocol: flags.protocol || null,
-                   cluster: flags.cluster, global: flags.global,
-                   profile: flags.profile,
-                   rank_cluster: flags.rankCluster,
-                   rank_global: flags.rankGlobal,
-                   recall_cluster: flags.recallCluster,
-                   recall_global: flags.recallGlobal },
-        });
-        warnings.value = r.warnings || [];
-        viewRun(r.run.id, true);
-        refreshRuns();
-      } catch (e) {
-        ElementPlus.ElMessage.error("启动失败: " + e.message);
-      } finally {
-        starting.value = false;
-      }
-    }
-
-    // ---- 日志查看（原 run-view 逻辑合并到同一组件）----
-    const meta = Vue.ref({});
-    const logLines = Vue.ref([]);
-    const logOffset = Vue.ref(0);
-    const logRem = Vue.ref("");
-    const logEof = Vue.ref(true);
-    const logEl = Vue.ref(null);
-    // 日志高度固定（禁止拖动）：不再使用 loadHeight/drag-handle
-    const logWrap = Vue.ref(true);        // 自动换行（默认开，与既有 pre-wrap 一致）
-    const searchQ = Vue.ref("");          // 日志搜索词
-    const matchIdx = Vue.ref(0);          // 当前命中序号
-    const runs = Vue.ref([]);
-    const stopping = Vue.ref(false);
-    const drawerOpen = Vue.ref(false);
-    const currentId = Vue.ref(null);
-
-    const busy = Vue.computed(() => {
-      if (store.status.active_run) return true;
-      if (meta.value.status === "running") return true;
+    const schedulerBusy = Vue.computed(() => {
       const sch = store.status.scheduler;
       return !!(sch && ["executing", "stopping"].includes(sch.state));
     });
 
-    // RUN 阻塞原因（小字提示问题点）；busy 类状态不提示
+    const cleanupHint = Vue.computed(() => {
+      if (launchMode.value === "rank_recall")
+        return "并行模式请切回单任务后按 namespace 分别清理";
+      if (schedulerBusy.value)
+        return "定时任务执行中，先停止调度后再清理";
+      return "";
+    });
+
+    function instanceRunHint(it) {
+      if (it.status === "running") return "该实例正在运行，先停止再运行";
+      if (schedulerBusy.value) return "定时任务执行中，暂不能启动实例";
+      return "";
+    }
+
+    function scrollToForm() {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    // 创建实例前的前置提示（只校验表单，实例可随时创建，不占运行槽）
     const runHint = Vue.computed(() => {
-      if (busy.value || starting.value || cleaning.value) return "";
       if (!hasSelection.value) return "未选择配置：先打开「选择配置」勾选文件或目录";
+      if (flags.png && !flags.pullRawLogs)
+        return "开启 PNG 绘图必须同时开启「拉取原始日志」";
       if (launchMode.value === "rank_recall") {
         if (!flags.rankCluster) return "未选择 rank cluster 配置";
         if (!flags.rankGlobal) return "未选择 rank global 配置";
@@ -554,167 +773,143 @@ const PerfView = {
       if (!flags.profile) return "未选择 profile 配置";
       return "";
     });
-    // STOP 的 loading/文案只在「仍在运行且停止中」时生效——后端 run.stopping
-    // 在完成时不重置，若直接绑定会永远停在 STOP...（本次修复点）
-    const stopLoading = Vue.computed(() =>
-      stopping.value || (!!meta.value.stopping && meta.value.status === "running"));
 
-    const viewingHistory = Vue.computed(() =>
-      !!(currentId.value && meta.value.id && meta.value.id !== currentId.value));
-
-    function statusType(s) {
-      return { running: "primary", done: "success", failed: "danger",
-               stopped: "warning", aborted: "warning" }[s] || "info";
-    }
-
-    function classify(ln) {
-      if (/\bFAIL\b|\bERROR\b/.test(ln)) return "ln-err";
-      if (/\bWARN\b/.test(ln)) return "ln-warn";
-      if (/SUMMARY: all .* OK|queue finished/.test(ln)) return "ln-ok";
-      return "";
+    // ---- 实例管理（创建=快照，不运行；运行/停止/删除/详情各自独立）----
+    function _instFlags() {
+      return { mode: mode.value, launch_mode: launchMode.value,
+               dry_run: flags.dryRun, no_warmup: flags.noWarmup,
+               no_report: flags.noReport, png: flags.png,
+               pull_raw_logs: flags.pullRawLogs,
+               keep_intermediates: flags.keepIntermediates,
+               verbose: flags.verbose,
+               protocol: flags.protocol || null,
+               cluster: flags.cluster, global: flags.global,
+               profile: flags.profile,
+               rank_cluster: flags.rankCluster,
+               rank_global: flags.rankGlobal,
+               recall_cluster: flags.recallCluster,
+               recall_global: flags.recallGlobal };
     }
 
-    function appendLog(text) {
-      if (!text) return;
-      const el = logEl.value;
-      const wasBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 60);
-      const lines = (logRem.value + text).split("\n");
-      logRem.value = lines.pop();
-      for (const ln of lines) logLines.value.push({ text: ln, cls: classify(ln) });
-      if (logLines.value.length > 5000) logLines.value.splice(0, logLines.value.length - 5000);
-      if (wasBottom) Vue.nextTick(() => {
-        if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
-      });
-    }
-
-    // ---- 日志搜索/复制（命中行高亮 + 跳转）----
-    const matchLines = Vue.computed(() => {
-      const q = searchQ.value.trim().toLowerCase();
-      if (!q) return [];
-      const hits = [];
-      logLines.value.forEach((ln, i) => {
-        if (ln.text.toLowerCase().includes(q)) hits.push(i);
-      });
-      return hits;
-    });
-    const matchCount = Vue.computed(() => matchLines.value.length);
-    const curMatchLine = Vue.computed(() =>
-      matchCount.value ? matchLines.value[matchIdx.value % matchCount.value] : -1);
-
-    function hasHit(text) {
-      const q = searchQ.value.trim().toLowerCase();
-      return !!q && text.toLowerCase().includes(q);
-    }
-    function lineSegs(text) {
-      const q = searchQ.value.trim();
-      if (!q) return [{ t: text, hit: false }];
-      const lower = text.toLowerCase(), lq = q.toLowerCase();
-      const out = [];
-      let pos = 0;
-      for (;;) {
-        const at = lower.indexOf(lq, pos);
-        if (at < 0) {
-          if (pos < text.length) out.push({ t: text.slice(pos), hit: false });
-          break;
-        }
-        if (at > pos) out.push({ t: text.slice(pos, at), hit: false });
-        out.push({ t: text.slice(at, at + q.length), hit: true });
-        pos = at + q.length;
-      }
-      return out.length ? out : [{ t: text, hit: false }];
-    }
-    function scrollToCurMatch() {
-      Vue.nextTick(() => {
-        const el = logEl.value, idx = curMatchLine.value;
-        if (!el || idx < 0 || !el.children[idx]) return;
-        el.children[idx].scrollIntoView({ block: "center" });
-      });
-    }
-    function nextMatch() {
-      if (!matchCount.value) return;
-      matchIdx.value = (matchIdx.value + 1) % matchCount.value;
-      scrollToCurMatch();
-    }
-    function prevMatch() {
-      if (!matchCount.value) return;
-      matchIdx.value = (matchIdx.value - 1 + matchCount.value) % matchCount.value;
-      scrollToCurMatch();
-    }
-    Vue.watch(searchQ, () => { matchIdx.value = 0; scrollToCurMatch(); });
-    async function copyLog() {
-      const text = logLines.value.map(l => l.text).join("\n");
+    async function loadInstances() {
+      instLoading.value = true;
       try {
-        await navigator.clipboard.writeText(text);
-        ElementPlus.ElMessage.success("日志已复制");
+        await refreshInstances();
       } catch (e) {
-        try {
-          const ta = document.createElement("textarea");
-          ta.value = text;
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand("copy");
-          document.body.removeChild(ta);
-          ElementPlus.ElMessage.success("日志已复制");
-        } catch (e2) {
-          ElementPlus.ElMessage.error("复制失败: " + e2.message);
-        }
+        ElementPlus.ElMessage.error("加载实例失败: " + e.message);
+      } finally {
+        instLoading.value = false;
       }
     }
 
-    function viewRun(id, live) {
-      currentId.value = currentId.value || id;
-      meta.value = { id };
-      logLines.value = [];
-      logOffset.value = 0;
-      logRem.value = "";
-      logEof.value = false;
-      pollRun();
-    }
-
-    async function pollRun() {
-      const id = meta.value.id;
-      if (!id) return;
+    async function createInstance() {
+      if (runHint.value) { ElementPlus.ElMessage.warning(runHint.value); return; }
+      const acc = { dirs: selected.value.dirs.slice(),
+                    files: selected.value.files.slice() };
+      if (!acc.dirs.length && !acc.files.length) {
+        ElementPlus.ElMessage.warning("先选择配置文件或目录");
+        return;
+      }
+      let name = "";
       try {
-        const prevStatus = meta.value.status;
-        const m = await api("GET", "/api/runs/" + id);
-        if (meta.value.id !== id) return;
-        meta.value = m;
-        if (!_perfShouldFetchLog(prevStatus, m.status, logEof.value)) return;
-        const lg = await api("GET", "/api/runs/" + id + "/log?offset=" + logOffset.value);
-        if (meta.value.id !== id) return;
-        if (lg.content) appendLog(lg.content);
-        logOffset.value = lg.offset;
-        logEof.value = lg.eof;
-        if (logEof.value && logRem.value && m.status !== "running") {
-          logLines.value.push({ text: logRem.value, cls: classify(logRem.value) });
-          logRem.value = "";
-        }
-      } catch (e) { /* run pruned or server hiccup */ }
+        const r = await ElementPlus.ElMessageBox.prompt(
+          "实例名称（留空 = 自动命名）", "创建实例",
+          { inputValue: "", confirmButtonText: "创建", cancelButtonText: "取消" });
+        name = (r.value || "").trim();
+      } catch (e) { return; }
+      creating.value = true;
+      warnings.value = [];
+      try {
+        await api("POST", "/api/instances", {
+          name: name,
+          selector: { dirs: acc.dirs, files: acc.files },
+          flags: _instFlags(),
+        });
+        ElementPlus.ElMessage.success("实例已创建");
+        await loadInstances();
+      } catch (e) {
+        ElementPlus.ElMessage.error("创建失败: " + e.message);
+      } finally {
+        creating.value = false;
+      }
     }
 
-    async function refreshRuns() {
-      try { runs.value = (await api("GET", "/api/runs")).runs; }
+    async function runInstance(it) {
+      busy[it.id] = "run";
+      warnings.value = [];
+      try {
+        const r = await api("POST", "/api/instances/" + it.id + "/run");
+        if (r.warnings && r.warnings.length) warnings.value = r.warnings;
+        ElementPlus.ElMessage.success("实例已启动");
+        await loadInstances();
+      } catch (e) {
+        ElementPlus.ElMessage.error("启动失败: " + e.message);
+      } finally { delete busy[it.id]; }
+    }
+
+    async function stopInstance(it) {
+      busy[it.id] = "stop";
+      try {
+        await api("POST", "/api/instances/" + it.id + "/stop");
+        ElementPlus.ElMessage.success("已请求停止");
+        await loadInstances();
+      } catch (e) {
+        ElementPlus.ElMessage.error("停止失败: " + e.message);
+      } finally { delete busy[it.id]; }
+    }
+
+    async function deleteInstance(it) {
+      try {
+        await confirmDanger(
+          "删除实例「" + it.name + "」？实例定义将被直接删除；运行记录、日志与 outputs 保留。",
+          "删除实例");
+      } catch (e) { return; }
+      try {
+        await api("DELETE", "/api/instances/" + it.id);
+        ElementPlus.ElMessage.success("实例已删除");
+        await loadInstances();
+      } catch (e) {
+        ElementPlus.ElMessage.error("删除失败: " + e.message);
+      }
+    }
+
+    function openInstance(it) {
+      const open = store.instancesOpen || [];
+      if (!open.includes(it.id)) open.push(it.id);
+      store.instancesOpen = open;
+      store.instancesTarget = it.id;
+      store.view = "instances";
+    }
+
+    function openResults(tsDir) {
+      if (!tsDir) return;
+      const rel = String(tsDir).replace(/^outputs[\\/]/, "");
+      store.resultsTarget = rel.split("/")[0];
+      store.view = "results";
+    }
+
+    async function reloadRuns() {
+      try { await refreshRuns(); }
       catch (e) { /* ignore */ }
     }
 
     function onHistoryClick(row) {
-      viewRun(row.id, row.status === "running");
       drawerOpen.value = false;
-    }
-
-    async function stop() {
-      if (!meta.value.id) return;
-      stopping.value = true;
-      try {
-        const r = await api("POST", "/api/runs/" + meta.value.id + "/stop");
-        if (r && r.run) meta.value = r.run;
-      } catch (e) { ElementPlus.ElMessage.error(e.message); }
-      finally { stopping.value = false; }
+      const iid = row && row.meta && row.meta.instance;
+      if (iid) {
+        const open = store.instancesOpen || [];
+        if (!open.includes(iid)) open.push(iid);
+        store.instancesOpen = open;
+        store.instancesTarget = iid;
+        store.view = "instances";
+      } else if (row && row.ts_dir) {
+        openResults(row.ts_dir);
+      }
     }
 
     async function cleanup() {
-      if (busy.value) {
-        ElementPlus.ElMessage.warning("当前有运行/调度任务，先停止后再清理");
+      if (schedulerBusy.value) {
+        ElementPlus.ElMessage.warning("调度任务执行中，先停止调度后再清理");
         return;
       }
       try {
@@ -735,8 +930,8 @@ const PerfView = {
                    global: flags.global },
         });
         warnings.value = r.warnings || [];
-        viewRun(r.run.id, true);
-        refreshRuns();
+        reloadRuns();
+        ElementPlus.ElMessage.success("清理完成（远端残留已删除）");
       } catch (e) {
         ElementPlus.ElMessage.error("清理失败: " + e.message);
       } finally {
@@ -744,28 +939,25 @@ const PerfView = {
       }
     }
 
-    function gotoResults() {
-      if (meta.value.ts_dir) {
-        store.resultsTarget = meta.value.ts_dir.split("/").pop();
-        store.view = "results";
-      }
-    }
-
-    let timer = null, histTimer = null;
-    Vue.onMounted(() => { loadConfigs().then(loadClusterImage); refreshRuns(); });
+    Vue.onMounted(() => {
+      loadConfigs().then(loadClusterImage);
+      reloadRuns();
+      loadInstances();
+    });
     Vue.onActivated(() => {
       loadConfigs();
-      refreshRuns();
-      timer = setInterval(pollRun, 1500);
-      histTimer = setInterval(refreshRuns, 6000);
+      reloadRuns();
+      loadInstances();
     });
-    Vue.onDeactivated(() => { clearInterval(timer); clearInterval(histTimer); });
 
-    return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection, modeCandidates, onModeChange,
-             flags, warnings, starting, cleaning, busy, clusterImage, clearSel, startRun, cleanup,
-             meta, logLines, logEl, runs, stopping, drawerOpen, viewingHistory,
-             statusType, stop, gotoResults, onHistoryClick,
-             runHint, stopLoading, logWrap, searchQ, matchCount, matchIdx, curMatchLine,
-             hasHit, lineSegs, nextMatch, prevMatch, copyLog };
+    return { mode, launchMode, cfgDialog, treeRoots, selected, hasSelection,
+             paramDocs, paramGroups, paramLoading, refreshConfigs,
+             modeCandidates, onModeChange, flags, warnings, creating, cleaning,
+             clusterImage, clearSel, loadConfigs, cfgLoading, runHint, cleanupHint, schedulerBusy,
+             statusType, statusText, fmtTimeRel, fmtTimeAbs,
+             instanceRunHint, scrollToForm,
+             instances, instLoading, busy, loadInstances, createInstance, runInstance,
+             stopInstance, deleteInstance, openInstance, openResults,
+             runs, drawerOpen, onHistoryClick, cleanup };
   },
 };

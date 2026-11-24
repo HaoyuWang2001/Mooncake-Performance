@@ -72,15 +72,14 @@ def test_config_get_put_validate():
             "content": json.dumps({"scenario": "basic", "protocol": "tcp",
                                    "data_size": ["64KB"],
                                    "params": [{"num_clients": 1, "num_threads": 2}]})})
-        assert code == 200
-        assert d["backup"] is None or d["backup"].startswith("webui/backups/")
-        # 二次保存已有文件 -> 必有备份
+        assert code == 200 and "backup" not in d
+        # 二次保存已有文件 -> 仍然不备份（WebUI 不留隐藏副本）
         code, d = _req("PUT", "/api/config", {
             "path": tmp,
             "content": json.dumps({"scenario": "basic", "protocol": "tcp",
                                    "data_size": ["64KB"],
                                    "params": [{"num_clients": 1, "num_threads": 2}]})})
-        assert code == 200 and d["backup"].startswith("webui/backups/")
+        assert code == 200 and "backup" not in d
         code, d = _req("GET", "/api/config?path=" + tmp)
         assert code == 200 and json.loads(d["content"])["scenario"] == "basic"
         # 白名单外 -> 400/404
@@ -89,6 +88,51 @@ def test_config_get_put_validate():
     finally:
         if os.path.isfile(tmp):
             os.remove(tmp)
+
+
+def test_config_chain_inheritance():
+    """配置继承链：各级 _configs.json（含缺失级）+ 本文件 + 合并后的生效配置。"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tmp = "configs/basic/zz-chain-test.json"
+    fp = os.path.join(root, tmp)
+    try:
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"scenario": "basic", "operation": "put",
+                       "data_size": ["64KB"],
+                       "params": [{"num_clients": 1, "num_threads": 1}]}, f)
+        code, d = _req("GET", "/api/config/chain?path=" + tmp)
+        assert code == 200 and d["inherits"] is True
+        assert d["category"] == "basic"
+        paths = [lv["path"] for lv in d["levels"]]
+        assert paths[0] == "configs/basic/_configs.json"
+        assert paths[-1] == tmp
+        assert d["levels"][-1]["kind"] == "self"
+        assert all(lv["exists"] for lv in d["levels"])
+        eff = json.loads(d["effective"])
+        assert eff["scenario"] == "basic" and "data_size" in eff
+        # 已有多级链：pipeline 根 + rank 子目录两级都存在
+        code, d = _req("GET",
+            "/api/config/chain?path=configs/pipeline/rank/rank_balanced_1w10r_1x.json")
+        assert code == 200 and d["inherits"] is True
+        assert [lv["exists"] for lv in d["levels"]][:2] == [True, True]
+        # 子目录缺失的 _configs.json 也列出（exists=False）
+        code, d = _req("GET",
+            "/api/config/chain?path=configs/pipeline/smoke/rank_smoke.json")
+        assert code == 200 and d["inherits"] is True
+        assert [lv["exists"] for lv in d["levels"]][:2] == [True, False]
+        # 非继承配置：只有 self，无 effective
+        code, d = _req("GET", "/api/config/chain?path=configs/cluster.json")
+        assert code == 200 and d["inherits"] is False
+        assert [lv["kind"] for lv in d["levels"]] == ["self"]
+        assert d["effective"] == ""
+        # 不存在 / 越界
+        code, _ = _req("GET", "/api/config/chain?path=configs/basic/nope.json")
+        assert code == 404
+        code, _ = _req("GET", "/api/config/chain?path=../etc/passwd")
+        assert code == 404
+    finally:
+        if os.path.isfile(fp):
+            os.remove(fp)
 
 
 def test_run_selector_validation():
@@ -124,7 +168,6 @@ def test_output_rename_delete():
     new = old + "-renamed"
     src = os.path.join(out, old)
     dst = os.path.join(out, new)
-    trash = []
     os.makedirs(src)
     try:
         with open(os.path.join(src, "benchmark_detail.csv"), "w") as f:
@@ -147,11 +190,11 @@ def test_output_rename_delete():
         code, d = _req("GET", "/api/outputs/{}/tree".format(new))
         assert code == 200
 
-        # 单删（移入回收站）
+        # 单删（WSL/Linux 下永久删除；无 trash/backup 副本）
         code, d = _req("DELETE", "/api/outputs/{}".format(new))
-        assert code == 200 and d["trash"].startswith("webui/backups/outputs-trash/")
-        trash.append(os.path.join(root, d["trash"]))
-        assert not os.path.isdir(dst) and os.path.isdir(trash[-1])
+        assert code == 200 and "trash" not in d
+        assert not os.path.isdir(dst)
+        assert not os.path.isdir(os.path.join(root, "webui", "backups"))
     finally:
         for p in (src, dst):
             if os.path.isdir(p):
@@ -170,13 +213,6 @@ def test_output_rename_delete():
     finally:
         for t in names:
             shutil.rmtree(os.path.join(out, t), ignore_errors=True)
-        trash_dir = os.path.join(root, "webui/backups/outputs-trash")
-        for p in trash:
-            shutil.rmtree(p, ignore_errors=True)
-        if os.path.isdir(trash_dir):
-            for name in os.listdir(trash_dir):
-                if any(name == t or name.startswith(t + ".") for t in names):
-                    shutil.rmtree(os.path.join(trash_dir, name), ignore_errors=True)
     code, _ = _req("POST", "/api/outputs/delete", {"names": []})
     assert code == 400
 
@@ -200,10 +236,23 @@ def test_dry_run_via_api():
     prof = "configs/zz-webui-test-profile.json"
     with open(prof, "w", encoding="utf-8") as f:
         json.dump({"tools": {"spdiag": {"enabled": False}}}, f)
+    # dry-run 用 mock 集群专属 global（venv=mock），不依赖
+    # configs/_ssh/global.json 的环境默认值——该文件在本地 lab 沙箱里是
+    # 适配过的（venv=mooncake-bench），依赖它会让本测试因环境而失败。
+    gpath = "mock/zz-global-test.json"
+    with open(gpath, "w", encoding="utf-8") as f:
+        json.dump({"venv": "mock", "master_type": "http",
+                   "etcd_endpoints": "", "master_addr": "127.0.0.1:50051",
+                   "metadata_server": "http://127.0.0.1:9999/metadata",
+                   "mooncake_store_nodes": ["store1"],
+                   "remote_dir": "/tmp/mc_mock",
+                   "remote_data_dir": "/tmp/mc_mock/data",
+                   "remote_results_dir": "/tmp/mc_mock/results"}, f)
     try:
         code, d = _req("POST", "/api/run", {
             "selector": {"files": ["mock/smoke/put.json"]},
             "flags": {"cluster": "mock/cluster.json",
+                      "global": gpath,
                       "profile": prof, "dry_run": True}})
         assert code == 200, d
         rid = d["run"]["id"]

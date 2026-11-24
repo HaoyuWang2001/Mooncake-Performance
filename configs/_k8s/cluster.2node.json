@@ -6,7 +6,7 @@
     "ssh_user": "root",
     "ssh_port": 22,
     "ssh_key": "",
-    "passwd": "Jingdong12#$",
+    "passwd": "",
     "kubectl": "/usr/local/bin/kubectl",
     "kubeconfig": ""
   },

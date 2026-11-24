@@ -58,6 +58,20 @@ CLI 的 `--protocol` 可选值为 `tcp / rdma / ub`，优先级最高、可覆�
 
 接口清单、签名与梯队分类详见 **`Mooncake-api.md`**。
 
+### 3.0 统一口径：引擎（engine）× 场景（scenario）
+
+测试矩阵按两个正交维度描述（报表 `meta` 同名）：
+
+- **引擎 engine**：`python`（Python client）｜`kvtest`（C++ `mooncake_kvtest`）——决定“谁来发请求”；
+- **场景 scenario**：`basic`（接口级逐接口扫描）｜`pipeline`（writer→reader 生产消费）——决定“报表版式与负载形态”。
+
+2×2 组合即 `python:basic` / `python:pipeline` / `kvtest:basic` / `kvtest:pipeline`。
+配置里沿用历史字段 `scenario: "basic"|"pipeline"|"kvtest"`：`"kvtest"` 表示 **引擎 kvtest + 形态默认
+pipeline**（可用 `report_scenario` 覆盖形态）；报表读取时统一归一化为 `scenario=pipeline|basic`
++ `engine=kvtest|python`。日志标签按「操作归属」：`[kvtest]` = kvtest 引擎专属操作，
+`[pipeline]`/`[basic]` = 场景专属操作，`[k8s]` = 集群动作，其余为 `[verify]`/`[remove-keys]`/
+`[parallel]`/`[report]` 等语义标签。
+
 ### 3.1 并发维度（params 组合）
 
 并发维度由场景配置中的 `params` 数组显式指定，每个元素为一个
@@ -239,6 +253,13 @@ store 节点列表），实际通信仍经 master 发现 store。
   另记录 `notify_queue_peak`、`notify_queue_wait_avg_ms/max_ms`（入发送队列到开始发送的等待时间），
   以及 `notify_connections_created/reused`（包含 warmup 的连接创建/复用次数）。TOTAL 行队列/在途峰值取各实例最大值。
   异步发送不会消除接收端瓶颈；队列满时仍会背压，HTTP 超时仍计为失败且不自动重试。
+  **notify 热路径默认走轻量实现（C++ kvtest 之外，Python 侧也尽量少占 GIL）**：发送端用裸 socket
+  长连接，只按 Content-Length 定界读响应，不再为每个响应构造 `http.client` 响应对象和 email 头解析器；
+  接收端自实现 HTTP/1.1 keep-alive（手写 query 解析、预置响应字节），跳过
+  `BaseHTTPRequestHandler` 的请求行正则、头解析器与 Date 头拼装。`MC_NOTIFY_HTTP=legacy` 可切回旧
+  实现做 A/B 或回退。线程争用另可用 `BENCH_GIL_SWITCH_INTERVAL`（秒，默认不改解释器行为）调小
+  GIL 切换间隔（如 0.001），实际生效值写入 writer/reader SUMMARY 的 `gil_switch_interval`。
+  本地微基准（无需集群）：`python3 scripts/bench_notify_gil.py --server fast --threads 8`。
 - **operation 角色化**：`writer.operation`（写接口）与 `reader.operation`（读接口）**真实驱动调用**
   ——writer 支持 `put_batch`（整批一次调用）/`put`、`put_from`、`upsert_from`（逐 key 调用），reader 支持
   `get`/`get_into`/`get_buffer`（逐 key）与 `get_batch`（整批一次调用）；时延样本 = 单次接口调用
@@ -458,18 +479,25 @@ device plugin 按集群自行维护。
 `RUN_LABEL` = `<ts>-<cfg>`（写 `labels.run`，用于清理）；`ROLE_LABEL` 是 pod 的逻辑角色
 （如 `client-0`），**不是** k8s 节点名。
 
-**k8s 失败处理**：**任何场景失败都会把现场证据自动写进编排器日志**——`get pods -o wide`
-（全量 pod 状态/节点）+ `get events --sort-by=.lastTimestamp`（真实原因）自动 dump；客户端
-`exitrc` 非零或等待超时再自动 dump 对应 pod 的 `describe` 尾部（容器重启/OOMKilled）；
-启动时单独打印镜像名；创建 ns 后给出 `get pods` 命令、pod 创建后
-给出 `describe` 命令、Ready 后给出 `exec` 命令。pod 60s 内未 Ready 会识别
-`ErrImageNeverPull`/`ImagePullBackOff`/`CreateContainerError`/`FailedScheduling`
-等事件并立即报错终止。**Deployment rollout（pipeline）同样秒级快速失败**：每 3s 轮询
-pod 致命状态与 namespace 事件，失败或 60s 超时都 dump **证据三件套**——`get pods -o wide`
-+ `get events --sort-by=.lastTimestamp`（pod 级事件承载真实原因）+ `describe deployment`，
-并给出可直接复制的排查命令。**任何失败（含部署失败）都保留现场**：pod、Deployment 与
-namespace 全部保留，打印 exec/describe/events 命令并进入等待（不自动退出）：按
-STOP/Ctrl+C 或 `--clean-up` 收场；下次运行会自动回收遗留 namespace。
+**k8s 失败处理（kvtest / basic / pipeline 统一）**：失败分两类，输出都很短：
+
+- **容器没起来**（镜像/调度问题：`ErrImageNeverPull`/`ImagePullBackOff`/
+  `CreateContainerError`/`FailedCreatePodSandBox`/`FailedScheduling`/`CrashLoopBackOff`）：
+  先打印一行 `[FAIL] scenario <cfg> failed at stage 'deploy ...': <reason>`，随后是
+  `kubectl get pods -o wide` 的全量 pod 列表，以及可直接复制的
+  `kubectl describe pod <pod>` / `kubectl get events` 命令。**不打印 describe/events 内容**，
+  并跳过 fail-cleanup（没有实例/数据需要清理）。
+- **容器正常、某个执行阶段失败**：先打印一行
+  `[FAIL] scenario <cfg> failed at stage '<阶段>': <异常>`（阶段如
+  `remove-keys (pre-run, 3.5MB)` / `launch writers` / `measurement`），随后是全量 pod 列表
+  与每个 pod 一行原始日志目录（`ssh <host> -> <host_log_root>/<run>/<pod>/`）。
+  **不再拉取/截取任何日志**，也没有每 pod 的 exec/describe 提示；原始 log/glog/exitrc
+  留在节点现场。失败阶段本身是 `remove-keys` 时不会再重试 store remove-all（避免再等一个
+  RPC 超时）。
+
+任何失败（含部署失败）都保留 pod、Deployment 与 namespace，打印上述信息后进入等待
+（不自动退出）：按 STOP/Ctrl+C 或 `--clean-up` 收场，挂起期间每 5 分钟提示一次；
+下次运行会自动回收遗留 namespace。
 
 ### 7.2 configs/global.json（业务无关全局超参）
 
@@ -517,7 +545,7 @@ env.sh 生成的环境变量按**消费者**分四组（各用独立前缀，Moo
 |---|---|---|---|
 | `MC_` | Mooncake C++ 进程直读 | C++ SDK `getenv` | 仅 `MC_TCP_BIND_ADDRESS`、`MC_YLT_LOG_PATH`（runner 逐 client inline 注入） |
 | `SETUP_` | wrapper→setup() 传参 | mooncake_benchmark_client.py 读取后显式传给 `store.setup()` | `SETUP_PROTOCOL/MASTER_TYPE/MASTER_ADDR/METADATA_SERVER/ETCD_ENDPOINTS/FABRIC_IP/UB_DEVICE/LOCAL_BUFFER_SIZE/TENANT_ID/RANDOM_SEED` |
-| `BENCH_` | 仓库基准逻辑自用 | 仅本仓库 | `BENCH_SCENARIO/WORK_MODE/OPERATION/KEY_PREFIX/KEY_COUNT/DATA_SIZE/BATCH_SIZE/PUT_RATIO/DURATION/WARMUP_DURATION/REMOTE_DATA_DIR/EXCLUDE_CPUS` + pipeline 族 |
+| `BENCH_` | 仓库基准逻辑自用 | 仅本仓库 | `BENCH_SCENARIO/WORK_MODE/OPERATION/KEY_PREFIX/KEY_COUNT/DATA_SIZE/BATCH_SIZE/PUT_RATIO/DURATION/WARMUP_DURATION/REMOTE_DATA_DIR/EXCLUDE_CPUS` + pipeline 族（`BENCH_NOTIFY_*`、`BENCH_GIL_SWITCH_INTERVAL`） |
 | `ORCH_` | 编排/runner 传输层 | runner 脚本 | `ORCH_VENV`（python 解释器）、`ORCH_CPU_SHARD`（绑核分片） |
 
 env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），与 env.sh 无同名冲突。
@@ -528,13 +556,25 @@ env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），�
 `SETUP_UB_DEVICE` 由容器内 `urma_admin show` 自动探测（取首个 bonding_dev_*，
 仅 ub 协议时）；绑核相关变量不注入（容器不做 numactl）。
 
-**编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头。
+**日志编码**：run 日志统一 UTF-8。WebUI 启动的进程由 runmgr 注入
+`PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`；CLI 重定向时入口会
+`reconfigure` 非 tty 的 stdout/stderr，因此 Windows 下中文日志不再乱码。
+
+**编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头；阶段分割行
+（`──── 阶段 ────` / `  ── 子阶段 ──`）不带时间戳，且前置一个空行，便于快速定位
+「参数与环境 / run 初始化 / 场景 … / 资源创建 / 清库 / 启动实例 / 测量 / 收集 / 清理收尾 /
+运行收尾」。中文只用于阶段名、难以理解的说明（store 容量、key 池、心跳、退出进度）
+和少量动词；标识符/命令/标签保持英文。
 **verbose 开关**：CLI `--verbose`/`-v`、环境变量 `MC_BENCH_VERBOSE=1`、
-WebUI 运行框勾选 `verbose`。默认打印：启动摘要（mode/配置路径/k8s 设置）、
-workspace 创建、脚本 staging 目录与文件清单（upload → controller 路径）、
-ConfigMap 创建（ns + keys）、pod 创建/挂载/ready（含 k8s node 与耗时）、
-每个 stage 的 done rc/elapsed、日志拉取汇总（源→目标）。verbose 额外输出：
-逐文件上传大小、逐文件拉取、完整 kubectl 命令、失败时 `kubectl describe pod` 尾部。
+WebUI 运行框勾选 `verbose`。默认打印：参数与环境摘要（controller/镜像/namespace/配置路径）、
+容量探测结论、workspace/预运行/namespace、脚本上传与 ConfigMap、deployment/pod 就绪、
+每个 stage 的 `running.../done rc=…`（标签带引擎/场景，如 `[kvtest] remove-keys`）、
+健康门/屏障、测量心跳、日志拉取汇总（文件数/实例数/耗时/字节）。细节（逐文件清单、
+kubectl 命令、describe 尾部、多次 DNS 解析）只进 `benchmark.log`（log_detail）。
+**测量心跳**：`global.json` 的 `heartbeat_interval_s`（默认 60，0=关闭）对全部 2×2
+引擎×场景生效，格式 `[<tag>] 测试已进行 hh:mm:ss，剩余 hh:mm:ss，预计结束于 hh:mm:ss`
+（无固定时长时只打已进行时间）。kvtest 退出等待每 10s 打一行
+`[kvtest] 实例正在退出: x/n (xs)`。
 
 **client 启动环境快照**：每个 benchmark client 进程启动的最开始会打印一行
 `[client-env] pid=... argv=...`，包含 `POD_IP / NODE_NAME / LD_LIBRARY_PATH /
@@ -577,14 +617,23 @@ TENT 不使用 setup 的 `device_names` 作为 UB 过滤器，因此自定义 JS
 
 ### 7.3 日志体系
 
-客户端进程有三条日志流，落点如下（`<LOG_FILE>` 为对应 stage 的 client 日志，随
-`cfg_name.*` glob 自动拉回本地 `outputs/<ts>/logs/<cfg>/`）：
+客户端进程的日志**按来源三流分离**（read / writer / client-glog），互不混写：
 
 | 日志流 | 承载内容 | 落点 |
 |---|---|---|
-| Python stdout（`log()`/`emit()`/RESULT） | 进度打点、META/SUMMARY/RESULT | 合并进 `<LOG_FILE>`（与 C++ stderr 按时间交织） |
-| C++ glog（`LOG()`/`MC_LOG()`） | setup 期连接证据：`ConnectToCvmSubmasters`、`connected to submaster`、`Loaded partition routing`、`Version mismatch`、`MountSegment` 等 | **stderr**，被 `2>&1` 合入 `<LOG_FILE>` |
+| Python（`log()`/`emit()`/RESULT） | 进度打点、META/SUMMARY/RESULT | **`MC_WRITER_LOG` / `MC_READER_LOG` 文件**（客户端启动即 `sys.stdout` 重绑到角色日志；dual 进程按 thread-local 路由：reader 工作线程/notify 线程 → reader 日志，其余 → writer 日志；单角色/basic/stage 进程只设其一，全部 Python 输出进该文件；两者都未设时回退 stdout 兼容手工 CLI） |
+| C++ SDK glog（`LOG()`/`MC_LOG()`） | setup 期连接证据：`ConnectToCvmSubmasters`、`connected to submaster`、`Loaded partition routing`、`Version mismatch`、`MountSegment` 等 | SDK 默认写 **OS fd1（stdout）**（`MC_LOG_ENABLE=on` 且未设 `MC_LOG_DIR` 时）；runner 把 fd1+fd2 收进 **`<GLOG_FILE>`**（Python fatal traceback 也在其中）。若需 SDK 自管日志文件，可设 `MC_LOG_DIR`（实测可靠），但本仓库默认不用它——stdout 单一流最简单 |
 | C++ ylt easylog（coro_rpc 内部） | 连接池事件、建连失败细节（connect/fail/refuse/timeout） | `<LOG_FILE>.ylt.log`（绝对路径，multi-client 带 `===== client.N =====` 分节头） |
+
+**节点身份（报表口径）**：报告里的「节点」= **节点 IP**——k8s 场景取
+`pod.status.hostIP`（宿主节点 IP），ssh 场景取节点管理 IP；同一宿主上的多个
+client pod 在节点级合并为一个节点（pod 名保留在 `meta.pod` 与客户端名中，明细
+不丢）；取不到 IP 或 ssh 配置出现重复 IP 时回退原节点名。历史产物（IP 未记录）
+沿用 pod 名/节点名。
+
+glog 文件名：dual `<base>.glog`；分离角色 `<base>.writer_<node>_w<gid>.glog` /
+`<base>.reader_<node>_r<idx>_p<port>.glog`；basic/stage `LOG_FILE` 去掉 `.log` 换 `.glog`
+（basic 多客户端逐 client 拆分后合并）。WebUI 已把 `.glog` 归入日志分组。
 
 关键说明：
 
@@ -647,8 +696,8 @@ pipeline 场景字段见 3.3（含 `writer`/`reader` 角色块，无顶层 store
 ### 7.5 测试阶段（--mode）
 
 - `generate-data`：按固定种子生成数据文件并持久化
-- `remove-keys`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`，失败即报错退出，无回退
-- `prepare-store`：`batch_is_exist` 检查存在性，仅对缺失 key 执行 `put_batch` 补写
+- `remove-keys`：`--scope key-prefix` 仅清理本场景 key（`batch_is_exist` + `batch_remove` 分类统计不存在/失败）；`--scope full` 使用 `remove_all()`——**单次调用只入队 master oplog 放行窗口内的对象**（`--oplog_batch_max_entries` 默认 1024；背压下溢出对象被静默跳过、不报错），因此客户端**重复调用直到某轮 cleared==0** 才算收敛（默认最多 32 轮、轮间 1s；超限即 `exit 1`）。轮数/间隔可用 `--remove-all-max-passes` / `--remove-all-pass-delay` 或环境变量 `MC_REMOVE_ALL_MAX_PASSES` / `MC_REMOVE_ALL_PASS_DELAY` 调整（≤1 = 单次 legacy 行为）
+- `prepare-store`：先以同一 drain 原语清空（`remove_all` 循环至 cleared==0，失败/未收敛 `exit 1`），再 `batch_is_exist` 检查存在性，仅对缺失 key 执行 `put_batch` 补写
 - `benchmark`：`--warmup true|false`，预热在正式测量前执行小规模运行
 - `pipeline`：生产-消费 pipeline 模式（精排/召排，按 `--role writer|reader` 分派）
 
@@ -666,24 +715,39 @@ get 家族循环读取预填数据直至到时；put 家族与 mixed 以"完整�
 
 层级约定：**场景** = 一次 `benchmark.py` 调用（可含多套配置）；**配置** = 单个配置文件运行。
 
+每次 remove-keys 阶段都带两道闸（`global.json` → `pipeline` 块）：
+
+- `remove_skip_when_clean`（默认 `true`）：执行前先探测 master 指标，已分配空间 ≤ 1% 容差
+  （`_STORE_CLEAN_TOLERANCE`）即判定 store 已空、**直接跳过**该阶段（省去约 40s 的客户端
+  冷启动）；探测不可用（未配置/不可达）时照常执行，绝不懈怠。
+- `remove_release_timeout_s`（默认 `120`，`0` = 关闭）：remove-all 只是把删除入队，master
+  通过 oplog 异步回放，空间不会立刻归零。执行后每 2s 轮询直到 allocated ≤ 1% 容差或到时；
+  到时后仍按 `require_clean_store` 决定 WARN/FAIL（等待使严格模式不再被 oplog 延迟误伤）。
+  仅 `--scope full` 做释放等待；`key-prefix` 只做跳过预检（共享 store 等不到归零）。
+
+以上闸门与执行统一收敛在编排侧唯一入口 `_remove_keys_stage()`（precheck → `run_stage` →
+释放等待），所有站点（basic/pipeline/kvtest/sweep/fail-cleanup）都经它执行；命令与日志
+路径由 `run_stage` 统一组合。**kvtest config-end 的 remove 日志随之从扁平路径移入 pod
+子目录**（与 pre-run / `pull_logs` 的 per-pod glob 布局一致）。
+
 basic 场景：
 
 | 时机 | 动作 | 日志 |
 | --- | --- | --- |
 | 场景启动 | 无 | — |
-| 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
-| put/put_batch/mixed 每个 combo 运行前 | remove-all（`--scope full`，保证写入隔离） | `<配置名>.remove-keys.log`（覆盖） |
-| 配置结束 | 仅删除本配置写入的 key（`--scope key-prefix`） | `<配置名>.remove-keys-end.log` |
-| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留） | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
+| 配置启动 | remove-all（`--scope full`）+ 预检/释放等待 | `<配置名>.remove-keys.log` |
+| put/put_batch/mixed 每个 combo 运行前 | remove-all（`--scope full`，保证写入隔离）+ 预检/释放等待 | `<配置名>.remove-keys.log`（覆盖） |
+| 配置结束 | 仅删除本配置写入的 key（`--scope key-prefix`，仅预检） | `<配置名>.remove-keys-end.log` |
+| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留）+ 预检/释放等待 | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
 
-pipeline 场景：
+pipeline / kvtest 场景：
 
 | 时机 | 动作 | 日志 |
 | --- | --- | --- |
 | 场景启动 | 无 | — |
-| 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
-| 配置结束 | remove-all（`--scope full`；pipeline 运行期清空了 `MC_KEY_COUNT`，key-prefix 不可用） | `<配置名>.remove-keys-end.log` |
-| 场景结束 | remove-all（`--scope full`，兜底） | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
+| 配置启动 | remove-all（`--scope full`）+ 预检/释放等待 | `<配置名>.remove-keys.log` |
+| 配置结束 | remove-all（`--scope full`；pipeline 运行期清空了 `MC_KEY_COUNT`，key-prefix 不可用）+ 预检/释放等待 | `<配置名>.remove-keys-end.log` |
+| 场景结束 | remove-all（`--scope full`，兜底）+ 预检/释放等待 | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
 
 场景结束的 remove-all 在**最后一个成功配置**的主节点上执行（该配置返回的 runner/日志目录可复用）；
 配置失败时其配置结束清理不会执行，因此场景结束兜底必须执行。该步骤失败仅 `[WARN]`，不影响整体结果汇总。
@@ -779,6 +843,9 @@ WebUI 点击「停止」或命令行 Ctrl+C 时，benchmark **不会立即被杀
 - **SSH**：按 `.state` 台账终止远端 client/stage/profiling 进程（reader 先 HTTP /shutdown）；
 - 默认等待 60s（环境变量 `MCWEB_STOP_GRACE` 可调），超时才强制 kill；后台再做一次兜底清理；
 - 第二次 Ctrl+C 立即强制退出（跳过剩余清理）；
+- **停止也会出报表**：清理前先把当前场景的原始日志回拉并本地重算，产出
+  `logs/<配置名>/report/report.html` 与 `report/overview.html`（`early_stop` 标注
+  「提前停止/数据不完整」）；`MC_STOP_REPORT=0` 可关闭（大 run 停止时会多花几十秒拉日志）；
 - 普通停止**保留**远端日志/数据与 controller workspace；只有 `--clean-up` 才删除；
 - 本地 `webui/data/runs/<id>.log` / `outputs/` 保留用于排查；run 状态先 `stopping`，最终 `stopped`；
 - scheduler 执行中的任务同样走优雅停止（stop 文件 + 信号 + grace）。
@@ -792,29 +859,154 @@ mode + cluster + global，**不需要 profile**，不可恢复。
 
 ```
 outputs/<时间戳，如 20261010-1308>/
-├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 为双 Schema 40 列）
+├── <配置名>.csv                # 各用例性能明细（按配置文件名；pipeline 42 列）
 ├── benchmark_detail.csv        # 全部用例汇总（pipeline 仅 writer/reader TOTAL 行）
+├── report/
+│   └── overview.html           # run 总览：各场景摘要卡 + 链接 + 节点日志量
 ├── profiling/                  # run 级异常值台账（跨配置聚合）
 │   ├── outliers.json
 │   └── outliers.slices.txt
 └── logs/
     ├── final.remove-keys.log   # 场景结束兜底 remove-all 日志（最后一个成功配置节点）
     └── <配置名>/               # 每个配置一个子目录
+        ├── report/
+        │   ├── report.html     # 场景完整报表（自包含：内联 ECharts + TopK 数据）
+        │   └── data.js         # 全量数据（同目录时报表自动加载，供客户端深查）
         ├── <配置名>.generate-data.log
         ├── <配置名>.prepare-store.log
         ├── <配置名>.remove-keys.log
-        ├── <配置名>.benchmark_c{clients}_t{threads}.log
+        ├── <配置名>.<run>.log.stats.json   # ← 默认只回传该紧凑统计（原始日志留远端）
         ├── profiling/<节点>/   # 该配置的 profiling 产物（多配置 run 互不覆盖）
         │   ├── spdiag.show.txt
         │   ├── spdiag_tree.<接口>.txt   # 自动生成的文本打点树（见 10.4）
         │   └── perf.data / *.out ...
-        └── (pipeline) <配置名>.benchmark_c1_t1.reader_port{port}.log / .writer{gid}.log ...
-            （脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
+        └── (pipeline) <配置名>.benchmark_c1_t1.dual_<pod>_c0_p9301.{writer,reader}.log[.stats.json] / .glog
+            （--pull-raw-logs / 失败路径 / 小 run 自动回拉时才有原始 .log；
+             脚本级启动失败时可能保留非空 .nohup 诊断文件，成功时自动清理）
 ```
+
+**k8s 宿主机日志持久化**：pod 的 logs 目录挂 hostPath，日志实际落
+`<k8s.host_log_root>/<run_id>/<pod名称>/…`（默认 `/var/lib/mooncake-bench`，可配）。
+pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**，只提示逐节点清理命令。
+报表「现场索引」列出每节点/pod 的远程路径、日志体积与登录命令（ssh / kubectl exec）。
 
 ## 10. 本地分析工具
 
-### 10.1 plot_latency.py（时延统计图）
+### 10.1 HTML 报表（默认产物，logstats map + report reduce）
+
+结果分析默认不再生成 PNG 散点图，而是**可独立打开的 HTML 报表**（与 WebUI 解耦）：
+
+- **map（远端就地）**：`scripts/logstats.py` 在节点/pod 内逐客户端日志统计，产出
+  `<log>.stats.json`（全局精确计数/分位数、对数定梯直方图、1s/1min 桶、per-op 统计、
+  SUMMARY 字段、错误码 + 首错误 ±20 行摘录、Top-100 慢点、异常窗口自检）。编排器默认
+  **只回传 stats**，且只回传**真正产出的**文件——map 失败（远端 python 异常/venv 为空/
+  超时）只 WARN 并让报表缺该客户端，不会把跑完的性能测试判失败；每文件超时
+  `MC_MAP_TIMEOUT`（默认 900s，0=不限）并打印 `[map] … 1.2s` 耗时。
+  原始日志留在节点（失败路径、`--pull-raw-logs`，或「`.log` + `.glog` 合计 ≤100MB」的
+  小 run 才自动回拉——阈值把 SDK glog 体积算在内，避免把 GB 级 glog 拖回来）。
+- **kvtest（C++ 场景）同样走 map-reduce**：`scripts/logstats.py --kvtest-samples`
+  把每个实例的请求级 `samples.csv`（`elapsed_us` 以测量起点为原点：无 warmup 是
+  `/start`，有 warmup 是 `/arm`，warmup 样本已被 C++ `/reset` 清空）
+  转成与 Python 客户端完全同构的 `<...>.stats.json`——dual 实例按 operation 拆成
+  writer/reader 两份产物；reduce 复用同一套 `report.py`，按 data_size 出
+  `report.html`/`data.js`/`meta.json` 与 run 级 `overview.html`。map 在编排器本地
+  执行（样本本就要拉回做 CSV/点位图），时间桶用显式 epoch，不受宿主时区影响。
+  `--rebuild-report` 在失败 run 只留 `samples.csv` 时会先补跑 map。
+  只存在于 summary 的 reader「值校验失败」与「队列等待均/峰」也被提升进
+  reader 角色概要；节点日志体积取真实 `log+glog` 大小；Ctrl+C 的 STOP
+  路径先发 `/stop` 落盘样本、再收集并出 `early_stop` 报表。
+  每配置的 CSV + 报表 map/reduce 由后台 worker 在场景返回后生成——它们只消费
+  已回拉的本地产物，因此与「本配置收尾 + 下一配置部署」重叠；run 级
+  `overview.html` 在全局收尾前渲染，PNG 点位图与 sweep-end remove / pod /
+  namespace 删除并行。
+- **形态与引擎解耦**：报表格式由 `meta.scenario`（`basic`|`pipeline`）决定，
+  `meta.engine`（`python`|`kvtest`）只做标注（副标题「引擎 …」）；kvtest 场景可在配置里用
+  `"report_scenario": "pipeline"|"basic"` 声明形态（缺省 pipeline）。旧产物
+  `mode="kvtest"` 在读取/重建时归一化为 `scenario="pipeline" + engine="kvtest"`
+  （此前把引擎写进形态槽位，导致 kvtest 报表同一节点 writer/reader 两行重复）。
+- **中间产物清理（默认开启，成功才清）**：每个配置的所有单元都通过校验
+  （`report.html` 非空且完整、`data.js` 非空、单元数与 stats 分组一致）后，删除
+  `logs/<配置>/` 下除 `report/`、`profiling/` 外的全部中间产物——`*.stats.json`、
+  `*.trace.json`、回拉的原始 `.log`/`.glog`、kvtest 的 `samples.csv`/`summary.json`/
+  `timeseries.csv`/`kvtest_report_meta.json` 等；python 与 kvtest、basic 与 pipeline
+  一致。run 级 `benchmark_detail.csv`、各配置 `<cfg>.csv`、`overview.html` 与
+  `profiling/`（监控 CSV）**始终保留**。逃生口：`--keep-intermediates`
+  （或 env `MC_KEEP_INTERMEDIATES=1`）保留整个 run；`--pull-raw-logs` / `--png`
+  因用户显式要原始日志而跳过；失败配置、STOP/Ctrl+C、`--no-report` 的 run 一律保留。
+  注意：被清理的成功 run 不能再 `--rebuild-report`（会提示「中间产物已按成功清理」），
+  失败 run 的 `samples.csv`/stats 仍在，可正常补跑。
+- **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
+  渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
+  `overview.html`（run 总览）。**`data.js` 必须与 report.html 同目录**：从磁盘双击打开时
+  自动加载全量客户端；经 WebUI「在新标签页打开报表」（`/api/file?mode=raw`）时相对路径
+  取不到 data.js，客户端表退化为 p99 前 20 名并在卡片里明确提示。
+- **视觉体系**：图表视觉 token 来自开源项目 **Lieflat Charts**
+  （`webui/web/vendor/lieflat/`，PolyForm Noncommercial 1.0.0，见同目录 NOTICE.md），
+  使用其 **Wire（编辑部红）** 色系——灰阶承载全部数据，荧光橙只给一个视觉焦点
+  （失败 / 疑似泄露 / 最大值）；亮色纸灰底、暗色炭黑底自动适配；每张图附「图型 · 系列 ·
+  数据来源」来源行。
+- **展示方式**：主时间线默认 **1s 桶**（跨度 >1 天自动切 1min 桶，此时 HTML 只内嵌
+  分钟序列、1s 完整留在 data.js）——
+  双桶策略（时间档 1s~1 天 + 自适应按样本数），横轴恒为时间轴；对象可选
+  总体（含角色）/ 节点聚合 / 单客户端并多选叠加对比（多选用指标切换）；
+  QPS 柱 + p50/p99/p999/最大 线 + 失败柱，悬停查看该桶全部统计量、滚轮缩放；点击客户端
+  行可加入对比；异常窗口在图上以橙色竖线标注；Top-100 慢点另有 G15 慢点分布图。
+- **新增图型（Lieflat 语法）**：F14 时延分布直方图（p50/p99 位置标注）、F5 状态分布横条、
+  G10 进程 RSS 增幅正负条、F11 QPS 达成率刻度、G15 慢点分布（jitter strip）；节点监控
+  仍为「节点监控（内存 / URMA 端口）」卡片。
+- **三路径**：done / failed / stopped 都会出报表（kvtest 的 stopped 会先发
+  `/stop` 让 C++ 落盘样本再收集，报表标注 `early_stop`）。done/failed 走远端 map；stopped 在清理
+  前回拉原始日志、本地重算（不再静默无产物）。三种路径的报表都标注「提前停止/异常」。
+- **重建**：`benchmark.py --rebuild-report <ts>`（传时间戳目录名，**不要**带 `outputs/`
+  前缀）仅用本地 stats/原始日志重建报表，覆盖「run 正常结束但报表阶段失败」；远端重建
+  需重新 map，暂未自动实现。成功 run 的中间产物已按默认策略清理，重建会提示
+  「中间产物已按成功清理，无法重建」；需要保留时用 `--keep-intermediates` 重跑。
+  本地重算会从文件名/目录回填 `size/role/node`（如
+  `<cfg>.<run>_8MB.dual_<node>_c0_p9301.reader.log`），因此多 data_size 与读写角色
+  仍能正确分块。
+- **开关**：`--no-report` 只跳过 HTML 报表（per-unit `report.html` 与 run 级
+  `overview.html`，场景级报表、STOP/失败的部分报表、kvtest 的 map+reduce 一并生效）。
+  绘图**默认关闭**，显式 `--png` 才生成旧 PNG 图（`plot_latency.py`，含 kvtest 点位图）；
+  `--png` 必须与 `--pull-raw-logs` 同开（否则报错），`--pull-raw-logs` 也决定是否把
+  原始客户端日志拉回本地（默认只拉紧凑 `*.stats.json`）。`--keep-intermediates`
+  保留报表成功后的全部中间产物。`--dry-run` 仍全部跳过。
+- **待办（已记录）**：store 容量周期采样时间线（P3）、增量 map / 节点日志轮转上限、
+  按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。
+- **产物版本标记**（旧 run 兼容）：`stats.json` 带 `meta.bucket_unit`（时间桶 t 恒为
+  epoch 秒）与 `meta.hist_version`（v2 = 0.001ms 起 ratio 1.2、108 档到 ~250s；无标记的
+  旧产物按 v1 的 81 档 2.16s 解释）；`trace.json` 带 `meta.bins="us-v1"`（µs 值用 µs
+  阶梯，无标记的旧 trace 不显示直方图分位，避免把 µs 当 ms 误读）。
+- 依赖：无第三方库（ECharts 5.5.1 已 vendor 在 `webui/web/vendor/echarts.min.js`）。
+
+#### SDK 全链路（C++ trace）—— 报表内的第二层统计
+
+在 Python 侧打点（RESULT）之外，报表还解析 **Mooncake SDK 自己打到 glog 的
+`breakdown[<op>]` trace 行**（`scripts/tracestats.py`，map 阶段就地统计）：
+`trace_id[...] breakdown[get_buffer|put|upsert|...] name[value] ...`（括号感知解析，
+`start_time` 含空格、`-1` 为拿不到时间戳的哨兵）。它给出每个样本请求的**端到端时延
+与各阶段时延的树状分解**，远细于 Python 侧的单点时延：
+
+- **读**（get_buffer）：`total ≈ query_total(route+rpc) + select + buf_alloc + memread_total(submit+queue+urma+teardown)`
+- **写**（put/upsert 家族）：`total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare + query/put_start + memwrite_total(submit+queue+urma+teardown) + put_end/finalize + cache_invalidate + revoke`
+- 报表展示：方向页签（读/写/其它）+ op 选择、样本/分位卡、**阶段 p50 堆叠构成**、
+  独立 1s/1min 时间线（样本数柱 + 端到端 p50/p99）、**树形阶段分位表（含残差
+  total−阶段和）**、Top-50 慢请求（含前三耗时阶段）、状态分布；未知的 `*_us` 字段
+  自动归入「其它阶段」。
+- **数值口径**：`*_us` 单位是微秒，直方图用独立 µs 阶梯（0.001µs 起、ratio 1.2、
+  120 档到 ~3.4s）；`-1` 表示该阶段拿不到时间戳，只计入样本数与 neg，不参与
+  平均/分位（平均分母为「有效样本数」）；读写方向优先按字段判定、字段缺失时按 op 名兜底。
+- **采样门控**：主行仅在采样命中（`MC_HIFREQ_LOG_SAMPLE_RATE`）或失败时出现，
+  **样本数 ≠ 请求总数**，报表显示实际采样率。仓库当前配置为 `1`：若 SDK 语义是
+  「全量」，每请求约 0.4–0.6KB trace，50k QPS 约 30MB/s、单小时上百 GB，会明显干扰
+  磁盘/日志 I/O 与 map 耗时（map 还要两遍扫 glog）——**长跑前请先按需下调**（如 0.01），
+  并在真实环境确认该变量的采样语义。
+- **多副本限制**：put/upsert 的 `memwrite_*` 与 slice 明细仅代表最后一个副本的传输，
+  `memwrite_total_us` 为全部副本合计（SDK 侧限制，报表脚注说明）。
+- **slice 明细行**（`breakdown[<op>.slice]`）P1 仅计数，逐 slice 分析后续补充。
+- 原始 `.glog` 默认留远端（hostPath），报表「现场索引」列出其路径/体积与登录命令；
+  `--rebuild-report` 也能从本地 `.glog` 重算 trace 统计。
+
+### 10.1.1 plot_latency.py（旧 PNG 图，`--png` 兼容模式）
 
 根据客户端日志中的 RESULT 行绘制**点线图**：横轴 = 第 i 个请求，纵轴 = 时延(ms)；
 横向虚线标注 `avg`/`max`（恒定）与 `p99`/`p999`/`p9999`（样本量门控：分别需 ≥100/1000/10000 个样本，不足则不加线，不同颜色 + 数值），`1ms`/`2ms` 灰色点划参考线；
@@ -837,8 +1029,8 @@ python scripts/plot_latency.py --log <日志> --outlier 50 --out /tmp/figs
 - **离群双图**：存在离群值时每个统计量出两幅——原名图（包含离群值，红 x 标注，分位线按
   全量计算）+ `.trimmed.png`（剔除离群值，分位线按剔除后数据重算）；无离群仅单图
 - 依赖 matplotlib：`pip install matplotlib`；输出 PNG（dpi 150）
-- **新 run 自动绘图**：benchmark.py 主流程结束后自动对本 run 的 `outputs/<ts>/logs/`
-  全量出图（子进程隔离，绘图失败仅 `[WARN]` 不影响测试结果）；`--no-plot` 跳过
+- **自动调用**：仅在 `--png` 模式下由 benchmark.py 主流程结束调用（子进程隔离，失败仅
+  `[WARN]`）；默认产物是 10.1 的 HTML 报表
 
 ### 10.2 run_schedule.py（夜间定时串行执行）
 
@@ -866,21 +1058,32 @@ python -m pytest webui/tests -q                     # 测试（亦可 python web
 
 目录结构学习 Services-Deployment：`backend/`（routers 按域拆分）+ `web/`（前端成品，
 vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL 前缀 /static/）+
-`data/`（运行时状态，gitignored）+ `backups/`（编辑备份，gitignored）+ `tests/`，侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
+`data/`（运行时状态，gitignored）+ `tests/`，侧边栏导航 + 亮暗双主题（首次跟随系统，localStorage 持久化）：
 
 - **配置维护**：运行框（通栏最上方：选中文件展示【目录/文件分开，目录先执行】+ cluster/global/
-  profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-plot/protocol 选项 + 运行按钮）；
+  profile 下拉【候选来自通用配置自动推导】+ dry-run/no-warmup/no-report/PNG 绘图/
+  拉取原始日志/保留中间产物/protocol 选项 + 运行按钮；PNG 绘图必须与拉取原始日志同开）；
   左列**通用配置**（configs 根下全部 `*.json`，过滤 `*.example.json` 模板）+ **运行配置**
   （configs 下所有非 `_` 目录的层级树）；右侧编辑器在线编辑（写入前自动校验——复用编排器自身
-  的场景配置校验；自动备份到 `webui/backups/`）。树用**复选框**选择运行范围：勾目录=整目录
+  的场景配置校验；校验通过原子写回、不备份）。树用**复选框**选择运行范围：勾目录=整目录
   收编（子孙不可单独取消）、勾文件=独立选中（父目录半选）、目录选中后其下已独立选中的文件
   自动去重（取消目录后恢复独立选中）；提交为 `--config-dir a,b` + `-f x,y` 多值形式，目录先执行
-- **运行**：仅观察——状态卡（id/状态/耗时/rc/产物目录）+ 停止按钮 + 编排器日志实时滚动
-  （FAIL/ERROR 高亮）+ 历史 runs 表格；运行完毕后手动点击「查看运行结果」跳转结果页
-- **Rank + Recall 并行（k8s）**：启动方式切换为该模式后，分别选择 rank/recall 的
+- **性能测试（实例管理）**：运行框保留为**创建模板**——选择 mode/启动方式/cluster/global/
+  profile/配置树/选项后点「创建实例」（命名弹窗，留空自动命名），**创建不运行**；运行框右侧保留
+  CLEAN-UP（集群级清理，纳入并发守卫）。下方是**纵向实例卡片列表**：名称/类型（单任务或
+  Rank+Recall）/状态/mode/集群（及 namespace）/配置数量/最近一次运行的 id/耗时/rc/产物链接，
+  每张卡片按钮为 **运行 / 停止 / 删除(确认，运行中拒绝) / 详情**；实例可反复运行，每次运行
+  生成独立 run（历史抽屉按 run 列出，点击跳实例详情或结果）
+- **实例详情（新页签）**：顶部**浏览器式页签**可同时打开多个实例（× 关闭、sessionStorage
+  记忆），内容为实例信息快照 + 操作（运行/停止/删除/改名/**跳转至结果详情**/**查看报表**）
+  + 日志查看
+  （复制、自动换行开关、搜索高亮与 ↑↓ 跳转、按页自动加载）。**Rank+Recall 组合实例的日志
+  上下分屏**分别显示 rank / recall 两路，并可切换「合并日志」查看含父进程行的原始流；
+  跳转结果取 run 产物目录的顶层父目录（`rank/`、`recall/` 子目录在结果页内浏览）
+- **Rank + Recall 并行（k8s）**：创建实例时启动方式切换为该模式，分别选择 rank/recall 的
   cluster 与 global 配置（可对应不同 namespace、etcd/master 服务），配置树中可一次勾选
   两类测试；父任务按继承后的 `work_mode` 自动分组并同时启动两个 benchmark。统一日志以
-  `[rank]` / `[recall]` 标记，产物收在同一 run 的 `rank/`、`recall/` 子目录；STOP 会同时
+  `[rank]` / `[recall]` 标记，产物收在同一 run 的 `rank/`、`recall/` 子目录；停止会同时
   通知两边并按各自 namespace 清理。该模式要求选择中两类配置均非空
 - **Rank + Recall 并行（真机 CLI）**：使用
   `python3 scripts/run_rank_recall.py --ssh ...`；rank/recall 可共用 worker
@@ -889,13 +1092,26 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
   `configs/kvtest/README.md`。
 - **运行结果**：左侧 runs 列表（跳入自动聚焦最新）；右侧单窗格 / **对比模式**（上下双窗格
   并排查看，CSV 表格与图片直接对照）；**同文件锁定**默认开启（上窗格选文件后下窗格自动
-  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty（profiling 指标占位：
-  profiling/outliers.json）、文本 tail
+  匹配同名文件）；支持 CSV 表格渲染、图片直接显示、JSON pretty、文本分页；
+  文件分组新增**「报表」**（`.html`）：选中后在面板点击「在新标签页打开报表」，HTML 报表
+  内联 ECharts 可独立打开/分享（同目录 `data.js` 自动加载全量深查数据）
 - **Schedule**：计划增删改 + 启停 scheduler；触发时刻若 benchmark 在跑会**等它结束**
   再执行（scheduler 等待期允许手动发起 run，响应带 warning）
-- **并发规则**：单一执行槽——benchmark（并行模式的父任务仍只占一个槽位）或 scheduler
-  任务运行中新 run 请求返回 409
-- 运行历史与日志持久化于 `webui/data/runs/`（gitignore）
+- **并发规则（多实例）**：可同时运行多个实例，但按共享资源守卫——k8s 的
+  `(controller, context, namespace)` 相同、SSH 节点 IP 集合相交、global 的 etcd 端点或
+  master/metrics 相同（同 store 容量）任一命中即 409 并标明占用实例；同一实例不可并发运行；
+  scheduler 任务执行中拒绝新运行、scheduler 任务等待所有实例空闲。不同集群 + 不同栈可真正并行
+  （Rank+Recall 组合实例正是如此）。共享资源同时被占用时硬并行会互相摧毁：namespace 创建失败、
+  端口/`value.bin` 冲突、`mcbench/` 被互清、store 被双方同时打爆
+- 运行历史与日志持久化于 `webui/data/runs/`；实例定义持久化于 `webui/data/instances/`
+  （均 gitignore），删除实例直接移除定义（runs/日志/outputs 保留）；删除结果在 Windows 原生进系统回收站、WSL/Linux 永久删除
+- **界面规范（webui-design skill）**：设计 token 化（`--mc-space/font/radius/term-*`，深青主色亮
+  `#0e7490`/暗 `#27b3c9`）；日志/终端亮暗双主题恒深底；状态文案中文化（运行中/停止中/已完成/
+  失败/已停止/未运行）；危险操作统一 `confirmDanger`（确认键 danger）；每页至多一个 primary 实心
+  按钮（次级 plain、行内 link、刷新 circle+tooltip）；禁用按钮说明原因；空状态 `el-empty` 带下一步；
+  数字列 tabular-nums；相对时间（悬停绝对）；动效 <300ms 且尊重 `prefers-reduced-motion`；
+  仅图标按钮带 `aria-label`。规范文件：`.opencode/skills/webui-design/SKILL.md`（源
+  Services-Deployment，回归 lint：`webui/tests/test_style.py`）
 
 触发模型（混合）：任务显式带 `date`+`time` 则睡到该时刻（已过点立即执行）；
 省略时刻则链式（上一条完成 + `wait_seconds`）。失败按 `on_fail`（continue/abort）。
@@ -903,7 +1119,9 @@ vendored Vue3 + Element Plus 约 1.8MB 入库，无构建、离线可用，URL �
 计划文件格式详见 `schedule/README.md`。
 
 - **进程台账 `.state`**：所有远端 client 进程（pipeline reader/writer、basic 客户端）启动即记录
-  （ip/节点/端口/pid/marker，仓库根 `.state`，已 gitignore）；正常/失败退出自动清除对应行。编排器每次
+  （ip/节点/端口/pid/marker，仓库根 `.state`，已 gitignore；**WebUI 管理的每个 run 使用独立
+  `webui/data/runs/<id>.state`**，Rank+Recall 子任务为 `<id>.state.rank|recall`，多个实例并发
+  时台账互不干扰）；正常/失败退出自动清除对应行。编排器每次
   启动、`--clean-up` 与 **WebUI 停止 run** 时自动 **reap** 残留：kill 前校验远端 `/proc/<pid>/cmdline`
   含台账 marker（basic 直启客户端 = `mooncake_benchmark_client`；pipeline 的 pid 是
   `run_benchmark_pipeline.sh` bash 包装进程，python 客户端为其子进程，防 pid 重用误杀）、有端口的

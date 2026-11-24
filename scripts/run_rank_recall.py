@@ -15,6 +15,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import benchmark as bm
+from utils import ensure_utf8_stdio
 
 
 def _csv(value):
@@ -80,7 +81,12 @@ def _child_argv(args, work_mode, files, parent, ready_dir):
         argv += ["--result-dir", os.path.join("outputs", parent, work_mode)]
     for enabled, flag in ((args.dry_run, "--dry-run"),
                           (args.no_warmup, "--no-warmup"),
-                          (args.no_plot, "--no-plot"),
+                          (getattr(args, "no_report", False), "--no-report"),
+                          (getattr(args, "png", False), "--png"),
+                          (getattr(args, "pull_raw_logs", False),
+                           "--pull-raw-logs"),
+                          (getattr(args, "keep_intermediates", False),
+                           "--keep-intermediates"),
                           (args.verbose, "--verbose")):
         if enabled:
             argv.append(flag)
@@ -114,9 +120,12 @@ def _pump(label, proc, output=None):
 def _child_env(work_mode):
     # Namespace ledgers must be isolated. Otherwise one child can interpret
     # the other child's freshly-created namespace as a stale previous run and
-    # delete it during startup.
+    # delete it during startup. A WebUI-managed run passes its own per-run
+    # MC_BENCH_STATE_FILE; derive child ledgers from it so two concurrent
+    # combined runs never share a ledger.
     env = dict(os.environ)
-    env["MC_BENCH_STATE_FILE"] = os.path.join(ROOT, ".state." + work_mode)
+    base = env.get("MC_BENCH_STATE_FILE") or os.path.join(ROOT, ".state")
+    env["MC_BENCH_STATE_FILE"] = base + "." + work_mode
     # The parent decodes both child pipes as UTF-8.  Make that contract
     # explicit on Windows too, where redirected Python stdio otherwise uses
     # the active ANSI code page (commonly GBK/CP936).
@@ -146,13 +155,21 @@ def parse_args(argv=None):
     parser.add_argument("--protocol", choices=("tcp", "rdma", "ub"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--no-report", action="store_true")
+    parser.add_argument("--png", action="store_true")
+    parser.add_argument("--pull-raw-logs", action="store_true")
+    parser.add_argument("--keep-intermediates", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-file")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.png and not args.pull_raw_logs:
+        parser.error("开启 png 必须开启 pull-raw-logs（PNG 绘图需要原始客户端"
+                     "日志）")
+    return args
 
 
 def main(argv=None):
+    ensure_utf8_stdio()
     args = parse_args(argv)
     owned_stop_file = not args.stop_file
     if owned_stop_file:

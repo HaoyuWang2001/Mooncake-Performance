@@ -7,6 +7,7 @@ function _fileGroup(rel) {
   if (/spdiag_tree\.[^.]+\.txt$/.test(base)) return "spdiag树";
   if (rel.includes("/profiling/") || rel.startsWith("profiling/")) return "profiling";
   if (base.endsWith(".csv")) return "csv";
+  if (base.endsWith(".html")) return "报表";
   if (base.endsWith(".png") || base.endsWith(".jpg") || base.endsWith(".gif")) return "图片";
   if (base.endsWith(".log") || base.endsWith(".glog") || base.endsWith(".txt")) return "日志";
   if (base.endsWith(".json")) return "json";
@@ -21,6 +22,7 @@ function _kindOf(pane) {
   const g = _fileGroup(pane.file);
   if (g === "图片") return "img";
   if (g === "csv") return "csv";
+  if (g === "报表") return "html";
   if (g === "json") return "json";
   return "txt";
 }
@@ -31,7 +33,7 @@ function _groupedFiles(pane) {
     const g = _fileGroup(f);
     (groups[g] = groups[g] || []).push(f);
   }
-  const order = ["csv", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
+  const order = ["csv", "报表", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
   return order.filter(g => groups[g]).map(g => ({ label: g, opts: groups[g] }));
 }
 
@@ -148,6 +150,23 @@ async function _loadMore(pane) {
   }
 }
 
+/* 数字列判定：整列非空值均为数字（含负号/小数）则右对齐 + tabular-nums。 */
+function _csvIsNumeric(rows, key) {
+  let seen = false;
+  for (const r of rows || []) {
+    const v = (r[key] === null || r[key] === undefined) ? "" : String(r[key]).trim();
+    if (!v || v === "-") continue;
+    if (!/^[-+]?\d+(\.\d+)?$/.test(v)) return false;
+    seen = true;
+  }
+  return seen;
+}
+
+function rawUrlOf(pane) {
+  return "/api/file?path=" +
+    encodeURIComponent("outputs/" + pane.ts + "/" + pane.file) + "&mode=raw";
+}
+
 /* CSV 列宽按表头显示宽度估算（CJK≈2 个显示单位），保证表头单行显示；
    Element Plus 默认 min-width=90 会把 queue_wait_avg_ms 等长表头挤成两行。 */
 function _csvColWidth(h) {
@@ -217,7 +236,7 @@ const ResPane = {
     </div>
     <div class="pane-body" :class="{ fsbody: fs, auto: pane.auto }" v-loading="pane.loading"
          :style="(fs || pane.auto) ? null : { height: pane.h + 'px' }">
-      <div v-if="!pane.file" class="hint" style="padding: 30px; text-align: center">选择文件查看</div>
+      <div v-if="!pane.file" class="hint hint-pad">选择文件查看</div>
       <template v-else-if="kindOf(pane) === 'img'">
         <div v-if="fs" class="imgfs">
           <div class="imgbar">
@@ -243,8 +262,22 @@ const ResPane = {
                 :empty-text="pane.loading ? '加载中…' : '无数据'">
         <el-table-column v-for="(h, i) in pane.headers" :key="i" :label="h"
                          :prop="'c' + i" show-overflow-tooltip
-                         :min-width="csvColWidth(h)"></el-table-column>
+                         :min-width="csvColWidth(h)"
+                         :align="csvIsNumeric(pane.rows, 'c' + i) ? 'right' : 'left'"
+                         :class-name="csvIsNumeric(pane.rows, 'c' + i) ? 'mc-num' : ''"></el-table-column>
       </el-table>
+      <div v-else-if="kindOf(pane) === 'html'" class="report-pane">
+        <div class="report-pane-icon">📊</div>
+        <div class="report-pane-title">{{ pane.file }}</div>
+        <div class="report-pane-desc">
+          HTML 报表与 WebUI 解耦，可独立打开；点击按钮在新标签页查看
+          （图表可缩放/悬停查看每个桶的统计量）。
+        </div>
+        <el-button type="primary" @click="openReport(pane)">在新标签页打开报表</el-button>
+        <div class="mc-muted mt-2">
+          也可直接分享该文件：report.html 单文件可用；同目录 data.js 提供全量深查数据。
+        </div>
+      </div>
       <pre v-else-if="kindOf(pane) === 'json'" class="json" :class="{ nw: !pane.wrap }">{{ pane.text }}</pre>
       <spdiag-tree v-else-if="kindOf(pane) === 'tree' && !pane.rawView"
                    :text="pane.text"></spdiag-tree>
@@ -306,48 +339,65 @@ const ResPane = {
     }
     const dragging = Vue.ref(false);
     return { setAuto, kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
-             csvColWidth: _csvColWidth,
+             csvColWidth: _csvColWidth, csvIsNumeric: _csvIsNumeric,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              loadMore: _loadMore, fmtBytes: _fmtBytes,
-             rawUrl: p => "/api/file?path=" +
-               encodeURIComponent("outputs/" + p.ts + "/" + p.file) + "&mode=raw" };
+             openReport: p => window.open(rawUrlOf(p), "_blank"),
+             rawUrl: rawUrlOf };
   },
 };
 
 const ResultsView = {
   template: `
   <div class="page">
-    <div class="header-row">
-      <span class="hint">点击左侧 run 分配到焦点框（主色描边 + 发光 = 焦点，点框内任意处切换）；框可任意增删/全屏</span>
-      <span class="spacer"></span>
-      <template v-if="panes.length >= 2">
-        <span style="font-size: 13px">同文件锁定</span>
-        <el-switch v-model="lockFile"></el-switch>
-      </template>
-      <el-button size="small" type="primary" plain @click="addPane()">＋ 添加结果框</el-button>
-      <el-button size="small" @click="loadRuns" :loading="loading">刷新</el-button>
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">统计结果</h1>
+        <p class="desc">点击左侧 run 分配到焦点框（主色描边 = 焦点）；同文件锁定便于跨 run 对比 CSV 与图片。</p>
+      </div>
+      <div class="actions">
+        <el-tooltip :content="listOpen ? '收起运行结果列表' : '展开运行结果列表'" placement="top">
+          <el-button size="small" circle @click="toggleList"
+                     :aria-label="listOpen ? '收起运行结果列表' : '展开运行结果列表'">
+            <el-icon><component :is="listOpen ? 'Fold' : 'Expand'"/></el-icon>
+          </el-button>
+        </el-tooltip>
+        <template v-if="panes.length >= 2">
+          <span class="mc-label">同文件锁定</span>
+          <el-switch v-model="lockFile"></el-switch>
+        </template>
+        <el-button size="small" type="primary" plain @click="addPane()">＋ 添加结果框</el-button>
+        <el-tooltip content="刷新运行结果列表" placement="top">
+          <el-button size="small" circle :loading="loading" aria-label="刷新运行结果列表"
+                     @click="loadRuns">
+            <el-icon><component is="Refresh"/></el-icon>
+          </el-button>
+        </el-tooltip>
+      </div>
     </div>
 
-    <el-row :gutter="14">
-      <el-col :span="6">
-        <el-card shadow="never" class="run-list-card">
-          <template #header>
-            <div class="header-row" style="margin: 0">
+    <div class="results-layout">
+      <el-card v-show="listOpen" shadow="never" class="run-list-card"
+               :style="{ width: listW + 'px' }">
+        <template #header>
+            <div class="mc-toolbar">
               <b>运行结果（{{ runs.length }}）</b>
               <span class="spacer"></span>
-              <el-button size="small" :type="multiSelect ? 'primary' : ''" @click="toggleMulti">
+              <el-button size="small" plain :type="multiSelect ? 'primary' : ''" @click="toggleMulti">
                 {{ multiSelect ? "退出多选" : "多选" }}
               </el-button>
             </div>
           </template>
           <div v-if="multiSelect" class="ms-bar">
             <el-checkbox :model-value="allSelected" @change="onSelectAll">全选</el-checkbox>
-            <span class="hint">已选 {{ selected.length }}</span>
+            <span class="hint mc-num">已选 {{ selected.length }}</span>
             <span class="spacer"></span>
             <el-button size="small" type="danger" :disabled="!selected.length"
+                       title="先多选勾选要删除的运行结果"
                        @click="deleteSelected">删除选中</el-button>
           </div>
           <div class="run-list">
+          <el-empty v-if="!runs.length" :image-size="60" description="还没有运行结果" />
           <div v-for="r in runs" :key="r.ts" class="run-item"
                :class="{ active: isActivePaneTs(r.ts), selected: isSelected(r.ts) }"
                @click="pickRun(r.ts)">
@@ -356,26 +406,44 @@ const ResultsView = {
                          @click.stop @change="toggleSelect(r.ts)"></el-checkbox>
             <div class="ri-body">
               <div class="ri-title">
-                <span class="ri-name">{{ r.ts }}</span>
+                <span class="ri-name" :title="r.ts">{{ r.ts }}</span>
                 <el-tag class="ri-tag" :type="r.has_detail ? 'success' : 'info'" size="small">
                   {{ r.has_detail ? "detail" : "无 detail" }}
                 </el-tag>
               </div>
               <div class="ri-sub">{{ r.mtime }} · {{ r.csv_count }} csv</div>
             </div>
-            <div v-if="!multiSelect" class="ri-actions">
-              <el-button size="small" text @click.stop="renameRun(r.ts)" title="重命名">改名</el-button>
-              <el-button size="small" text type="danger" @click.stop="deleteRun(r.ts)" title="删除">删除</el-button>
-            </div>
+            <span class="ri-more-wrap" @click.stop>
+              <el-dropdown trigger="click" placement="bottom-end"
+                           popper-class="ri-more-menu"
+                           @command="cmd => onRunCommand(cmd, r.ts)">
+                <el-button size="small" text circle class="ri-more"
+                           :loading="rebuilding === r.ts"
+                           :disabled="!!rebuilding && rebuilding !== r.ts"
+                           aria-label="更多操作"
+                           :title="rebuilding && rebuilding !== r.ts
+                                   ? '另一运行结果正在重建报表，完成后再试' : '更多操作'"
+                           @click.stop>
+                  <el-icon v-if="rebuilding !== r.ts"><component is="MoreFilled"/></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="rebuild">重建报表</el-dropdown-item>
+                    <el-dropdown-item command="rename">改名</el-dropdown-item>
+                    <el-dropdown-item command="delete" class="danger-item">删除</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </span>
           </div>
-          <el-empty v-if="!runs.length" description="暂无结果" :image-size="60"></el-empty>
           </div>
         </el-card>
-      </el-col>
+      <hdrag-handle v-show="listOpen" v-model="listW" :min="240" :max="560"
+                    persist="mcweb-results-list-w"></hdrag-handle>
 
-      <el-col :span="18">
+      <div class="results-main">
         <div v-if="!panes.length" class="pane pane-empty">
-          <div class="hint" style="padding: 40px; text-align: center">
+          <div class="hint hint-pad">
             尚无结果框——点击左侧 run 或「＋ 添加结果框」开始查看
           </div>
         </div>
@@ -384,10 +452,9 @@ const ResultsView = {
                   :pane="p" :idx="i" :runs="runs" :focused="activePane === i"
                   @focus="activePane = i"
                   @close="removePane(i)"
-                  @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"
-                  style="margin-bottom: 14px"></res-pane>
-      </el-col>
-    </el-row>
+                  @toggle-fs="fullscreenIdx = fullscreenIdx === i ? -1 : i"></res-pane>
+      </div>
+    </div>
 
     <teleport to="body">
       <div v-if="fullscreenIdx >= 0 && panes[fullscreenIdx]" class="fs-mask"
@@ -408,6 +475,32 @@ const ResultsView = {
     const fullscreenIdx = Vue.ref(-1);
     const panes = Vue.reactive([]);
 
+    // 左列运行结果：可收起（整体隐藏）+ 可拖宽（240–560px），两者都持久化
+    const LIST_W_KEY = "mcweb-results-list-w";
+    const LIST_OPEN_KEY = "mcweb-results-list-open";
+    function _loadListW() {
+      try {
+        const v = parseInt(localStorage.getItem(LIST_W_KEY), 10);
+        return Number.isFinite(v) && v >= 240 && v <= 560 ? v : 300;
+      } catch (e) { return 300; }
+    }
+    function _loadListOpen() {
+      try { return localStorage.getItem(LIST_OPEN_KEY) !== "0"; }
+      catch (e) { return true; }
+    }
+    const listW = Vue.ref(_loadListW());
+    const listOpen = Vue.ref(_loadListOpen());
+    Vue.watch(listW, v => {
+      try { localStorage.setItem(LIST_W_KEY, String(Math.round(v))); } catch (e) { /* ignore */ }
+    });
+    Vue.watch(listOpen, v => {
+      try { localStorage.setItem(LIST_OPEN_KEY, v ? "1" : "0"); } catch (e) { /* ignore */ }
+    });
+    function toggleList() {
+      listOpen.value = !listOpen.value;
+      Vue.nextTick(fitRunList);
+    }
+
     // 左侧结果列表精确贴合可用高度（不依赖固定 magic number）
     function fitRunList() {
       Vue.nextTick(() => {
@@ -426,8 +519,9 @@ const ResultsView = {
       // Vue.reactive：pane 必须从创建起即为代理对象——addPane 持有该引用做
       // 异步写入（_loadFiles），raw 对象的赋值不会触发响应式更新（首个
       // 结果框曾因此卡在 loading 且文件列表永不刷新）
-      let wrap = false;
-      try { wrap = localStorage.getItem("mcweb-wrap") === "1"; } catch (e) { /* ignore */ }
+      // 与实例详情日志页统一：未设置时默认开启换行（关闭后长行可横向滚动）
+      let wrap = true;
+      try { wrap = localStorage.getItem("mcweb-wrap") !== "0"; } catch (e) { /* ignore */ }
       return Vue.reactive({ uid: ++_paneUid, ts: "", files: [], file: "", loading: false,
                             rawView: false, wrap: wrap, imgScale: "fit",
                             imgX: 0, imgY: 0,
@@ -509,6 +603,12 @@ const ResultsView = {
       if (i >= 0) selected.value.splice(i, 1);
     }
 
+    function onRunCommand(cmd, ts) {
+      if (cmd === "rebuild") return rebuildReport(ts);
+      if (cmd === "rename") return renameRun(ts);
+      if (cmd === "delete") return deleteRun(ts);
+    }
+
     async function renameRun(ts) {
       let name;
       try {
@@ -536,11 +636,57 @@ const ResultsView = {
       }
     }
 
-    async function _deleteNames(names, label) {
+    // ---- 重建报表：某 run 已有日志/产物但 report.html 缺失或过期时重出 ----
+    const rebuilding = Vue.ref("");
+    async function _waitRun(rid, timeoutMs) {
+      const deadline = Date.now() + (timeoutMs || 180000);
+      while (Date.now() < deadline) {
+        await new Promise(res => setTimeout(res, 1200));
+        try {
+          const d = await api("GET", "/api/runs/" + encodeURIComponent(rid));
+          if (d.status !== "running") return d;
+        } catch (e) { return null; }
+      }
+      return null;
+    }
+    async function rebuildReport(ts) {
+      if (rebuilding.value) return;
       try {
-        await ElementPlus.ElMessageBox.confirm(
-          "将把" + label + "移入回收站（webui/backups/outputs-trash），确定？",
-          "删除运行结果", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+        await confirmDanger("将用本地 stats / 原始日志重建 " + ts +
+                            " 的 report.html 与 overview.html；不访问集群，" +
+                            "不会重新拉取远端产物。", "重建报表");
+      } catch (e) { return; }
+      rebuilding.value = ts;
+      try {
+        const r = await api("POST", "/api/runs/rebuild-report", { ts: ts });
+        const done = await _waitRun(r.run.id);
+        if (done && done.rc === 0) {
+          ElementPlus.ElMessage.success("报表已重建：" + ts);
+          await loadRuns();
+          for (const p of panes) if (p.ts === ts) _loadFiles(p, true);
+        } else if (done) {
+          ElementPlus.ElMessage.error(
+            "重建失败（rc=" + done.rc + "），日志见「性能测试 → 历史运行」");
+        } else {
+          ElementPlus.ElMessage.warning("重建仍在进行，稍后刷新查看结果");
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        rebuilding.value = "";
+      }
+    }
+
+    async function _deleteNames(names, label) {
+      // Windows 原生 = 系统回收站（可恢复）；WSL/Linux = 永久删除
+      const win = (store.status && store.status.platform) === "windows";
+      const action = win ? "移入 Windows 回收站（可从资源管理器恢复）"
+                         : "永久删除（不可恢复）";
+      try {
+        await confirmDanger("将把" + label + " " + action + "。" +
+                            (names.length > 1 ? "目标：" + names.slice(0, 5).join("、") +
+                             (names.length > 5 ? " 等 " + names.length + " 个" : "") : ""),
+                            "删除运行结果");
       } catch (e) { return; }
       try {
         const r = await api("POST", "/api/outputs/delete", { names: names });
@@ -548,7 +694,9 @@ const ResultsView = {
           ElementPlus.ElMessage.warning("部分删除失败：" +
             r.failed.map(f => f.ts + "（" + f.error + "）").join("；"));
         } else {
-          ElementPlus.ElMessage.success("已删除 " + r.deleted.length + " 项（已移入回收站）");
+          ElementPlus.ElMessage.success(
+            (win ? "已移入 Windows 回收站：" : "已永久删除 ") +
+            r.deleted.length + " 项");
         }
         selected.value = selected.value.filter(t => !names.includes(t));
         await loadRuns();
@@ -615,9 +763,11 @@ const ResultsView = {
     });
 
     return { runs, loading, lockFile, activePane, fullscreenIdx, panes,
-             multiSelect, selected, allSelected,
+             listW, listOpen, toggleList,
+             multiSelect, selected, allSelected, rebuilding,
              loadRuns, addPane, removePane, pickRun, isActivePaneTs,
              isSelected, toggleSelect, onSelectAll, toggleMulti,
-             renameRun, deleteRun, deleteSelected };
+             rebuildReport, renameRun, deleteRun, deleteSelected,
+             onRunCommand };
   },
 };

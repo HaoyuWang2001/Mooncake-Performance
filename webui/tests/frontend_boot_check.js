@@ -10,9 +10,12 @@ const vm = require("vm");
 
 const jsDir = path.resolve(__dirname, "..", "web", "js");
 const files = [
+  "status.js",
   "spdiag.js",
   "views/config-view.js",
   "views/perf-view.js",
+  "views/instance-view.js",
+  "views/nodes-view.js",
   "views/results-view.js",
   "views/schedule-view.js",
   "views/spdiag-tree.js",
@@ -84,7 +87,8 @@ for (const rel of files) {
   }
 }
 
-const mustHave = ["perf-view", "sel-node", "config-view", "cfg-node",
+const mustHave = ["perf-view", "sel-node", "instance-view", "instance-log-pane",
+                  "config-view", "cfg-node",
                   "results-view", "res-pane", "schedule-view",
                   "spdiag-tree", "sdt-node", "drag-handle"];
 for (const [name, comp] of registered) {

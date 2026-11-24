@@ -160,10 +160,16 @@ writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node
 
 ## 结果
 
-成功运行的最终目录按 Python 模式收敛，只保留每实例 `log`/`glog`、请求级
-PNG，以及 run 级 `<cfg>.csv` 和 `benchmark_detail.csv`。`summary.json` 和
-`samples.csv` 仅作为汇总、作图的临时输入，成功后自动删除；失败或绘图失败时
-保留它们用于排障和重画。注意：
+成功运行保留最终产物：**HTML 报表（map-reduce 产物，见下节）**、run 级
+`<cfg>.csv` 和 `benchmark_detail.csv`、`profiling/`（监控 CSV）。**中间产物默认在
+报表校验通过后清理**（与 python 引擎、basic/pipeline 形态一致）：`samples.csv` /
+`summary.json` / `timeseries.csv` / `*.stats.json` / `kvtest_report_meta.json`
+以及回拉的原始 log/glog 都会删除；需要保留现场时用 `--keep-intermediates`
+（或 env `MC_KEEP_INTERMEDIATES=1`）。清理后该 run 不能再 `--rebuild-report`；
+失败/STOP 的 run 不清理，`samples.csv` 仍在，可补跑 map。失败 run 不再自动拉取原始日志：编排器只打印
+失败场景/阶段/异常、全量 pod 列表（`get pods -o wide`）和每个 pod 一行原始日志目录
+（k8s: `<host_log_root>/<run_id>/<pod>/`，ssh: `remote_log_dir`），原始 log/glog/exitrc
+留在节点上；失败阶段本身是 `remove-keys` 时不会重试 store remove-all。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。配置 warmup 时，`/start` 先释放 warmup；到时后编排器依次执行
 `/pause`（停 writer 并排空出站通知）、`/drain`（排空 reader 入站队列）、
@@ -186,7 +192,66 @@ kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` �
 `<实例>.<operation>.latency.png`；`notify_queue_wait` 使用
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
 request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回窗口聚合数据；
-`--no-plot` 可关闭自动绘图。
+这份 PNG **默认不生成**：需显式 `--png`，且必须与 `--pull-raw-logs` 同开
+（PNG 读原始日志；只开 `--png` 会直接报错）。HTML 报表不受影响（由 `--no-report`
+单独控制）。
+
+## HTML 报表（map-reduce）
+
+kvtest 与 Python 共用同一套报表链路，map 阶段把 C++ 的请求级样本转换成
+标准的 `<log>.stats.json`，reduce 阶段（`scripts/report.py`）按**形态（scenario）**
+渲染单元报表。**格式只由形态决定，与引擎无关**：生成器写 `meta.scenario`
+（`basic`|`pipeline`）与 `meta.engine`（`python`|`kvtest`），`meta.mode` 镜像
+scenario 仅兼容旧页面；kvtest-pipeline 与 Python pipeline 同构，kvtest-basic
+与 Python basic 同构（单「总览」）。kvtest 配置可用顶层
+`"report_scenario": "pipeline"|"basic"` 声明形态（缺省 pipeline）；旧 run 的
+`mode="kvtest"` 在读取/重建时自动归一化为 `scenario="pipeline" + engine="kvtest"`，
+副标题显示「引擎 kvtest」。
+
+1. **map**（编排器本地，场景结束、CSV 汇总后自动执行）：
+   `scripts/logstats.py --kvtest-samples <实例>.samples.csv --start-epoch <测量起点
+   epoch> --summary <实例>.summary.json --role writer|reader`。
+   `samples.csv` 的 `elapsed_us` 是相对**测量起点**的偏移：无 warmup 时即 `/start`；
+   配置 warmup 时 C++ 在 `/reset` 清空样本、`/arm` 启动正式计时，编排器在 `/arm`
+   完成后刷新 epoch（`/start` 时刻先记录一次，warmup 中途 STOP 也能得到正确的
+   warmup 时间轴）。报表时间轴、1s/1min 桶与慢点列表因此都是绝对时刻；每个实例
+   按 operation 拆成 **writer**（`upsert*`/`remove`）与 **reader**
+   （`get*`/`exist`）两份产物（dual 实例同时有两边，对应 Python dual client 的
+   writer.log/reader.log）。
+2. **reduce**（同一进程内）：`report.py` 按 data_size 汇总这些 stats，生成
+   `logs/<cfg>/report/<size>/report.html` + `data.js` + `meta.json`，并在 run 结束
+   时生成 `report/overview.html`。版式由 `report_scenario` 决定（缺省 pipeline）：
+   pipeline 为 writer/reader 角色单选 + 总计 + 角色化节点（同一节点每角色仅一行）、
+   角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口；
+   basic 为单「总览」、无角色分组；若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
+3. **重建**：`python benchmark.py --rebuild-report <ts>`。成功 run 的中间产物已按
+   默认策略清理，重建会提示「中间产物已按成功清理，无法重建」（报表与 data.js 仍可用）；
+   失败 run 保留了
+   `samples.csv` 时，会自动先补跑 map 再重建报表。运行期会把
+   `iid→节点/节点数/每个 size 的测量起点 epoch`写进
+   `logs/<cfg>/kvtest_report_meta.json`（旁挂文件，成功后也保留），重建据此
+   恢复真实节点名与精确时间轴；该文件缺失时才回退为
+   `summary.json` 的 mtime 减去 `elapsed_seconds` 估算。
+
+报表参数卡沿用 pipeline 字段（场景/协议/工作模式/QPS/notify/操作/节点数/客户端
+总数/KV 配置名等），并标记「运行模式 = kvtest」。注意：
+
+- `--no-report` 关闭 HTML 报表；绘图默认关闭，`--png`（必须配 `--pull-raw-logs`）
+  才生成 PNG（与 pipeline 一致，两者独立）；
+- 报表生成是 WARN-only，失败不影响压测结论；
+- 中间产物只有在该配置**全部单元报表校验通过**后才清理（`report/` 与 `profiling/`
+  保留；失败/STOP 配置保留）；`--keep-intermediates` 可保留整个 run；
+- **只存在于 summary 的指标也已进 HTML**：reader 的「值校验失败」
+  （`verify_failures`，数据正确性信号）与「队列等待均/峰」
+  （`notify_queue_wait` 的 avg/max）由 map 从 `summary.json` 提升进 reader
+  角色概要；通知发送侧指标（YLT 为 `notify_rpc`，旧二进制为 `notify_http`
+  的提交/失败/平均/最大）仍只在 CSV；
+- **节点日志体积取真实日志**：stats 的 `meta.bytes` 优先用该实例
+  `log + glog` 体积（另存 `meta.samples_bytes` 为样本文件体积），
+  run 总览的“节点日志量”不再被样本 CSV 低估；
+- **STOP（Ctrl+C）也出部分报表**：中断时先向实例发 `/stop`（C++ 只在
+  这里落盘样本）、等待退出、拉回样本与 summary，再做 map-reduce；
+  报表标注 `early_stop`。收集中按 Ctrl+C 第二次仍为强制退出。
 
 kvtest 实例文件使用紧凑名称
 `kv<配置哈希>.i<instance>_p<port>.kvtest_<size>.*`。K8s Pod 全名不再进入

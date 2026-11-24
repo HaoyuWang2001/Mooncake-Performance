@@ -26,5 +26,12 @@ schedule/plan.json
 mock/cluster.json
 
 webui/data/
-webui/backups/
+configs/_ssh/cluster.json
+configs/_ssh/global.json
+configs/_ssh/profile.json
+configs/_k8s/cluster.json
+configs/_k8s/global.json
+configs/_k8s/profile.json
 
+# Stray benchmark output dumps (never tracked)
+*.text

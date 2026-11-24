@@ -155,22 +155,47 @@ def _generate_openapi():
     paths["/api/configs"] = _p("Config inventory (general + trees + candidates)")
     paths["/api/config"] = _p("Read a config file")
     paths["/api/config"]["get"]["parameters"] = [_q("path", required=True)]
-    paths["/api/config"].update(_put("Save config (backup + validate)"))
+    paths["/api/config/chain"] = _p(
+        "Inheritance chain (_configs.json levels + self + effective merged)")
+    paths["/api/config/chain"]["get"]["parameters"] = [_q("path", required=True)]
+    paths["/api/config"].update(_put("Save config (validate + atomic write, no backup)"))
     paths["/api/config/validate"] = _post("Validate config content without saving")
     paths["/api/run"] = _post("Launch benchmark run (mode: ssh/k8s)")
-    paths["/api/run"]["post"]["responses"]["409"] = {"description": "Slot busy"}
+    paths["/api/run"]["post"]["responses"]["409"] = {"description": "Shared resource conflict / same instance running / scheduler executing"}
     paths["/api/cleanup"] = _post("Standalone clean-up (k8s namespace/workspace or SSH remote_dir)")
-    paths["/api/cleanup"]["post"]["responses"]["409"] = {"description": "Slot busy"}
+    paths["/api/cleanup"]["post"]["responses"]["409"] = {"description": "Shared resource conflict / scheduler executing"}
     paths["/api/runs"] = _p("Run history (max 60)")
     paths["/api/runs/{id}"] = _p("Run metadata by id")
     paths["/api/runs/{id}/log"] = _p("Incremental log fetch by byte offset")
-    paths["/api/runs/{id}/log"]["get"]["parameters"] = [_q("offset", "integer", False, 0)]
+    paths["/api/runs/{id}/log"]["get"]["parameters"] = [
+        _q("offset", "integer", False, 0),
+        _q("stream", default="all")]
     paths["/api/runs/{id}/stop"] = _post("Stop a run (cross-platform kill + remote reap)")
+    paths["/api/runs/{id}/reattach"] = _post(
+        "Re-attach a still-running run (idempotent; repairs wrongly finalized status)")
+    paths["/api/instances"] = _p("List instances (instance = reusable form snapshot)")
+    paths["/api/instances"].update(_post("Create instance (does NOT start it)"))
+    paths["/api/instances"]["post"]["responses"]["409"] = {"description": "Conflict"}
+    paths["/api/instances/{iid}"] = _p("Instance detail + its runs")
+    paths["/api/instances/{iid}"].update(_delete("Delete instance record (keeps runs/logs)"))
+    paths["/api/instances/{iid}/run"] = _post("Run this instance (guard-checked)")
+    paths["/api/instances/{iid}/run"]["post"]["responses"]["409"] = {
+        "description": "Running or shared resource conflict"}
+    paths["/api/instances/{iid}/stop"] = _post("Stop this instance's active run")
+    paths["/api/instances/{iid}/reattach"] = _post(
+        "Re-attach a still-running instance after WebUI restart/network loss")
+    paths["/api/instances/{iid}/rename"] = _post("Rename instance")
+    paths["/api/nodes"] = _p("Cluster nodes from cluster.json + roles from global.json")
+    paths["/api/nodes"]["get"]["parameters"] = [_q("cluster"), _q("global")]
+    paths["/api/nodes/{name}/test"] = _p("SSH probe: connectivity, env, mooncake processes, expected ports")
+    paths["/api/nodes/{name}/test"]["get"]["parameters"] = [_q("cluster"), _q("global")]
+    paths["/api/nodes/{name}/ports"] = _p("Listening ports on one node (ss -tlnp)")
+    paths["/api/nodes/{name}/ports"]["get"]["parameters"] = [_q("cluster")]
     paths["/api/outputs"] = _p("List output runs")
     paths["/api/outputs/{ts}/tree"] = _p("File tree of one output run")
-    paths["/api/outputs/{ts}"] = _delete("Delete run result (moved to trash)")
+    paths["/api/outputs/{ts}"] = _delete("Delete run result (Windows: recycle bin; WSL/Linux: permanent)")
     paths["/api/outputs/{ts}/rename"] = _post("Rename run result directory")
-    paths["/api/outputs/delete"] = _post("Batch delete run results (moved to trash)")
+    paths["/api/outputs/delete"] = _post("Batch delete run results (same discard semantics as single delete)")
     paths["/api/file"] = _p("Read file (text/raw/tail)")
     paths["/api/file"]["get"]["parameters"] = [
         _q("path", required=True), _q("mode", default="text"),
@@ -179,7 +204,7 @@ def _generate_openapi():
     paths["/api/csv"]["get"]["parameters"] = [_q("path", required=True), _q("max_rows", "integer", False, 5000)]
     paths["/api/schedule/plans"] = _p("List schedule plans")
     paths["/api/schedule/plan/{name}"] = _p("Read one schedule plan")
-    paths["/api/schedule/plan/{name}"].update(_put("Create/overwrite plan (validate + backup)"))
+    paths["/api/schedule/plan/{name}"].update(_put("Create/overwrite plan (validate + atomic write, no backup)"))
     paths["/api/schedule/start"] = _post("Start scheduler")
     paths["/api/schedule/stop"] = _post("Stop scheduler")
     paths["/api/schedule/status"] = _p("Scheduler status")

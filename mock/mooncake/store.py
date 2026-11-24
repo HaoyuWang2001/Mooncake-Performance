@@ -108,12 +108,16 @@ class MooncakeDistributedStore:
         return _MockBufferHandle(data)
 
     def remove_all(self, force=False):
+        """Mirror the real store's contract: return the number of objects
+        actually removed (the client loops until a pass clears 0)."""
+        removed = 0
         for name in os.listdir(self._dir):
             try:
                 os.remove(os.path.join(self._dir, name))
+                removed += 1
             except FileNotFoundError:
                 pass
-        return 0
+        return removed
 
     def batch_remove(self, keys, force=False):
         for k in keys:

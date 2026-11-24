@@ -2,10 +2,8 @@
 """webui/backend/common.py — 各 router 共用的错误类型与请求/文件工具。"""
 import json
 import os
-import shutil
-import time
 
-from .paths import BACKUP_DIR, ROOT
+from .paths import ROOT
 
 
 class ApiError(Exception):
@@ -41,15 +39,6 @@ def read_json_body(handler):
         return json.loads(raw.decode("utf-8")) if raw else {}
     except (ValueError, UnicodeDecodeError) as exc:
         raise ApiError(400, "bad JSON body: {}".format(exc))
-
-
-def backup_file(path):
-    """写入前备份到 webui/backups/（文件名 = 相对路径斜杠转下划线 + 时间戳）。"""
-    rel = os.path.relpath(path, ROOT).replace("\\", "/").replace("/", "__")
-    dst = os.path.join(BACKUP_DIR, rel + "." + time.strftime("%Y%m%d-%H%M%S"))
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    shutil.copy2(path, dst)
-    return os.path.relpath(dst, ROOT)
 
 
 def atomic_write(path, content):

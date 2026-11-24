@@ -13,7 +13,6 @@ Output (stdout, captured by run_benchmark_*.sh into per-client log files):
 import argparse
 import copy
 import gc
-import http.client
 import json
 import os
 import random
@@ -118,6 +117,136 @@ def unbuffer_stdio():
         sys.stderr.reconfigure(line_buffering=True)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Phase markers for C++ trace analysis (tracestats.py consumes these).
+#
+# One single line per (phase, action) per PROCESS, written to STDERR: the
+# runners redirect fd1+fd2 into the .glog file, so the markers land next to
+# the SDK trace stream (they never touch the RESULT/role logs on stdout).
+# tracestats classifies every breakdown row into setup / warmup / measured /
+# teardown by these timestamps — the C++ report then shows MEASURED-only
+# statistics (warmup prefill puts & reads no longer pollute them).
+#
+# Once-semantics matter for dual-role clients: the writer thread and the
+# reader-side HTTP handler both race to mark "measured start"; first wins,
+# the other side's call becomes a no-op.
+# ---------------------------------------------------------------------------
+_PHASE_MARK_LOCK = threading.Lock()
+_PHASE_MARKED = set()
+
+
+def _phase_marker(phase, action):
+    """Emit `MC_PHASE <phase> <action> <epoch_us>` once per (phase, action)."""
+    key = (phase, action)
+    with _PHASE_MARK_LOCK:
+        if key in _PHASE_MARKED:
+            return
+        _PHASE_MARKED.add(key)
+        sys.stderr.write("MC_PHASE {} {} {:.6f}\n".format(
+            phase, action, time.time()))
+        sys.stderr.flush()
+
+
+# --------------------------------------------------------------------------
+# Three-stream log separation (read / writer / client-glog)
+#
+# The mooncake SDK writes its glog stream to the OS-level fd 1 (stdout), so a
+# plain `> LOG_FILE` redirect would mix SDK glog into the Python RESULT
+# stream. Instead the runner captures fd1+fd2 into the .glog file and the
+# client rebinds sys.stdout to the ROLE LOGS below: Python output
+# (RESULT/META/SUMMARY/progress) goes to MC_WRITER_LOG / MC_READER_LOG while
+# fd 1 stays dedicated to the SDK. Routing:
+#   only one log configured (single-role / basic / stage processes)
+#       -> ALL Python output goes there
+#   both configured (dual) -> reader-marked threads write the reader log,
+#       everything else (writer thread + process-level lines) the writer log
+#   neither configured      -> stdout untouched (manual CLI runs)
+# --------------------------------------------------------------------------
+class _RoleStdout(object):
+    """sys.stdout replacement routing Python output into the role logs."""
+
+    def __init__(self, writer_h, reader_h, fallback):
+        self._w = writer_h
+        self._r = reader_h
+        self._fallback = fallback
+        self._tls = threading.local()
+
+    def _target(self):
+        if self._r is not None and getattr(self._tls, "reader", False):
+            return self._r
+        return self._w or self._r or self._fallback
+
+    def mark_reader(self):
+        self._tls.reader = True
+
+    def write(self, s):
+        return self._target().write(s)
+
+    def writelines(self, lines):
+        return self._target().writelines(lines)
+
+    def flush(self):
+        self._target().flush()
+
+    @property
+    def encoding(self):
+        return getattr(self._target(), "encoding", "utf-8")
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def reconfigure(self, **kwargs):
+        # line-buffered handles are opened by _open_role_log; forward any
+        # reconfigure (e.g. unbuffer_stdio) to them, never to fd 1
+        for h in (self._w, self._r):
+            if h is not None:
+                try:
+                    h.reconfigure(**kwargs)
+                except Exception:
+                    pass
+
+
+def _open_role_log(env_name):
+    path = (os.environ.get(env_name) or "").strip()
+    if not path:
+        return None
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        return open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        sys.stderr.write("[WARN] cannot open {} {}: {}; Python output "
+                         "falls back to stdout\n".format(env_name, path, exc))
+        return None
+
+
+def init_role_logs():
+    """Rebind sys.stdout to the role-log proxy; called as the FIRST thing in
+    main() so every Python line lands in the role logs (see _RoleStdout)."""
+    writer_h = _open_role_log("MC_WRITER_LOG")
+    reader_h = _open_role_log("MC_READER_LOG")
+    if writer_h is None and reader_h is None:
+        return
+    sys.stdout = _RoleStdout(writer_h, reader_h, sys.stdout)
+
+
+def _mark_reader_thread():
+    """Tag the CURRENT thread as reader-side (dual-mode output routing)."""
+    so = sys.stdout
+    if isinstance(so, _RoleStdout):
+        so.mark_reader()
+
+
+def _reader_log_handle():
+    """The MC_READER_LOG handle opened by init_role_logs (None when unset)."""
+    so = sys.stdout
+    return so._r if isinstance(so, _RoleStdout) else None
 
 # Environment snapshot printed once at process start (per client), before
 # argparse / SDK import. <unset> keeps missing values explicit.
@@ -300,17 +429,93 @@ def cmd_generate_data(args):
     emit("META", {"mode": "generate-data", "scenario": args.scenario,
                   "key_count": len(keys), "data_size_bytes": data_size,
                   "value_file": vpath, "keys_file": kpath, "seed": args.data_seed})
+
+
+def _remove_all_settings(args):
+    """(max_passes, pass_delay_s) with env fallbacks for ops-side tuning."""
+    passes = getattr(args, "remove_all_max_passes", None)
+    if passes is None:
+        passes = os.environ.get("MC_REMOVE_ALL_MAX_PASSES", 32)
+    try:
+        passes = int(passes)
+    except (TypeError, ValueError):
+        passes = 32
+    delay = getattr(args, "remove_all_pass_delay", None)
+    if delay is None:
+        delay = os.environ.get("MC_REMOVE_ALL_PASS_DELAY", 1.0)
+    try:
+        delay = float(delay)
+    except (TypeError, ValueError):
+        delay = 1.0
+    return max(1, passes), max(0.0, delay)
+
+
+def _remove_all_until_drained(store, max_passes, pass_delay_s):
+    """Repeat remove_all until a pass clears 0 objects (drained).
+
+    A single remove_all only ENQUEUES the removals admitted by the master's
+    oplog window (``--oplog_batch_max_entries``, default 1024; under
+    backpressure the overflow is skipped internally with no retry and no
+    error). "Success" therefore means "this pass enqueued N removals", not
+    "the store is empty", so we repeat until a pass reports 0.
+
+    Returns ``(passes, total_cleared)``. ``(-1, ret)`` reports a failed RPC;
+    ``(-passes, total)`` reports "still not drained after max_passes"."""
+    passes = 0
+    total = 0
+    while True:
+        ret = store.remove_all(force=True)
+        if ret < 0:
+            return -1, ret
+        passes += 1
+        total += max(ret, 0)
+        log("remove-all pass {}: cleared={} (total={})".format(
+            passes, max(ret, 0), total))
+        if ret == 0:
+            return passes, total
+        if passes >= max_passes:
+            return -passes, total
+        if pass_delay_s > 0:
+            time.sleep(pass_delay_s)
+
+
+def _remove_all_checked(store, args, what):
+    """Drain the whole store or exit 1 (single remove_all is not enough).
+
+    ``max_passes <= 1`` restores the legacy single-call behaviour (accept the
+    first pass's result); the default repeats until a pass clears 0."""
+    max_passes, pass_delay = _remove_all_settings(args)
+    if max_passes <= 1:
+        ret = store.remove_all(force=True)
+        if ret < 0:
+            print("[ERROR] {}: remove_all returned {}".format(what, ret))
+            sys.exit(1)
+        log("remove-all pass 1: cleared={} (total={})".format(
+            max(ret, 0), max(ret, 0)))
+        return 1, max(ret, 0)
+    passes, total = _remove_all_until_drained(store, max_passes, pass_delay)
+    if passes < 0 and total < 0:
+        print("[ERROR] {}: remove_all returned {}".format(what, total))
+        sys.exit(1)
+    if passes < 0:
+        print("[ERROR] {}: store not drained after {} passes ({} objects "
+              "cleared); raise --remove-all-max-passes / "
+              "MC_REMOVE_ALL_MAX_PASSES, or speed up etcd / raise "
+              "--oplog_batch_max_entries".format(what, -passes, total))
+        sys.exit(1)
+    return passes, total
+
+
 def cmd_remove_keys(args, store):
     log("remove-keys start (scope={}, scenario={})".format(args.scope, args.scenario))
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     scope = args.scope
     if scope == "full":
-        ret = store.remove_all(force=True)
-        if ret < 0:
-            print("[ERROR] remove-keys full failed: remove_all returned {}".format(ret))
-            sys.exit(1)
-        log("remove-keys done (scope=full, cleared={})".format(max(ret, 0)))
-        emit("META", {"mode": "remove-keys", "scope": "full", "cleared": max(ret, 0)})
+        passes, total = _remove_all_checked(store, args, "remove-keys full")
+        log("remove-keys done (scope=full, cleared={}, passes={})".format(
+            total, passes))
+        emit("META", {"mode": "remove-keys", "scope": "full",
+                      "cleared": total, "passes": passes})
         return
     existence = store.batch_is_exist(keys)
     statuses = store.batch_remove(keys, force=True)
@@ -343,8 +548,12 @@ def cmd_remove_keys(args, store):
         sys.exit(1)
 def cmd_prepare_store(args, store):
     log("prepare-store start (scenario={})".format(args.scenario))
-    # Force release all segment space before preparing new data
-    store.remove_all(force=True)
+    # Force release all segment space before preparing new data. A single
+    # remove_all can silently skip objects under oplog backpressure, and the
+    # leftover keys would pollute the get-family baseline, so drain fully.
+    _passes, _total = _remove_all_checked(store, args, "prepare-store remove-all")
+    log("prepare-store remove-all done (cleared={}, passes={})".format(
+        _total, _passes))
     value = load_value(args.remote_data_dir, args.scenario)
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
     existence = store.batch_is_exist(keys)
@@ -443,14 +652,30 @@ class _NoCall(Exception):
 
 
 def now_hms():
-    """Local wall-clock timestamp for RESULT rows (HH:MM:SS.microseconds).
+    """Local wall-clock timestamp for RESULT rows (YYYY-MM-DD HH:MM:SS.micro).
 
+    The DATE part disambiguates multi-day (7x24h) runs — the legacy
+    HH:MM:SS-only format folded midnight heuristically in every parser.
     Localization aid only — latency values come from the timed region; wall
     clock may skew across nodes and is never used for measurement.
     """
     t = time.time()
-    return time.strftime("%H:%M:%S", time.localtime(t)) + ".{:06d}".format(
-        int((t % 1) * 1e6))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + \
+        ".{:06d}".format(int((t % 1) * 1e6))
+
+
+_BASIC_RESULT_LOCK = threading.Lock()
+
+
+def _write_result_row(op_name, key, lat, status, ts):
+    """Stream ONE basic RESULT row as it is produced (streaming flush): a
+    mid-run kill (STOP/kill -9) keeps every completed sample instead of
+    losing the whole in-memory buffer. The write sits OUTSIDE the timed
+    region (latency is captured around the interface call only)."""
+    with _BASIC_RESULT_LOCK:
+        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\n".format(
+            ts, op_name, key, lat, status))
+        sys.stdout.flush()
 
 
 def _run_iface(store, make_call, check, keys, value, ctx):
@@ -600,11 +825,18 @@ GET_IFACE_DEFS = {
     "get_into": (_get_into_make_call, _get_into_check),
     "get_buffer": (_get_buffer_make_call, _get_buffer_check),
 }
-def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
+def _run_thread(args, store, keys, value, results, deadline=None, ctx=None,
+                emit_rows=True):
     op = args.operation
     batch_size = max(1, args.batch_size)
     put_ratio = args.put_ratio
     local = []
+
+    def record(op_name, key, lat, status):
+        ts = now_hms()
+        local.append((op_name, key, lat, status, ts))
+        if emit_rows:                      # warmup rows are discarded
+            _write_result_row(op_name, key, lat, status, ts)
     def keys_iter():
         if deadline is None:
             for k in keys:
@@ -660,7 +892,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if i < n_put_units:
                 group = put_keys[i * batch_size:(i + 1) * batch_size]
                 lat, status = _run_iface(store, *PUT_IFACE_DEFS[put_iface], group, value, ctx)
-                local.append(("put", group[0], lat, status, now_hms()))
+                record("put", group[0], lat, status)
                 pace()
             if i < n_get_units:
                 base = i * batch_size
@@ -669,7 +901,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                 gkeys = gkeys[:n_get - base]
                 if gkeys:
                     lat, status = _run_iface(store, *GET_IFACE_DEFS[get_iface], gkeys, value, ctx)
-                    local.append(("get", gkeys[0], lat, status, now_hms()))
+                    record("get", gkeys[0], lat, status)
                     pace()
 
         if deadline is None:
@@ -699,7 +931,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if deadline is None:
                 for group in groups_iter():
                     lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                    local.append((op, group[0], lat, status, now_hms()))
+                    record(op, group[0], lat, status)
                     pace()
             else:
                 # duration mode: full-key passes; after each completed pass
@@ -715,7 +947,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                             break
                         group = keys[j:j + batch_size]
                         lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], group, value, ctx)
-                        local.append((op, group[0], lat, status, now_hms()))
+                        record(op, group[0], lat, status)
                         pace()
                     else:
                         store.batch_remove(keys, force=True)
@@ -725,7 +957,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
             if deadline is None:
                 for k in keys_iter():
                     lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                    local.append((op, k, lat, status, now_hms()))
+                    record(op, k, lat, status)
                     pace()
             else:
                 # duration mode: full-key passes with untimed self-clear
@@ -737,7 +969,7 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
                         if time.time() >= deadline:
                             break
                         lat, status = _run_iface(store, *PUT_IFACE_DEFS[op], [k], value, ctx)
-                        local.append((op, k, lat, status, now_hms()))
+                        record(op, k, lat, status)
                         pace()
                     else:
                         if op != "upsert_from":
@@ -748,12 +980,12 @@ def _run_thread(args, store, keys, value, results, deadline=None, ctx=None):
         if op in GET_BATCH_IFACES:
             for group in groups_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], group, value, ctx)
-                local.append((op, group[0], lat, status, now_hms()))
+                record(op, group[0], lat, status)
                 pace()
         else:
             for k in keys_iter():
                 lat, status = _run_iface(store, *GET_IFACE_DEFS[op], [k], value, ctx)
-                local.append((op, k, lat, status, now_hms()))
+                record(op, k, lat, status)
                 pace()
     else:
         raise SystemExit("[ERROR] unsupported operation: {}".format(op))
@@ -792,7 +1024,7 @@ def run_warmup(args, store, value, ctx=None):
     wargs.target_qps = 0  # warmup free-runs; pacing is for measured phase
     results = []
     _run_thread(wargs, store, keys, value, results, deadline=time.time() + duration,
-                ctx=ctx)
+                ctx=ctx, emit_rows=False)
     store.batch_remove(keys, force=True)
     log("warmup done (ops={})".format(len(results)))
 def _percentile(sorted_vals, p):
@@ -828,6 +1060,7 @@ def cmd_benchmark(args, store):
             print("[ERROR] register_buffer failed, cannot use zero-copy interfaces")
             sys.exit(1)
     if args.warmup == "true":
+        _phase_marker("warmup", "start")   # warmup window opens (incl. prefill puts)
         run_warmup(args, store, value, ctx)
     end_idx = args.key_end if args.key_end is not None else len(keys)
     chunk = keys[args.key_start:end_idx]
@@ -853,6 +1086,7 @@ def cmd_benchmark(args, store):
             op, len(chunk), args.num_threads, duration or 0, args.target_qps or 0))
         results = []
         wall_t0 = time.perf_counter()
+        _phase_marker("measured", "start")   # measured window opens
         if chunk:
             per_thread = _split_even(chunk, args.num_threads)
             with ThreadPoolExecutor(max_workers=args.num_threads) as pool:
@@ -861,6 +1095,7 @@ def cmd_benchmark(args, store):
                 for f in futures:
                     f.result()
         wall_s = time.perf_counter() - wall_t0
+        _phase_marker("measured", "end")     # measured window closed
     finally:
         try:
             if ctx is not None:
@@ -919,10 +1154,9 @@ def cmd_benchmark(args, store):
     emit("SUMMARY", summary)
     log("benchmark done (total={}, ok={}, fail={}, wall_s={:.3f})".format(
         total, ok_count, fail_count, wall_s))
-    for opname, k, lat, status, ts in results:
-        sys.stdout.write("RESULT\t{}\t{}\t{}\t{:.6f}\t{}\n".format(
-            ts, opname, k, lat, status))
-    sys.stdout.flush()
+    # RESULT rows were streamed per-op by _write_result_row (basic streaming
+    # flush): nothing left to write here — the order change (RESULT before
+    # SUMMARY) is invisible to every parser (line scans, order-independent).
 
 # --------------------------------------------------------------------------
 
@@ -1016,7 +1250,13 @@ def _normalize_local_readers(readers):
 
 
 class _NotifyHTTPPool:
-    """Exclusive checkout per connection; retain at most two idle per peer."""
+    """Exclusive checkout per connection; retain at most two idle per peer.
+
+    Uses a raw keep-alive socket instead of ``http.client``: the response
+    headers are framed by our own reader server (Content-Length always
+    present), so the email-based header parser `http.client` builds for every
+    response is pure GIL-bound overhead on the notify hot path."""
+
     def __init__(self, timeout=0.5):
         self.timeout = timeout
         self.idle = {}
@@ -1034,17 +1274,14 @@ class _NotifyHTTPPool:
             else:
                 self.created += 1
         if conn is None:
-            conn = http.client.HTTPConnection(*peer, timeout=self.timeout)
+            conn = socket.create_connection(peer, timeout=self.timeout)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
-            if conn.sock is None:
-                conn.connect()
-                conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            conn.request("GET", path)
-            response = conn.getresponse()
-            response.read()  # consume the complete body before reuse
-            if response.status != 200:
-                raise RuntimeError("HTTP {}".format(response.status))
-            if response.will_close:
+            conn.sendall(_notify_request_bytes(peer, path))
+            status, keep_alive = _read_notify_reply(conn)
+            if status != 200:
+                raise RuntimeError("HTTP {}".format(status))
+            if not keep_alive:
                 conn.close()
                 return
         except Exception:
@@ -1064,6 +1301,57 @@ class _NotifyHTTPPool:
                 for conn in available:
                     conn.close()
             self.idle.clear()
+
+
+def _notify_request_bytes(peer, path):
+    """One request head for the keep-alive notify connection (no body)."""
+    host, port = peer
+    return (b"GET " + path.encode("ascii", "replace") + b" HTTP/1.1\r\n"
+            b"Host: " + host.encode("ascii", "replace") + b":" +
+            str(port).encode("ascii") + b"\r\n"
+            b"Connection: keep-alive\r\n\r\n")
+
+
+def _read_notify_reply(sock):
+    """Read one Content-Length framed reply -> (status, keep_alive).
+
+    The notify server (both implementations) always sends Content-Length, so
+    a fixed framing read replaces a full HTTP response object."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("notify peer closed before the reply")
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        raise ValueError("malformed notify status line: {!r}".format(
+            lines[0][:80]))
+    length = 0
+    keep_alive = True
+    for line in lines[1:]:
+        name, _, value = line.partition(b":")
+        name = name.strip().lower()
+        if name == b"content-length":
+            try:
+                length = int(value.strip())
+            except ValueError:
+                raise ValueError("malformed notify Content-Length: {!r}".format(
+                    value[:40]))
+        elif name == b"connection" and value.strip().lower() == b"close":
+            keep_alive = False
+    if len(body) > length:
+        # Pipelined/desynchronised peer: never reuse a stream we cannot align.
+        keep_alive = False
+    while len(body) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("notify peer closed mid-body")
+        body += chunk
+    return status, keep_alive
 
 
 class _NotifySendQueue(Queue):
@@ -1374,6 +1662,7 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
                 warmup_duration, target_qps))
             emit("META", {"mode": "pipeline_warmup_start", "writer_id": writer_id,
                           "duration": warmup_duration, "ts": time.time()})
+            _phase_marker("warmup", "start")   # warmup window opens
             _run_phase(time.time() + warmup_duration, True)
             # Do not let warmup notifications leak into the measured window.
             sender.drain()
@@ -1381,15 +1670,22 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
                           "ts": time.time()})
             log("pipeline writer warmup done")
         log("pipeline writer measured start (duration={}s)".format(duration))
+        _phase_marker("measured", "start")     # measured window opens
+        _measured_t0 = time.perf_counter()
         _run_phase(time.time() + duration, False)
+        # 实际测量窗口的墙钟（配置 duration 只应作为计划值；早停/超时截断时
+        # 必须用真实 elapsed，否则报表“时长/QPS”会按计划值虚报）
+        measured_wall_s = time.perf_counter() - _measured_t0
+        log("pipeline writer measured done (keys_ok={}, keys_fail={}, "
+            "wall_s={:.3f})".format(
+                stats["keys_ok"], stats["keys_fail"], measured_wall_s))
+        _phase_marker("measured", "end")       # measured window closed
         # Preserve delivery semantics: all accepted notifications finish before
         # the writer summary/client shutdown, but this drain is outside 30s.
         sender.drain(measured=True)
     finally:
         sender.close()
         http_pool.close()
-    log("pipeline writer measured done (keys_ok={}, keys_fail={})".format(
-        stats["keys_ok"], stats["keys_fail"]))
     sys.stdout.flush()
     if ctx is not None:
         ctx.teardown(store)
@@ -1407,9 +1703,11 @@ def _writer_run_phases(args, store, readers, do_warmup=True, exclude_id=None):
         "traffic_mode": traffic_mode, "batch_size": batch_keys,
         "duration": duration, "warmup_duration": warmup_duration,
         "total": keys_total, "bytes": ok_bytes,
-        "wall_s": duration, "ok": stats["keys_ok"], "fail": stats["keys_fail"],
-        "qps": (keys_total / duration) if duration > 0 else 0.0,
+        "wall_s": measured_wall_s,
+        "ok": stats["keys_ok"], "fail": stats["keys_fail"],
+        "qps": (keys_total / measured_wall_s) if measured_wall_s > 0 else 0.0,
         "fail_rate": (stats["keys_fail"] / keys_total) if keys_total else 0.0,
+        "gil_switch_interval": _GIL_SWITCH_INTERVAL[0],
         "notify_async": notify_async,
         "notify_max_inflight": notify_max_inflight,
         "notify_queue_size": notify_queue_size,
@@ -1548,11 +1846,17 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     qdepth = 0
     qmax = 0
     qlock = None
+    # measured notify span (writer-side write_ts epochs): the reader's actual
+    # measurement window; used for wall_s/QPS instead of the configured
+    # duration (which lies when the run is truncated or paced differently)
+    m_ts0 = 0.0
+    m_ts1 = 0.0
     def do_GET(self):
         self._handle()
     def do_POST(self):
         self._handle()
     def _handle(self):
+        _mark_reader_thread()   # dual mode: reader-side service thread
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/notify":
@@ -1560,6 +1864,18 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
             writer_id = params.get("writer_id", ["0"])[0]
             write_ts = float(params.get("write_ts", ["0"])[0])
             is_warmup = params.get("warmup", ["0"])[0] == "1"
+            # phase markers from the notify stream itself: the first warmup
+            # notify opens the warmup window, the first regular notify opens
+            # the measured window (once-semantics: in dual clients the
+            # writer thread usually already emitted them)
+            _phase_marker("warmup" if is_warmup else "measured", "start")
+            if not is_warmup and write_ts > 0:
+                with _PipelineNotifyHandler.qlock:
+                    if (_PipelineNotifyHandler.m_ts0 <= 0
+                            or write_ts < _PipelineNotifyHandler.m_ts0):
+                        _PipelineNotifyHandler.m_ts0 = write_ts
+                    if write_ts > _PipelineNotifyHandler.m_ts1:
+                        _PipelineNotifyHandler.m_ts1 = write_ts
             # one queue item per notify batch (the writer's whole batch); the
             # queue depth unit therefore counts pending notify batches
             if time.time() < _PipelineNotifyHandler.deadline + _PipelineNotifyHandler.exit_grace:
@@ -1584,6 +1900,149 @@ class _PipelineNotifyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # suppress HTTP server logs
     do_GET = do_POST
+
+
+def _parse_notify_query(query):
+    """urlencoded query -> {name: [values]}.
+
+    Matches ``urllib.parse.parse_qs`` defaults (blank values dropped,
+    ``+`` -> space, ``%XX`` decoded) without its dict/list machinery.
+    """
+    values = {}
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        name, sep, value = pair.partition("=")
+        if not sep or not value:
+            continue  # blank value: parse_qs drops it by default
+        if "+" in name:
+            name = name.replace("+", " ")
+        if "%" in name:
+            name = urllib.parse.unquote(name)
+        if "+" in value:
+            value = value.replace("+", " ")
+        if "%" in value:
+            value = urllib.parse.unquote(value)
+        values.setdefault(name, []).append(value)
+    return values
+
+
+def _http_reply(body, close=False):
+    """Static 200 reply with Content-Length framing (keep-alive safe)."""
+    return (b"HTTP/1.1 200 OK\r\nContent-Length: " +
+            str(len(body)).encode("ascii") + b"\r\n" +
+            (b"Connection: close\r\n" if close else b"") +
+            b"\r\n" + body)
+
+
+# Both HTTP implementations share the legacy handler's class-level reader
+# state (queue / deadline / exit_grace / start_event / qdepth / qlock):
+# _pipeline_reader and _pipeline_dual keep writing exactly one place.
+_NotifyState = _PipelineNotifyHandler
+
+
+class _FastNotifyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 512
+
+
+class _FastNotifyHandler(socketserver.StreamRequestHandler):
+    """Minimal HTTP/1.1 keep-alive notify server.
+
+    `http.server.BaseHTTPRequestHandler` pays, per request, a regex request-
+    line parse, an email-based header parser, per-header date/server
+    formatting and one write() syscall per header. On the reader hot path
+    (every notify from every writer) that Python work competes with the
+    reader workers for the GIL, so the same protocol is implemented directly
+    on the socket here: read the request line + discard headers, parse the
+    query by hand, write one prebuilt reply."""
+
+    rbufsize = -1          # buffered line reads
+    wbufsize = 0           # one write syscall per reply
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30.0)
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def handle(self):
+        _mark_reader_thread()
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                return
+            if line in (b"\r\n", b"\n"):
+                continue
+            parts = line.rstrip(b"\r\n").split(b" ")
+            if len(parts) < 2:
+                return
+            target = parts[1]
+            keep_alive = True
+            while True:
+                header = self.rfile.readline(65536)
+                if not header or header in (b"\r\n", b"\n"):
+                    break
+                if header[:11].lower() == b"connection:" and \
+                        b"close" in header.lower():
+                    keep_alive = False
+            try:
+                self.wfile.write(_http_reply(self._dispatch(target),
+                                             close=not keep_alive))
+            except OSError:
+                return
+            if not keep_alive:
+                return
+
+    @staticmethod
+    def _dispatch(target):
+        path, _, query = target.partition(b"?")
+        if path == b"/notify":
+            params = _parse_notify_query(query.decode("latin-1"))
+            keys = params.get("key", [])
+            writer_id = params.get("writer_id", ["0"])[0]
+            write_ts = float(params.get("write_ts", ["0"])[0])
+            is_warmup = params.get("warmup", ["0"])[0] == "1"
+            # phase markers from the notify stream itself (see the legacy
+            # handler: once-semantics, first warmup/first measured notify)
+            _phase_marker("warmup" if is_warmup else "measured", "start")
+            # measured notify span (writer-side write_ts epochs) drives the
+            # reader's real wall_s/QPS instead of the configured duration
+            if not is_warmup and write_ts > 0:
+                with _NotifyState.qlock:
+                    if (_NotifyState.m_ts0 <= 0
+                            or write_ts < _NotifyState.m_ts0):
+                        _NotifyState.m_ts0 = write_ts
+                    if write_ts > _NotifyState.m_ts1:
+                        _NotifyState.m_ts1 = write_ts
+            if time.time() < _NotifyState.deadline + _NotifyState.exit_grace:
+                _NotifyState.queue.put(
+                    (keys, int(writer_id), write_ts, is_warmup,
+                     time.perf_counter()))
+                with _NotifyState.qlock:
+                    _NotifyState.qdepth += 1
+                    if _NotifyState.qdepth > _NotifyState.qmax:
+                        _NotifyState.qmax = _NotifyState.qdepth
+            return b"OK"
+        if path == b"/health":
+            return b"HEALTHY"
+        if path == b"/start" and _NotifyState.start_event is not None:
+            _NotifyState.start_event.set()
+            return b"STARTED"
+        if path == b"/shutdown":
+            _NotifyState.deadline = -1.0
+            return b"SHUTDOWN"
+        return b"UNKNOWN:" + target
+
+
+def _notify_server_impl():
+    """Reader HTTP implementation: 'fast' (default) or 'legacy' rollback."""
+    choice = (os.environ.get("MC_NOTIFY_HTTP") or "fast").strip().lower()
+    if choice == "legacy":
+        return _PipelineNotifyServer, _PipelineNotifyHandler
+    return _FastNotifyServer, _FastNotifyHandler
+
+
 def _reader_worker(args, store, queue, deadline, results, ctx=None):
     """Reader worker thread: dequeue a notify batch, run the optional exist
     pre-checks, then execute the configured get interface (reader.operation).
@@ -1597,6 +2056,7 @@ def _reader_worker(args, store, queue, deadline, results, ctx=None):
     actual store reads warm up the reader->store path — but are tagged so
     they stay out of the measured metrics.
     """
+    _mark_reader_thread()   # dual mode: route this thread's log() to reader log
     pipeline = args.notify_pipeline if isinstance(args.notify_pipeline, list) else ["get"]
     reader_op = args.operation or "get"
     if reader_op not in GET_IFACE_DEFS:
@@ -1716,12 +2176,15 @@ def _pipeline_reader(args, store):
     _PipelineNotifyHandler.qdepth = 0
     _PipelineNotifyHandler.qmax = 0
     _PipelineNotifyHandler.qlock = threading.Lock()
+    _PipelineNotifyHandler.m_ts0 = 0.0
+    _PipelineNotifyHandler.m_ts1 = 0.0
     # Start HTTP server in a daemon thread BEFORE starting workers so a bind
     # failure fails fast (workers would otherwise block the exception for the
     # whole reader lifetime)
     socketserver.ThreadingTCPServer.allow_reuse_address = True
+    server_cls, handler_cls = _notify_server_impl()
     try:
-        server = _PipelineNotifyServer(("0.0.0.0", my_port), _PipelineNotifyHandler)
+        server = server_cls(("0.0.0.0", my_port), handler_cls)
     except OSError as exc:
         raise SystemExit("[ERROR] reader failed to bind port {}: {}".format(my_port, exc))
     server.daemon_threads = True
@@ -1758,14 +2221,33 @@ def _pipeline_reader(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
+    _phase_marker("measured", "end")   # reader window closed (pure-reader pods)
     log("pipeline reader done (items={})".format(len(results)))
     if ctx is not None:
         ctx.teardown(store)
-    _emit_reader_summary(args, results, num_threads, meas_duration)
+    _emit_reader_summary(
+        args, results, num_threads, meas_duration,
+        wall_s=_measured_wall_from_notifies(
+            _PipelineNotifyHandler.m_ts0, _PipelineNotifyHandler.m_ts1,
+            meas_duration))
 
 # --------------------------------------------------------------------------
 
-def _emit_reader_summary(args, results, num_threads, meas_duration, out=None):
+def _measured_wall_from_notifies(ts0, ts1, fallback):
+    """Actual measured wall from the notify (write) epoch span.
+
+    Falls back to the configured measurement window when no measured notify
+    was observed (e.g. zero-traffic run)."""
+    if ts1 > ts0 > 0:
+        return float(ts1 - ts0)
+    try:
+        return float(fallback or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _emit_reader_summary(args, results, num_threads, meas_duration, out=None,
+                        wall_s=None):
     """Flush the reader-side SUMMARY + RESULT rows (shared by the pure
     reader process and the dual-role client).
 
@@ -1790,15 +2272,18 @@ def _emit_reader_summary(args, results, num_threads, meas_duration, out=None):
     latencies = sorted(lat_ok)
     busy_s = (sum(lat_ok) / 1000.0) if lat_ok else 0.0
     queue_waits = [r[4] for r in results]
+    wall = float(wall_s) if wall_s and wall_s > 0 else float(meas_duration or 0)
     summary = {
         "mode": "pipeline_reader", "scenario": args.scenario,
         "work_mode": args.work_mode or "recall", "protocol": args.protocol,
         "client_id": args.client_id, "reader_count": args.reader_count,
         "num_threads": num_threads,
-        "total": total, "bytes": total_bytes, "wall_s": meas_duration,
+        "gil_switch_interval": _GIL_SWITCH_INTERVAL[0],
+        "total": total, "bytes": total_bytes,
+        "duration": meas_duration, "wall_s": wall,
         "warmup_total": warmup_total,
         "ok": ok_keys, "fail": fail_keys,
-        "qps": (total / meas_duration) if meas_duration > 0 else 0.0,
+        "qps": (total / wall) if wall > 0 else 0.0,
         "fail_rate": (fail_keys / total) if total else 0.0,
         # interface throughput = successful bytes / sum of successful store.get
         # call durations (busy time, not wall clock)
@@ -1874,11 +2359,13 @@ def _pipeline_dual(args, store):
     _PipelineNotifyHandler.qdepth = 0
     _PipelineNotifyHandler.qmax = 0
     _PipelineNotifyHandler.qlock = threading.Lock()
+    _PipelineNotifyHandler.m_ts0 = 0.0
+    _PipelineNotifyHandler.m_ts1 = 0.0
     _PipelineNotifyHandler.start_event = started
     socketserver.ThreadingTCPServer.allow_reuse_address = True
+    server_cls, handler_cls = _notify_server_impl()
     try:
-        server = _PipelineNotifyServer(("0.0.0.0", my_port),
-                                                 _PipelineNotifyHandler)
+        server = server_cls(("0.0.0.0", my_port), handler_cls)
     except OSError as exc:
         raise SystemExit("[ERROR] dual client failed to bind port {}: {}"
                          "".format(my_port, exc))
@@ -1946,26 +2433,19 @@ def _pipeline_dual(args, store):
         for f in worker_futures:
             f.result()
         server.shutdown()
+    _phase_marker("measured", "end")   # no-op when the writer already ended
     wthread.join(timeout=60)
     log("pipeline dual client done (reader items={})".format(len(results)))
     if rctx is not None:
         rctx.teardown(store)
-    # reader output → its own log (writer rows stay on stdout / main log)
-    reader_log = (os.environ.get("MC_READER_LOG") or "").strip()
-    out_stream = None
-    if reader_log:
-        try:
-            out_stream = open(reader_log, "a", encoding="utf-8", buffering=1)
-        except OSError:
-            log("[WARN] cannot open MC_READER_LOG {}; reader output -> stdout"
-                "".format(reader_log))
-            out_stream = None
-    try:
-        _emit_reader_summary(args, results, num_threads, meas_duration,
-                             out=out_stream)
-    finally:
-        if out_stream is not None:
-            out_stream.close()
+    # reader output → its own log (writer rows stay on the writer log);
+    # the handle is owned by init_role_logs (MC_READER_LOG), line-buffered
+    _emit_reader_summary(
+        args, results, num_threads, meas_duration,
+        out=_reader_log_handle(),
+        wall_s=_measured_wall_from_notifies(
+            _PipelineNotifyHandler.m_ts0, _PipelineNotifyHandler.m_ts1,
+            meas_duration))
     if writer_error:
         raise SystemExit("[ERROR] dual {}: writer phase failed: {}"
                          "".format(my_id, writer_error[0]))
@@ -2067,13 +2547,57 @@ def _resolve_env(args):
     if args.rendezvous_timeout is None:
         args.rendezvous_timeout = int(
             os.environ.get("BENCH_RENDEZVOUS_TIMEOUT", "120"))
+
+
+_GIL_SWITCH_INTERVAL = [0.0]
+
+
+def _apply_gil_switch_interval():
+    """BENCH_GIL_SWITCH_INTERVAL -> sys.setswitchinterval().
+
+    The notify hot path is threaded Python (writer send workers + reader HTTP
+    handlers + reader queue workers). With the default 5 ms switch interval a
+    runnable thread can wait milliseconds for the GIL, which shows up as
+    notify latency and queue build-up; a smaller interval lets the I/O and
+    queue threads hand off faster. Unset = interpreter default (no change)."""
+    raw = (os.environ.get("BENCH_GIL_SWITCH_INTERVAL") or "").strip()
+    if not raw:
+        return
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit("[ERROR] BENCH_GIL_SWITCH_INTERVAL must be a float")
+    if value <= 0:
+        raise SystemExit("[ERROR] BENCH_GIL_SWITCH_INTERVAL must be > 0")
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(value)
+    _GIL_SWITCH_INTERVAL[0] = value
+    log("gil switch interval: {:.6f} -> {:.6f}".format(old, value))
+
+
 def main():
+    init_role_logs()
     unbuffer_stdio()
+    _apply_gil_switch_interval()
+    # TEST-ONLY hook: simulate the C++ SDK writing its glog stream straight
+    # to OS fd 1 (the stream the runner captures into <base>.glog). Lets the
+    # hermetic runner e2e assert the three-stream separation without the
+    # real SDK. Never set in production.
+    if os.environ.get("MC_FAKE_SDK_GLOG"):
+        os.write(1, b"I20261112 101500.123456 999 fake.cc:42] fake sdk glog\n")
+        os.write(1, b"W20261112 101500.200000 999 fake.cc:43] fake sdk warn\n")
     log("[client-env] pid={} argv={} {}".format(
         os.getpid(), " ".join(sys.argv[1:]), env_snapshot()))
     parser = argparse.ArgumentParser(description="Mooncake benchmark client")
     parser.add_argument("--mode", required=True, choices=["generate-data", "remove-keys", "prepare-store", "benchmark", "pipeline"])
     parser.add_argument("--scope", default="key-prefix", choices=["key-prefix", "full"])
+    parser.add_argument("--remove-all-max-passes", type=int, default=None,
+                        help="max remove_all passes until drained (0/1 = legacy "
+                             "single call); env MC_REMOVE_ALL_MAX_PASSES, "
+                             "default 32")
+    parser.add_argument("--remove-all-pass-delay", type=float, default=None,
+                        help="seconds between remove_all passes (0 = none); "
+                             "env MC_REMOVE_ALL_PASS_DELAY, default 1.0")
     parser.add_argument("--client-id", type=int, default=1,
                         help="process instance id within this test run "
                              "(basic: 1..num-clients; pipeline writer: global writer id; "

@@ -28,6 +28,42 @@ import threading
 import time
 
 
+def log_phase(name, level=1):
+    """Print a phase divider (blank line + untimestamped rule line).
+
+    level 1 = run/scenario phase, level 2 = stage inside a scenario. Written
+    to the console and the full detail log under the logging lock; no
+    timestamp/prefix so the divider stands out visually."""
+    line = ("──── {} ────".format(name) if level <= 1
+            else "  ── {} ──".format(name))
+    with _LOG_LOCK:
+        print("\n" + line, flush=True)
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write("\n" + line + "\n")
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
+
+
+def ensure_utf8_stdio():
+    """Force redirected stdout/stderr to UTF-8.
+
+    On Windows a Python child whose stdio is redirected to a file (the WebUI
+    run log) otherwise encodes print() with the active ANSI code page
+    (CP936/GBK). The WebUI reads logs as UTF-8, so Chinese orchestrator lines
+    turned into mojibake. Interactive consoles (tty) are left untouched;
+    PYTHONIOENCODING/PYTHONUTF8 (set by the WebUI launcher) already cover the
+    normal path — this is the defensive fallback for direct CLI redirection."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None and not stream.isatty():
+                reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 # --- dual-sink logging: console summary + full benchmark.log --------------
 # log()        console (summary) AND the full log file
 # log_detail() the full log file ALWAYS; console only when verbose
@@ -35,6 +71,10 @@ import time
 # per-pod/per-command line, so the WebUI console stays short while every
 # detail remains locatable on disk.
 _DETAIL_FH = None
+# Per-config CSV/report post-processing runs on a background thread while the
+# main thread drives the next scenario; keep every log line atomic so the
+# console/file streams never interleave mid-line.
+_LOG_LOCK = threading.Lock()
 
 
 def set_detail_log(path):
@@ -59,19 +99,26 @@ def close_detail_log():
 
 
 def _detail_write(msg):
-    if _DETAIL_FH is not None:
-        try:
-            _DETAIL_FH.write("[{}] [benchmark] {}\n".format(
-                time.strftime("%H:%M:%S"), msg))
-            _DETAIL_FH.flush()
-        except Exception:
-            pass
+    line = "[{}] [benchmark] {}\n".format(time.strftime("%H:%M:%S"), msg)
+    with _LOG_LOCK:
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write(line)
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
 
 
 def log(msg):
-    print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
-          flush=True)
-    _detail_write(msg)
+    line = "[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg)
+    with _LOG_LOCK:
+        print(line, flush=True)
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write(line + "\n")
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
 
 
 # --- verbose logging (CLI --verbose / env MC_BENCH_VERBOSE / WebUI toggle) ---
@@ -89,10 +136,18 @@ def verbose_enabled():
 
 def log_detail(msg):
     """Full-detail line: always to benchmark.log, console only when verbose."""
-    _detail_write(msg)
-    if _VERBOSE:
-        print("[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg),
-              flush=True)
+    if not _VERBOSE:
+        _detail_write(msg)
+        return
+    line = "[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg)
+    with _LOG_LOCK:
+        print(line, flush=True)
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write(line + "\n")
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
 
 
 # --- cooperative stop (WebUI stop file / Ctrl+C signals) -------------------
@@ -557,6 +612,7 @@ def _ssh_exec(node, command, relay=False, timeout=None):
     that never finishes — raises instead of hanging forever, so callers
     can drop the connection and retry."""
     out = []
+    deadline = time.time() + timeout if timeout else None
     try:
         client = _ssh_client(node)
         if timeout:
@@ -570,6 +626,15 @@ def _ssh_exec(node, command, relay=False, timeout=None):
             chan = stdout.channel
         deadline = time.time() + timeout if timeout else None
         while not chan.exit_status_ready():
+            if deadline is not None and time.time() > deadline:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                _ssh_drop(node)
+                raise RuntimeError(
+                    "ssh command timed out after {}s: {}".format(
+                        timeout, command))
             if stop_requested():
                 try:
                     chan.close()
@@ -624,7 +689,8 @@ def run_ssh(host, node, command, dry_run=False):
             "".format(rc, host, command))
 
 
-def ssh_check_output(host, node, command, dry_run=False, quiet=False, timeout=None):
+def ssh_check_output(host, node, command, dry_run=False, quiet=False,
+                     timeout=None):
     if is_k8s_node(node):
         if not quiet:
             log_detail("[k8s] $ {}".format(kubectl_exec_line(node, command)))

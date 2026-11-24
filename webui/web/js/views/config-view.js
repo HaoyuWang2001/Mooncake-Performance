@@ -1,7 +1,7 @@
 "use strict";
-/* 配置维护视图（v4）：
-   - 左列：通用配置（configs 根 *.json，点击编辑）+ 运行配置树（点击文件名编辑）
-   - 右侧：编辑器（校验/保存）
+/* 配置维护视图（v5）：
+   - 左：通用配置（configs 根 *.json）｜右：运行配置树（默认全折叠）
+   - 点击文件名 -> 弹窗编辑器（校验/保存，未保存关闭需确认）；不再常驻编辑器
    运行框已移至“性能测试”页；本页只负责配置浏览与编辑。 */
 
 const CfgNode = {
@@ -23,7 +23,8 @@ const CfgNode = {
     </div>
   </div>`,
   setup(props) {
-    const open = Vue.ref(props.depth < 1);
+    // 默认全部折叠：目录需要逐层展开（文件多时不至于满屏刷出）
+    const open = Vue.ref(false);
     const openFile = Vue.inject("openConfigFile", () => {});
     const onName = () => {
       if (props.node.isDir) open.value = !open.value;
@@ -36,11 +37,17 @@ const CfgNode = {
 const ConfigView = {
   template: `
   <div class="page">
+    <div class="mc-page-head">
+      <div>
+        <h1 class="title">配置维护</h1>
+        <p class="desc">编辑 cluster/global/profile 与测试场景配置；打开运行配置即可看到各级 _configs.json 继承链与合并后的生效配置，每级 _configs.json 需点「编辑」才进入修改。</p>
+      </div>
+    </div>
     <el-row :gutter="14">
-      <el-col :span="8">
-        <el-card shadow="never" style="margin-bottom: 14px">
+      <el-col :span="10">
+        <el-card shadow="never">
           <template #header><b>通用配置</b>
-            <span class="hint" style="margin-left: 8px">configs/_ssh、_k8s 及根目录</span></template>
+            <span class="card-hint">configs/_ssh、_k8s 及根目录</span></template>
           <div class="newcfg-row">
             <el-input v-model="newCfgName" placeholder="新文件名，如 cluster.3nodes.json"
                       size="small" style="width: 220px"></el-input>
@@ -58,12 +65,13 @@ const ConfigView = {
           </div>
           <el-empty v-if="!general.length" description="无通用配置" :image-size="50"></el-empty>
         </el-card>
-
+      </el-col>
+      <el-col :span="14">
         <el-card shadow="never">
           <template #header>
-            <div class="header-row" style="margin: 0">
+            <div class="mc-toolbar">
               <b>运行配置</b>
-              <span class="hint" style="margin-left: 8px">点击文件名可编辑</span>
+              <span class="card-hint">目录默认折叠，点击文件名编辑</span>
             </div>
           </template>
           <div class="cfg-tree">
@@ -71,25 +79,84 @@ const ConfigView = {
           </div>
         </el-card>
       </el-col>
-      <el-col :span="16">
-        <el-card shadow="never">
-          <template #header>
-            <b>编辑器</b>
-            <span v-if="editPath" style="margin-left: 10px; font-family: monospace; font-weight: 400">
-              {{ editPath }}
-            </span>
-          </template>
-          <el-input type="textarea" :rows="24" v-model="editContent" class="editor"
-                    :placeholder="editPath ? '' : '点击通用配置或运行配置文件开始编辑'"></el-input>
-          <div class="header-row" style="margin: 10px 0 0">
-            <el-button size="small" @click="validate" :disabled="!editPath">校验</el-button>
-            <el-button size="small" type="primary" @click="save" :disabled="!dirty" :loading="saving">保存</el-button>
-            <span v-if="editMsg.text" :style="{ color: editMsg.ok ? 'var(--el-color-success)' : 'var(--el-color-error)',
-                      fontSize: '12.5px' }">{{ editMsg.text }}</span>
-          </div>
-        </el-card>
-      </el-col>
     </el-row>
+
+    <el-dialog v-model="dlgOpen" width="96%" top="24px" class="cfg-dlg"
+               :close-on-click-modal="false" :before-close="askClose">
+      <template #header>
+        <div class="cfg-dlg-head">
+          <b>配置</b>
+          <span v-if="editPath" class="cfg-dlg-path">{{ editPath }}</span>
+          <el-tag v-if="editingFragment" size="small" type="warning">编辑 _configs.json</el-tag>
+          <el-tag v-if="isNew" size="small" type="warning">新文件（未保存）</el-tag>
+          <span class="spacer"></span>
+          <el-button v-if="editingFragment" size="small" @click="backToRoot">
+            返回 {{ shortName(chainRoot) }}
+          </el-button>
+        </div>
+      </template>
+      <div class="cfg-dlg-body" :class="{ 'has-chain': chain.inherits }">
+        <div v-if="chain.inherits" class="cfg-chain" v-loading="chain.loading">
+          <div class="cfg-chain-title">
+            配置继承链（自上而下共 {{ chain.levels.length }} 层；各级 _configs.json 依次合并到本文件）
+          </div>
+          <div v-for="(lv, i) in chain.levels" :key="lv.kind + ':' + lv.path"
+               class="cfg-chain-item" :class="{ self: lv.kind === 'self' }">
+            <div class="cfg-chain-head">
+              <el-tag size="small" :type="lv.kind === 'self' ? 'primary' : 'info'">
+                {{ lv.kind === 'self' ? '本文件' : ('L' + (i + 1)) }}
+              </el-tag>
+              <span class="cfg-chain-path" :title="lv.path">{{ lv.path }}</span>
+              <el-tag v-if="lv.kind !== 'self' && !lv.exists" size="small"
+                      type="warning" effect="plain">无</el-tag>
+              <span class="spacer"></span>
+              <template v-if="lv.kind !== 'self'">
+                <el-button size="small" text @click="toggleLevel(lv)">
+                  {{ openLevels[lv.path] ? '收起' : '展开' }}
+                </el-button>
+                <el-tooltip :disabled="!dirty" placement="top"
+                            content="先保存或取消当前修改，再切换编辑目标">
+                  <span>
+                    <el-button size="small" link type="primary" :disabled="dirty"
+                               @click="editChainLevel(lv)">
+                      {{ lv.exists ? '编辑' : '新建' }}
+                    </el-button>
+                  </span>
+                </el-tooltip>
+              </template>
+            </div>
+            <div v-if="lv.kind !== 'self' && openLevels[lv.path]">
+              <pre v-if="lv.exists && !lv.error" class="cfg-chain-pre">{{ lv.content }}</pre>
+              <div v-else-if="!lv.exists" class="cfg-chain-none">该级没有 _configs.json</div>
+              <el-alert v-if="lv.error" :title="lv.error" type="error"
+                        :closable="false" show-icon class="mt-2"></el-alert>
+            </div>
+          </div>
+          <div class="cfg-chain-item">
+            <div class="cfg-chain-head">
+              <el-tag size="small" type="success" effect="plain">生效</el-tag>
+              <span class="cfg-chain-path">合并后（各级 _configs.json → 本文件）</span>
+              <span class="spacer"></span>
+              <el-button size="small" text @click="effOpen = !effOpen">
+                {{ effOpen ? '收起' : '展开' }}
+              </el-button>
+            </div>
+            <pre v-if="effOpen" class="cfg-chain-pre">{{ chain.effective || '（无可合并内容）' }}</pre>
+          </div>
+        </div>
+        <div class="cfg-editor-pane">
+          <el-input type="textarea" :rows="22" v-model="editContent" class="editor" ref="editInput"></el-input>
+          <el-alert v-if="editMsg.text" :type="editMsg.ok ? 'success' : 'error'"
+                    :title="editMsg.text" :closable="false" show-icon class="mt-2" />
+        </div>
+      </div>
+      <template #footer>
+        <el-button size="small" @click="askClose">取消</el-button>
+        <el-button size="small" :disabled="!editPath" @click="validate">校验</el-button>
+        <el-button size="small" type="primary" :disabled="!dirty" :loading="saving"
+                   @click="save">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 `,
   setup() {
@@ -101,6 +168,9 @@ const ConfigView = {
     const newCfgSource = Vue.ref("configs/_ssh/cluster.example.json");
     const newCfgSources = Vue.ref(["configs/_ssh/cluster.example.json"]);
 
+    const dlgOpen = Vue.ref(false);
+    const editInput = Vue.ref(null);
+    const newSession = Vue.ref(false);   // 新建（未保存）会话标记
     const editPath = Vue.ref("");
     const editContent = Vue.ref("");
     const editSnapshot = Vue.ref("");
@@ -108,6 +178,61 @@ const ConfigView = {
     const saving = Vue.ref(false);
     const dirty = Vue.computed(() =>
       !!editPath.value && editContent.value !== editSnapshot.value);
+    const isNew = Vue.computed(() => newSession.value);
+
+    // ---- 继承链：各级 _configs.json（默认展开，一次性看全）+ 生效配置 ----
+    const chain = Vue.reactive({ inherits: false, levels: [], effective: "",
+                                 loading: false });
+    const chainRoot = Vue.ref("");       // 场景配置本身（返回目标）
+    const openLevels = Vue.reactive({}); // path -> 预览是否展开
+    const effOpen = Vue.ref(true);
+    const editingFragment = Vue.computed(() =>
+      chain.inherits && !!chainRoot.value && editPath.value !== chainRoot.value);
+
+    function shortName(p) { return (p || "").split("/").pop(); }
+    function toggleLevel(lv) { openLevels[lv.path] = !openLevels[lv.path]; }
+
+    async function _loadChain(path) {
+      chain.loading = true;
+      try {
+        const r = await api("GET", "/api/config/chain?path=" +
+                            encodeURIComponent(path));
+        chain.inherits = !!r.inherits;
+        chain.levels = r.levels || [];
+        chain.effective = r.effective || "";
+        for (const lv of chain.levels) {
+          if (!(lv.path in openLevels)) openLevels[lv.path] = true;
+        }
+        return r;
+      } finally {
+        chain.loading = false;
+      }
+    }
+
+    // 显式入口：只有点该级「编辑/新建」才进入 _configs.json 修改
+    function editChainLevel(lv) {
+      if (lv.kind === "self") return;
+      if (dirty.value) {
+        ElementPlus.ElMessage.warning(
+          "当前有未保存的修改：先保存或取消后再切换编辑目标");
+        return;
+      }
+      editPath.value = lv.path;
+      editContent.value = lv.exists ? lv.content : "{\n\n}";
+      editSnapshot.value = editContent.value;
+      editMsg.text = "";
+      newSession.value = !lv.exists;
+      Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
+    }
+
+    async function backToRoot() {
+      if (!chainRoot.value) return;
+      if (dirty.value) {
+        ElementPlus.ElMessage.warning("当前有未保存的修改：先保存或取消");
+        return;
+      }
+      await openFile(chainRoot.value);
+    }
 
     function toNode(treeNode) {
       const children = [
@@ -145,19 +270,43 @@ const ConfigView = {
     }
 
     async function openFile(path) {
+      let r;
       try {
-        const r = await api("GET", "/api/config?path=" + encodeURIComponent(path));
-        editPath.value = path;
-        editContent.value = r.content;
-        editSnapshot.value = r.content;
-        editMsg.text = "";
+        r = await _loadChain(path);
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
+        return;
       }
+      const self = (r.levels || []).find(lv => lv.kind === "self") ||
+                   { content: "" };
+      chainRoot.value = r.inherits ? path : "";
+      editPath.value = path;
+      editContent.value = self.content;
+      editSnapshot.value = self.content;
+      editMsg.text = "";
+      newSession.value = false;
+      dlgOpen.value = true;
+      Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
+    }
+
+    // 未保存关闭 -> 丢弃确认（破坏性丢弃未保存内容，确认键 danger）
+    function askClose(done) {
+      const close = () => {
+        editMsg.text = "";
+        dlgOpen.value = false;
+        if (typeof done === "function") done();
+      };
+      if (!dirty.value) { close(); return; }
+      ElementPlus.ElMessageBox.confirm(
+        "有未保存的修改，丢弃并关闭？", "未保存的修改",
+        { confirmButtonText: "丢弃修改", cancelButtonText: "继续编辑",
+          type: "warning" })
+        .then(() => close())
+        .catch(() => { /* 继续编辑 */ });
     }
 
     // 新建配置：拉取复制源内容，以新文件名打开未保存的编辑会话；
-    // 保存走现有 PUT /api/config（新文件 backup=None）
+    // 保存走现有 PUT /api/config（校验后原子写回，不备份）
     async function newConfig() {
       const name = newCfgName.value.trim();
       if (!name.endsWith(".json")) {
@@ -176,8 +325,10 @@ const ConfigView = {
         editContent.value = r.content;
         editSnapshot.value = r.content;
         editMsg.ok = true;
-        editMsg.text = "新文件（基于 " + newCfgSource.value + "，未保存）";
-        ElementPlus.ElMessage.success("已打开新文件编辑会话，编辑后点击「保存」创建");
+        editMsg.text = "新文件（基于 " + newCfgSource.value + "，保存后创建）";
+        newSession.value = true;
+        dlgOpen.value = true;
+        Vue.nextTick(() => { if (editInput.value) editInput.value.focus(); });
       } catch (e) {
         ElementPlus.ElMessage.error("读取复制源失败: " + e.message);
       }
@@ -195,12 +346,24 @@ const ConfigView = {
     async function save() {
       saving.value = true;
       try {
-        const r = await api("PUT", "/api/config",
-                            { path: editPath.value, content: editContent.value });
-        editMsg.ok = true;
-        editMsg.text = "已保存" + (r.backup ? "（备份 " + r.backup + "）" : "");
+        const savedPath = editPath.value;
+        await api("PUT", "/api/config",
+                  { path: savedPath, content: editContent.value });
+        ElementPlus.ElMessage.success("已保存");
+        editMsg.text = "";
         editSnapshot.value = editContent.value;
+        newSession.value = false;
         await loadAll();
+        if (chain.inherits && chainRoot.value) {
+          if (savedPath !== chainRoot.value) {
+            // 保存的是某级 _configs.json：回到本文件，立即看到新链与生效值
+            await openFile(chainRoot.value);
+          } else {
+            await _loadChain(chainRoot.value);   // 本文件保存：刷新链预览
+          }
+        } else {
+          dlgOpen.value = false;                 // 普通配置保持原行为
+        }
       } catch (e) {
         editMsg.ok = false; editMsg.text = e.message;
       } finally {
@@ -208,13 +371,27 @@ const ConfigView = {
       }
     }
 
+    function onEditorKey(e) {
+      if (!dlgOpen.value) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "s" || e.key === "S") {
+        e.preventDefault();
+        if (dirty.value) save();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        validate();
+      }
+    }
     Vue.provide("openConfigFile", openFile);
-    Vue.onMounted(loadAll);
+    Vue.onMounted(() => { loadAll(); window.addEventListener("keydown", onEditorKey); });
     // 每次切入页签都重新拉取：手动创建/修改的配置文件切回即自动可见
     Vue.onActivated(loadAll);
+    Vue.onUnmounted(() => window.removeEventListener("keydown", onEditorKey));
 
     return { treeRoots, general, openFile, newCfgName, newCfgSource, newCfgSources,
-             newConfig, editPath, editContent, editMsg, saving, dirty,
-             validate, save, loadAll };
+             newConfig, dlgOpen, editInput, editPath, editContent, editMsg, saving, dirty,
+             isNew, askClose, validate, save, loadAll,
+             chain, chainRoot, openLevels, effOpen, editingFragment,
+             shortName, toggleLevel, editChainLevel, backToRoot };
   },
 };

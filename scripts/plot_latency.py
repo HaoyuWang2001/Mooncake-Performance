@@ -27,7 +27,7 @@ pipeline 日志主干中的 Pod 名不写入图片文件名，仅保留全局唯
 标识，避免 Windows MAX_PATH 导致出图失败。
 横轴：有时间戳 → 下轴时间线（HH:MM:SS）+ 顶轴 request#i；无时间戳 → request#i。
 benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用本脚本
-（--no-plot 关闭）。依赖：matplotlib（pip install matplotlib）。
+（默认关闭，`--png` 开启）。依赖：matplotlib（pip install matplotlib）。
 """
 import argparse
 import csv
@@ -60,7 +60,9 @@ STAT_HLINES_ALWAYS = [("avg", "tab:blue"), ("max", "tab:red")]
 STAT_HLINES_GATED = [("p99", "tab:orange", 100), ("p999", "tab:green", 1000),
                      ("p9999", "tab:purple", 10000)]
 REF_LINES = [(1.0, "1ms"), (2.0, "2ms")]
-TS_PREFIX = re.compile(r"^\d{2}:\d{2}:\d{2}")
+# new "YYYY-MM-DD HH:MM:SS.micro" (dated, multi-day safe) or legacy
+# "HH:MM:SS.micro" — one regex detects both
+TS_PREFIX = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}")
 _PIPELINE_POD_STEM_PATTERNS = (
     # dual:   ...dual_<pod>_c0_p9301.reader
     re.compile(r"^(?P<prefix>.*\.dual)_.+(?P<suffix>_c\d+_p\d+\.(?:reader|writer))$"),
@@ -94,8 +96,14 @@ def _plot_file_stem(log_stem):
 
 
 def ts_to_seconds(ts):
-    """'HH:MM:SS.micro' -> seconds since midnight (float)."""
-    h, m, rest = ts.split(":")
+    """'YYYY-MM-DD HH:MM:SS.micro' (or legacy 'HH:MM:SS.micro')
+    -> seconds since midnight of the time-of-day part (float).
+
+    The day part is dropped HERE on purpose: callers fold day boundaries
+    forward heuristically (a backward jump in time-of-day = one day passed),
+    which is exact for the continuous per-op log stream."""
+    hms = ts.split(" ")[-1] if " " in ts else ts
+    h, m, rest = hms.split(":")
     return int(h) * 3600 + int(m) * 60 + float(rest)
 
 

@@ -21,6 +21,7 @@ sudo 运行产生的 root 属主产物在收集前自动 chown 回 ssh 用户；
 import json
 import os
 import re
+import shlex
 import sys
 import time
 
@@ -35,6 +36,7 @@ except ImportError:  # spdiag_tree.py missing -> text-tree generation off
     spdiag_tree_mod = None
 
 BT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bt")
+MON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 SPDIAG_TREES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "configs", "_spdiag_trees")
 
@@ -46,7 +48,26 @@ TOOL_DEFAULTS = {
                 "interval_s": 10},
     "offcputime": {"enabled": False, "bin": "bpftrace", "sudo": True,
                    "min_block_us": 1000},
+    # node/process memory sampler (leak observation); on by default. The
+    # script prefers `numastat -m` but falls back to /sys node meminfo, so the
+    # presence probe is bash (a minimal image without numactl still works).
+    "mem": {"enabled": True, "bin": "bash", "sudo": False,
+            "interval_s": 1, "proc_pattern": "mooncake_benchmark_client",
+            "leak_growth_pct": 30, "leak_min_mb": 200},
+    # UBPU port traffic via mdcli; opt-in (only specific nodes ship mdcli —
+    # prof_core probes it and silently skips the rest)
+    "urma": {"enabled": False, "bin": "mdcli", "sudo": False,
+             "slot": 2, "ubpus": [0, 1], "interval_s": 1,
+             "bytes_per_flit": 20},
 }
+
+# artifacts each monitor tool writes into the remote profiling dir; the
+# report reduce reads these CSVs (monitor.config.json carries tool params)
+MONITOR_ARTIFACTS = {
+    "mem": ["mem.host.csv", "mem.proc.csv", "mem.err.log"],
+    "urma": ["urma.flits.csv", "urma.err.log"],
+}
+MONITOR_CONFIG_FILE = "monitor.config.json"
 
 
 def load_matrix(path):
@@ -113,6 +134,28 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
         except Exception as exc:
             log("[WARN] [profile] mkdir on {}: {}".format(node_name, exc))
             continue
+        # effective monitor params (thresholds/intervals/slot) travel with the
+        # artifacts so report.py can compute leak flags / GiB/s without
+        # re-reading profile.json
+        mon_cfg = {t: {k: v for k, v in matrix["tools"][t].items()
+                       if k not in ("bin", "sudo")}
+                   for t in MONITOR_ARTIFACTS
+                   if matrix["tools"].get(t, {}).get("enabled")}
+        # 报表侧节点显示名 = 节点 IP（k8s=宿主 IP / ssh=管理 IP）；
+        # 产物目录仍按节点原名（唯一），标签由本字段覆盖
+        if mon_cfg:
+            try:
+                mon_cfg["node_ip"] = bm._node_display(cluster, n, node_name)
+            except Exception:
+                pass
+        if mon_cfg:
+            try:
+                _run(ip, n, "printf '%s' {} > {}/{}".format(
+                    shlex.quote(json.dumps(mon_cfg, ensure_ascii=False)),
+                    remote_out_dir, MONITOR_CONFIG_FILE))
+            except Exception as exc:
+                log("[WARN] [profile] monitor config on {}: {}".format(
+                    node_name, exc))
         started = {}
         for tool, tcfg in matrix["tools"].items():
             if not tcfg.get("enabled"):
@@ -156,6 +199,35 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                         started[tool] = pid.strip()
                         bm.state_append([_ledger_row(ip, node_name, pid.strip(),
                                                      "perf record", "perf record", cfg_name)])
+                elif tool in MONITOR_ARTIFACTS:
+                    # mem / urma sampler scripts: pushed next to the outputs
+                    # (the orchestrator-side path never exists on the node)
+                    local_script = os.path.join(
+                        MON_DIR, "{}_monitor.sh".format(tool))
+                    remote_script = "{}/{}_monitor.sh".format(remote_out_dir, tool)
+                    scp_push(ip, n, [local_script], remote_out_dir)
+                    envs = ["OUT_DIR={}".format(shlex.quote(remote_out_dir)),
+                            "INTERVAL_S={}".format(int(tcfg.get("interval_s", 1)))]
+                    if tool == "mem":
+                        envs.append("PROC_PATTERN={}".format(shlex.quote(
+                            str(tcfg.get("proc_pattern")
+                                or "mooncake_benchmark_client"))))
+                    else:  # urma
+                        envs.append("SLOT={}".format(int(tcfg.get("slot", 2))))
+                        ubpus = tcfg.get("ubpus") or [0, 1]
+                        if isinstance(ubpus, (list, tuple)):
+                            ubpus = " ".join(str(u) for u in ubpus)
+                        envs.append("UBPUS={}".format(shlex.quote(str(ubpus))))
+                    out_file = "{}/{}.err.log".format(remote_out_dir, tool)
+                    sudo_prefix = "sudo -n " if tcfg.get("sudo") else ""
+                    cmd = "nohup {}env {} bash {} > {} 2>&1 & echo $!".format(
+                        sudo_prefix, " ".join(envs), remote_script, out_file)
+                    pid = _run(ip, n, cmd)
+                    if pid.strip().isdigit():
+                        started[tool] = pid.strip()
+                        bm.state_append([_ledger_row(
+                            ip, node_name, pid.strip(), tool,
+                            "bash {}".format(remote_script), cfg_name)])
                 else:  # runqlat / offcputime via the shipped bpftrace scripts
                     # the .bt lives orchestrator-side only -> push it next to
                     # the outputs and reference the REMOTE posix path (the
@@ -229,6 +301,14 @@ def stop_and_collect(cluster, session, local_prof_dir):
                         out_file = "{}/spdiag.show.txt".format(remote_out)
                         _run(ip, n, "{} show > {}".format(_bin(tcfg), out_file))
                         collected.append("spdiag.show.txt")
+                    elif tool in MONITOR_ARTIFACTS:
+                        # sampler loops append line-buffered CSV rows; a plain
+                        # kill is enough (no flush/stabilize wait needed)
+                        sudo = "sudo -n " if tcfg.get("sudo") else ""
+                        if pid:
+                            _run(ip, n, "{}kill -INT {} 2>/dev/null || true".format(
+                                sudo, pid))
+                        collected.extend(MONITOR_ARTIFACTS[tool])
                     elif pid:
                         fname = "perf.data" if tool == "perf" else "{}.out".format(tool)
                         out_file = "{}/{}".format(remote_out, fname)
@@ -254,6 +334,8 @@ def stop_and_collect(cluster, session, local_prof_dir):
                         collected.append(fname)
                 except Exception as exc:
                     log("[WARN] [profile] stop {} on {}: {}".format(tool, node_name, exc))
+            if any(t in MONITOR_ARTIFACTS for t in tools):
+                collected.append(MONITOR_CONFIG_FILE)
             node_local = os.path.join(local_prof_dir, node_name)
             os.makedirs(node_local, exist_ok=True)
             for fname in collected:
@@ -283,7 +365,10 @@ def stop_and_collect(cluster, session, local_prof_dir):
 # --------------------------------------------------------------------------
 
 def _ts_to_seconds(ts):
-    h, m, rest = ts.split(":")
+    # "YYYY-MM-DD HH:MM:SS.micro" (dated) or legacy "HH:MM:SS.micro":
+    # take the time-of-day part; the caller folds day boundaries forward
+    hms = ts.split(" ")[-1] if " " in ts else ts
+    h, m, rest = hms.split(":")
     return int(h) * 3600 + int(m) * 60 + float(rest)
 
 
@@ -331,7 +416,11 @@ def slice_window(prof_dir, center_seconds, window_ms):
                 continue
             lines = []
             for line in open(path, "r", encoding="utf-8", errors="replace"):
-                for m in re.finditer(r"\b(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\b", line):
+                # dated "YYYY-MM-DD HH:MM:SS(.micro)" (new RESULT rows) or
+                # bare time-of-day (bpftrace/spdiag artifacts)
+                for m in re.finditer(
+                        r"\b(?:(?:\d{4}-\d{2}-\d{2}) )?(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\b",
+                        line):
                     try:
                         s = _ts_to_seconds(m.group(1))
                     except ValueError:

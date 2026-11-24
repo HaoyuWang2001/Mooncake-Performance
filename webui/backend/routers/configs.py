@@ -2,21 +2,46 @@
 """configs router：/api/configs、/api/config（读/写/校验）。
 
 写入前校验复用编排器自身的 loader/validator（benchmark.data_size_list /
-pipeline_plan / _configs.json 继承合并），保存自动备份到 webui/backups/。"""
+pipeline_plan / _configs.json 继承合并）；校验通过后**原子写回、不保留备份**。"""
 import json
 import os
+import tempfile
 
 import benchmark as bm
 
 from .. import runmgr
-from ..common import (ApiError, atomic_write, backup_file, jpath,
-                      read_json_body, real_under)
-from ..paths import BACKUP_DIR, CONF_ROOTS, ROOT
+from ..common import (ApiError, atomic_write, jpath, read_json_body,
+                      real_under)
+from ..paths import CONF_ROOTS, ROOT
 
 ROUTES = []
 
 
 # ------------------------------------------------------------- 校验（复用编排器）
+
+INHERIT_CATS = ("basic", "pipeline", "kvtest")
+
+
+def _inheritance_chain(path):
+    """-> (scenario 类别 | None, [各级目录（场景根 -> 文件所在目录）])。
+
+    与 validate_config_content 的继承语义一致：basic/pipeline/kvtest 参与
+    `_configs.json` 继承；其它（cluster/global/profile、_ssh/_k8s 等）不继承。
+    """
+    rp = os.path.realpath(path)
+    for cat in INHERIT_CATS:
+        cdir = os.path.realpath(os.path.join(bm.CONFIGS_DIR, cat))
+        if rp == cdir or rp.startswith(cdir + os.sep):
+            chain = [cdir]
+            rel = os.path.relpath(os.path.dirname(rp), cdir)
+            if rel != ".":
+                acc = cdir
+                for part in rel.split(os.sep):
+                    acc = os.path.join(acc, part)
+                    chain.append(acc)
+            return cat, chain
+    return None, []
+
 
 def validate_config_content(path, content):
     """-> list of error strings (empty = valid). JSON 语法 + 语义校验。"""
@@ -31,25 +56,11 @@ def validate_config_content(path, content):
     if base.startswith("_"):
         # shared-defaults fragment: syntax is all we can check
         return errors
-    rp = os.path.realpath(path)
-    scenario_dir = None
-    for cat in ("basic", "pipeline", "kvtest"):
-        cdir = os.path.realpath(os.path.join(bm.CONFIGS_DIR, cat))
-        if rp == cdir or rp.startswith(cdir + os.sep):
-            scenario_dir = cat
-            break
+    scenario_dir, chain = _inheritance_chain(path)
     if scenario_dir is None:
         return errors  # cluster/global/profile/external: syntax only
     # inheritance: _configs.json chain merged under the new content
     merged = {}
-    cfg_dir = os.path.dirname(rp)
-    chain = [os.path.realpath(os.path.join(bm.CONFIGS_DIR, scenario_dir))]
-    rel = os.path.relpath(cfg_dir, chain[0])
-    if rel != ".":
-        acc = chain[0]
-        for part in rel.split(os.sep):
-            acc = os.path.join(acc, part)
-            chain.append(acc)
     for level in chain:
         frag = os.path.join(level, "_configs.json")
         if os.path.isfile(frag):
@@ -115,10 +126,9 @@ def validate_config_content(path, content):
 def validate_plan_content(content):
     """-> list of error strings, using run_schedule's own loaders."""
     errors = []
-    tmp = os.path.join(BACKUP_DIR, "plan-validate.tmp.json")
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="plan-validate-", suffix=".json")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         rs = runmgr.load_run_schedule()
         try:
@@ -209,6 +219,62 @@ def api_configs(handler, query):
     return out
 
 
+def api_config_chain(handler, query):
+    """GET /api/config/chain?path=...
+
+    返回该配置的完整继承链（场景根 -> 文件所在目录各级 `_configs.json`，
+    缺失级也列出）+ 文件自身 + 合并后的生效配置。供配置维护弹窗一次性展示。
+    """
+    path = jpath(query, "path")
+    full = os.path.join(ROOT, path)
+    if not real_under(full, CONF_ROOTS) or not os.path.isfile(full):
+        raise ApiError(404, "config not found: {}".format(path))
+    cat, dirs = _inheritance_chain(full)
+    levels = []
+    merged = {}
+    for d in dirs:
+        frag = os.path.join(d, "_configs.json")
+        rel = os.path.relpath(frag, ROOT).replace("\\", "/")
+        item = {"kind": "defaults", "path": rel, "exists": False,
+                "content": "", "bytes": 0}
+        if os.path.isfile(frag):
+            try:
+                with open(frag, "r", encoding="utf-8") as f:
+                    content = f.read()
+                doc = json.loads(content)
+            except (OSError, ValueError) as exc:
+                item.update({"exists": True,
+                             "error": "解析失败: {}".format(exc)})
+                levels.append(item)
+                continue
+            item.update({"exists": True, "content": content,
+                         "bytes": len(content.encode("utf-8"))})
+            if isinstance(doc, dict):
+                bm._deep_merge(merged, doc)
+        levels.append(item)
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            self_content = f.read()
+    except OSError as exc:
+        raise ApiError(500, "read config failed: {}".format(exc))
+    levels.append({"kind": "self", "path": path, "exists": True,
+                   "content": self_content,
+                   "bytes": len(self_content.encode("utf-8"))})
+    effective = ""
+    if cat is not None:
+        try:
+            doc = json.loads(self_content)
+            if isinstance(doc, dict):
+                bm._deep_merge(merged, doc)
+        except ValueError:
+            pass
+        if merged:
+            effective = json.dumps(merged, ensure_ascii=False, indent=2)
+    return {"path": path, "inherits": cat is not None,
+            "category": cat or "", "levels": levels,
+            "effective": effective}
+
+
 def api_config_get(handler, query):
     path = jpath(query, "path")
     full = os.path.join(ROOT, path)
@@ -230,11 +296,8 @@ def api_config_put(handler, query):
     errors = validate_config_content(full, content)
     if errors:
         raise ApiError(422, "; ".join(errors))
-    backup = None
-    if os.path.isfile(full):
-        backup = backup_file(full)
     atomic_write(full, content)
-    return {"ok": True, "path": path, "backup": backup}
+    return {"ok": True, "path": path}
 
 
 def api_config_validate(handler, query):
@@ -249,6 +312,7 @@ def api_config_validate(handler, query):
 
 ROUTES += [
     ("GET", r"^/api/configs$", lambda h, q, m=None: api_configs(h, q)),
+    ("GET", r"^/api/config/chain$", api_config_chain),
     ("GET", r"^/api/config$", api_config_get),
     ("PUT", r"^/api/config$", lambda h, q, m=None: api_config_put(h, q)),
     ("POST", r"^/api/config/validate$", lambda h, q, m=None: api_config_validate(h, q)),
