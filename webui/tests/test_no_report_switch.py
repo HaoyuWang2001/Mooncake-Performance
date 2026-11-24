@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""--no-plot / --no-report 两个独立开关的契约：
-  1) CLI：两个参数互不隐含（parse_arguments）；
+"""绘图（--png）与报表（--no-report）开关契约：
+  1) CLI：绘图默认关闭、仅 --png 开启，且 --png 必须与 --pull-raw-logs 同开；
+     报表开关与绘图互不隐含；
   2) 报表门控只认 no_report（场景 / kvtest / STOP 三条路径）；
   3) WebUI 重建报表端点（POST /api/runs/rebuild-report）的入参校验与 argv。
 """
@@ -33,31 +34,41 @@ def _parse(extra=()):
 
 def test_flags_default_off():
     args = _parse()
-    assert args.no_plot is False
+    assert args.png is False
+    assert args.pull_raw_logs is False
+    assert args.keep_intermediates is False
     assert args.no_report is False
 
 
-def test_no_plot_does_not_imply_no_report():
-    args = _parse(["--no-plot"])
-    assert args.no_plot is True
-    assert args.no_report is False
+def test_png_requires_pull_raw_logs(capsys):
+    with pytest.raises(SystemExit) as exc:
+        _parse(["--png"])
+    assert exc.value.code == 2
+    assert "开启 png 必须开启 pull-raw-logs" in capsys.readouterr().err
+    args = _parse(["--png", "--pull-raw-logs"])
+    assert args.png is True and args.pull_raw_logs is True
 
 
-def test_no_report_does_not_imply_no_plot():
+def test_png_does_not_imply_no_report():
+    args = _parse(["--png", "--pull-raw-logs"])
+    assert args.png is True and args.no_report is False
+
+
+def test_no_report_does_not_touch_plotting():
     args = _parse(["--no-report"])
     assert args.no_report is True
-    assert args.no_plot is False
-
-
-def test_both_flags_stay_independent():
-    args = _parse(["--no-plot", "--no-report"])
-    assert args.no_plot is True and args.no_report is True
+    assert args.png is False
+    args = _parse(["--no-report", "--png", "--pull-raw-logs",
+                   "--keep-intermediates"])
+    assert args.no_report is True and args.png is True
+    assert args.keep_intermediates is True
 
 
 # ------------------------------------------------------------ 报表门控
 
 def _report_args(**kw):
-    base = dict(no_plot=False, no_report=False, dry_run=False, png=False)
+    base = dict(no_report=False, dry_run=False, png=False,
+                pull_raw_logs=False, keep_intermediates=False)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -72,11 +83,12 @@ def test_no_report_skips_unit_reports(monkeypatch):
     assert calls == ["units"]
 
 
-def test_no_plot_still_generates_reports(monkeypatch):
+def test_plot_switch_still_generates_reports(monkeypatch):
     calls = []
     monkeypatch.setattr(bm, "_generate_report_units",
                         lambda *a, **k: calls.append("units") or ["r.html"])
-    assert bm._generate_reports({}, "/tmp/none", _report_args(no_plot=True)) == ["r.html"]
+    args = _report_args(png=True, pull_raw_logs=True)
+    assert bm._generate_reports({}, "/tmp/none", args) == ["r.html"]
     assert calls == ["units"]
 
 
@@ -98,7 +110,8 @@ def test_kvtest_reports_gated_by_no_report(monkeypatch):
     assert bm._kvtest_generate_reports(cfg, "/tmp/none",
                                        _report_args(no_report=True)) is None
     assert calls == []
-    bm._kvtest_generate_reports(cfg, "/tmp/none", _report_args(no_plot=True))
+    bm._kvtest_generate_reports(cfg, "/tmp/none",
+                                _report_args(png=True, pull_raw_logs=True))
     assert calls == ["map", "reduce"]
 
 
@@ -120,14 +133,14 @@ def test_stop_report_gated_by_no_report(monkeypatch, tmp_path):
     bm._STOP_CTX.clear()
 
 
-def test_stop_report_not_gated_by_no_plot(monkeypatch):
+def test_stop_report_not_gated_by_plot_switch(monkeypatch):
     monkeypatch.delenv("MC_STOP_REPORT", raising=False)
     touched = []
     monkeypatch.setattr(bm, "clear_stop", lambda: None)
     monkeypatch.setattr(bm, "_generate_reports",
                         lambda *a, **k: touched.append("reduce") or ["r"])
     monkeypatch.setattr(bm, "_render_run_overview", lambda *a, **k: "ov.html")
-    _stop_args(no_plot=True)
+    _stop_args(png=True, pull_raw_logs=True)
     bm._STOP_CTX["args"].mode = "ssh"
     bm._STOP_CTX["cluster"] = {"node": "n1"}
     bm._STOP_CTX["report"] = {"mode": "basic", "skip_pull": True, "cfg": {},
@@ -185,15 +198,31 @@ def test_rebuild_refuses_run_still_writing(outputs, monkeypatch):
 
 # --------------------------------------------------- WebUI 参数转发
 
-def test_webui_forwards_both_flags():
+def test_webui_forwards_plot_and_report_flags():
     body = {"selector": {"files": ["mock/smoke/put.json"]},
             "flags": {"mode": "ssh",
                       "cluster": "mock/cluster.json",
                       "global": "mock/zz-global-test.json",
                       "profile": "mock/zz-global-test.json",
-                      "no_plot": True, "no_report": True}}
+                      "png": True, "pull_raw_logs": True,
+                      "keep_intermediates": True, "no_report": True}}
     argv = runs_router._build_run_argv(body)
-    assert "--no-plot" in argv and "--no-report" in argv
+    for flag in ("--png", "--pull-raw-logs", "--keep-intermediates",
+                 "--no-report"):
+        assert flag in argv, flag
+
+
+def test_webui_png_requires_pull_raw_logs():
+    body = {"selector": {"files": ["mock/smoke/put.json"]},
+            "flags": {"mode": "ssh",
+                      "cluster": "mock/cluster.json",
+                      "global": "mock/zz-global-test.json",
+                      "profile": "mock/zz-global-test.json",
+                      "png": True}}
+    with pytest.raises(ApiError) as exc:
+        runs_router._build_run_argv(body)
+    assert exc.value.code == 400
+    assert "pull-raw-logs" in str(exc.value)
 
 
 def test_webui_omits_disabled_flags():
@@ -203,10 +232,12 @@ def test_webui_omits_disabled_flags():
                       "global": "mock/zz-global-test.json",
                       "profile": "mock/zz-global-test.json"}}
     argv = runs_router._build_run_argv(body)
-    assert "--no-plot" not in argv and "--no-report" not in argv
+    for flag in ("--no-plot", "--png", "--pull-raw-logs",
+                 "--keep-intermediates", "--no-report"):
+        assert flag not in argv, flag
 
 
-def test_rank_recall_forwards_no_report():
+def test_rank_recall_forwards_no_report_and_plot_flags():
     from scripts import run_rank_recall as rr
     args = SimpleNamespace(
         mode="k8s", rank_cluster="mock/cluster.json",
@@ -214,8 +245,11 @@ def test_rank_recall_forwards_no_report():
         recall_cluster="mock/cluster.json",
         recall_global="mock/zz-global-test.json",
         profile="mock/zz-global-test.json", dry_run=False, no_warmup=False,
-        no_plot=False, no_report=True, verbose=False, protocol=None,
-        stop_file=None)
+        png=True, pull_raw_logs=True, keep_intermediates=True,
+        no_report=True, verbose=False, protocol=None, stop_file=None)
     argv = rr._child_argv(args, "rank", ["mock/smoke/put.json"], "parent",
                           "/tmp/ready")
-    assert "--no-report" in argv and "--no-plot" not in argv
+    for flag in ("--no-report", "--png", "--pull-raw-logs",
+                 "--keep-intermediates"):
+        assert flag in argv, flag
+    assert "--no-plot" not in argv

@@ -27,7 +27,7 @@ pipeline 日志主干中的 Pod 名不写入图片文件名，仅保留全局唯
 标识，避免 Windows MAX_PATH 导致出图失败。
 横轴：有时间戳 → 下轴时间线（HH:MM:SS）+ 顶轴 request#i；无时间戳 → request#i。
 benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用本脚本
-（--no-plot 关闭）。依赖：matplotlib（pip install matplotlib）。
+（默认关闭，`--png` 开启）。依赖：matplotlib（pip install matplotlib）。
 """
 import argparse
 import csv

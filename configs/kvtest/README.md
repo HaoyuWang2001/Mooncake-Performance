@@ -160,12 +160,13 @@ writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node
 
 ## 结果
 
-成功运行的最终目录保留每实例 `log`/`glog`、请求级 PNG、**HTML 报表
-（map-reduce 产物，见下节）**、run 级 `<cfg>.csv` 和 `benchmark_detail.csv`，
-以及 `summary.json` / `samples.csv`。后两者是 `--rebuild-report` 补跑 map 的
-**唯一输入**，因此默认保留；确认系统稳定后可设
-`MC_KVTEST_CLEAN_INTERMEDIATES=1`，在 run 全部成功且绘图成功后清掉它们
-（失败或绘图失败时该开关也不会删除）。失败 run 不再自动拉取原始日志：编排器只打印
+成功运行保留最终产物：**HTML 报表（map-reduce 产物，见下节）**、run 级
+`<cfg>.csv` 和 `benchmark_detail.csv`、`profiling/`（监控 CSV）。**中间产物默认在
+报表校验通过后清理**（与 python 引擎、basic/pipeline 形态一致）：`samples.csv` /
+`summary.json` / `timeseries.csv` / `*.stats.json` / `kvtest_report_meta.json`
+以及回拉的原始 log/glog 都会删除；需要保留现场时用 `--keep-intermediates`
+（或 env `MC_KEEP_INTERMEDIATES=1`）。清理后该 run 不能再 `--rebuild-report`；
+失败/STOP 的 run 不清理，`samples.csv` 仍在，可补跑 map。失败 run 不再自动拉取原始日志：编排器只打印
 失败场景/阶段/异常、全量 pod 列表（`get pods -o wide`）和每个 pod 一行原始日志目录
 （k8s: `<host_log_root>/<run_id>/<pod>/`，ssh: `remote_log_dir`），原始 log/glog/exitrc
 留在节点上；失败阶段本身是 `remove-keys` 时不会重试 store remove-all。注意：
@@ -191,7 +192,9 @@ kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` �
 `<实例>.<operation>.latency.png`；`notify_queue_wait` 使用
 `<实例>.notify_queue_wait.queuewait.png`。横轴下方是测量开始后的秒数，上方是
 request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回窗口聚合数据；
-`--no-plot` 可关闭这份自动绘图（PNG），HTML 报表不受影响（由 `--no-report` 单独控制）。
+这份 PNG **默认不生成**：需显式 `--png`，且必须与 `--pull-raw-logs` 同开
+（PNG 读原始日志；只开 `--png` 会直接报错）。HTML 报表不受影响（由 `--no-report`
+单独控制）。
 
 ## HTML 报表（map-reduce）
 
@@ -221,7 +224,9 @@ scenario 仅兼容旧页面；kvtest-pipeline 与 Python pipeline 同构，kvtes
    pipeline 为 writer/reader 角色单选 + 总计 + 角色化节点（同一节点每角色仅一行）、
    角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口；
    basic 为单「总览」、无角色分组；若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
-3. **重建**：`python benchmark.py --rebuild-report <ts>`。失败 run 保留了
+3. **重建**：`python benchmark.py --rebuild-report <ts>`。成功 run 的中间产物已按
+   默认策略清理，重建会提示「中间产物已按成功清理，无法重建」（报表与 data.js 仍可用）；
+   失败 run 保留了
    `samples.csv` 时，会自动先补跑 map 再重建报表。运行期会把
    `iid→节点/节点数/每个 size 的测量起点 epoch`写进
    `logs/<cfg>/kvtest_report_meta.json`（旁挂文件，成功后也保留），重建据此
@@ -231,10 +236,11 @@ scenario 仅兼容旧页面；kvtest-pipeline 与 Python pipeline 同构，kvtes
 报表参数卡沿用 pipeline 字段（场景/协议/工作模式/QPS/notify/操作/节点数/客户端
 总数/KV 配置名等），并标记「运行模式 = kvtest」。注意：
 
-- `--no-report` 关闭 HTML 报表；`--no-plot` 只关 PNG 绘图（与 pipeline 一致，两者独立）；
+- `--no-report` 关闭 HTML 报表；绘图默认关闭，`--png`（必须配 `--pull-raw-logs`）
+  才生成 PNG（与 pipeline 一致，两者独立）；
 - 报表生成是 WARN-only，失败不影响压测结论；
-- 成功清理只删除 `summary.json`/`samples.csv`，`*.stats.json` 与
-  `report/` 目录保留；
+- 中间产物只有在该配置**全部单元报表校验通过**后才清理（`report/` 与 `profiling/`
+  保留；失败/STOP 配置保留）；`--keep-intermediates` 可保留整个 run；
 - **只存在于 summary 的指标也已进 HTML**：reader 的「值校验失败」
   （`verify_failures`，数据正确性信号）与「队列等待均/峰」
   （`notify_queue_wait` 的 avg/max）由 map 从 `summary.json` 提升进 reader

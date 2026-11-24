@@ -13,8 +13,9 @@ Contract covered here:
      cluster["nodes"] the next k8s scenario keeps appending to;
   4) the STOP path joins pending background work BEFORE rendering the partial
      overview;
-  5) kvtest samples/summary are kept by default and only removed behind the
-     opt-in MC_KVTEST_CLEAN_INTERMEDIATES switch.
+  5) intermediates are removed by default only after a verified report; the
+     whole run is kept behind --keep-intermediates / MC_KEEP_INTERMEDIATES=1,
+     --pull-raw-logs / --png, --no-report, or any failed config.
 """
 import os
 import sys
@@ -125,7 +126,9 @@ def _stop_ctx(tmp_path):
         encoding="utf-8")
     return {
         "cluster": {"nodes": []},
-        "args": SimpleNamespace(no_plot=False, no_report=False,
+        "args": SimpleNamespace(no_report=False, png=False,
+                                pull_raw_logs=False,
+                                keep_intermediates=False,
                                 dry_run=False, mode="ssh"),
         "report": {
             "cfg": {"__cfg_path__": "cfg.json", "scenario": "basic"},
@@ -192,7 +195,7 @@ def test_main_report_overlaps_next_scenario(tmp_path, monkeypatch):
     def _fake_scenario(cluster, globals_cfg, cfg, ts, args):
         name = cfg["__cfg_path__"].rsplit("/", 1)[-1]
         if name == "a.json":
-            # a pulled kvtest sample makes want_plot true (PNG job)
+            # --png + samples make the run-level PNG job fire
             logs = ts_dir / "logs" / "a"
             logs.mkdir(parents=True, exist_ok=True)
             (logs / "kv1.i0_p9101.kvtest_8MB.samples.csv").write_text(
@@ -228,7 +231,8 @@ def test_main_report_overlaps_next_scenario(tmp_path, monkeypatch):
         cluster=os.path.join(ROOT, "configs/_ssh/cluster.json"),
         global_cfg=os.path.join(ROOT, "configs/_ssh/global.json"),
         profile=None, mode="ssh", dry_run=False,
-        result_dir=str(ts_dir), no_plot=False, no_report=False, png=False,
+        result_dir=str(ts_dir), no_report=False, png=True,
+        pull_raw_logs=True, keep_intermediates=False,
         clean_up=False, _matrix=None)
     bm.main(args, ["configs/basic/a.json", "configs/basic/b.json"])
 
@@ -242,39 +246,70 @@ def test_main_report_overlaps_next_scenario(tmp_path, monkeypatch):
 
 # ------------------------------------------------- kvtest intermediates
 
-def _mk_samples(tmp_path):
-    d = tmp_path / "logs" / "cfg"
+def _mk_run(tmp_path, verify=True):
+    ts = tmp_path / "ts"
+    d = ts / "logs" / "cfg"
     d.mkdir(parents=True)
     (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").write_text(
         "operation,status\n", encoding="utf-8")
     (d / "kv1.i0_p9101.kvtest_8MB.summary.json").write_text(
-        "{}", encoding="utf-8")
-    return d
+        "{}\n", encoding="utf-8")
+    if verify:
+        unit = d / "report" / "8MB"
+        unit.mkdir(parents=True)
+        (unit / "report.html").write_text("<html></html>\n")
+        (unit / "data.js").write_text("window.__MC_FULL__={};\n")
+    return ts, d
 
 
-def test_kvtest_samples_kept_by_default(tmp_path, monkeypatch):
-    monkeypatch.delenv("MC_KVTEST_CLEAN_INTERMEDIATES", raising=False)
-    d = _mk_samples(tmp_path)
-    removed = bm._maybe_cleanup_kvtest_intermediates(
-        str(tmp_path / "logs"), [], True)
-    assert removed == 0
-    assert (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").is_file()
-    assert (d / "kv1.i0_p9101.kvtest_8MB.summary.json").is_file()
+def _clean_args(**kw):
+    base = dict(no_report=False, png=False, pull_raw_logs=False,
+                keep_intermediates=False)
+    base.update(kw)
+    return SimpleNamespace(**base)
 
 
-def test_kvtest_samples_cleanup_opt_in_requires_success(tmp_path, monkeypatch):
-    monkeypatch.setenv("MC_KVTEST_CLEAN_INTERMEDIATES", "1")
-    d = _mk_samples(tmp_path)
-    # a failed scenario keeps the rebuild inputs even with the opt-in switch
-    assert bm._maybe_cleanup_kvtest_intermediates(
-        str(tmp_path / "logs"), ["cfg"], True) == 0
-    assert (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").is_file()
-    # a failed plot does too
-    assert bm._maybe_cleanup_kvtest_intermediates(
-        str(tmp_path / "logs"), [], False) == 0
-    assert (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").is_file()
-    # fully successful run + opt-in: intermediates are removed
-    removed = bm._maybe_cleanup_kvtest_intermediates(
-        str(tmp_path / "logs"), [], True)
+def test_cleanup_default_removes_after_verified_report(tmp_path, monkeypatch):
+    monkeypatch.delenv("MC_KEEP_INTERMEDIATES", raising=False)
+    ts, d = _mk_run(tmp_path)
+    monkeypatch.setattr(bm, "_verify_config_reports", lambda log_dir: (True, "1 unit"))
+    removed = bm._cleanup_run_intermediates(str(ts), [], _clean_args())
     assert removed == 2
     assert not (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").exists()
+    assert not (d / "kv1.i0_p9101.kvtest_8MB.summary.json").exists()
+    assert (d / "report" / "8MB" / "report.html").is_file()
+
+
+def test_cleanup_keeps_when_verify_fails(tmp_path, monkeypatch):
+    monkeypatch.delenv("MC_KEEP_INTERMEDIATES", raising=False)
+    ts, d = _mk_run(tmp_path, verify=False)
+    assert bm._cleanup_run_intermediates(str(ts), [], _clean_args()) == 0
+    assert (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").is_file()
+
+
+def test_cleanup_keeps_failed_configs(tmp_path, monkeypatch):
+    monkeypatch.delenv("MC_KEEP_INTERMEDIATES", raising=False)
+    ts, d = _mk_run(tmp_path)
+    monkeypatch.setattr(bm, "_verify_config_reports", lambda log_dir: (True, "1 unit"))
+    assert bm._cleanup_run_intermediates(
+        str(ts), ["cfg"], _clean_args()) == 0
+    assert (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").is_file()
+
+
+@pytest.mark.parametrize("args_kw,env", [
+    (dict(keep_intermediates=True), None),
+    (dict(), "1"),
+    (dict(png=True, pull_raw_logs=True), None),
+    (dict(pull_raw_logs=True), None),
+    (dict(no_report=True), None),
+])
+def test_cleanup_escape_hatches(tmp_path, monkeypatch, args_kw, env):
+    if env is None:
+        monkeypatch.delenv("MC_KEEP_INTERMEDIATES", raising=False)
+    else:
+        monkeypatch.setenv("MC_KEEP_INTERMEDIATES", env)
+    ts, d = _mk_run(tmp_path)
+    monkeypatch.setattr(bm, "_verify_config_reports", lambda log_dir: (True, "1 unit"))
+    assert bm._cleanup_run_intermediates(
+        str(ts), [], _clean_args(**args_kw)) == 0
+    assert (d / "kv1.i0_p9101.kvtest_8MB.samples.csv").is_file()

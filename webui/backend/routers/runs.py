@@ -37,6 +37,9 @@ def _build_run_argv(body):
     launch_mode = flags.get("launch_mode") or "single"
     if launch_mode not in ("single", "rank_recall"):
         raise ApiError(400, "flags.launch_mode must be 'single' or 'rank_recall'")
+    if flags.get("png") and not flags.get("pull_raw_logs"):
+        raise ApiError(400, "开启 png 必须开启 pull-raw-logs（PNG 绘图需要"
+                            "原始客户端日志）")
     # mode: "ssh" (default) or "k8s" -> adds --ssh / --k8s to the benchmark argv
     mode = flags.get("mode") or "ssh"
     if mode not in ("ssh", "k8s"):
@@ -74,7 +77,8 @@ def _build_run_argv(body):
                       "--recall-cluster", flags["recall_cluster"],
                       "--recall-global", flags["recall_global"],
                       "--profile", profile]
-        for flag in ("dry_run", "no_warmup", "no_plot", "no_report"):
+        for flag in ("dry_run", "no_warmup", "no_report", "png",
+                     "pull_raw_logs", "keep_intermediates"):
             if flags.get(flag):
                 dual_argv.append("--" + flag.replace("_", "-"))
         protocol = flags.get("protocol")
@@ -98,7 +102,8 @@ def _build_run_argv(body):
                      "first".format(name, path, example, target))
     argv += ["--" + mode, "--cluster", cluster, "--global", global_cfg,
              "--profile", profile]
-    for flag in ("dry_run", "no_warmup", "no_plot", "no_report"):
+    for flag in ("dry_run", "no_warmup", "no_report", "png",
+                 "pull_raw_logs", "keep_intermediates"):
         if flags.get(flag):
             argv.append("--" + flag.replace("_", "-"))
     protocol = flags.get("protocol")

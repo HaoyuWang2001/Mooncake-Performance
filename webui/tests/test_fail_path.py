@@ -19,7 +19,7 @@ def test_fail_path_keeps_original_error(tmp_path, monkeypatch):
     cfg = bm.load_json(os.path.join(ROOT, "mock", "smoke", "put.json"))
     cfg["__cfg_path__"] = "mock/smoke/put.json"
     args = SimpleNamespace(
-        no_warmup=True, dry_run=False, no_plot=True, pull_raw_logs=False,
+        no_warmup=True, dry_run=False, pull_raw_logs=False,
         png=False, mode="ssh", _result_dir_path=str(tmp_path), profile=None,
         clean_up=False, _matrix=None)
     for name in ("ensure_pods", "deploy_scripts", "ensure_configmap",

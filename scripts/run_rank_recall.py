@@ -81,8 +81,12 @@ def _child_argv(args, work_mode, files, parent, ready_dir):
         argv += ["--result-dir", os.path.join("outputs", parent, work_mode)]
     for enabled, flag in ((args.dry_run, "--dry-run"),
                           (args.no_warmup, "--no-warmup"),
-                          (args.no_plot, "--no-plot"),
                           (getattr(args, "no_report", False), "--no-report"),
+                          (getattr(args, "png", False), "--png"),
+                          (getattr(args, "pull_raw_logs", False),
+                           "--pull-raw-logs"),
+                          (getattr(args, "keep_intermediates", False),
+                           "--keep-intermediates"),
                           (args.verbose, "--verbose")):
         if enabled:
             argv.append(flag)
@@ -151,11 +155,17 @@ def parse_args(argv=None):
     parser.add_argument("--protocol", choices=("tcp", "rdma", "ub"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--no-report", action="store_true")
+    parser.add_argument("--png", action="store_true")
+    parser.add_argument("--pull-raw-logs", action="store_true")
+    parser.add_argument("--keep-intermediates", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-file")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.png and not args.pull_raw_logs:
+        parser.error("开启 png 必须开启 pull-raw-logs（PNG 绘图需要原始客户端"
+                     "日志）")
+    return args
 
 
 def main(argv=None):

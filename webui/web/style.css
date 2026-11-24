@@ -224,6 +224,9 @@ html, body, #app {
 }
 .runbox .rb-label { width: 56px; flex: none; color: var(--el-text-color-secondary);
                     font-size: 13px; }
+.runbox .rb-opt { display: inline-flex; flex-direction: column; gap: 1px; }
+.runbox .rb-opt-hint { font-size: 11px; line-height: 1.2;
+                       color: var(--el-text-color-secondary); padding-left: 24px; }
 .runbox .rb-group { margin-left: var(--mc-space-4); }
 .runbox .el-alert { margin-top: var(--mc-space-2); }
 .runbox .rb-spacer { flex: 1; }

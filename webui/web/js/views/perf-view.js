@@ -254,8 +254,16 @@ const PerfView = {
         <span class="rb-label">选项</span>
         <el-checkbox v-model="flags.dryRun">dry-run</el-checkbox>
         <el-checkbox v-model="flags.noWarmup">no-warmup</el-checkbox>
-        <el-checkbox v-model="flags.noPlot" title="只跳过 PNG 绘图（plot_latency），HTML 报表照常生成">no-plot</el-checkbox>
-        <el-checkbox v-model="flags.noReport" title="只跳过 HTML 报表（report.html + overview.html），PNG 绘图不受影响">no-report</el-checkbox>
+        <el-checkbox v-model="flags.noReport" title="只跳过 HTML 报表（report.html + overview.html），不影响绘图与原始日志">no-report</el-checkbox>
+        <span class="rb-opt">
+          <el-checkbox v-model="flags.png" title="生成旧版 PNG 散点图（plot_latency）；默认不绘图，且必须同时开启『拉取原始日志』">PNG 绘图</el-checkbox>
+          <span class="rb-opt-hint">必须与「拉取原始日志」同时开启</span>
+        </span>
+        <span class="rb-opt">
+          <el-checkbox v-model="flags.pullRawLogs" title="把原始客户端日志也拉回本地（默认只拉远端产出的紧凑 stats.json）">拉取原始日志</el-checkbox>
+          <span class="rb-opt-hint">可能导致拉取数据量过大</span>
+        </span>
+        <el-checkbox v-model="flags.keepIntermediates" title="报表成功生成后仍保留全部中间产物（stats/原始日志/kvtest 样本）；默认清理，report/ 与 profiling/ 始终保留">保留中间产物</el-checkbox>
         <el-checkbox v-model="flags.verbose" title="详细日志：上传路径、逐文件拉取、kubectl 命令、pod 详情">verbose</el-checkbox>
         <span class="rb-label rb-label-inline">协议</span>
         <el-select v-model="flags.protocol" size="small" style="width: 130px">
@@ -429,7 +437,8 @@ const PerfView = {
     const candidates = Vue.ref({ cluster: [], global: [], profile: [] });
     const cfgLoading = Vue.ref(false);
     const flags = Vue.reactive(Object.assign(
-      { dryRun: false, noWarmup: false, noPlot: false, noReport: false,
+      { dryRun: false, noWarmup: false, noReport: false, png: false,
+        pullRawLogs: false, keepIntermediates: false,
         verbose: false, protocol: "", cluster: "",
         global: "", profile: "", rankCluster: "",
         rankGlobal: "", recallCluster: "", recallGlobal: "" },
@@ -591,8 +600,10 @@ const PerfView = {
       const opt = [];
       if (flags.dryRun) opt.push("dry-run");
       if (flags.noWarmup) opt.push("no-warmup");
-      if (flags.noPlot) opt.push("no-plot");
       if (flags.noReport) opt.push("no-report");
+      if (flags.png) opt.push("png");
+      if (flags.pullRawLogs) opt.push("pull-raw-logs");
+      if (flags.keepIntermediates) opt.push("keep-intermediates");
       if (flags.verbose) opt.push("verbose");
       const common = [
         ["模式", mode.value === "k8s" ? "k8s" : "真机"],
@@ -747,6 +758,8 @@ const PerfView = {
     // 创建实例前的前置提示（只校验表单，实例可随时创建，不占运行槽）
     const runHint = Vue.computed(() => {
       if (!hasSelection.value) return "未选择配置：先打开「选择配置」勾选文件或目录";
+      if (flags.png && !flags.pullRawLogs)
+        return "开启 PNG 绘图必须同时开启「拉取原始日志」";
       if (launchMode.value === "rank_recall") {
         if (!flags.rankCluster) return "未选择 rank cluster 配置";
         if (!flags.rankGlobal) return "未选择 rank global 配置";
@@ -765,7 +778,9 @@ const PerfView = {
     function _instFlags() {
       return { mode: mode.value, launch_mode: launchMode.value,
                dry_run: flags.dryRun, no_warmup: flags.noWarmup,
-               no_plot: flags.noPlot, no_report: flags.noReport,
+               no_report: flags.noReport, png: flags.png,
+               pull_raw_logs: flags.pullRawLogs,
+               keep_intermediates: flags.keepIntermediates,
                verbose: flags.verbose,
                protocol: flags.protocol || null,
                cluster: flags.cluster, global: flags.global,

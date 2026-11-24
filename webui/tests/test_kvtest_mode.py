@@ -308,23 +308,34 @@ def test_kvtest_artifact_flatten_includes_request_samples(monkeypatch):
     assert "latency_timeseries.csv" not in commands[0]
 
 
-def test_kvtest_success_cleanup_keeps_logs_and_png(tmp_path):
+def test_cleanup_removes_intermediates_and_keeps_report(tmp_path):
+    """Per-config cleanup: everything but report/ and profiling/ goes (raw
+    logs/glog/samples/summary/timeseries/PNG are all intermediates; --png
+    runs skip the whole-run cleanup via --pull-raw-logs)."""
     nested = tmp_path / "logs" / "case"
     nested.mkdir(parents=True)
     disposable = [
         nested / "case.node_i0_p9101.kvtest_8MB.summary.json",
         nested / "case.node_i0_p9101.kvtest_8MB.samples.csv",
         nested / "case.node_i0_p9101.kvtest_8MB.timeseries.csv",
+        nested / "case.node_i0_p9101.kvtest_8MB.log",
+        nested / "case.node_i0_p9101.kvtest_8MB.log.glog",
+        nested / "case.node_i0_p9101.kvtest_8MB.upsert.latency.png",
+        nested / "case.node_i0_p9101.kvtest_8MB.log.stats.json",
     ]
-    keep = [nested / "case.node_i0_p9101.kvtest_8MB.log",
-            nested / "case.node_i0_p9101.kvtest_8MB.log.glog",
-            nested / "case.node_i0_p9101.kvtest_8MB.upsert.latency.png"]
-    for path in disposable + keep:
+    for path in disposable:
         path.write_text("x", encoding="utf-8")
+    unit = nested / "report" / "8MB"
+    unit.mkdir(parents=True)
+    (unit / "report.html").write_text("<html></html>", encoding="utf-8")
+    (unit / "data.js").write_text("x", encoding="utf-8")
+    (nested / "profiling").mkdir()
+    (nested / "profiling" / "mem.host.csv").write_text("x", encoding="utf-8")
 
-    assert bm._cleanup_kvtest_success_intermediates(str(tmp_path / "logs")) == 3
+    assert bm._cleanup_config_intermediates(str(nested)) == 7
     assert all(not path.exists() for path in disposable)
-    assert all(path.exists() for path in keep)
+    assert (unit / "report.html").is_file()
+    assert (nested / "profiling" / "mem.host.csv").is_file()
 
 
 def test_kvtest_artifact_base_is_compact_and_omits_node_name():
