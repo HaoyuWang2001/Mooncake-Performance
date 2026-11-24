@@ -107,6 +107,8 @@ basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字
 | `numa_bind` | 客户端 NUMA 绑定：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配）。解析优先级：用例/层级显式值 > global.json（默认 true）> 代码缺省 true | `true` |
 | `parallel.fanout_workers` | 并发上限：kubectl exec / HTTP fan-out / 实例配置推送 / 启动 / 退出等待 / 产物整理（flatten+trace） | `16` |
 | `parallel.pull_workers` | 产物拉回并发（controller SFTP，受 sshd MaxSessions≈10 约束，勿超过） | `10` |
+| `k8s.reduce_on_controller` | kvtest 产物 pod→controller 单跳（kubectl cp），map+reduce 在 controller 执行，编排机只收 reduced/meta/summary；失败自动回退本地链路 | `true` |
+| `k8s.controller_keep_data` | 保留 controller 侧 per-run 中间产物（默认成功后清理，失败总是保留） | `false` |
 | `k8s_numa_node` | K8s basic 场景显式 NUMA 节点；通过 `numactl --cpunodebind/--membind` 同时绑定 CPU 和内存，未配置时 K8s basic 不绑定 | 未配置 |
 
 - **限速说明**：`target_qps` 为**整个场景的总 QPS**——编排器按组合拆给各 client 进程，客户端再按线程均分；与 `duration` 可组合（限速 + 定时循环）。注意：低压限速会显著拉长计数扫描耗时（如 1000 keys ÷ 100qps ≈ 10s/组合，22 组合 ≈ 220s），做低压对比时建议配精简 `params`。

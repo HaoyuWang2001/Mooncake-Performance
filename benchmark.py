@@ -6145,6 +6145,168 @@ def _wait_kvtest_processes(cluster, instance_pids, timeout_s, expected_s=None,
     return results
 
 
+def _controller_reduce_enabled(globals_cfg):
+    """k8s.reduce_on_controller (default true): kvtest artifacts take ONE
+    kubectl cp hop pod -> controller, map+reduce run on the controller, and
+    only reduced.json/meta/summary.json come back to the orchestrator. Any
+    failure falls back to the local pull+map+reduce path."""
+    block = (globals_cfg or {}).get("k8s") or {}
+    return bool(block.get("reduce_on_controller", True))
+
+
+def _controller_keep_data(globals_cfg):
+    return bool(((globals_cfg or {}).get("k8s") or {})
+                .get("controller_keep_data"))
+
+
+def _controller_cp_groups(cluster, groups, cdir, workers=None):
+    """kubectl cp every group's pod files into the controller dir (the
+    FIRST hop of scp_pull's k8s branch only — data stops ON the controller,
+    the second SFTP hop to the orchestrator never happens)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(group):
+        node, files, _label = group
+        c = node["_controller"]
+        controller_mkdir(c, cdir)
+        for f in files:
+            out, rc = controller_run(
+                c, ["-n", node["_ns"], "cp",
+                    "{}:{}".format(node["_pod"], f), cdir], check=False)
+            if rc != 0:
+                raise RuntimeError(
+                    "kubectl cp failed (rc={}) for {} on {}: {}".format(
+                        rc, os.path.basename(f), node["_pod"],
+                        (out or "")[:200]))
+        return True
+
+    _workers = max(1, min(workers or _PIPELINE_PARALLEL, len(groups) or 1))
+    with ThreadPoolExecutor(max_workers=_workers) as pool:
+        return list(pool.map(_one, groups))
+
+
+def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
+                                cfg_name, ds, instance_pids, groups,
+                                local_log_dir, extra_bytes,
+                                qps_target=0, nodes=0):
+    """Controller-side kvtest data plane: cp artifacts pod->controller,
+    run the staged map+reduce driver there, pull back only the compact
+    reduced/meta/summary products. Raises on any failure so the caller can
+    fall back to the local path (pods still hold everything)."""
+    c = cluster["_controller"]
+    ws = k8s_settings(cluster).get("controller_workspace") or "/tmp"
+    cdir = posixpath.join(ws, "data", "{}__{}__{}".format(ts, cfg_name, ds))
+    red_dir = os.path.join(local_log_dir, "report", ds)
+    os.makedirs(red_dir, exist_ok=True)
+    _controller_cp_groups(cluster, groups, cdir)
+    scripts_dst = posixpath.join(ws, "scripts")
+    stage = [os.path.join(SCRIPTS_DIR, n) for n in
+             ("logstats.py", "report.py", "kvtest_controller_job.py")]
+    controller_put(c, stage, scripts_dst)
+    out, rc = controller_exec(
+        c, "python3 -c 'import json,csv,heapq,gzip,argparse'")
+    if rc != 0:
+        raise RuntimeError("controller python3 probe failed: {}".format(
+            (out or "")[:200]))
+    # which pod files actually exist (R1 gzip decides the samples/trace
+    # transfer form) — one scan of the group manifests
+    names = set()
+    for _n, files, _l in groups:
+        for f in files:
+            names.add(os.path.basename(f))
+    iid_nodes = cfg.get("_kvtest_iid_nodes") or {}
+    iid_pods = cfg.get("_kvtest_iid_pods") or {}
+    start_epochs = cfg.get("_kvtest_start_epochs") or {}
+    instances = []
+    for entry, _pid in instance_pids:
+        base = entry["_base"]
+        if (base + ".samples.csv.gz") in names:
+            samples = base + ".samples.csv.gz"
+        elif (base + ".samples.csv") in names:
+            samples = base + ".samples.csv"
+        else:
+            raise RuntimeError(
+                "kvtest i{}: no samples artifact for the controller job"
+                "".format(entry["iid"]))
+        trace = None
+        for cand in (base + ".log.glog.trace.json",
+                     base + ".log.glog.trace.json.gz"):
+            if cand in names:
+                trace = cand
+                break
+        instances.append({
+            "samples": samples,
+            "summary": base + ".summary.json",
+            "trace": trace,
+            "node": iid_nodes.get(str(entry["iid"]),
+                                  "i{}".format(entry["iid"])),
+            "pod": iid_pods.get(str(entry["iid"]), ""),
+            "ds": ds,
+            "start_epoch": start_epochs.get(str(ds)),
+            "extra_bytes": int(extra_bytes.get(base) or 0),
+            "writer_ops": sorted(KVTEST_WRITE_OPS),
+            "reader_ops": sorted(KVTEST_READ_OPS),
+        })
+    job = {"dir": cdir,
+           "out_dir": posixpath.join(cdir, "reduced"),
+           "meta_base": _kvtest_report_meta_base(
+               cfg, args, cfg_name, ds,
+               qps_target=qps_target, nodes=nodes),
+           "instances": instances}
+    job_local = os.path.join(local_log_dir, "controller_job.json")
+    with open(job_local, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False, indent=1)
+    controller_put(c, [job_local], cdir)
+    os.remove(job_local)
+    job_remote = posixpath.join(cdir, "controller_job.json")
+    out, rc = controller_exec(
+        c, "python3 {} --job {}".format(
+            shlex.quote(posixpath.join(scripts_dst,
+                                        "kvtest_controller_job.py")),
+            shlex.quote(job_remote)))
+    log_detail("[kvtest] controller job: {}".format((out or "")[-800:]))
+    if rc != 0:
+        raise RuntimeError("controller map+reduce job failed (rc={}): {}"
+                           "".format(rc, (out or "")[-200:]))
+    for _n, files, _l in groups:
+        for f in files:
+            if f.endswith(".summary.json"):
+                controller_get_file(
+                    c, posixpath.join(cdir, os.path.basename(f)),
+                    local_log_dir)
+    for name in ("{}.reduced.json".format(ds), "{}.meta.json".format(ds)):
+        controller_get_file(
+            c, posixpath.join(cdir, "reduced", name), red_dir)
+    # reduced.json is the durable re-renderable artifact of this unit
+    os.replace(os.path.join(red_dir, "{}.reduced.json".format(ds)),
+               os.path.join(red_dir, "reduced.json"))
+    os.replace(os.path.join(red_dir, "{}.meta.json".format(ds)),
+               os.path.join(red_dir, "meta.json"))
+    if not _controller_keep_data(globals_cfg):
+        controller_exec(c, "rm -rf {}".format(shlex.quote(cdir)))
+    return cdir
+
+
+def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
+                              qps_target=0, nodes=0):
+    """The reduce meta the controller driver needs (everything except
+    'started', which only the data itself knows)."""
+    meta = {
+        "config": cfg_name, "mode": "pipeline", "scenario": "pipeline",
+        "engine": "kvtest", "launch_mode": "single",
+        "qps_target": qps_target, "protocol": cfg.get("protocol") or "",
+        "cluster_cfg": os.path.basename(getattr(args, "cluster", "") or ""),
+        "global_cfg": os.path.basename(getattr(args, "global_cfg", "") or ""),
+        "profile_cfg": os.path.basename(getattr(args, "profile", "") or ""),
+        "early_stop": False, "unit": ds, "unit_size": ds,
+    }
+    try:
+        meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
+    except Exception as exc:
+        log_detail("[kvtest] controller meta params failed: {}".format(exc))
+    return meta
+
+
 def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
                               retry_s=0):
     """Copy one instance's nested artifacts into the pullable log root.
@@ -6673,6 +6835,35 @@ def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False,
     WARN-only: a report failure must never fail the benchmark."""
     if getattr(args, "no_report", False) or getattr(args, "dry_run", False):
         return None
+    # controller 数据面：map+reduce 已在 controller 完成，本地只剩渲染
+    try:
+        _reds = sorted(glob.glob(os.path.join(
+            local_log_dir, "report", "*", "reduced.json")))
+        if _reds:
+            rp = _report_module()
+            echarts = os.path.join(ROOT, "webui", "web",
+                                   "vendor", "echarts.min.js")
+            written = []
+            for red in _reds:
+                with open(red, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                out_dir = os.path.dirname(red)
+                html, _datajs = rp.render_scenario(
+                    data, out_dir, echarts,
+                    rel_base=os.path.relpath(out_dir, ROOT)
+                    .replace(os.sep, "/"))
+                _REPORT_ACC.append({
+                    "data": data, "report_html": html,
+                    "config": os.path.splitext(os.path.basename(
+                        cfg.get("__cfg_path__") or "scenario"))[0],
+                    "unit": os.path.basename(out_dir)})
+                written.append(html)
+            if written:
+                log("[report] kvtest controller render: {} unit(s)".format(
+                    len(written)))
+                return written
+    except Exception as exc:
+        log("[WARN] kvtest controller render failed: {}".format(exc))
     try:
         mapped = _kvtest_map_stats(local_log_dir, cfg)
         if mapped:
@@ -7509,14 +7700,33 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                       len(instance_pids) or 1))
                 with ThreadPoolExecutor(max_workers=_workers) as pool:
                     _groups = list(pool.map(_collect_one, instance_pids))
-            _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
-            # gunzip the pulled .gz back to original names so the map/report
-            # glob surface stays unchanged, THEN account bytes per category.
-            if not dry:
-                _gunzip_local_dir(local_log_dir)
+            _ctrl_done = False
+            if (not dry and is_k8s and _controller_reduce_enabled(globals_cfg)
+                    and not getattr(args, "png", False)
+                    and not getattr(args, "pull_raw_logs", False)):
+                try:
+                    _t_red = time.time()
+                    _kvtest_controller_collect(
+                        cluster, globals_cfg, cfg, args, ts, cfg_name, ds,
+                        instance_pids, _groups, local_log_dir,
+                        _extra_bytes, qps_target=plan.get("total_qps") or 0,
+                        nodes=int(cfg.get("_kvtest_nodes") or 0))
+                    _ctrl_done = True
+                    log("[kvtest] controller 数据面完成: {:.1f}s（pod→controller 单跳，"
+                        "编排机零中间产物，只回传 reduced/meta/summary）".format(
+                            time.time() - _t_red))
+                except Exception as exc:
+                    log("[WARN] controller map+reduce 失败，回退本地拉取链路: {}"
+                        "".format(exc))
+            if not _ctrl_done:
+                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+                # gunzip the pulled .gz back to original names so the map/report
+                # glob surface stays unchanged, THEN account bytes per category.
+                if not dry:
+                    _gunzip_local_dir(local_log_dir)
             _pulled_bytes = 0
             _cat_bytes = {"samples": 0, "trace": 0, "summary": 0, "other": 0}
-            if not dry:
+            if not dry and not _ctrl_done:
                 for _n, _files, _l in _groups:
                     for _f in _files:
                         _name = os.path.basename(_f)
@@ -8235,6 +8445,21 @@ def _glob_log_sources(directory, pattern):
             key = key[:-len(".stats.json")]
         found[key] = p        # stats version added last -> wins
     return [found[k] for k in sorted(found)]
+def _kvtest_reduced_for_size(local_log_dir, ds, role):
+    """Exact merged percentiles of one role's TOTAL row from a
+    controller-reduce reduced.json (report/<ds>/reduced.json); None when
+    absent (the caller then leaves the percentile columns empty — never a
+    weighted approximation)."""
+    try:
+        with open(os.path.join(local_log_dir, "report", ds, "reduced.json"),
+                  "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    blk = ((doc.get("sizes") or {}).get(ds) or {})
+    return ((blk.get("role_summaries") or {}).get(role)) or None
+
+
 def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None):
     """Load request-level OK latencies keyed by (size, iid, node, op)."""
     legacy_re = re.compile(
@@ -8693,9 +8918,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 for k in lat_keys:
                     row[k] = round(stats[k], 4)
             else:
-                # Compatibility fallback for an old binary without samples:
-                # avg/percentiles remain weighted approximations, but max is
-                # still exactly the largest per-instance maximum.
+                # 无原始样本时绝不使用加权近似：优先 controller reduce 的
+                # 精确合并值（report/<ds>/reduced.json），否则分位列留空（N/A）。
+                # avg/min/max/阈值计数仍然精确（极值/求和天然无损）。
+                _red = _kvtest_reduced_for_size(local_log_dir, ds, role)
                 for k in lat_keys:
                     if k == "min_ms":
                         row[k] = min((float(r.get(k, 0) or 0)
@@ -8708,9 +8934,17 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                     elif k in LATENCY_THRESHOLD_COLUMNS:
                         row[k] = sum(int(r.get(k, 0) or 0)
                                      for r in inst_rows)
-                    else:
+                    elif k == "avg_ms":
+                        # 加权均值在数学上等于全样本均值（精确，非近似）
                         row[k] = weighted_of(
                             inst_rows, k, weight_key="success")
+                    elif _red is not None and _red.get(k) is not None:
+                        row[k] = round(float(_red[k]), 4)
+                    else:
+                        row[k] = ""
+                        log("[WARN] kvtest TOTAL 分位不可得（无原始样本且无 "
+                            "controller reduce 产物），置空: {} {} {}"
+                            "".format(ds, role, k))
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)

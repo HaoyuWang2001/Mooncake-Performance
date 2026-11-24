@@ -498,13 +498,16 @@ def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
     assert w0["key_pool_size"] == 256
     assert w0["num_threads"] == 1 and w0["notify_threads"] == 10
     assert w0["target_qps"] == 105
-    # Old-summary fallback: counts sum exactly; avg/percentiles are weighted
-    # by successful request count and max is the largest instance max.
+    # 无原始样本且无 controller reduce 产物：计数/阈值求和与 min/max/加权均值
+    # 仍精确（均值加权 = 全样本均值），分位数一律置空（N/A）——绝不使用
+    # “分位数加权平均”这类近似。
     assert wT["total"] == 2800 and wT["success"] == 2800
     assert wT["notify_submitted"] == 28000 and wT["notify_fail"] == 20
     assert wT["notify_avg_ms"] == 1.5 and wT["notify_max_ms"] == 9.0
     assert wT["avg_ms"] == round((1500 * 1.0 + 1300 * 3.0) / 2800, 4)
-    assert wT["p50_ms"] == 0.8                   # identical inputs -> same
+    for _k in ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "p999_ms",
+               "p9999_ms"):
+        assert wT[_k] == ""                     # N/A，绝不近似
     assert wT["max_ms"] == 19.0                  # true max, never weighted
     assert wT["throughput_mb_s"] == round(2800 * 8 / 30, 2)   # MB per second
     # reader rows: queue wait + verify failures (read-path verification)
