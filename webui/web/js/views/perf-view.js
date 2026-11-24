@@ -264,6 +264,14 @@ const PerfView = {
           <span class="rb-opt-hint">可能导致拉取数据量过大</span>
         </span>
         <el-checkbox v-model="flags.keepIntermediates" title="报表成功生成后仍保留全部中间产物（stats/原始日志/kvtest 样本）；默认清理，report/ 与 profiling/ 始终保留">保留中间产物</el-checkbox>
+        <span class="rb-opt">
+          <el-checkbox v-model="flags.monitorMem" title="每节点启动内存监控 DaemonSet（mem.host.csv / mem.proc.csv）；环境内存紧张时关闭">内存监控</el-checkbox>
+          <span class="rb-opt-hint">2G 节点上会与压测争内存</span>
+        </span>
+        <span class="rb-opt">
+          <el-checkbox v-model="flags.monitorUrma" title="每节点采集 URMA 端口计数（urma.flits.csv，需宿主 mdcli）">URMA 端口监控</el-checkbox>
+          <span class="rb-opt-hint">需要节点具备宿主工具</span>
+        </span>
         <el-checkbox v-model="flags.verbose" title="详细日志：上传路径、逐文件拉取、kubectl 命令、pod 详情">verbose</el-checkbox>
         <span class="rb-label rb-label-inline">协议</span>
         <el-select v-model="flags.protocol" size="small" style="width: 130px">
@@ -439,6 +447,7 @@ const PerfView = {
     const flags = Vue.reactive(Object.assign(
       { dryRun: false, noWarmup: false, noReport: false, png: false,
         pullRawLogs: false, keepIntermediates: false,
+        monitorMem: false, monitorUrma: false,
         verbose: false, protocol: "", cluster: "",
         global: "", profile: "", rankCluster: "",
         rankGlobal: "", recallCluster: "", recallGlobal: "" },
@@ -604,6 +613,8 @@ const PerfView = {
       if (flags.png) opt.push("png");
       if (flags.pullRawLogs) opt.push("pull-raw-logs");
       if (flags.keepIntermediates) opt.push("keep-intermediates");
+      opt.push(flags.monitorMem ? "内存监控" : "无内存监控");
+      opt.push(flags.monitorUrma ? "URMA 监控" : "无 URMA 监控");
       if (flags.verbose) opt.push("verbose");
       const common = [
         ["模式", mode.value === "k8s" ? "k8s" : "真机"],
@@ -781,6 +792,8 @@ const PerfView = {
                no_report: flags.noReport, png: flags.png,
                pull_raw_logs: flags.pullRawLogs,
                keep_intermediates: flags.keepIntermediates,
+               monitor_mem: !!flags.monitorMem,
+               monitor_urma: !!flags.monitorUrma,
                verbose: flags.verbose,
                protocol: flags.protocol || null,
                cluster: flags.cluster, global: flags.global,

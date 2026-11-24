@@ -92,6 +92,10 @@ def _child_argv(args, work_mode, files, parent, ready_dir):
             argv.append(flag)
     if args.protocol:
         argv += ["--protocol", args.protocol]
+    for flag, val in (("--monitor-mem", getattr(args, "monitor_mem", None)),
+                      ("--monitor-urma", getattr(args, "monitor_urma", None))):
+        if val in ("on", "off"):
+            argv += [flag, val]
     if args.stop_file:
         argv += ["--stop-file", args.stop_file]
     return argv
@@ -159,6 +163,8 @@ def parse_args(argv=None):
     parser.add_argument("--png", action="store_true")
     parser.add_argument("--pull-raw-logs", action="store_true")
     parser.add_argument("--keep-intermediates", action="store_true")
+    parser.add_argument("--monitor-mem", choices=("on", "off"), default=None)
+    parser.add_argument("--monitor-urma", choices=("on", "off"), default=None)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-file")
     args = parser.parse_args(argv)

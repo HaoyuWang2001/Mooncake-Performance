@@ -973,6 +973,10 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   绘图**默认关闭**，显式 `--png` 才生成旧 PNG 图（`plot_latency.py`，含 kvtest 点位图）；
   `--png` 必须与 `--pull-raw-logs` 同开（否则报错），`--pull-raw-logs` 也决定是否把
   原始客户端日志拉回本地（默认只拉紧凑 `*.stats.json`）。`--keep-intermediates`
+  保留全部中间产物。两个独立的监控开关 `--monitor-mem on|off` 与
+  `--monitor-urma on|off` 覆盖 `profile.json` 的对应工具；WebUI 运行表单
+  总会发送两者（默认关闭），内存紧张的环境可关掉它们避免监控 DaemonSet
+  与压测争内存。
   保留报表成功后的全部中间产物。`--dry-run` 仍全部跳过。
 - **待办（已记录）**：store 容量周期采样时间线（P3）、增量 map / 节点日志轮转上限、
   按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。

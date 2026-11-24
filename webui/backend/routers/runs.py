@@ -81,6 +81,10 @@ def _build_run_argv(body):
                      "pull_raw_logs", "keep_intermediates"):
             if flags.get(flag):
                 dual_argv.append("--" + flag.replace("_", "-"))
+        for name, flag in (("monitor_mem", "--monitor-mem"),
+                           ("monitor_urma", "--monitor-urma")):
+            if name in flags:            # WebUI always sends both booleans
+                dual_argv += [flag, "on" if flags.get(name) else "off"]
         protocol = flags.get("protocol")
         if protocol:
             if protocol not in ("tcp", "rdma", "ub"):
@@ -106,6 +110,10 @@ def _build_run_argv(body):
                  "pull_raw_logs", "keep_intermediates"):
         if flags.get(flag):
             argv.append("--" + flag.replace("_", "-"))
+    for name, flag in (("monitor_mem", "--monitor-mem"),
+                       ("monitor_urma", "--monitor-urma")):
+        if name in flags:                # WebUI always sends both booleans
+            argv += [flag, "on" if flags.get(name) else "off"]
     protocol = flags.get("protocol")
     if protocol:
         if protocol not in ("tcp", "rdma", "ub"):

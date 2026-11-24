@@ -926,6 +926,34 @@ def _wait_store_released(cluster, globals_cfg, cfg_name, when):
     return _verify_store_clean(cluster, globals_cfg, cfg_name, when)
 
 
+def _apply_monitor_overrides(matrix, args):
+    """--monitor-mem/--monitor-urma on|off override the profile matrix.
+
+    The WebUI run form always sends both (default off), so lab users can
+    drop the two host-monitoring DaemonSets when the environment is too
+    memory-constrained; direct CLI users who pass neither keep profile.json
+    untouched. Turning the last enabled tool off disables profiling for the
+    run (same as an all-disabled matrix)."""
+    overrides = {"mem": getattr(args, "monitor_mem", None),
+                 "urma": getattr(args, "monitor_urma", None)}
+    if matrix is None:
+        if any(v == "on" for v in overrides.values()):
+            log("[profile] 监控开关要求开启，但 profile 矩阵无可用工具；保持关闭")
+        return None
+    for tool, val in sorted(overrides.items()):
+        if val not in ("on", "off"):
+            continue
+        cfg = matrix["tools"].setdefault(tool, {})
+        cfg["enabled"] = (val == "on")
+        log("[profile] {} 监控: {}".format(
+            "内存" if tool == "mem" else "URMA 端口",
+            "开" if cfg["enabled"] else "关"))
+    if not any(c.get("enabled") for c in matrix["tools"].values()):
+        log("[profile] 所有监控已关闭，本轮不启动监控 DaemonSet")
+        return None
+    return matrix
+
+
 def _remove_keys_stage(cluster, globals_cfg, host, node, runner,
                        remote_log_dir, cfg_name, log_name, scope, when,
                        dry=False, pull_to=None, node_name=None, label=None,
@@ -9630,6 +9658,12 @@ def parse_arguments(argv=None):
     parser.add_argument("--global", dest="global_cfg", default=None,
                         help="path to global hyper json (default: configs/_ssh/global.json "
                              "or configs/_k8s/global.json per mode)")
+    parser.add_argument("--monitor-mem", choices=("on", "off"), default=None,
+                        help="override profile.json mem monitor (on|off); "
+                             "the WebUI always sends it (default off)")
+    parser.add_argument("--monitor-urma", choices=("on", "off"), default=None,
+                        help="override profile.json URMA-port monitor "
+                             "(on|off); the WebUI always sends it (default off)")
     parser.add_argument("--profile", default=None,
                         help="profile json (default: <mode-dir>/profile.json; "
                              "must exist together with cluster/global)")
@@ -10112,6 +10146,7 @@ def main(args, cfg_paths):
     matrix = None
     if prof_core is not None:
         matrix = prof_core.load_matrix(profile_path)
+        matrix = _apply_monitor_overrides(matrix, args)
     args._matrix = matrix
     if matrix:
         log("profiling 已启用: {} (触发={})".format(
