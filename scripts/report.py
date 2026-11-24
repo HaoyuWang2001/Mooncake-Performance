@@ -264,13 +264,25 @@ def _tier_policy(span, base_step=1):
     return scales, embed
 
 
-def _series_columns(merged, step, edges=None):
+def _series_columns(merged, step, edges=None, pools=None):
     """Columnar series for the chart (compact JSON, fixed key order).
-    """
+
+    pools: exact per-second raw samples of this object's scope — the
+    per-bucket percentiles come from a plain sort (absolute true values),
+    and are null when the scope's raw samples are unavailable (never a
+    histogram approximation)."""
     edges = ls.BIN_EDGES if edges is None else edges
     out = {"t": [], "c": [], "ok": [], "fail": [], "avg": [], "p50": [],
            "p99": [], "p999": [], "p9999": [], "min": [], "max": [],
            "qw": [], "qwmax": []}
+    agg = None
+    if pools is not None:
+        agg = {}
+        for sec, lats in (pools.get("buckets") or {}).items():
+            agg.setdefault(sec - sec % step, []).extend(lats)
+        for lats in agg.values():
+            lats.sort()
+        unavailable = bool(pools.get("missing"))
     prev_t = None
     for t in sorted(merged):
         c, ok, fail, s, mx, qs, qm, h = merged[t]
@@ -279,22 +291,47 @@ def _series_columns(merged, step, edges=None):
         out["ok"].append(int(ok))
         out["fail"].append(int(fail))
         out["avg"].append(round(s / ok, 4) if ok else 0.0)
-        out["p50"].append(round(ls.hist_percentile(h, 0.50, edges), 4)
-                          if h else 0.0)
-        out["p99"].append(round(ls.hist_percentile(h, 0.99, edges), 4)
-                          if h else 0.0)
-        out["p999"].append(round(ls.hist_percentile(h, 0.999, edges), 4)
-                           if h else 0.0)
-        out["p9999"].append(round(ls.hist_percentile(h, 0.9999, edges), 4)
-                            if h else 0.0)
-        # min：直方图最低非空分箱的下界（对数分箱 -> 近似最小值）
-        mn = 0.0
-        if h:
-            try:
-                mn = float(edges[min(int(k) for k in h)])
-            except (ValueError, IndexError):
-                mn = 0.0
-        out["min"].append(round(mn, 4))
+        if pools is None:
+            out["p50"].append(round(ls.hist_percentile(h, 0.50, edges), 4)
+                              if h else 0.0)
+            out["p99"].append(round(ls.hist_percentile(h, 0.99, edges), 4)
+                              if h else 0.0)
+            out["p999"].append(round(ls.hist_percentile(h, 0.999, edges), 4)
+                               if h else 0.0)
+            out["p9999"].append(round(ls.hist_percentile(h, 0.9999, edges), 4)
+                                if h else 0.0)
+            # min：直方图最低非空分箱的下界（对数分箱 -> 近似最小值）
+            mn = 0.0
+            if h:
+                try:
+                    mn = float(edges[min(int(k) for k in h)])
+                except (ValueError, IndexError):
+                    mn = 0.0
+            out["min"].append(round(mn, 4))
+        else:
+            lats = (agg.get(t) or [])
+            if unavailable:
+                out["p50"].append(None)
+                out["p99"].append(None)
+                out["p999"].append(None)
+                out["p9999"].append(None)
+                out["min"].append(None)
+            elif lats:
+                out["p50"].append(
+                    round(ls._exact_percentile(lats, 0.50), 4))
+                out["p99"].append(
+                    round(ls._exact_percentile(lats, 0.99), 4))
+                out["p999"].append(
+                    round(ls._exact_percentile(lats, 0.999), 4))
+                out["p9999"].append(
+                    round(ls._exact_percentile(lats, 0.9999), 4))
+                out["min"].append(round(lats[0], 4))
+            else:
+                out["p50"].append(0.0)
+                out["p99"].append(0.0)
+                out["p999"].append(0.0)
+                out["p9999"].append(0.0)
+                out["min"].append(0.0)
         out["max"].append(round(mx, 4))
         # logstats accumulates queue wait on successful rows only -> divide
         # by ok (not by every row, which understated it by the failure rate)
@@ -304,8 +341,13 @@ def _series_columns(merged, step, edges=None):
     return out
 
 
-def _summary_of(stats):
-    """Cluster summary from merged per-instance globals."""
+def _summary_of(stats, pools=None):
+    """Cluster summary from merged per-instance globals.
+
+    pools: exact raw samples of this scope (kvtest) — percentiles come from
+    a plain sort over the pooled samples (absolute true values) and are None
+    ("N/A") when any instance's raw samples are unavailable; never a
+    histogram approximation. None keeps the legacy reconstruction."""
     combos = combos_of(stats)
     total = ok = fail = ok_rows = 0
     lat_sum = 0.0
@@ -364,6 +406,14 @@ def _summary_of(stats):
     edges = _hist_edges(stats)
 
     def pct(q, key):
+        # kvtest scopes: exact pooled raw samples, or N/A when unavailable —
+        # approximation is forbidden by design.
+        if pools is not None:
+            if pools.get("missing"):
+                return None
+            if pools.get("lats"):
+                return round(ls._exact_percentile(pools["lats"], q), 4)
+            return 0.0
         # single client: the map product already holds EXACT percentiles (the
         # CSV uses the same values); otherwise reconstruct from the merged
         # histogram and never report more than the true maximum.
@@ -453,19 +503,100 @@ def _samples(rows):
     return sum(int(r[1]) for r in rows or [])
 
 
-def _obj_tiers(rows, edges, offered, min_step, adaptive_step):
+# ---------------------------------------------------------------------------
+# Exact pooled percentiles (kvtest). The histogram merge reconstructs
+# cross-instance percentiles from log-ladder counts; kvtest map products
+# instead self-describe their raw per-request CSV (meta.format =
+# "kvtest_samples" and product _path == "<samples>.<role>.stats.json"), so
+# every merged percentile of a kvtest scope is recomputed from the POOLED
+# RAW SAMPLES — a plain sort, an absolute true value. A scope whose samples
+# are unavailable (older binary / file deleted) degrades its percentiles to
+# null ("N/A"), NEVER to a histogram approximation.
+# ---------------------------------------------------------------------------
+
+_KVTEST_PRODUCT_POOL = {}
+
+
+def _kvtest_read_product_pool(st):
+    """Read one kvtest product's sibling samples.csv once (cached by path).
+
+    Returns {"lats": [sorted OK latencies], "secs": {epoch_s: [lats]}} or
+    None when the raw samples are unavailable."""
+    m = st.get("meta") or {}
+    path = st.get("_path") or ""
+    role = m.get("role") or ""
+    suffix = ".{}.stats.json".format(role)
+    if not path or not path.endswith(suffix):
+        return None
+    if path in _KVTEST_PRODUCT_POOL:
+        return _KVTEST_PRODUCT_POOL[path]
+    samples = path[:-len(suffix)]
+    pool = None
+    if os.path.isfile(samples):
+        ops = set((st.get("ops") or {}).keys()) or None
+        pool = {"lats": [], "secs": {}}
+        for row in ls.iter_kvtest_rows(samples, m.get("ts_from"), ops):
+            if row["status"] != "OK" or row["lat"] is None:
+                continue
+            pool["lats"].append(row["lat"])
+            ep = row.get("epoch")
+            if ep is not None:
+                pool["secs"].setdefault(int(ep), []).append(row["lat"])
+        pool["lats"].sort()
+    _KVTEST_PRODUCT_POOL[path] = pool
+    return pool
+
+
+def _kvtest_scope_pools(stats_list):
+    """Merged raw OK samples of one product scope (all/role/node/instance).
+
+    None when the scope holds no kvtest product (python-engine groups keep
+    the histogram merge); otherwise {"lats": [sorted], "buckets": {sec:
+    [lats]}, "missing": [instance labels with unavailable raw samples]}."""
+    pools = {"lats": [], "buckets": {}, "missing": []}
+    seen = False
+    for st in stats_list:
+        m = st.get("meta") or {}
+        if (m.get("format") or "") != "kvtest_samples":
+            continue
+        seen = True
+        per = _kvtest_read_product_pool(st)
+        if per is None:
+            pools["missing"].append(m.get("source") or st.get("_path") or "?")
+            continue
+        pools["lats"].extend(per["lats"])
+        for sec, lats in per["secs"].items():
+            pools["buckets"].setdefault(sec, []).extend(lats)
+    if not seen:
+        return None
+    pools["lats"].sort()
+    return pools
+
+
+def _scope_pct(pools, q):
+    """Exact percentile of a pooled scope, or None when unavailable."""
+    if pools is None or pools.get("missing") or not pools.get("lats"):
+        return None
+    return round(ls._exact_percentile(pools["lats"], q), 4)
+
+
+def _obj_tiers(rows, edges, offered, min_step, adaptive_step, pools=None):
     """Build the tier dict for one chart object.
 
     min_step: finest time tier to materialise (= embed tier for nodes,
-    data.js allowance for roles). adaptive_step: 自适应档的折叠步长（秒）。"""
+    data.js allowance for roles). adaptive_step: 自适应档的折叠步长（秒）。
+    pools: exact per-second raw samples of this object's scope (None keeps
+    the histogram reconstruction)."""
     tiers = {}
     for s in offered:
         if s < min_step:
             continue
-        tiers[str(s)] = _series_columns(_tier_rows(rows, s), s, edges)
+        tiers[str(s)] = _series_columns(_tier_rows(rows, s), s, edges,
+                                        pools=pools)
     if adaptive_step:
         tiers[COUNT_KEY] = _series_columns(
-            _tier_rows(rows, adaptive_step), adaptive_step, edges)
+            _tier_rows(rows, adaptive_step), adaptive_step, edges,
+            pools=pools)
     return tiers
 
 
@@ -608,7 +739,7 @@ def reduce_size(stats, meta):
             best = n
             excerpt = st["error_excerpt"]
             excerpt_status = st.get("error_excerpt_status")
-    summary = _summary_of(stats)
+    summary = _summary_of(stats, _kvtest_scope_pools(stats))
     span = 0.0
     if summary.get("ts_from") is not None and summary.get("ts_to") is not None:
         span = float(summary["ts_to"]) - float(summary["ts_from"])
@@ -629,7 +760,8 @@ def reduce_size(stats, meta):
     # 也要有这一条 —— 对象树的顶层与「总体 vs 节点 vs 客户端」对比
     # 都依赖它（否则总体曲线根本不存在）。
     all_rows = _obj_seconds(stats)
-    all_tiers = _obj_tiers(all_rows, edges, offered, fine_roles, adaptive)
+    all_tiers = _obj_tiers(all_rows, edges, offered, fine_roles, adaptive,
+                           pools=_kvtest_scope_pools(stats))
     used += _tier_rowcount(all_tiers)
     # basic 是「单场景 sweep」，顶层对象就是所有节点/实例的平均 —— 叫「总览」；
     # pipeline 保留「总体（全部）」（其对象树还有 writer/reader 角色层）。
@@ -642,7 +774,8 @@ def reduce_size(stats, meta):
         if role == "all":
             continue          # 与「总体（全部）」是同一条，不重复建
         rows = _obj_seconds(group)
-        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive)
+        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive,
+                           pools=_kvtest_scope_pools(group))
         used += _tier_rowcount(tiers)
         objects[role] = {"label": _role_label(role), "kind": "role",
                          "tiers": tiers}
@@ -656,7 +789,8 @@ def reduce_size(stats, meta):
                 by_role.setdefault(_role_of(st), []).append(st)
             for role, gg in sorted(by_role.items()):
                 rows = _obj_seconds(gg)
-                tiers = _obj_tiers(rows, edges, offered, embed, adaptive)
+                tiers = _obj_tiers(rows, edges, offered, embed, adaptive,
+                                   pools=_kvtest_scope_pools(gg))
                 used += _tier_rowcount(tiers)
                 node_bytes = sum(int((st.get("meta") or {}).get("bytes") or 0)
                                  for st in gg)
@@ -665,7 +799,8 @@ def reduce_size(stats, meta):
                     "role": role, "bytes": node_bytes, "tiers": tiers}
         else:
             rows = _obj_seconds(group)
-            tiers = _obj_tiers(rows, edges, offered, embed, adaptive)
+            tiers = _obj_tiers(rows, edges, offered, embed, adaptive,
+                               pools=_kvtest_scope_pools(group))
             used += _tier_rowcount(tiers)
             node_bytes = sum(int((st.get("meta") or {}).get("bytes") or 0)
                              for st in group)
@@ -675,7 +810,8 @@ def reduce_size(stats, meta):
     # clients: 与角色/节点同一套时间尺度 + 自适应
     for st, c in zip(stats, clients):
         rows = st.get("seconds") or []
-        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive)
+        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive,
+                           pools=_kvtest_scope_pools([st]))
         objects["client:" + c["name"]] = {
             "label": c["name"], "kind": "client", "node": c["node"],
             "role": c["role"], "p99_ms": c["p99_ms"], "tiers": tiers}
@@ -683,7 +819,8 @@ def reduce_size(stats, meta):
     role_summaries = {}
     for role, group in role_stats.items():
         if role in ("writer", "reader"):
-            role_summaries[role] = _summary_of(group)
+            role_summaries[role] = _summary_of(
+                group, _kvtest_scope_pools(group))
     tiers_meta = [{"key": str(s), "label": TIER_LABELS[s], "step": s}
                   for s in offered]
     tiers_meta.append({"key": COUNT_KEY, "label": COUNT_LABEL,
@@ -6867,18 +7004,52 @@ def _fmt_bytes(n):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Build HTML reports from logstats JSONs")
-    ap.add_argument("--stats", nargs="+", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--stats", nargs="+", required=False)
+    ap.add_argument("--out", required=False)
     ap.add_argument("--echarts", default=os.path.join(
         os.path.dirname(_HERE), "webui", "web", "vendor", "echarts.min.js"))
     ap.add_argument("--config", default="")
     ap.add_argument("--mode", default="")
     ap.add_argument("--topk", type=int, default=TOPK_DEFAULT)
+    ap.add_argument("--reduce-only", action="store_true",
+                    help="stop after reduce_scenario and write the reduced "
+                         "data JSON to --out-reduced (run this stage next "
+                         "to the map products; the renderer runs wherever "
+                         "the orchestrator lives)")
+    ap.add_argument("--out-reduced", default=None,
+                    help="--reduce-only output path (required with it)")
+    ap.add_argument("--render-only", action="store_true",
+                    help="render report.html/data.js from a reduced data "
+                         "JSON produced by --reduce-only (no stats needed)")
+    ap.add_argument("--reduced", default=None,
+                    help="reduced data JSON to render (--render-only)")
     args = ap.parse_args(argv)
+
+    if args.render_only:
+        if not args.reduced or not args.out:
+            sys.exit("[ERROR] --render-only needs --reduced and --out")
+        with open(args.reduced, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        html, datajs = render_scenario(data, args.out, args.echarts,
+                                       topk=args.topk)
+        print("[report] {} (+ {})".format(html, os.path.basename(datajs)))
+        return 0
+
+    if not args.stats or not args.out:
+        sys.exit("[ERROR] need --stats and --out (or --render-only)")
     stats = load(args.stats)
     if not stats:
         sys.exit("[ERROR] no readable stats files")
     data = reduce_scenario(stats, {"config": args.config, "mode": args.mode})
+    if args.reduce_only:
+        if not args.out_reduced:
+            sys.exit("[ERROR] --reduce-only needs --out-reduced")
+        tmp = args.out_reduced + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, args.out_reduced)
+        print("[report] reduced -> {}".format(args.out_reduced))
+        return 0
     html, datajs = render_scenario(data, args.out, args.echarts,
                                    topk=args.topk)
     print("[report] {} (+ {})".format(html, os.path.basename(datajs)))
