@@ -682,24 +682,34 @@ get 家族循环读取预填数据直至到时；put 家族与 mixed 以"完整�
 
 层级约定：**场景** = 一次 `benchmark.py` 调用（可含多套配置）；**配置** = 单个配置文件运行。
 
+每次 remove-keys 阶段都带两道闸（`global.json` → `pipeline` 块）：
+
+- `remove_skip_when_clean`（默认 `true`）：执行前先探测 master 指标，已分配空间 ≤ 1% 容差
+  （`_STORE_CLEAN_TOLERANCE`）即判定 store 已空、**直接跳过**该阶段（省去约 40s 的客户端
+  冷启动）；探测不可用（未配置/不可达）时照常执行，绝不懈怠。
+- `remove_release_timeout_s`（默认 `120`，`0` = 关闭）：remove-all 只是把删除入队，master
+  通过 oplog 异步回放，空间不会立刻归零。执行后每 2s 轮询直到 allocated ≤ 1% 容差或到时；
+  到时后仍按 `require_clean_store` 决定 WARN/FAIL（等待使严格模式不再被 oplog 延迟误伤）。
+  仅 `--scope full` 做释放等待；`key-prefix` 只做跳过预检（共享 store 等不到归零）。
+
 basic 场景：
 
 | 时机 | 动作 | 日志 |
 | --- | --- | --- |
 | 场景启动 | 无 | — |
-| 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
-| put/put_batch/mixed 每个 combo 运行前 | remove-all（`--scope full`，保证写入隔离） | `<配置名>.remove-keys.log`（覆盖） |
-| 配置结束 | 仅删除本配置写入的 key（`--scope key-prefix`） | `<配置名>.remove-keys-end.log` |
-| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留） | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
+| 配置启动 | remove-all（`--scope full`）+ 预检/释放等待 | `<配置名>.remove-keys.log` |
+| put/put_batch/mixed 每个 combo 运行前 | remove-all（`--scope full`，保证写入隔离）+ 预检/释放等待 | `<配置名>.remove-keys.log`（覆盖） |
+| 配置结束 | 仅删除本配置写入的 key（`--scope key-prefix`，仅预检） | `<配置名>.remove-keys-end.log` |
+| 场景结束 | remove-all（`--scope full`，兜底失败配置遗留）+ 预检/释放等待 | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
 
-pipeline 场景：
+pipeline / kvtest 场景：
 
 | 时机 | 动作 | 日志 |
 | --- | --- | --- |
 | 场景启动 | 无 | — |
-| 配置启动 | remove-all（`--scope full`） | `<配置名>.remove-keys.log` |
-| 配置结束 | remove-all（`--scope full`；pipeline 运行期清空了 `MC_KEY_COUNT`，key-prefix 不可用） | `<配置名>.remove-keys-end.log` |
-| 场景结束 | remove-all（`--scope full`，兜底） | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
+| 配置启动 | remove-all（`--scope full`）+ 预检/释放等待 | `<配置名>.remove-keys.log` |
+| 配置结束 | remove-all（`--scope full`；pipeline 运行期清空了 `MC_KEY_COUNT`，key-prefix 不可用）+ 预检/释放等待 | `<配置名>.remove-keys-end.log` |
+| 场景结束 | remove-all（`--scope full`，兜底）+ 预检/释放等待 | `final.remove-keys.log`（scp 回 results 的 `logs/` 目录） |
 
 场景结束的 remove-all 在**最后一个成功配置**的主节点上执行（该配置返回的 runner/日志目录可复用）；
 配置失败时其配置结束清理不会执行，因此场景结束兜底必须执行。该步骤失败仅 `[WARN]`，不影响整体结果汇总。

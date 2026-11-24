@@ -69,9 +69,9 @@ benchmark.py main()
 |---|---|
 | pod 产生 | 先建 ConfigMap（`:3087`）→ `ensure_k8s_pod`（`:1421-1491`）：`kubectl apply` pod → `wait_k8s_pod_ready` → 注册 `node{_pod,_ns,_controller,ip=podIP}`。整配置复用该 pod（`sleep infinity` + `kubectl exec`） |
 | 脚本下发 | `deploy_scripts` 对 k8s 节点只 `mkdir -p` 日志目录（脚本经 ConfigMap 只读挂载） |
-| **配置开始（前）** | `try` 内第一步：**无条件** `remove-keys --scope full`（`:3113-3117`，在 pod 内）。**注意：之后没有 `_verify_store_clean`** |
-| **每个 combo 前** | put 族或 mixed（`need_remove_before_run`，`:3119`）→ 再 `remove-keys --scope full`（`:3188-3193`）；纯 get 族不 pre-remove，但 `prepare-store` 自身会先 `store.remove_all(force=True)` 再预填（`client:442-446`） |
-| **配置结束（后）** | `remove-keys --scope key-prefix`（`remove-keys-end`，`:3273-3276`，`run_ssh` 在 pod 内）→ 只删本配置 `key_prefix+scenario+key_count` 的键；rc≠0 抛错（`utils.py:559-580`） |
+| **配置开始（前）** | `try` 内第一步：`remove-keys --scope full`（`:3113-3117`，在 pod 内），外面包预检跳过 + 执行后 oplog 释放等待（见 2.3），终态 `_verify_store_clean` |
+| **每个 combo 前** | put 族或 mixed（`need_remove_before_run`，`:3119`）→ 再 `remove-keys --scope full`（`:3188-3193`，同样带预检 + 释放等待）；纯 get 族不 pre-remove，但 `prepare-store` 自身会先 `store.remove_all(force=True)` 再预填（`client:442-446`） |
+| **配置结束（后）** | `remove-keys --scope key-prefix`（`remove-keys-end`，`:3273-3276`，`run_ssh` 在 pod 内）→ 只删本配置 `key_prefix+scenario+key_count` 的键；rc≠0 抛错（`utils.py:559-580`）。key-prefix 只做预检跳过，**不做释放等待**（共享 store 等不到归零） |
 | 失败清理 | `fail_cleanup_basic` **只拉日志，不清 store**（`:2732-2739`） |
 
 ### 2.2 pipeline（pod = per-role Deployment 的副本；pod 即进程）
@@ -79,11 +79,26 @@ benchmark.py main()
 | 阶段 | 实现 |
 |---|---|
 | pod 产生 | 先算 N=Ready 节点与 plan → 建 ConfigMap → `try` 内建 per-role Deployment 并等 rollout（`:3740`）→ 按实际 pod 列表逐 entry 物化 pod 名，**数量不足直接 FAIL**（`:3742-3765`）→ 注册 node（pod IP） |
-| **每个 data_size 前** | `generate-data`（每 pod 一次，缓存）→ **`remove-keys --scope full`**（primary writer pod，`:3876-3881`）→ `_verify_store_clean("{ds} start")`（`:3882`）→ 清 etcd 前缀 → 启动 reader/writer |
-| **配置结束（后）** | `remove-keys --scope full`（`remove-keys-end`，`:4314-4318`）→ `_verify_store_clean("config end")` → 按需拉原始日志 |
-| 失败清理 | `fail_cleanup_pipeline` 第 4 步：客户端全死后**额外发一次 full remove**（primary pod，best-effort，WARN）→ `_verify_store_clean("fail cleanup")` → 拉日志（`:2702-2717`） |
+| **每个 data_size 前** | `generate-data`（每 pod 一次，缓存）→ **`remove-keys --scope full`**（primary writer pod，`:3876-3881`，带预检跳过 + 释放等待）→ `_verify_store_clean("{ds} start")`（`:3882`）→ 清 etcd 前缀 → 启动 reader/writer |
+| **配置结束（后）** | `remove-keys --scope full`（`remove-keys-end`，`:4314-4318`，带预检 + 释放等待）→ `_verify_store_clean("config end")` → 按需拉原始日志 |
+| 失败清理 | `fail_cleanup_pipeline` 第 4 步：客户端全死后**额外发一次 full remove**（primary pod，best-effort，WARN；带预检 + 释放等待）→ `_verify_store_clean("fail cleanup")` → 拉日志（`:2702-2717`） |
 
-### 2.3 客户端语义（所有 remove 的最终执行体）
+### 2.3 编排级闸门（预检跳过 + oplog 释放等待）
+
+每次 remove-keys 阶段（full 与 key-prefix）都由 `benchmark.py` 的两道闸包裹：
+
+- **预检跳过** `_remove_keys_precheck()`（`benchmark.py`）：执行前探测 master Prometheus
+  指标（`_store_usage_snapshot`），`allocated/total <= _STORE_CLEAN_TOLERANCE (1%)` 即判定
+  store 已空 → 跳过整段（省去约 40s 客户端冷启动），并保留 `state_remove_cfg` 台账副作用。
+  开关 `pipeline.remove_skip_when_clean`（默认 `true`）。**探测不可用（None）或探测脏 → 照常执行**，
+  绝不以不可观测为由跳过真实清理。
+- **oplog 释放等待** `_wait_store_released()`：`remove_all` 仅入队，master 经 oplog 异步回放，
+  `segment_allocated_bytes` 滞后。执行后每 2s 轮询（循环内 `_check_stop()` 可打断），直到
+  ≤1% 容差或 `pipeline.remove_release_timeout_s`（默认 `120`，`0` 关闭）到时；终态仍由
+  `_verify_store_clean` 按 `require_clean_store` 决定 WARN/FAIL。**仅 `--scope full` 做释放等待**：
+  key-prefix 在共享 store 上等不到归零，只做预检。
+
+### 2.4 客户端语义（所有 remove 的最终执行体）
 
 `scripts/mooncake_benchmark_client.py`：
 
@@ -113,10 +128,10 @@ benchmark.py main()
 | 1 | **运行开始时没有 run 级 remove-all** | 上次崩溃残留只能等下一个配置开始或下次成功 run 的 sweep | k8s 下 run 开始时**没有 pod**，需"一次性清理 pod"或并入 CLEAN-UP 流程，需先定方向 |
 | 2 | **全部配置失败 → 跳过 sweep** | store 残留 + namespace/pod 保留（后两者是刻意的现场保留） | 可考虑失败时也做一次 best-effort run 级 sweep |
 | 3 | **basic 失败清理不清 store**（pipeline 有） | 失败后残留到下一个配置开始 | 建议与 pipeline 对齐 |
-| 4 | **basic 配置开始 remove 后无 `_verify_store_clean`**（pipeline 每 ds 都有） | 清空失败不易被发现 | 建议补 verify（默认 WARN） |
+| 4 | ~~**basic 配置开始 remove 后无 `_verify_store_clean`**~~ **已修** | 清空失败不易被发现 | 现在 basic pre-run/combo 也走 `_wait_store_released`（内含 verify，默认 WARN） |
 | 5 | **配置结束清理失败会把"数据已完整"的配置标 FAILED** | 语义上是"清理失败=场景失败" | 需确认是否接受；pipeline 失败清理还会再试一次 |
-| 6 | **`--scope full` = 全局 `remove_all(force=True)`**（prepare-store 也如此） | store 必须**专用**；共享 master 时会误删非 benchmark 数据 | 并发守卫只防同 master 的实例并发，防不了"其他业务也在用" |
-| 7 | **remove 阶段无超时**（仅 STOP 可打断） | 大 store 的 remove_all 可能长时间阻塞 | `controller_stream` 只在 stop_requested 时终止 |
+| 6 | **`--scope full` = 全局 `remove_all(force=True)`**（prepare-store 也如此） | store 必须**专用**；共享 master 时会误删非 benchmark 数据 | 并发守卫只防同 master 的实例并发，防不了"其他业务也在用"；预检跳过也依赖该前提（1% 容差内可能藏有非本 run 残留） |
+| 7 | **remove 阶段无超时**（仅 STOP 可打断） | 大 store 的 remove_all 可能长时间阻塞 | `controller_stream` 只在 stop_requested 时终止；新增的释放等待有 `remove_release_timeout_s` 上限，但 remove 调用本身仍无超时 |
 | 8 | Deployment 异常重建后，sweep 仍指向原 primary pod 名 | sweep 的 exec 可能失败 → 仅 WARN | 可接受，但需知晓 |
 | 9 | 只删最后一个配置的 pod/ConfigMap，早前配置的残留 | 由最终的 namespace 删除兜底 | 失败保留 namespace 时全部保留（设计） |
 
@@ -129,6 +144,8 @@ benchmark.py main()
 3. **调用证据**：日志中的 `[k8s] $ kubectl -n <ns> exec <pod> -- bash -c …` 行（verbose 下更完整）。
 4. **失败路径**：`[FAIL] fail-cleanup: store remove-all issued`、`[WARN] sweep-end remove-keys failed`、`[verify] … store not fully empty`（依据 `require_clean_store` 决定是否硬失败）。
 5. **clean 校验**：`_verify_store_clean` 的 `when` 取值应依次出现：`<ds> start` / `config end`（pipeline）、`fail cleanup`（pipeline 失败）、`sweep end`（run 结束）。
+6. **预检跳过**：store 已空时日志出现 `[remove-keys] <when>: store already clean (…)；skipping remove-keys`，且不再出现该阶段的 `remove-keys ... running/done`。
+7. **释放等待**：store 非空时日志出现 `[remove-keys] <when>: waiting for oplog release (timeout 120s): …`，随后 `released after Ns` 或超时后的 `[verify] …` 终态行。
 
 ---
 
@@ -139,6 +156,6 @@ benchmark.py main()
    - (b) 不做自动 run-start remove，把"清残留"并入 CLEAN-UP（显式、带确认）。
 2. 失败时也做 best-effort run 级 sweep（不依赖"有配置成功"）。
 3. basic 失败清理补 store remove（与 pipeline 对齐）。
-4. basic 配置开始 remove 后补 `_verify_store_clean`。
-5. 为 remove 阶段加超时（例如 60s，超时 WARN 并按失败处理/保留现场）。
+4. ~~basic 配置开始 remove 后补 `_verify_store_clean`~~ 已随 `_wait_store_released` 实施。
+5. 为 remove 调用本身加超时（例如 60s，超时 WARN 并按失败处理/保留现场）；释放等待已有 `remove_release_timeout_s`。
 6. 明确文档：`--scope full` 为全局清空，store 必须专用。

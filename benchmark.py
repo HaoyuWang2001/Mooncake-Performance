@@ -811,6 +811,109 @@ def _verify_store_clean(cluster, globals_cfg, cfg_name, when):
     return snap
 
 
+def _remove_skip_when_clean(globals_cfg):
+    return bool((globals_cfg.get("pipeline") or {}).get(
+        "remove_skip_when_clean", True))
+
+
+def _remove_release_timeout_s(globals_cfg):
+    """pipeline.remove_release_timeout_s: seconds to wait for the master
+    oplog to drain a remove-all. 0 disables the wait (legacy behaviour)."""
+    raw = (globals_cfg.get("pipeline") or {}).get(
+        "remove_release_timeout_s", 120)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 120
+    return max(0, value)
+
+
+_REMOVE_RELEASE_POLL_S = 2.0
+_REMOVE_RELEASE_LOG_EVERY_S = 10.0
+
+
+def _store_snapshot_is_clean(snap):
+    """Same acceptance criterion as _verify_store_clean: allocated within
+    _STORE_CLEAN_TOLERANCE of total. An unavailable snapshot (None) is never
+    clean, so probing failures always fall back to running the stage. When
+    the master reports no capacity at all, fall back to an absolute-zero
+    check so a missing total can never be read as "clean"."""
+    if not snap:
+        return False
+    if (snap.get("total") or 0) <= 0:
+        return (snap.get("allocated") or 0) <= 0
+    return snap["pct"] <= _STORE_CLEAN_TOLERANCE
+
+
+def _fmt_store_snapshot(snap):
+    nonzero = sum(1 for a in snap["seg_alloc"] if a > 0)
+    return ("allocated={} / total={} ({:.1f}%), nonzero segments={}/{}"
+            .format(_fmt_gib(snap["allocated"]), _fmt_gib(snap["total"]),
+                    snap["pct"] * 100.0, nonzero, len(snap["seg_alloc"])))
+
+
+def _remove_keys_precheck(cluster, globals_cfg, cfg_name, when):
+    """Skip a remove-keys stage outright when the store is already clean.
+
+    One master-metrics probe (~1-2s) replaces a full client cold start
+    (~40s with ub). Fail-safe: an unavailable probe or a disabled knob
+    returns False (run the stage), so a degraded metrics path never
+    silently skips a real cleanup. On skip the config's ledger rows are
+    dropped as run_stage would have done."""
+    if not _remove_skip_when_clean(globals_cfg):
+        return False
+    snap = _store_usage_snapshot(cluster, globals_cfg)
+    if snap is None:
+        log_detail("[remove-keys] {}: pre-check skipped (master metrics "
+                   "unavailable)".format(when))
+        return False
+    if not _store_snapshot_is_clean(snap):
+        return False
+    log("[remove-keys] {}: store already clean ({}); skipping remove-keys"
+        .format(when, _fmt_store_snapshot(snap)))
+    if cfg_name:
+        state_remove_cfg(cfg_name)
+    return True
+
+
+def _wait_store_released(cluster, globals_cfg, cfg_name, when):
+    """Wait for the master oplog to apply a remove-all, then verify.
+
+    remove_all only enqueues the deletion; segment_allocated_bytes drains
+    afterwards, so an immediate post-remove verify could false-WARN (or
+    false-FAIL under require_clean_store). Poll until the store reads clean,
+    bounded by pipeline.remove_release_timeout_s. A disabled wait, an
+    unavailable probe or an already-clean store degrades to the legacy
+    single-shot verify."""
+    timeout_s = _remove_release_timeout_s(globals_cfg)
+    if timeout_s <= 0:
+        return _verify_store_clean(cluster, globals_cfg, cfg_name, when)
+    snap = _store_usage_snapshot(cluster, globals_cfg)
+    if snap is None or _store_snapshot_is_clean(snap):
+        return _verify_store_clean(cluster, globals_cfg, cfg_name, when)
+    t0 = time.time()
+    log("[remove-keys] {}: waiting for oplog release (timeout {}s): {}"
+        .format(when, timeout_s, _fmt_store_snapshot(snap)))
+    last_log = t0
+    while time.time() - t0 < timeout_s:
+        _check_stop()
+        time.sleep(min(_REMOVE_RELEASE_POLL_S,
+                       max(0.0, timeout_s - (time.time() - t0))))
+        snap = _store_usage_snapshot(cluster, globals_cfg)
+        if snap is None or _store_snapshot_is_clean(snap):
+            break
+        now = time.time()
+        if now - last_log >= _REMOVE_RELEASE_LOG_EVERY_S:
+            log("[remove-keys] {}: still releasing ({:.0f}s/{:.0f}s): {}"
+                .format(when, now - t0, timeout_s,
+                        _fmt_store_snapshot(snap)))
+            last_log = now
+    if snap is not None and _store_snapshot_is_clean(snap):
+        log("[remove-keys] {}: released after {:.1f}s"
+            .format(when, time.time() - t0))
+    return _verify_store_clean(cluster, globals_cfg, cfg_name, when)
+
+
 def _basic_store_check(globals_cfg, cfg):
     """basic mode: total key space (key_count x data_size, shared across
     clients) must be strictly smaller than store_total_size when that is
@@ -4191,11 +4294,17 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                               node_name=primary_node_name)
                 current_ds = ds
             if need_remove_before_run:
-                run_stage(host, node, remote_runner,
-                          "remove-keys", remote_log_dir, cfg_name,
-                          extra="--scope full", dry_run=dry,
-                          pull_to=local_log_dir,
-                          node_name=primary_node_name)
+                stage = "remove-keys (run {}, {})".format(c, ds)
+                if dry or not _remove_keys_precheck(
+                        cluster, globals_cfg, cfg_name, stage):
+                    run_stage(host, node, remote_runner,
+                              "remove-keys", remote_log_dir, cfg_name,
+                              extra="--scope full", dry_run=dry,
+                              pull_to=local_log_dir,
+                              node_name=primary_node_name)
+                    if not dry:
+                        _wait_store_released(cluster, globals_cfg, cfg_name,
+                                             stage)
             # data_size is always part of the run file name, so different
             # sizes under the same (c, t) never collide
             name = "benchmark_c{}_t{}_{}".format(c, t, ds)
@@ -4279,10 +4388,13 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # sweep is deferred to the sweep-end remove-all in main(). The log
         # name is distinct (<cfg>.remove-keys-end.log) so it sits next to the
         # config-start remove-keys log instead of overwriting it.
-        remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
-                                         "remove-keys-end", node)
-        command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
-        run_ssh(host, node, command, dry_run=dry)
+        stage = "remove-keys (config end)"
+        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
+                                            "config end"):
+            remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
+                                             "remove-keys-end", node)
+            command = "bash {} remove-keys {} --scope key-prefix".format(remote_runner, remove_log)
+            run_ssh(host, node, command, dry_run=dry)
         # raw-log full pull only on explicit request (stats already pulled
         # per run combo; failure paths pull raw for diagnosis separately)
         if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
@@ -5036,13 +5148,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             # env default (1000) must never decide the write space
             kc = _caps[ds]
             kc_arg = " --key-count {}".format(kc)
-            run_stage(host, node, remote_runner,
-                      "remove-keys", remote_log_dir, cfg_name,
-                      extra="--scope full", dry_run=dry, pull_to=local_log_dir,
-                      node_name=primary_node_name)
-            if not dry:
-                _verify_store_clean(cluster, globals_cfg, cfg_name,
-                                    "{} start".format(ds))
+            stage = "remove-keys (pre-run, {})".format(ds)
+            if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
+                                                stage):
+                run_stage(host, node, remote_runner,
+                          "remove-keys", remote_log_dir, cfg_name,
+                          extra="--scope full", dry_run=dry,
+                          pull_to=local_log_dir,
+                          node_name=primary_node_name)
+                if not dry:
+                    _wait_store_released(cluster, globals_cfg, cfg_name,
+                                         "{} start".format(ds))
             # fresh rendezvous state per size iteration (stale registrations
             # from a previous size must never leak into this one)
             reader_pids = []
@@ -5481,12 +5597,16 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # no key count to work with; a full sweep here is short and precise
         # enough. The log name is distinct (<cfg>.remove-keys-end.log) so it
         # sits next to the config-start remove-keys log.
-        remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
-                                         "remove-keys-end", node)
-        command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
-        run_ssh(host, node, command, dry_run=dry)
-        if not dry:
-            _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
+        stage = "remove-keys (config end)"
+        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
+                                            "config end"):
+            remove_log = remote_log_path_pod(remote_log_dir, cfg_name,
+                                             "remove-keys-end", node)
+            command = "bash {} remove-keys {} --scope full".format(remote_runner, remove_log)
+            run_ssh(host, node, command, dry_run=dry)
+            if not dry:
+                _wait_store_released(cluster, globals_cfg, cfg_name,
+                                     "config end")
         # raw-log full pull only on explicit request (per-role stats were
         # pulled right after each role exited; failure paths pull raw)
         if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
@@ -6813,13 +6933,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         for ds in sizes:
             # fresh store per size: full remove-all (kvtest keys use the
             # hardcoded mooncake_kvtest_ prefix, but scope=full clears them)
-            run_stage(host, node, remote_runner_pipeline,
-                      "remove-keys", remote_log_dir, cfg_name,
-                      extra="--scope full", dry_run=dry, pull_to=local_log_dir,
-                      node_name=primary_node_name)
-            if not dry:
-                _verify_store_clean(cluster, globals_cfg, cfg_name,
-                                    "{} start".format(ds))
+            stage = "remove-keys (pre-run, {})".format(ds)
+            if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
+                                                stage):
+                run_stage(host, node, remote_runner_pipeline,
+                          "remove-keys", remote_log_dir, cfg_name,
+                          extra="--scope full", dry_run=dry,
+                          pull_to=local_log_dir,
+                          node_name=primary_node_name)
+                if not dry:
+                    _wait_store_released(cluster, globals_cfg, cfg_name,
+                                         "{} start".format(ds))
             current_ds = ds
             instance_pids = []
             key_pool = pools[ds]
@@ -7064,13 +7188,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         ssh_check_output(n["ip"], n, cleanup_cmd, dry_run=dry)
         # Config end: remove-all — clears everything this config's writers
         # wrote (kvtest keys share the store with nothing else here)
-        remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
-        command = "bash {} remove-keys {} --scope full".format(
-            remote_runner_pipeline, remove_log)
-        run_ssh(host, node, command, dry_run=dry)
-        pull_stage_logs(host, node, [remove_log], local_log_dir, dry)
-        if not dry:
-            _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
+        stage = "remove-keys (config end)"
+        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
+                                            "config end"):
+            remove_log = remote_log_path(remote_log_dir, cfg_name, "remove-keys-end")
+            command = "bash {} remove-keys {} --scope full".format(
+                remote_runner_pipeline, remove_log)
+            run_ssh(host, node, command, dry_run=dry)
+            pull_stage_logs(host, node, [remove_log], local_log_dir, dry)
+            if not dry:
+                _wait_store_released(cluster, globals_cfg, cfg_name,
+                                     "config end")
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
@@ -9168,18 +9296,23 @@ def main(args, cfg_paths):
     if sweep_remove:
         try:
             nd = get_node(cluster, sweep_remove["node"])
-            run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
-                      sweep_remove["remote_log_dir"], "final",
-                      extra="--scope full", dry_run=False,
-                      cfg_name="final", node_name=sweep_remove["node"])
-            scp_pull(sweep_remove["host"], nd,
-                     "{}*".format(_pod_base("{}/final".format(
-                         sweep_remove["remote_log_dir"]), nd)
-                         + ".remove-keys.log"),
-                     os.path.join(ts_dir, "logs"), dry_run=False)
-            _verify_store_clean(cluster, globals_cfg, "final", "sweep end")
-            log("sweep-end remove-keys -> {}".format(
-                os.path.join(ts_dir, "logs", "final.remove-keys.log")))
+            if _remove_keys_precheck(cluster, globals_cfg, "final",
+                                     "sweep end"):
+                log("sweep-end remove-keys skipped (store already clean)")
+            else:
+                run_stage(sweep_remove["host"], nd, sweep_remove["runner"], "remove-keys",
+                          sweep_remove["remote_log_dir"], "final",
+                          extra="--scope full", dry_run=False,
+                          cfg_name="final", node_name=sweep_remove["node"])
+                scp_pull(sweep_remove["host"], nd,
+                         "{}*".format(_pod_base("{}/final".format(
+                             sweep_remove["remote_log_dir"]), nd)
+                             + ".remove-keys.log"),
+                         os.path.join(ts_dir, "logs"), dry_run=False)
+                _wait_store_released(cluster, globals_cfg, "final",
+                                     "sweep end")
+                log("sweep-end remove-keys -> {}".format(
+                    os.path.join(ts_dir, "logs", "final.remove-keys.log")))
         except Exception as exc:
             log("[WARN] sweep-end remove-keys failed: {}".format(exc))
         finally:
