@@ -294,6 +294,15 @@ html, body, #app {
 }
 .logview.log-fixed { height: 480px; min-height: 480px; }
 .logview.log-nowrap { white-space: pre; word-break: normal; }
+/* 不换行日志：每行按内容宽度撑开，保证横向滚动可靠。
+   （行上启用了 content-visibility: auto 做纵向虚拟化；在 nowrap 模式下它会让
+   未渲染行不参与宽度计算，滚动宽被容器宽度限制 → 无法左右滚。这里恢复可见
+   让行内容真实参与 scrollWidth，min-width:100% 保证短行铺满。） */
+.logview.log-nowrap > div {
+  width: max-content;
+  min-width: 100%;
+  content-visibility: visible;
+}
 .logview .ln-mark {
   background: var(--mc-term-hit-bg); color: var(--mc-term-hit-fg);
   border-radius: 2px;
@@ -689,7 +698,7 @@ html, body, #app {
   font-size: 12px; font-weight: 600;
   color: var(--el-text-color-secondary); margin-bottom: var(--mc-space-1);
 }
-.ilog-view { height: 300px; min-height: 220px; overflow-x: auto; min-width: 0; }
+.ilog-view { height: 300px; min-height: 220px; overflow: auto; min-width: 0; }
 .ilog-progress { font-size: 12px; }
 .ilog-conn { margin-left: var(--mc-space-1); }
 /* 日志全屏弹窗（SD 日志终端形态：操作行 + 搜索行 + 铺满剩余高度的终端区）。

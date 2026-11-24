@@ -228,7 +228,10 @@ def test_log_surfaces_scroll_horizontally():
     m = re.search(r"\.pane-body \{[^}]*\}", css)
     assert m and "overflow: auto;" in m.group(0), \
         "results pane-body must scroll both axes"
-    assert ".ilog-view { height: 300px; min-height: 220px; overflow-x: auto;" in css
+    assert ".ilog-view { height: 300px; min-height: 220px; overflow: auto;" in css
+    # 不换行日志：行按内容宽度撑开（content-visibility 关闭），横向滚动可靠
+    assert ".logview.log-nowrap > div" in css
+    assert "width: max-content" in css
     # JSON 不再自建滚动容器（横向滚动条始终在 pane-body 边缘可达）
     m = re.search(r"\.pane-body \.json \{[^}]*\}", css)
     assert m and "overflow: auto" not in m.group(0)
