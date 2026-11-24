@@ -36,7 +36,8 @@ import urllib.parse
 
 from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    clear_stop, controller_desc, controller_diagnose,
-                   controller_exec, controller_mkdir, controller_put,
+                   controller_exec, controller_get_file, controller_mkdir,
+                   controller_put,
                    controller_remove,
                    controller_run, controller_stream, ensure_utf8_stdio,
                    get_node, is_k8s_node,

@@ -333,12 +333,18 @@ def stop_and_collect(cluster, session, local_prof_dir):
                         _run(ip, n, "{} show > {}".format(_bin(tcfg), out_file))
                         collected.append("spdiag.show.txt")
                     elif tool in MONITOR_ARTIFACTS:
-                        # sampler loops append line-buffered CSV rows; a plain
-                        # kill is enough (no flush/stabilize wait needed)
+                        # sampler loops append line-buffered CSV rows; kill it
+                        # and WAIT for the size to stabilize — a live append
+                        # during the copy would otherwise trip scp_pull's
+                        # post-copy size verification ("remote > local") and
+                        # the artifact would be dropped as partial.
                         sudo = "sudo -n " if tcfg.get("sudo") else ""
                         if pid:
                             _run(ip, n, "{}kill -INT {} 2>/dev/null || true".format(
                                 sudo, pid))
+                        for fname in MONITOR_ARTIFACTS[tool]:
+                            _wait_artifact_stable(
+                                ip, n, "{}/{}".format(remote_out, fname), sudo)
                         collected.extend(MONITOR_ARTIFACTS[tool])
                     elif pid:
                         fname = "perf.data" if tool == "perf" else "{}.out".format(tool)
