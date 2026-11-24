@@ -43,7 +43,7 @@ def test_stop_reports_partial(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "_REPORT_ACC", [])
     monkeypatch.setattr(bm, "_STOP_CTX", {
         "cluster": {"nodes": []}, "args": SimpleNamespace(
-            no_plot=False, dry_run=False, mode="ssh"),
+            dry_run=False, mode="ssh"),
         "report": _ctx(tmp_path, ts, logdir)})
     bm._stop_reports()
     assert pulled, "stop 前必须先把远端日志拉回来"
@@ -59,7 +59,7 @@ def test_stop_reports_can_be_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "_REPORT_ACC", [])
     monkeypatch.setattr(bm, "_STOP_CTX", {
         "cluster": {"nodes": []}, "args": SimpleNamespace(
-            no_plot=False, dry_run=False, mode="ssh"),
+            dry_run=False, mode="ssh"),
         "report": _ctx(tmp_path, ts, logdir)})
     monkeypatch.setenv("MC_STOP_REPORT", "0")
     bm._stop_reports()

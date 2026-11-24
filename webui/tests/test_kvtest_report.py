@@ -116,7 +116,8 @@ def _clean_report_acc():
 
 
 def _args():
-    return SimpleNamespace(no_plot=False, dry_run=False, png=False,
+    return SimpleNamespace(dry_run=False, png=False, pull_raw_logs=False,
+                           keep_intermediates=False,
                            cluster="mock/cluster.json",
                            global_cfg="configs/_ssh/global.json",
                            profile="configs/_ssh/profile.json", mode="ssh")
@@ -367,6 +368,48 @@ def test_kvtest_rebuild_from_samples_only(tmp_path, monkeypatch):
     assert any(p[0] == "客户端总数" for p in params)
 
 
+def test_verify_reports_requires_data_js_and_complete_html(tmp_path):
+    logs = tmp_path / "logs" / "kvtest_verify"
+    logs.mkdir(parents=True)
+    _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0],
+                    cfg_name="kvtest_verify")
+    cfg = _cfg()
+    cfg["__cfg_path__"] = str(tmp_path / "kvtest_verify.json")
+    bm._kvtest_generate_reports(cfg, str(logs), _args())
+    ok, _ = bm._verify_config_reports(str(logs))
+    assert ok
+    unit = logs / "report" / "8MB"
+    (unit / "data.js").unlink()
+    ok, detail = bm._verify_config_reports(str(logs))
+    assert not ok and "data.js" in detail
+    (unit / "data.js").write_text("x", encoding="utf-8")
+    html = unit / "report.html"
+    text = html.read_text(encoding="utf-8")
+    html.write_text(text.rsplit("</html>", 1)[0], encoding="utf-8")
+    ok, detail = bm._verify_config_reports(str(logs))
+    assert not ok and "truncated" in detail
+    html.write_text(text, encoding="utf-8")
+    extra = logs / "report" / "16MB"
+    extra.mkdir()
+    (extra / "report.html").write_text("<html></html>", encoding="utf-8")
+    (extra / "data.js").write_text("x", encoding="utf-8")
+    ok, detail = bm._verify_config_reports(str(logs))
+    assert not ok and "mismatch" in detail
+
+
+def test_rebuild_reports_explains_cleaned_intermediates(tmp_path, monkeypatch):
+    logs = tmp_path / "run1" / "logs" / "kvtest_cleaned"
+    unit = logs / "report" / "8MB"
+    unit.mkdir(parents=True)
+    (unit / "report.html").write_text("<html></html>", encoding="utf-8")
+    (unit / "data.js").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(bm, "RESULTS_DIR", str(tmp_path))
+    msgs = []
+    monkeypatch.setattr(bm, "log", lambda m: msgs.append(str(m)))
+    assert bm.rebuild_reports("run1") == 1
+    assert any("中间产物已按成功清理" in m for m in msgs), msgs
+
+
 def test_kvtest_report_meta_roundtrip(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
@@ -480,8 +523,9 @@ def test_kvtest_report_js_does_not_crash(tmp_path):
     assert "队列等待均" in cards
 
 
-def test_kvtest_cleanup_keeps_stats_and_report(tmp_path):
-    """Success cleanup removes raw kvtest inputs but keeps map products."""
+def test_kvtest_cleanup_removes_all_intermediates(tmp_path):
+    """Verified report -> every intermediate (samples/summary/stats) goes;
+    report/ and profiling/ stay."""
     logs = tmp_path / "logs" / "kvtest_clean"
     logs.mkdir(parents=True)
     base = _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0],
@@ -489,12 +533,18 @@ def test_kvtest_cleanup_keeps_stats_and_report(tmp_path):
     cfg = _cfg()
     cfg["__cfg_path__"] = str(tmp_path / "kvtest_clean.json")
     bm._kvtest_generate_reports(cfg, str(logs), _args())
-    removed = bm._cleanup_kvtest_success_intermediates(str(logs))
-    assert removed == 2                       # summary + samples
+    (logs / "profiling").mkdir()
+    (logs / "profiling" / "mem.host.csv").write_text("x\n")
+    ok, detail = bm._verify_config_reports(str(logs))
+    assert ok, detail
+    removed = bm._cleanup_config_intermediates(str(logs))
+    assert removed >= 3                       # samples + summary + stats
     assert not (logs / (base + ".samples.csv")).exists()
     assert not (logs / (base + ".summary.json")).exists()
-    assert list(logs.glob("*.stats.json"))
+    assert not list(logs.glob("*.stats.json"))
     assert (logs / "report" / "8MB" / "report.html").is_file()
+    assert (logs / "report" / "8MB" / "data.js").is_file()
+    assert (logs / "profiling" / "mem.host.csv").is_file()
 
 
 def test_kvtest_report_disabled_with_no_report(tmp_path):
@@ -511,8 +561,8 @@ def test_kvtest_report_disabled_with_no_report(tmp_path):
     assert not list(logs.glob("*.stats.json"))
 
 
-def test_kvtest_report_survives_no_plot(tmp_path):
-    """--no-plot only drops PNG drawing; the HTML report is unaffected."""
+def test_kvtest_report_independent_of_plot_switch(tmp_path):
+    """The plot switch (--png) never gates the HTML report."""
     logs = tmp_path / "logs" / "kvtest_noplot"
     logs.mkdir(parents=True)
     _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0],
@@ -520,7 +570,8 @@ def test_kvtest_report_survives_no_plot(tmp_path):
     cfg = _cfg()
     cfg["__cfg_path__"] = str(tmp_path / "kvtest_noplot.json")
     args = _args()
-    args.no_plot = True
+    args.png = True
+    args.pull_raw_logs = True
     written = bm._kvtest_generate_reports(cfg, str(logs), args)
     assert written and (logs / "report" / "8MB" / "report.html").is_file()
     assert list(logs.glob("*.stats.json"))
@@ -564,16 +615,17 @@ def test_kvtest_full_lifecycle_matches_documented_artifacts(tmp_path):
     assert written and len(written) == 1
     # 4) run overview
     assert bm._render_run_overview(str(root), "ssh")
-    # 5) success cleanup (plot succeeded in the real flow)
-    removed = bm._cleanup_kvtest_success_intermediates(str(logs))
-    assert removed == 4                      # 2 instances x (summary+samples)
+    # 5) success cleanup: verified reports -> all intermediates removed
+    ok, detail = bm._verify_config_reports(str(logs))
+    assert ok, detail
+    bm._cleanup_config_intermediates(str(logs))
     assert not list(logs.glob("*.samples.csv"))
     assert not list(logs.glob("*.summary.json"))
-    assert len(list(logs.glob("*.stats.json"))) == 4   # 2 roles x 2 instances
+    assert not list(logs.glob("*.stats.json"))
     assert (logs / "report" / "8MB" / "report.html").is_file()
     assert (logs / "report" / "8MB" / "data.js").is_file()
     assert (root / "report" / "overview.html").is_file()
-    assert (logs / bm.KVTEST_REPORT_META).is_file()
+    assert not (logs / bm.KVTEST_REPORT_META).exists()
 
 
 def test_kvtest_partial_report_on_stop(tmp_path, monkeypatch):

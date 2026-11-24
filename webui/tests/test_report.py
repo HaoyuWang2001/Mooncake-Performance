@@ -1561,7 +1561,7 @@ def test_generate_reports_unit_split_basic(tmp_path):
     for c, t, sz in ((1, 1, "8MB"), (2, 4, "8MB"), (1, 1, "1MB")):
         (logs / "cfg.benchmark_c{}_t{}_{}.log".format(c, t, sz)).write_text(
             rows, encoding="utf-8")
-    args = SimpleNamespace(no_plot=False, dry_run=False, cluster="cluster.json",
+    args = SimpleNamespace(dry_run=False, cluster="cluster.json",
                            global_cfg="global.json", profile="profile.json")
     written = bm._generate_reports(
         {"__cfg_path__": "cfg.json", "scenario": "basic"}, str(logs), args,
@@ -2562,7 +2562,6 @@ def test_report_started_time_uses_data_timestamp(tmp_path):
         cluster = ""
         global_cfg = ""
         profile = ""
-        no_plot = False
         dry_run = False
 
     written = bm._generate_report_units({}, str(logs), A(), mode="pipeline")

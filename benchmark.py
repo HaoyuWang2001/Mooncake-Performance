@@ -6059,47 +6059,125 @@ def _kvtest_trace_bytes(local_log_dir, base):
         return 0
 
 
-def _cleanup_kvtest_success_intermediates(log_dir):
-    """Remove raw kvtest inputs after aggregation, reporting and plotting.
+KEEP_INTERMEDIATE_DIRS = ("report", "profiling")
 
-    kvtest needs summary.json/samples.csv for the CSV aggregation, the
-    map-reduce HTML report and the request-level plots, but they are not final
-    user-facing artifacts: the map products (*.stats.json) and report/ tree
-    are kept. Failed runs intentionally retain these inputs (rebuild)."""
-    patterns = ("*.kvtest_*.summary.json", "*.kvtest_*.samples.csv",
-                "*.kvtest_*.timeseries.csv")
-    removed = 0
-    for pattern in patterns:
-        for path in glob.glob(os.path.join(log_dir, "**", pattern),
-                              recursive=True):
+
+def _verify_config_reports(log_dir):
+    """True only when every expected unit rendered a self-contained
+    report.html + data.js (and no unit is missing). Report generation is
+    WARN-only, so a failed write must be detected explicitly before any
+    intermediate artifact is deleted. Returns (ok, detail)."""
+    stats = _collect_local_stats(log_dir)
+    if not stats:
+        return False, "no local stats"
+    meta = {}
+    try:
+        with open(os.path.join(log_dir, "report", "meta.json"),
+                  "r", encoding="utf-8") as f:
+            meta = json.load(f) or {}
+    except (OSError, ValueError):
+        meta = {}
+    engine = meta.get("engine") or (
+        "kvtest" if meta.get("mode") == "kvtest" else "python")
+    scenario = _report_scenario(
+        {"report_scenario": meta.get("scenario"),
+         "scenario": meta.get("mode")}, None, engine)
+    units = _unit_groups(stats, scenario)
+    if not units:
+        return False, "no report unit"
+    rep = os.path.join(log_dir, "report")
+    if not os.path.isdir(rep):
+        return False, "no report dir"
+    for u in units.values():
+        d = os.path.join(rep, u["name"])
+        html = os.path.join(d, "report.html")
+        data_js = os.path.join(d, "data.js")
+        for path in (html, data_js):
             try:
+                if os.path.getsize(path) <= 0:
+                    return False, "empty " + os.path.basename(path)
+            except OSError:
+                return False, "missing " + os.path.basename(path)
+        try:
+            with open(html, "rb") as f:
+                f.seek(max(0, os.path.getsize(html) - 2048))
+                tail = f.read()
+        except OSError:
+            return False, "unreadable report.html"
+        if b"</html>" not in tail:
+            return False, "truncated report.html"
+    dirs = [x for x in os.listdir(rep)
+            if os.path.isdir(os.path.join(rep, x))]
+    if len(dirs) != len(units):
+        return False, "unit count mismatch ({} != {})".format(
+            len(dirs), len(units))
+    return True, "{} unit(s)".format(len(units))
+
+
+def _cleanup_config_intermediates(log_dir):
+    """Remove every intermediate artifact under logs/<cfg>/ once its reports
+    are verified. report/ (the final artifact) and profiling/ (monitor CSVs,
+    deliberately retained) always stay; run-level CSVs live outside this
+    directory and are never touched."""
+    removed = 0
+    for entry in sorted(os.listdir(log_dir)):
+        if entry in KEEP_INTERMEDIATE_DIRS:
+            continue
+        path = os.path.join(log_dir, entry)
+        try:
+            if os.path.isdir(path):
+                removed += sum(len(files) for _r, _d, files in os.walk(path))
+                shutil.rmtree(path)
+            else:
                 os.remove(path)
                 removed += 1
-            except OSError as exc:
-                log("[WARN] cannot remove kvtest intermediate {}: {}".format(
-                    path, exc))
+        except OSError as exc:
+            log("[WARN] cannot remove intermediate {}: {}".format(path, exc))
     return removed
 
 
-def _maybe_cleanup_kvtest_intermediates(log_dir, failed_scenarios,
-                                        plot_succeeded):
-    """kvtest summary.json/samples.csv are the ONLY inputs of --rebuild-report
-    (the map stage): keep them by default so a report that was missed or
-    failed can always be rebuilt without re-running the benchmark. Cleanup is
-    opt-in (MC_KVTEST_CLEAN_INTERMEDIATES=1) and still requires a fully
-    successful run + plots."""
-    if os.environ.get("MC_KVTEST_CLEAN_INTERMEDIATES", "0") != "1":
-        if glob.glob(os.path.join(log_dir, "**", "*.kvtest_*.samples.csv"),
-                     recursive=True):
-            log("kvtest samples/summary kept for --rebuild-report "
-                "(set MC_KVTEST_CLEAN_INTERMEDIATES=1 to remove them)")
+def _cleanup_run_intermediates(ts_dir, failed_scenarios, args):
+    """Delete per-config intermediates (python + kvtest, basic + pipeline)
+    after a fully successful run, once each config's report tree verifies.
+
+    Whole-run escape hatches: --keep-intermediates / MC_KEEP_INTERMEDIATES=1,
+    --pull-raw-logs / --png (the user explicitly asked for raw logs), and
+    --no-report (nothing to verify). Failed configs keep everything; STOP /
+    Ctrl+C bypass this run-end block entirely (StopRequested unwinds main)."""
+    if (getattr(args, "keep_intermediates", False)
+            or os.environ.get("MC_KEEP_INTERMEDIATES", "0") == "1"):
+        log("intermediates kept (--keep-intermediates / "
+            "MC_KEEP_INTERMEDIATES=1)")
         return 0
-    if failed_scenarios or not plot_succeeded:
+    if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
+        log("intermediates kept (--pull-raw-logs / --png)")
         return 0
-    removed = _cleanup_kvtest_success_intermediates(log_dir)
-    if removed:
-        log("kvtest intermediate artifacts removed: {}".format(removed))
-    return removed
+    if getattr(args, "no_report", False):
+        log("intermediates kept (--no-report: no report to verify)")
+        return 0
+    failed = set(failed_scenarios or [])
+    logs = os.path.join(ts_dir, "logs")
+    if not os.path.isdir(logs):
+        return 0
+    total = 0
+    for name in sorted(os.listdir(logs)):
+        d = os.path.join(logs, name)
+        if not os.path.isdir(d):
+            continue
+        if name in failed:
+            log("[report] intermediates kept for failed config {}".format(name))
+            continue
+        ok, detail = _verify_config_reports(d)
+        if not ok:
+            log("[WARN] intermediates kept for {}: {}".format(name, detail))
+            continue
+        n = _cleanup_config_intermediates(d)
+        total += n
+        log("[report] {} verified ({}); removed {} intermediate file(s)"
+            .format(name, detail, n))
+    if total:
+        log("[report] intermediate artifacts removed: {} file(s)".format(total))
+    return total
 
 
 def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
@@ -8697,21 +8775,23 @@ def parse_arguments(argv=None):
                         help="cooperative stop flag file (WebUI stop); a "
                              "SIGINT/SIGTERM/SIGBREAK also requests stop")
     parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--no-plot", action="store_true",
-                        help="skip the PNG plots only (legacy plot_latency "
-                             "charts written with --png / for kvtest samples); "
-                             "the HTML reports are still generated")
     parser.add_argument("--no-report", action="store_true",
                         help="skip the HTML reports of this run (per-unit "
                              "report.html + the run-level overview.html); "
-                             "plotting is controlled separately by --no-plot")
+                             "independent of plotting")
     parser.add_argument("--png", action="store_true",
-                        help="compat switch: also pull the RAW client logs and "
-                             "generate the legacy PNG plots (plot_latency.py); "
-                             "implies --pull-raw-logs")
+                        help="generate the legacy PNG plots (plot_latency.py); "
+                             "plotting is off by default and --png requires "
+                             "--pull-raw-logs (the plots read raw client logs)")
     parser.add_argument("--pull-raw-logs", action="store_true",
                         help="pull the raw client logs back (default: only the "
                              "compact *.stats.json produced by remote logstats)")
+    parser.add_argument("--keep-intermediates", action="store_true",
+                        help="keep the pulled/mapped intermediates (*.stats.json,"
+                             " raw *.log/*.glog, kvtest samples/summary) after "
+                             "a successful report; default: remove them "
+                             "(report/ and profiling/ are always kept). "
+                             "env: MC_KEEP_INTERMEDIATES=1")
     parser.add_argument("--rebuild-report", default=None, metavar="TS",
                         help="rebuild the reports for an existing LOCAL run "
                              "from its timestamp directory name (e.g. "
@@ -8729,6 +8809,9 @@ def parse_arguments(argv=None):
     args = parser.parse_args(argv)
     if args.ssh and args.k8s:
         sys.exit("[ERROR] --ssh and --k8s are mutually exclusive")
+    if args.png and not args.pull_raw_logs:
+        parser.error("开启 png 必须开启 pull-raw-logs（PNG 绘图需要原始客户端"
+                     "日志）")
     # deployment config dir per mode (default --ssh for backward compat);
     # explicit --cluster/--global/--profile always win over the mode defaults
     args.mode = "k8s" if args.k8s else "ssh"
@@ -8843,6 +8926,18 @@ def rebuild_reports(ts):
             continue
         stats = _collect_local_stats(d)
         _samples = glob.glob(os.path.join(d, "*.kvtest_*.samples.csv"))
+        if not stats and not _samples:
+            rep = os.path.join(d, "report")
+            has_report = os.path.isdir(rep) and any(
+                os.path.isfile(os.path.join(rep, x, "report.html"))
+                for x in os.listdir(rep)
+                if os.path.isdir(os.path.join(rep, x)))
+            if has_report:
+                log("[ERROR] {}: 中间产物已按成功清理（仅保留 report/ 与 "
+                    "profiling/），无法重建；报表与 data.js 仍可用。如需重建，"
+                    "请在跑测时加 --keep-intermediates（或 "
+                    "MC_KEEP_INTERMEDIATES=1）".format(name))
+                continue
         _have_kvtest_stats = any(
             os.path.basename(p).endswith(".stats.json") and
             ".samples.csv." in os.path.basename(p) for p in stats)
@@ -9003,8 +9098,9 @@ def rebuild_reports(ts):
 
     if not scenarios:
         log("[ERROR] rebuild: no local stats or raw logs found under {} — "
-            "re-run with --pull-raw-logs, or use --rebuild-report on the "
-            "originating machine".format(os.path.relpath(logs_root, ROOT)))
+            "re-run with --pull-raw-logs, use --rebuild-report on the "
+            "originating machine, or keep the intermediates next time with "
+            "--keep-intermediates".format(os.path.relpath(logs_root, ROOT)))
         return 1
     by_node = {}
     for sc in scenarios:
@@ -9287,11 +9383,11 @@ def main(args, cfg_paths):
     #   - per-config reports were rendered by the background worker
     #   - the run-level overview is rendered here             [--no-report]
     #   - the legacy PNG plots run on the background worker while the global
-    #     teardown below proceeds                            [--no-plot]
+    #     teardown below proceeds                            [--png]
     #   - kvtest has no per-unit HTML of its own: its request samples go
     #     through the same map+reduce chain (report.py)
-    # The two switches are independent: --no-report keeps PNG plots, and
-    # --no-plot keeps the HTML reports.
+    # Plotting is opt-in (--png, paired with --pull-raw-logs); --no-report
+    # controls the HTML reports only and is independent of it.
     log_dir = os.path.join(ts_dir, "logs")
     if not args.no_report:
         if _REPORT_ACC:
@@ -9301,23 +9397,20 @@ def main(args, cfg_paths):
                     os.path.relpath(ov, ROOT)))
             except Exception as exc:
                 log("[WARN] overview report failed: {}".format(exc))
-    plot_succeeded = bool(args.no_plot)
     plot_job = None
-    if not args.no_plot:
+    if args.png:
         has_logs = bool(glob.glob(os.path.join(log_dir, "**", "*.log"),
                                   recursive=True))
         has_samples = bool(glob.glob(os.path.join(log_dir, "**", "*.samples.csv"),
                                    recursive=True))
-        # --png keeps the legacy behaviour (needs RESULT logs); kvtest samples
-        # are plotted whenever plotting is enabled because PNG is its only
-        # per-request view.
-        want_plot = (args.png and has_logs) or has_samples
-        if args.png and not has_logs and not has_samples:
-            log("[WARN] --png: no raw *.log under {} (raw logs are only "
-                "pulled for small runs / failures / --pull-raw-logs)"
-                "".format(log_dir))
-        if want_plot:
+        # kvtest samples are always plotted when the switch is on: PNG is its
+        # only per-request view; python plots need the pulled raw logs.
+        if has_logs or has_samples:
             plot_job = _bg_submit("plots", _run_legacy_plots, log_dir)
+        else:
+            log("[WARN] --png: no raw *.log / samples under {} (raw logs are "
+                "only pulled for small runs / failures / --pull-raw-logs)"
+                .format(log_dir))
     # Sweep end: remove-all on the last successful config's primary node.
     # Failed configs never reach their own end-remove, so this final pass is
     # what guarantees the store ends the sweep empty. Removing from an empty
@@ -9364,13 +9457,12 @@ def main(args, cfg_paths):
         for name, ok, result, err in _bg_join():
             if name != "plots":
                 continue
-            plot_succeeded = bool(ok and result)
             if not ok:
                 log("[WARN] auto-plot failed: {}".format(err))
-    # kvtest summary/samples are the ONLY --rebuild-report inputs: keep them
-    # by default (cleanup is opt-in; see _maybe_cleanup_kvtest_intermediates).
-    _maybe_cleanup_kvtest_intermediates(log_dir, failed_scenarios,
-                                        plot_succeeded)
+    # Success-only intermediate cleanup (both engines, both scenarios):
+    # a config is cleaned only after every unit's report.html + data.js is
+    # verified; failed configs keep their artifacts for --rebuild-report.
+    _cleanup_run_intermediates(ts_dir, failed_scenarios, args)
     log("done. results in {}".format(ts_dir))
     if args.clean_up:
         # reap first: recorded processes must be killed before their
