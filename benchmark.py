@@ -6438,15 +6438,19 @@ def _controller_cp_groups(cluster, groups, cdir, workers=None):
     FIRST hop of scp_pull's k8s branch only — data stops ON the controller,
     the second SFTP hop to the orchestrator never happens)."""
     from concurrent.futures import ThreadPoolExecutor
+    controller_mkdir(cluster["_controller"], cdir)
 
     def _one(group):
         node, files, _label = group
         c = node["_controller"]
-        controller_mkdir(c, cdir)
         for f in files:
+            # kubectl cp treats a bare directory dest as a FILE target
+            # ("is a directory"); scp_pull's working remote branch passes the
+            # explicit file path — mirror it here.
+            dst = posixpath.join(cdir, os.path.basename(f))
             out, rc = controller_run(
                 c, ["-n", node["_ns"], "cp",
-                    "{}:{}".format(node["_pod"], f), cdir], check=False)
+                    "{}:{}".format(node["_pod"], f), dst], check=False)
             if rc != 0:
                 raise RuntimeError(
                     "kubectl cp failed (rc={}) for {} on {}: {}".format(
@@ -6473,7 +6477,7 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
     red_dir = os.path.join(local_log_dir, "report", ds)
     os.makedirs(red_dir, exist_ok=True)
     _controller_cp_groups(cluster, groups, cdir)
-    scripts_dst = posixpath.join(ws, "scripts")
+    scripts_dst = posixpath.join(cdir, "scripts")
     stage = [os.path.join(SCRIPTS_DIR, n) for n in
              ("logstats.py", "report.py", "kvtest_controller_job.py")]
     controller_put(c, stage, scripts_dst)

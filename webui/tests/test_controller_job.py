@@ -80,3 +80,46 @@ def test_controller_job_missing_samples_fails(tmp_path):
          os.path.join(ROOT, "scripts", "kvtest_controller_job.py"),
          "--job", job_path], capture_output=True, text=True)
     assert out.returncode != 0        # no products -> non-zero, fallback fires
+
+
+def test_controller_cp_uses_explicit_file_dest(monkeypatch):
+    """真机回归：kubectl cp 的 dest 必须是显式文件路径。
+
+    传裸目录时 kubectl 把目录当目标文件 -> "is a directory"（scp_pull 的
+    远端分支正是用 stage/basename 才正常的）。
+    """
+    import benchmark as bm
+    calls = []
+
+    def fake_run(controller, argv, check=True, timeout=None):
+        calls.append(list(argv))
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake_run)
+    monkeypatch.setattr(bm, "controller_mkdir", lambda c, p: None)
+    cluster = {"_controller": {"host": "ctl"}}
+    node = {"_controller": {"host": "ctl"}, "_ns": "ns1", "_pod": "pod-a"}
+    groups = [(node, ["/logs/a/summary.json",
+                      "/logs/a/x.samples.csv.gz"], "kvtest i1")]
+    bm._controller_cp_groups(cluster, groups, "/data/run1")
+    assert len(calls) == 2
+    for argv, src in zip(calls, ("summary.json", "x.samples.csv.gz")):
+        assert argv[:3] == ["-n", "ns1", "cp"]
+        assert argv[3].startswith("pod-a:/logs/a/")
+        # explicit file destination — never the bare dir
+        assert argv[4] == "/data/run1/" + src
+
+
+def test_controller_cp_failure_raises(monkeypatch):
+    import benchmark as bm
+    monkeypatch.setattr(bm, "controller_run",
+                        lambda c, argv, check=True, timeout=None:
+                        ("error: open /x: is a directory", 1))
+    monkeypatch.setattr(bm, "controller_mkdir", lambda c, p: None)
+    node = {"_controller": {}, "_ns": "ns", "_pod": "p"}
+    try:
+        bm._controller_cp_groups(
+            {"_controller": {"host": "ctl"}}, [(node, ["/f"], "l")], "/d")
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "kubectl cp failed" in str(exc)
