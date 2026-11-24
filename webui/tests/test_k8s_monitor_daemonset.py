@@ -274,6 +274,53 @@ def test_stop_profiling_collects_then_tears_down(monkeypatch):
     assert torn == [False, False]
 
 
+def test_monitor_node_probes_container_mem_and_host_urma(monkeypatch):
+    """Real-cluster regression: the host wrapper must gate ONLY host tools.
+
+    A monitor pseudo-node carrying `_host_exec` made the mem probe run
+    `nsenter ... command -v bash`, which fails on images without nsenter and
+    silently disabled node memory monitoring. mem runs in-container (hostPID +
+    host /proc//sys), so only urma's mdcli goes through the wrapper."""
+    pc = bm.prof_core
+    assert pc is not None
+    calls = []
+
+    def fake_run(ip, node, cmd, quiet=True):
+        calls.append(cmd)
+        if "command -v" in cmd:
+            return "OK"
+        if "nohup" in cmd:
+            return "4242"
+        return ""
+
+    monkeypatch.setattr(pc, "_run", fake_run)
+    monkeypatch.setattr(pc, "scp_push", lambda *a, **k: None)
+    monkeypatch.setattr(bm, "state_append", lambda rows: None)
+    node = {"kind": "k8s-pod", "_pod": "mon-a", "_monitor": True,
+            "_host_exec": "nsenter -t 1 -m -n --", "host_ip": "10.1.1.1",
+            "ip": "10.42.0.9"}
+    cluster = {"_controller": {"ip": "10.0.0.1", "_ctx": ""},
+               "nodes": {"mon-a": node}}
+    matrix = {"tools": {
+        "mem": {"enabled": True, "bin": "bash", "interval_s": 1,
+                "proc_pattern": "mooncake_kvtest"},
+        "urma": {"enabled": True, "bin": "mdcli", "host_tool": True,
+                 "slot": 2, "ubpus": [0, 1], "interval_s": 1}},
+        "nodes": "auto", "trigger": "whole_run",
+        "outliers": {"threshold_ms": 1.0, "window_ms": 200, "auto": True}}
+    sess = pc.start_profiling(cluster, matrix, ["mon-a"], "cfg", "/tmp/out")
+    assert sess and sess["tools"]["mon-a"].get("mem") == "4242"
+    mem_probe = next(c for c in calls if "command -v bash" in c)
+    urma_probe = next(c for c in calls if "command -v mdcli" in c)
+    assert "nsenter" not in mem_probe, "mem probes the container, not the node"
+    assert "nsenter" in urma_probe, "urma probes the NODE mdcli"
+    mem_launch = next(c for c in calls if "mem_monitor.sh" in c)
+    urma_launch = next(c for c in calls if "urma_monitor.sh" in c)
+    assert "MDCLI_BIN" not in mem_launch
+    assert "MDCLI_BIN=" in urma_launch
+    assert "nsenter -t 1 -m -n -- mdcli" in urma_launch
+
+
 if __name__ == "__main__":
     import inspect
     for name, fn in sorted(globals().items()):

@@ -58,9 +58,10 @@ k8s 模式下 run 的"节点"其实是 pod：直接在 client pod 里跑采样�
 `ensure_k8s_monitor_daemonset`，每节点 1 个 pod，随 run namespace 创建/删除）：
 
 - `hostPID: true`：容器 `/proc` 即宿主进程表 → `mem.proc` 看到整机跨 pod 进程
-- `privileged: true` + `_host_exec` 包装（默认 `nsenter -t 1 -m -n --`）：探测/调用
-  宿主安装的 mdcli（`MDCLI_BIN`），镜像里不装这些宿主工具；`chroot /host` 是低权限
-  兜底（`cluster.json: k8s.monitor_host_exec`，空串 = 仅容器内工具）
+- `privileged: true` + `_host_exec` 包装（默认 `nsenter -t 1 -m -n --`）：**仅
+  `host_tool` 工具**（urma 的 mdcli）走包装探测/调用，借宿主安装的二进制；`chroot
+  /host` 是低权限兜底（`cluster.json: k8s.monitor_host_exec`，空串 = 仅容器内工具）。
+  mem 始终在容器内跑（hostPID + 宿主 `/proc` `/sys` 视图已足够，不依赖 nsenter）
 - 挂载与 benchmark pod **相同的 hostPath**（`<host_log_root>/<ts>` → 
   `<pod_workspace>/logs/<ts>`）：脚本与 CSV 落节点磁盘，收集链路与报表 reduce 零改动
 - 采样循环进程留在容器内（仅每次 mdcli 调用跨界），pod 删除/namespace 清理即回收，

@@ -55,8 +55,10 @@ TOOL_DEFAULTS = {
             "interval_s": 1, "proc_pattern": "mooncake_benchmark_client",
             "leak_growth_pct": 30, "leak_min_mb": 200},
     # UBPU port traffic via mdcli; opt-in (only specific nodes ship mdcli —
-    # prof_core probes it and silently skips the rest)
-    "urma": {"enabled": False, "bin": "mdcli", "sudo": False,
+    # prof_core probes it and silently skips the rest). host_tool=True: the
+    # binary lives on the NODE, never in the benchmark image, so a monitor
+    # DaemonSet pseudo-node probes/calls it through _host_exec (nsenter/chroot).
+    "urma": {"enabled": False, "bin": "mdcli", "sudo": False, "host_tool": True,
              "slot": 2, "ubpus": [0, 1], "interval_s": 1,
              "bytes_per_flit": 20},
 }
@@ -172,12 +174,15 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                 continue
             try:
                 # presence probe (absolute bin path checked directly).
-                # Monitor-DaemonSet pseudo-nodes (_host_exec) probe the HOST
-                # binary through the nsenter/chroot wrapper: mdcli is installed
-                # on the node, never in the benchmark image.
+                # host_tool tools on a monitor DaemonSet pseudo-node probe the
+                # NODE binary through the nsenter/chroot wrapper (mdcli lives
+                # on the node, never in the image). In-container tools (mem:
+                # bash + container /proc//sys are already host views) probe
+                # the container itself — the wrapper must not gate them.
                 probe = tcfg.get("bin", "")
                 host_exec = str(n.get("_host_exec") or "").strip()
-                if host_exec:
+                use_host = bool(tcfg.get("host_tool")) and bool(host_exec)
+                if use_host:
                     present = _run(
                         ip, n,
                         "{} bash -c {} >/dev/null 2>&1 && echo OK || echo MISSING"
@@ -238,7 +243,7 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                         if isinstance(ubpus, (list, tuple)):
                             ubpus = " ".join(str(u) for u in ubpus)
                         envs.append("UBPUS={}".format(shlex.quote(str(ubpus))))
-                        if host_exec:
+                        if use_host:
                             # borrow the node-installed mdcli through the
                             # nsenter/chroot wrapper (image has no mdcli)
                             envs.append("MDCLI_BIN={}".format(shlex.quote(
