@@ -29,11 +29,15 @@ def test_monitor_collect_waits_for_stable_before_pull(monkeypatch, tmp_path):
     def fake_wait(ip, node, out_file, sudo="", **kw):
         order.append(("stable", os.path.basename(out_file)))
 
+    def fake_pidgone(ip, node, pid, sudo="", **kw):
+        order.append(("pidgone", "pid"))
+
     def fake_pull(ip, node, remote_glob, local_dir, dry_run=False):
         order.append(("pull", os.path.basename(remote_glob)))
 
     monkeypatch.setattr(prof_core, "_run", fake_run)
     monkeypatch.setattr(prof_core, "_wait_artifact_stable", fake_wait)
+    monkeypatch.setattr(prof_core, "_wait_pid_gone", fake_pidgone)
     monkeypatch.setattr(prof_core, "scp_pull", fake_pull)
     monkeypatch.setattr(prof_core, "get_node",
                         lambda cluster, name: {"ip": "1.2.3.4"})
@@ -52,8 +56,11 @@ def test_monitor_collect_waits_for_stable_before_pull(monkeypatch, tmp_path):
     # never a pull before its artifact stabilized (that causes the live-CSV
     # "remote > local" size-mismatch WARNs)
     assert kinds[0] == "kill"
+    # the sampler must be dead before any pull (the old size-stability-only
+    # wait left it alive ~70s per pod and raced the copy)
+    assert kinds.index("kill") < kinds.index("pidgone")
+    assert kinds.index("pidgone") < kinds.index("stable")
+    assert kinds.index("pidgone") < kinds.index("pull")
     for f in files:
-        assert ("stable", f) in pos, "no stability wait for {}".format(f)
         assert ("pull", f) in pos, "no pull for {}".format(f)
-        assert pos[("stable", f)] < pos[("pull", f)]
-    assert kinds.index("kill") < kinds.index("stable")
+        assert pos[("pidgone", "pid")] < pos[("pull", f)]

@@ -6716,7 +6716,11 @@ def _verify_config_reports(log_dir):
     WARN-only, so a failed write must be detected explicitly before any
     intermediate artifact is deleted. Returns (ok, detail)."""
     stats = _collect_local_stats(log_dir)
-    if not stats:
+    # controller 数据面：map/reduce 在 controller 完成，本地没有 stats.json，
+    # 单元由 report/<size>/reduced.json 定义（渲染产物同目录校验）。
+    reds = sorted(glob.glob(os.path.join(log_dir, "report", "*",
+                                         "reduced.json")))
+    if not stats and not reds:
         return False, "no local stats"
     meta = {}
     try:
@@ -6730,7 +6734,12 @@ def _verify_config_reports(log_dir):
     scenario = _report_scenario(
         {"report_scenario": meta.get("scenario"),
          "scenario": meta.get("mode")}, None, engine)
-    units = _unit_groups(stats, scenario)
+    if stats:
+        units = _unit_groups(stats, scenario)
+    else:
+        units = {("size", os.path.basename(os.path.dirname(r))):
+                 {"name": os.path.basename(os.path.dirname(r))}
+                 for r in reds}
     if not units:
         return False, "no report unit"
     rep = os.path.join(log_dir, "report")

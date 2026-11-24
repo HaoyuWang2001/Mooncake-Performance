@@ -314,85 +314,118 @@ def _wait_artifact_stable(ip, node, out_file, sudo="", polls=15, interval_s=2):
         time.sleep(interval_s)
 
 
+def _wait_pid_gone(ip, node, pid, sudo="", polls=8, interval_s=1):
+    """Wait until a sampler pid exits; SIGKILL it if it ignores SIGINT.
+
+    A live appender keeps growing its CSV, which trips scp_pull's post-copy
+    size verification ("remote > local") and the artifact gets dropped as
+    partial. Waiting for the PROCESS (not for size stability — a slow
+    sampler can produce equal consecutive sizes by luck) is the reliable
+    condition; SIGINT is the graceful path, SIGKILL the bounded fallback."""
+    for _ in range(polls):
+        try:
+            raw = _run(ip, node, "{}kill -0 {} 2>/dev/null && echo alive "
+                                 "|| echo gone".format(sudo, pid),
+                       quiet=True)
+        except Exception:
+            return
+        if "gone" in str(raw):
+            return
+        time.sleep(interval_s)
+    try:
+        _run(ip, node, "{}kill -9 {} 2>/dev/null || true".format(sudo, pid),
+             quiet=True)
+    except Exception:
+        pass
+    time.sleep(0.3)
+
+
 def stop_and_collect(cluster, session, local_prof_dir):
     """Stop sampling, dump spdiag, collect artifacts. Never raises."""
     if not session:
         return
     import benchmark as bm
+    items = list(session["tools"].items())
+
+    def _one(item):
+        node_name, tools = item
+        n = get_node(cluster, node_name)
+        ip = n["ip"]
+        remote_out = session["remote_out_dir"]
+        collected = []
+        for tool, pid in tools.items():
+            tcfg = session["matrix_tools"].get(tool, {})
+            try:
+                if tool == "spdiag":
+                    out_file = "{}/spdiag.show.txt".format(remote_out)
+                    _run(ip, n, "{} show > {}".format(_bin(tcfg), out_file))
+                    collected.append("spdiag.show.txt")
+                elif tool in MONITOR_ARTIFACTS:
+                    # Wait for the sampler to EXIT before pulling: a live
+                    # appender trips scp_pull's post-copy size check. A
+                    # single short settle poll then lets the shell flush.
+                    sudo = "sudo -n " if tcfg.get("sudo") else ""
+                    if pid:
+                        _run(ip, n, "{}kill -INT {} 2>/dev/null || true".format(
+                            sudo, pid))
+                        _wait_pid_gone(ip, n, pid, sudo)
+                    _wait_artifact_stable(
+                        ip, n, "{}/{}".format(
+                            remote_out, MONITOR_ARTIFACTS[tool][0]),
+                        sudo, polls=2)
+                    collected.extend(MONITOR_ARTIFACTS[tool])
+                elif pid:
+                    fname = "perf.data" if tool == "perf" else "{}.out".format(tool)
+                    out_file = "{}/{}".format(remote_out, fname)
+                    sudo = "sudo -n " if tcfg.get("sudo") else ""
+                    # SIGINT so perf flushes its data file gracefully;
+                    # sudo-started pids need sudo to signal
+                    _run(ip, n, "{}kill -INT {} 2>/dev/null || true".format(sudo, pid))
+                    if tool == "perf":
+                        # big system-wide captures flush for a while
+                        # after SIGINT -> wait for the size to stabilize
+                        # instead of a fixed 2s (perf.data.err is created
+                        # by the launching shell, so it always collects)
+                        _wait_artifact_stable(ip, n, out_file, sudo)
+                        collected.append("perf.data.err")
+                    else:
+                        time.sleep(2)
+                    if tcfg.get("sudo"):
+                        # privileged run wrote a root-owned artifact
+                        # (perf.data): hand it back to the ssh user before
+                        # scp; $(id -un) expands remotely as that user
+                        _run(ip, n, 'sudo -n chown "$(id -un):$(id -gn)" "{}" '
+                                    '2>/dev/null || true'.format(out_file))
+                    collected.append(fname)
+            except Exception as exc:
+                log("[WARN] [profile] stop {} on {}: {}".format(tool, node_name, exc))
+        if any(t in MONITOR_ARTIFACTS for t in tools):
+            collected.append(MONITOR_CONFIG_FILE)
+        node_local = os.path.join(local_prof_dir, node_name)
+        os.makedirs(node_local, exist_ok=True)
+        for fname in collected:
+            try:
+                scp_pull(ip, n, "{}/{}".format(remote_out, fname), node_local)
+                log("[profile] collected {}/{}".format(node_name, fname))
+            except Exception as exc:
+                log("[WARN] [profile] collect {}/{}: {}".format(node_name, fname, exc))
+        # text-tree generation from the collected spdiag table: every
+        # interface tree under configs/_spdiag_trees/ whose root point
+        # matches gets a spdiag_tree.<interface>.txt next to it
+        if spdiag_tree_mod is not None and "spdiag.show.txt" in collected:
+            try:
+                for tree_file in spdiag_tree_mod.generate_trees(
+                        os.path.join(node_local, "spdiag.show.txt"),
+                        SPDIAG_TREES_DIR, node_local, node_name):
+                    log("[profile] spdiag tree {}/{}".format(node_name, tree_file))
+            except Exception as exc:
+                log("[WARN] [profile] spdiag tree on {}: {}".format(node_name, exc))
+        bm.state_remove([{"ip": ip, "pid": p} for p in tools.values() if p])
+
+    from concurrent.futures import ThreadPoolExecutor
     try:
-        for node_name, tools in session["tools"].items():
-            n = get_node(cluster, node_name)
-            ip = n["ip"]
-            remote_out = session["remote_out_dir"]
-            collected = []
-            for tool, pid in tools.items():
-                tcfg = session["matrix_tools"].get(tool, {})
-                try:
-                    if tool == "spdiag":
-                        out_file = "{}/spdiag.show.txt".format(remote_out)
-                        _run(ip, n, "{} show > {}".format(_bin(tcfg), out_file))
-                        collected.append("spdiag.show.txt")
-                    elif tool in MONITOR_ARTIFACTS:
-                        # sampler loops append line-buffered CSV rows; kill it
-                        # and WAIT for the size to stabilize — a live append
-                        # during the copy would otherwise trip scp_pull's
-                        # post-copy size verification ("remote > local") and
-                        # the artifact would be dropped as partial.
-                        sudo = "sudo -n " if tcfg.get("sudo") else ""
-                        if pid:
-                            _run(ip, n, "{}kill -INT {} 2>/dev/null || true".format(
-                                sudo, pid))
-                        for fname in MONITOR_ARTIFACTS[tool]:
-                            _wait_artifact_stable(
-                                ip, n, "{}/{}".format(remote_out, fname), sudo)
-                        collected.extend(MONITOR_ARTIFACTS[tool])
-                    elif pid:
-                        fname = "perf.data" if tool == "perf" else "{}.out".format(tool)
-                        out_file = "{}/{}".format(remote_out, fname)
-                        sudo = "sudo -n " if tcfg.get("sudo") else ""
-                        # SIGINT so perf flushes its data file gracefully;
-                        # sudo-started pids need sudo to signal
-                        _run(ip, n, "{}kill -INT {} 2>/dev/null || true".format(sudo, pid))
-                        if tool == "perf":
-                            # big system-wide captures flush for a while
-                            # after SIGINT -> wait for the size to stabilize
-                            # instead of a fixed 2s (perf.data.err is created
-                            # by the launching shell, so it always collects)
-                            _wait_artifact_stable(ip, n, out_file, sudo)
-                            collected.append("perf.data.err")
-                        else:
-                            time.sleep(2)
-                        if tcfg.get("sudo"):
-                            # privileged run wrote a root-owned artifact
-                            # (perf.data): hand it back to the ssh user before
-                            # scp; $(id -un) expands remotely as that user
-                            _run(ip, n, 'sudo -n chown "$(id -un):$(id -gn)" "{}" '
-                                        '2>/dev/null || true'.format(out_file))
-                        collected.append(fname)
-                except Exception as exc:
-                    log("[WARN] [profile] stop {} on {}: {}".format(tool, node_name, exc))
-            if any(t in MONITOR_ARTIFACTS for t in tools):
-                collected.append(MONITOR_CONFIG_FILE)
-            node_local = os.path.join(local_prof_dir, node_name)
-            os.makedirs(node_local, exist_ok=True)
-            for fname in collected:
-                try:
-                    scp_pull(ip, n, "{}/{}".format(remote_out, fname), node_local)
-                    log("[profile] collected {}/{}".format(node_name, fname))
-                except Exception as exc:
-                    log("[WARN] [profile] collect {}/{}: {}".format(node_name, fname, exc))
-            # text-tree generation from the collected spdiag table: every
-            # interface tree under configs/_spdiag_trees/ whose root point
-            # matches gets a spdiag_tree.<interface>.txt next to it
-            if spdiag_tree_mod is not None and "spdiag.show.txt" in collected:
-                try:
-                    for tree_file in spdiag_tree_mod.generate_trees(
-                            os.path.join(node_local, "spdiag.show.txt"),
-                            SPDIAG_TREES_DIR, node_local, node_name):
-                        log("[profile] spdiag tree {}/{}".format(node_name, tree_file))
-                except Exception as exc:
-                    log("[WARN] [profile] spdiag tree on {}: {}".format(node_name, exc))
-            bm.state_remove([{"ip": ip, "pid": p} for p in tools.values() if p])
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(items)))) as pool:
+            list(pool.map(_one, items))
     except Exception as exc:
         log("[WARN] [profile] stop_and_collect: {}".format(exc))
 
