@@ -2039,6 +2039,29 @@ def test_build_report_params_pipeline_qps_total():
     assert ps["client.count_per_node"] == 2
 
 
+def test_report_engine_scenario_inference_and_pipeline_params():
+    """engine(实现路线) 与 scenario(报表形态) 解耦：格式只看 scenario。"""
+    assert bm._report_engine({}, "kvtest") == "kvtest"
+    assert bm._report_engine({"engine": "kvtest"}) == "kvtest"
+    assert bm._report_engine({}, None, "kvtest") == "kvtest"
+    assert bm._report_engine({"engine": "python"}, None, "kvtest") == "python"
+    assert bm._report_scenario({"scenario": "kvtest"}, None, "kvtest") == \
+        "pipeline"
+    assert bm._report_scenario({"scenario": "kvtest",
+                                "report_scenario": "basic"},
+                               None, "kvtest") == "basic"
+    assert bm._report_scenario({"scenario": "pipeline"}, None,
+                               "python") == "pipeline"
+    assert bm._report_scenario({"scenario": "get_buffer_multi"}, None,
+                               "python") == "basic"
+    cfg = {"scenario": "kvtest", "report_scenario": "pipeline",
+           "base_qps": 10, "qps_multiple": 1, "notify_count": 2}
+    ps = dict(bm._build_report_params(
+        cfg, {"scenario": "pipeline", "engine": "kvtest"}, nodes=3))
+    assert ps["目标写 QPS"] == "10 × 3 节点 = 30"
+    assert ps["目标读 QPS"] == "30 × 2 读 = 60"
+
+
 def test_pipeline_tree_role_radio_total_and_scoped_nodes(tmp_path):
     """pipeline 对象树：角色单选（默认 reader）+ 总计（默认开）+ 角色化节点对象。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
@@ -2105,6 +2128,100 @@ def test_basic_tree_keeps_single_overview_selection(tmp_path):
     assert res["selobjs"] == ["all"]
     joined = " ".join(res["tree_rows"])
     assert "总览" in joined and "角色" not in joined
+
+
+def test_kvtest_pipeline_role_tree_no_duplicate_node_rows(tmp_path):
+    """kvtest + pipeline 形态：与 python pipeline 同构——角色单选、总计、
+    同一节点每角色仅一行；meta.engine 只做标注，不改变格式。"""
+    a = _stats(tmp_path, "w1.writer", "writer", node="n1")
+    b = _stats(tmp_path, "r1.reader", "reader", node="n1")
+    a2 = _stats(tmp_path, "w2.writer", "writer", node="n2")
+    b2 = _stats(tmp_path, "r2.reader", "reader", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b, a2, b2]),
+                              {"config": "kv", "mode": "pipeline",
+                               "scenario": "pipeline", "engine": "kvtest"})
+    z = data["sizes"]["8MB"]
+    assert "node:n1:writer" in z["objects"]
+    assert "node:n1:reader" in z["objects"]
+    assert "node:n1" not in z["objects"]
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["selobjs"] == ["reader"]          # 默认 reader + 总计
+    joined = " ".join(res["tree_rows"])
+    assert "角色" in joined and "总计" in joined
+    # 同一节点在树里只出现一行（writer/reader 不并排重复）
+    assert joined.count("n1") == 1, res["tree_rows"]
+    # 展开：当前角色视图只列 reader 实例
+    rx = _js_check(tmp_path, data, "--expand-tree")
+    if rx is None:
+        return
+    exp = " ".join(rx.get("tree_rows_expanded") or [])
+    assert exp.count("n1") == 1, rx.get("tree_rows_expanded")
+    assert "r1.reader" in exp and "w1.writer" not in exp, exp
+
+
+def test_kvtest_basic_is_single_overview(tmp_path):
+    """kvtest + basic 形态：单「总览」，无角色子区。"""
+    a = _stats(tmp_path, "w.writer", "writer", node="n1")
+    data = rp.reduce_scenario(rp.load([a]),
+                              {"config": "kv", "mode": "basic",
+                               "scenario": "basic", "engine": "kvtest"})
+    z = data["sizes"]["8MB"]
+    assert "node:n1" in z["objects"] and "node:n1:writer" not in z["objects"]
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["selobjs"] == ["all"]
+    joined = " ".join(res["tree_rows"])
+    assert "总览" in joined and "角色" not in joined
+
+
+def test_legacy_kvtest_mode_keeps_pipeline_shape(tmp_path):
+    """旧产物 meta.mode="kvtest"（无 scenario/engine）仍按 pipeline 形态。"""
+    a = _stats(tmp_path, "w.writer", "writer", node="n1")
+    b = _stats(tmp_path, "r.reader", "reader", node="n1")
+    a2 = _stats(tmp_path, "w2.writer", "writer", node="n2")
+    b2 = _stats(tmp_path, "r2.reader", "reader", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b, a2, b2]),
+                              {"config": "legacy", "mode": "kvtest"})
+    z = data["sizes"]["8MB"]
+    assert "node:n1:writer" in z["objects"]
+    assert "node:n1:reader" in z["objects"]
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["selobjs"] == ["reader"]
+    assert "角色" in " ".join(res["tree_rows"])
+
+
+def test_pipeline_single_role_falls_back(tmp_path):
+    """早停只剩 writer：角色单选自动切到 writer，不出现空树空图。"""
+    a = _stats(tmp_path, "w1.writer", "writer", node="n1")
+    a2 = _stats(tmp_path, "w2.writer", "writer", node="n2")
+    data = rp.reduce_scenario(rp.load([a, a2]),
+                              {"config": "kv", "mode": "pipeline",
+                               "scenario": "pipeline", "engine": "kvtest"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert res["selobjs"] == ["writer"], res["selobjs"]
+    assert "n1" in " ".join(res["tree_rows"])
+
+
+def test_subtitle_shows_engine(tmp_path):
+    """副标题承接引擎徽记：kvtest / python 都明确标注。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    for eng, mode in (("kvtest", "kvtest"), ("python", "pipeline")):
+        meta = {"config": "c", "mode": mode, "engine": eng,
+                "protocol": "tcp", "started": "2026-11-19 00:00:00"}
+        data = rp.reduce_scenario(rp.load([a]), meta)
+        html, _dj = rp.render_scenario(
+            data, str(tmp_path / ("e-" + eng)), ECHARTS)
+        src = open(html, encoding="utf-8").read()
+        assert "引擎 " + eng in src
 
 
 def test_multi_object_node_hues_and_metric_buttons_removed(tmp_path):

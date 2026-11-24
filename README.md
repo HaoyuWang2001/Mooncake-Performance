@@ -872,6 +872,11 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   `overview.html` 在全局收尾前渲染，PNG 点位图与 sweep-end remove / pod /
   namespace 删除并行。`summary.json`/`samples.csv` 默认保留（`--rebuild-report`
   的唯一输入），`MC_KVTEST_CLEAN_INTERMEDIATES=1` 才在成功 run 后清理。
+- **形态与引擎解耦**：报表格式由 `meta.scenario`（`basic`|`pipeline`）决定，
+  `meta.engine`（`python`|`kvtest`）只做标注（副标题「引擎 …」）；kvtest 场景可在配置里用
+  `"report_scenario": "pipeline"|"basic"` 声明形态（缺省 pipeline）。旧产物
+  `mode="kvtest"` 在读取/重建时归一化为 `scenario="pipeline" + engine="kvtest"`
+  （此前把引擎写进形态槽位，导致 kvtest 报表同一节点 writer/reader 两行重复）。
 - **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
   渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
   `overview.html`（run 总览）。**`data.js` 必须与 report.html 同目录**：从磁盘双击打开时

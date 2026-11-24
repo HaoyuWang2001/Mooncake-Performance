@@ -633,7 +633,8 @@ def reduce_size(stats, meta):
     used += _tier_rowcount(all_tiers)
     # basic 是「单场景 sweep」，顶层对象就是所有节点/实例的平均 —— 叫「总览」；
     # pipeline 保留「总体（全部）」（其对象树还有 writer/reader 角色层）。
-    all_label = ("总览" if (meta.get("mode") == "basic")
+    all_label = ("总览" if (meta.get("scenario") == "basic"
+                            or meta.get("mode") == "basic")
                  else _role_label("all"))
     objects["all"] = {"label": all_label, "kind": "role",
                       "tiers": all_tiers}
@@ -647,7 +648,7 @@ def reduce_size(stats, meta):
                          "tiers": tiers}
     # nodes: embed-tier upward only (bounded regardless of node count)
     # pipeline：同一节点的 writer/reader 分开建对象（角色单选下互不混用）
-    is_pipe = meta.get("mode") in ("pipeline", "kvtest")
+    is_pipe = _scenario_of(meta) == "pipeline"
     for node, group in sorted(node_stats.items()):
         if is_pipe:
             by_role = {}
@@ -1197,6 +1198,31 @@ def _volume_block(blk, traces):
     out["ratio"]["raw_to_pulled"] = (round(raw / pulled, 1)
                                      if pulled else None)
     return out
+
+
+def _scenario_of(meta):
+    """Report format: basic | pipeline (legacy name "scenario").
+
+    Old artifacts carry mode="kvtest" (engine written into the format slot):
+    treat them as pipeline, the shape kvtest has always produced."""
+    m = meta or {}
+    sc = m.get("scenario")
+    if sc in ("basic", "pipeline"):
+        return sc
+    mode = m.get("mode")
+    if mode in ("basic", "pipeline"):
+        return mode
+    if mode == "kvtest" or m.get("engine") == "kvtest":
+        return "pipeline"
+    return "basic"
+
+
+def _engine_of(meta):
+    m = meta or {}
+    eng = m.get("engine")
+    if eng in ("python", "kvtest"):
+        return eng
+    return "kvtest" if m.get("mode") == "kvtest" else "python"
 
 
 def reduce_scenario(stats, meta, monitors=None, traces=None):
@@ -1914,7 +1940,15 @@ let curRole = 'reader';
 let totalOn = true;
 let selByRole = {};          /* 各角色记住自己的节点/实例选择（切换不丢弃） */
 function isPipeMode(){
-  return String((D.meta||{}).mode||'')==='pipeline';
+  const m=D.meta||{};
+  if(m.scenario==='basic'||m.scenario==='pipeline') return m.scenario==='pipeline';
+  const md=String(m.mode||'');   /* 旧产物：kvtest 即 pipeline 形态 */
+  return md==='pipeline'||md==='kvtest';
+}
+function isBasicMode(){
+  const m=D.meta||{};
+  if(m.scenario==='basic'||m.scenario==='pipeline') return m.scenario==='basic';
+  return String(m.mode||'')==='basic';
 }
 function Z(){return S[curSize]||null;}
 function objAll(){
@@ -2381,6 +2415,9 @@ function ensureSel(){
   if(!Object.keys(all).length) return;
   selObjs=selObjs.filter(function(k){return !!all[k];});
   if(isPipeMode()){
+    /* 早停只剩单一角色时自动切过去，避免空树空图 */
+    if(!all[curRole]&&(all.writer||all.reader))
+      curRole=all.writer?'writer':'reader';
     /* 只保留：当前角色聚合（总计开启时）+ 当前角色的节点/实例 */
     selObjs=selObjs.filter(function(k){
       const o=all[k]; if(!o) return false;
@@ -3397,7 +3434,7 @@ function renderSummary(){
     if(p)pmeta[String(p[0])]=p[1];
   });
   const um=D.meta||{};
-  const isPipe=(String(um.mode||'')==='pipeline');
+  const isPipe=isPipeMode();
   const infoSize=um.unit_size||pmeta['数据大小']||curSize||'-';
   const infoClients=(um.unit_clients!=null&&um.unit_clients!=='')
     ?um.unit_clients:(pmeta['客户端数']!=null?pmeta['客户端数']:s.clients);
@@ -4237,7 +4274,7 @@ function renderObjTree(){
   ensureSel();
   box.innerHTML='';
   const m=objTreeModel();
-  const isBasic=(D.meta&&String(D.meta.mode))==='basic';
+  const isBasic=isBasicMode();
   if(isBasic){
     /* basic：顶层就是「总览」（全部节点/实例的平均），只此一行、无角色分组 */
     box.appendChild(treeRow('all',objLabel('all'),1));
@@ -6617,10 +6654,11 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     meta_bits.append("报告生成于 " + time.strftime("%Y-%m-%d %H:%M:%S"))
     if meta.get("protocol"):
         meta_bits.append("协议 " + str(meta["protocol"]))
+    meta_bits.append("引擎 " + _engine_of(meta))
     if meta.get("early_stop"):
         meta_bits.append("⚠ 提前停止/异常，数据不完整")
     subtitle = " · ".join(meta_bits)
-    is_pipe = str(meta.get("mode") or "") in ("pipeline", "kvtest")
+    is_pipe = _scenario_of(meta) == "pipeline"
     body = _BODY_PIPELINE if is_pipe else _BODY_BASIC
     mon = data.get("monitors") or {}
     body = body.replace("<!-- monitor -->",

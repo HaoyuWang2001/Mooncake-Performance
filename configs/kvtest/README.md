@@ -192,9 +192,15 @@ request #i。旧的 `latency_timeseries.csv` 已删除，不再生成或拉回�
 
 ## HTML 报表（map-reduce）
 
-kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的请求级样本转换成
-标准的 `<log>.stats.json`，reduce 阶段（`scripts/report.py`）渲染与 pipeline 同构的
-单元报表：
+kvtest 与 Python 共用同一套报表链路，map 阶段把 C++ 的请求级样本转换成
+标准的 `<log>.stats.json`，reduce 阶段（`scripts/report.py`）按**形态（scenario）**
+渲染单元报表。**格式只由形态决定，与引擎无关**：生成器写 `meta.scenario`
+（`basic`|`pipeline`）与 `meta.engine`（`python`|`kvtest`），`meta.mode` 镜像
+scenario 仅兼容旧页面；kvtest-pipeline 与 Python pipeline 同构，kvtest-basic
+与 Python basic 同构（单「总览」）。kvtest 配置可用顶层
+`"report_scenario": "pipeline"|"basic"` 声明形态（缺省 pipeline）；旧 run 的
+`mode="kvtest"` 在读取/重建时自动归一化为 `scenario="pipeline" + engine="kvtest"`，
+副标题显示「引擎 kvtest」。
 
 1. **map**（编排器本地，场景结束、CSV 汇总后自动执行）：
    `scripts/logstats.py --kvtest-samples <实例>.samples.csv --start-epoch <测量起点
@@ -208,9 +214,10 @@ kvtest 与 Python pipeline 共用同一套报表链路，map 阶段把 C++ 的�
    writer.log/reader.log）。
 2. **reduce**（同一进程内）：`report.py` 按 data_size 汇总这些 stats，生成
    `logs/<cfg>/report/<size>/report.html` + `data.js` + `meta.json`，并在 run 结束
-   时生成 `report/overview.html`。版式与 pipeline 一致：writer/reader 角色页签、
-   角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口，
-   若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
+   时生成 `report/overview.html`。版式由 `report_scenario` 决定（缺省 pipeline）：
+   pipeline 为 writer/reader 角色单选 + 总计 + 角色化节点（同一节点每角色仅一行）、
+   角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口；
+   basic 为单「总览」、无角色分组；若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
 3. **重建**：`python benchmark.py --rebuild-report <ts>`。失败 run 保留了
    `samples.csv` 时，会自动先补跑 map 再重建报表。运行期会把
    `iid→节点/节点数/每个 size 的测量起点 epoch`写进

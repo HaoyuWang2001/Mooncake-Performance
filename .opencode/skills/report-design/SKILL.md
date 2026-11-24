@@ -186,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 228 条 · ✓201 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 230 条 · ✓203 · ◐25 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -239,9 +239,11 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### C4 端到端时延曲线 · 对象树
 
-- C4.V1 basic = 单行「总览」+ 节点与实例；pipeline = 角色 radio（默认 reader、互斥）+ 总计（默认开、独立行）+ 节点与实例；无「总体（全部）」 —— R-LAT-1 〔test_basic_tree_keeps_single_overview_selection, test_pipeline_tree_role_radio_total_and_scoped_nodes〕
+- C4.V1 scenario=basic = 单行「总览」+ 节点与实例；scenario=pipeline = 角色 radio（默认 reader、互斥）+ 总计（默认开、独立行）+ 节点与实例；无「总体（全部）」 —— R-LAT-1 〔test_basic_tree_keeps_single_overview_selection, test_pipeline_tree_role_radio_total_and_scoped_nodes〕
 - C4.V2 单实例单元隐藏「节点与实例」组（避免与总览三重冗余） —— R-LAT-1 〔test_single_instance_tree_hides_duplicate_groups〕
 - C4.V3 组头显示「已选 N 项」 —— R-LAT-17 〔◐〕
+- C4.V4 **格式只由 scenario 决定，engine 只做徽记**：kvtest-pipeline 与 python-pipeline 同构（同一节点每角色仅一行，不再 writer/reader 并排重复）；kvtest-basic 单「总览」；旧 `meta.mode="kvtest"` 归一化为 pipeline；副标题「引擎 python|kvtest」 —— R-LAT-1/R-SHELL-5/DR-47 〔test_kvtest_pipeline_role_tree_no_duplicate_node_rows, test_kvtest_basic_is_single_overview, test_legacy_kvtest_mode_keeps_pipeline_shape, test_subtitle_shows_engine〕
+- C4.V5 pipeline 仅剩单一角色（早停）时角色视图自动切到现存角色，禁止空树/空图 —— R-LAT-1 〔test_pipeline_single_role_falls_back〕
 - C4.I1 切换角色互斥；按角色记忆节点/实例选择，切回自动恢复 —— R-LAT-1 〔test_pipeline_tree_role_radio_total_and_scoped_nodes〕
 - C4.I2 全选节点/全选实例为 toggle：未全选显示「全选*」，全选后变「清空*」 —— R-LAT-17 〔test_tree_toggle_buttons〕
 - C4.I3 全部清空：清节点与实例并**自动开启总计/总览** —— R-LAT-17 〔test_clear_all_auto_enables_total, test_tree_group_select_buttons〕
@@ -485,7 +487,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ## 模板架构规范
 
 - 共享：`_PAGE_CSS`、`_APP_JS`、`_PAGE_ADAPTER_JS`、外壳 `_page_html()`、以及各区块片段常量（`_SEC_*`）。
-- 两套 body 模板：`_BODY_BASIC` / `_BODY_PIPELINE`，由片段常量组装；`render_scenario` 按 `meta.mode` 选择；pipeline 页面标题为「Pipeline 场景报表」并带 `<!-- tpl:pipeline -->` 标记（basic 对应 `<!-- tpl:basic -->`）。
+- 两套 body 模板：`_BODY_BASIC` / `_BODY_PIPELINE`，由片段常量组装；`render_scenario` 按 `meta.scenario`（旧产物回退 `meta.mode`；`mode="kvtest"` 视为 pipeline）选择，与 `meta.engine`（python/kvtest）无关；pipeline 页面标题为「Pipeline 场景报表」并带 `<!-- tpl:pipeline -->` 标记（basic 对应 `<!-- tpl:basic -->`）。
 - JS 保持**单份共享**，模式差异只用 `D.meta.mode` 分支；禁止复制整份 JS。
 - 新增区块的流程：先抽 `_SEC_<NAME>` 片段 → 在两个 body 模板中显式引用 → 再写渲染 JS（用 `safe()` 隔离）→ 补测试。
 - 单元化产物：basic 目录 `c{C}_t{T}_{size}`，pipeline 目录 `{size}`；一个 size×参数组一份 report.html + data.js + meta.json。

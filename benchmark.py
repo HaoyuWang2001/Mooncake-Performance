@@ -2719,6 +2719,12 @@ def _collect_local_traces(local_log_dir):
 def _build_report_params(cfg, meta, nodes=0):
     """Flatten scenario config + run context into an ordered [[label, value]]
     list for the report's 参数配置 section. Empty fields are omitted."""
+    meta = meta or {}
+    cfg = cfg or {}
+    sc = (meta.get("scenario") or cfg.get("report_scenario")
+          or cfg.get("scenario"))
+    eng = (meta.get("engine")
+           or ("kvtest" if cfg.get("scenario") == "kvtest" else "python"))
     out = []
 
     def add(label, value):
@@ -2740,7 +2746,7 @@ def _build_report_params(cfg, meta, nodes=0):
     # 单元报表（一个 size×combo）：只显示本单元的 size / 并发参数
     if meta.get("unit_size"):
         _override_param(out, "数据大小", meta["unit_size"])
-    if cfg.get("scenario") not in ("pipeline", "kvtest"):
+    if sc != "pipeline" and eng != "kvtest":
         # pipeline/kvtest 的 c/t 来自文件名（每客户端进程 c1_t1），不代表并发
         # 规模；客户端数/写读规模在报表单元行由 client.count_per_node×N 推导
         _override_param(out, "客户端数", meta.get("unit_clients"))
@@ -2758,7 +2764,7 @@ def _build_report_params(cfg, meta, nodes=0):
     if qps:
         try:
             per_node_qps = float(qps) * float(mult)
-            if cfg.get("scenario") == "pipeline":
+            if sc == "pipeline":
                 # pipeline 的 base_qps 是「每节点」速率：完整写出集群口径，
                 # 并给出读 QPS（写总量 × notify_count）
                 if nodes:
@@ -2872,7 +2878,7 @@ def _override_param(params, label, value):
 
 def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
                            qps_target=0, launch_mode="single",
-                           mode="pipeline", nodes=0):
+                           mode="pipeline", nodes=0, engine="python"):
     """Unit-based report generation: ONE self-contained report.html per
     (data_size × combo) unit, in <local_log_dir>/report/<unit>/.
     Returns the list of written report paths (empty on failure)."""
@@ -2908,6 +2914,8 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
         meta = {
             "config": cfg_name,
             "mode": mode,
+            "scenario": mode,
+            "engine": engine,
             "launch_mode": launch_mode,
             "clients": n_clients,
             "qps_target": qps_target,
@@ -2923,7 +2931,7 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
             "unit_threads": u["t"],
         }
         # kvtest 现场索引：host 日志根目录 / run_id / namespace（来自侧车）
-        if mode == "kvtest":
+        if engine == "kvtest":
             _side = _kvtest_read_report_meta(local_log_dir)
             for _k in ("run_id", "remote_log_dir", "host_log_root",
                        "k8s_namespace"):
@@ -2953,17 +2961,50 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
     return written
 
 
+REPORT_SCENARIOS = ("basic", "pipeline")
+REPORT_ENGINES = ("python", "kvtest")
+
+
+def _report_engine(cfg, explicit=None, mode_hint=None):
+    """Report engine (python | kvtest): only tags the artifact source, it
+    never decides the report format."""
+    eng = explicit or (cfg or {}).get("engine")
+    if eng in REPORT_ENGINES:
+        return eng
+    return "kvtest" if mode_hint == "kvtest" else "python"
+
+
+def _report_scenario(cfg, explicit=None, engine="python"):
+    """Report format (basic | pipeline). The old name "scenario" is kept.
+
+    Priority: explicit argument > cfg["report_scenario"] > cfg["scenario"]
+    when it is basic/pipeline > kvtest defaults to pipeline > basic.
+    """
+    cfg = cfg or {}
+    for cand in (explicit, cfg.get("report_scenario"), cfg.get("scenario")):
+        if cand in REPORT_SCENARIOS:
+            return cand
+    return "pipeline" if engine == "kvtest" else "basic"
+
+
 def _generate_reports(cfg, local_log_dir, args, early_stop=False,
                       qps_target=0, launch_mode="single", mode="pipeline",
-                      nodes=0):
-    """WARN-only wrapper around the unit-based report generation."""
+                      nodes=0, engine=None, scenario=None):
+    """WARN-only wrapper around the unit-based report generation.
+
+    mode may still be the legacy "kvtest"; it is normalised into
+    engine=kvtest plus a basic/pipeline scenario (format only)."""
     if getattr(args, "no_report", False) or getattr(args, "dry_run", False):
         return None
+    eng = _report_engine(cfg, engine, mode_hint=mode)
+    explicit = (scenario if scenario in REPORT_SCENARIOS else
+                (mode if mode in REPORT_SCENARIOS else None))
+    sc = _report_scenario(cfg, explicit, eng)
     try:
         written = _generate_report_units(
             cfg, local_log_dir, args, early_stop=early_stop,
-            qps_target=qps_target, launch_mode=launch_mode, mode=mode,
-            nodes=nodes)
+            qps_target=qps_target, launch_mode=launch_mode, mode=sc,
+            nodes=nodes, engine=eng)
         return written or None
     except Exception as exc:
         log("[WARN] report generation failed: {}".format(exc))
@@ -6225,7 +6266,8 @@ def _kvtest_map_stats(local_log_dir, cfg):
     return written
 
 
-def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False):
+def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False,
+                             scenario=None):
     """Inject the map-reduce report chain into a kvtest scenario.
 
     map:   request samples -> per-role stats.json (see _kvtest_map_stats)
@@ -6250,7 +6292,8 @@ def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False):
     return _generate_reports(
         cfg, local_log_dir, args, early_stop=early_stop,
         qps_target=qps_target, launch_mode="single", mode="kvtest",
-        nodes=int(cfg.get("_kvtest_nodes") or 0))
+        nodes=int(cfg.get("_kvtest_nodes") or 0), engine="kvtest",
+        scenario=scenario)
 
 
 def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
@@ -8678,6 +8721,14 @@ def rebuild_reports(ts):
             saved = {}
         if saved.get("mode"):
             mode = saved["mode"]
+        # 归一化旧产物：mode="kvtest" 曾把引擎写进形态槽位
+        _engine = saved.get("engine") or (
+            "kvtest" if mode == "kvtest" else "python")
+        mode = (saved.get("scenario")
+                or (saved.get("mode") if saved.get("mode") in REPORT_SCENARIOS
+                    else None)
+                or ("pipeline" if _engine == "kvtest" else
+                    (mode if mode in REPORT_SCENARIOS else "basic")))
         units = _unit_groups(stats, mode)
         traces_by_unit = {}
         for tp in traces_all:
@@ -8720,7 +8771,7 @@ def rebuild_reports(ts):
                     params.append(["客户端总数", n_clients])
                 if n_nodes and "节点数" not in keys:
                     params.append(["节点数", n_nodes])
-            if not params and mode == "kvtest":
+            if not params and _engine == "kvtest":
                 # no scenario meta.json (failed/best-effort run): rebuild the
                 # params card from what the map products know
                 # prefer the C++ summary wall over the sample span (the
@@ -8736,7 +8787,8 @@ def rebuild_reports(ts):
                     {"scenario": "kvtest", "data_size": [u["size"]],
                      "duration": int(round(wall)) if wall > 0 else None},
                     {"unit_size": u["size"], "unit_clients": None,
-                     "unit_threads": None, "clients": n_clients},
+                     "unit_threads": None, "clients": n_clients,
+                     "scenario": mode, "engine": _engine},
                     nodes=n_nodes)
             # 单元只显示自己的 size / combo
             params = _override_param(params, "数据大小", u["size"])
@@ -8753,6 +8805,7 @@ def rebuild_reports(ts):
                          or time.strftime("%Y-%m-%d %H:%M:%S")))
             meta = {
                 "config": name, "mode": mode,
+                "scenario": mode, "engine": _engine,
                 "launch_mode": base.get("launch_mode") or "",
                 "clients": n_clients,
                 "qps_target": base.get("qps_target") or 0,

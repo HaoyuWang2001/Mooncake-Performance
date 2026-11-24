@@ -271,7 +271,9 @@ def test_kvtest_report_end_to_end(tmp_path):
     assert (out / "data.js").is_file()
     assert (out / "meta.json").is_file()
     meta = json.load(open(out / "meta.json", encoding="utf-8"))
-    assert meta["mode"] == "kvtest"
+    assert meta["mode"] == "pipeline"
+    assert meta["scenario"] == "pipeline"
+    assert meta["engine"] == "kvtest"
     assert meta["unit_size"] == "8MB"
     assert any(p[0] == "场景" and p[1] == "kvtest" for p in meta["params"])
     # kvtest warmup now reaches the params card ("预热时长")
@@ -356,7 +358,9 @@ def test_kvtest_rebuild_from_samples_only(tmp_path, monkeypatch):
     data = json.loads(re.search(r"=\s*(\{.*\})\s*;?\s*$", raw,
                                 re.S).group(1))
     blk = data["sizes"]["8MB"]
-    assert data["meta"]["mode"] == "kvtest"
+    assert data["meta"]["mode"] == "pipeline"
+    assert data["meta"]["scenario"] == "pipeline"
+    assert data["meta"]["engine"] == "kvtest"
     assert any(k.startswith("node:nodeA:") for k in blk["objects"])
     params = data["meta"]["params"]
     assert ["场景", "kvtest"] in params
@@ -469,9 +473,11 @@ def test_kvtest_report_js_does_not_crash(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = json.loads(proc.stdout)
     assert out["init_len"] > 0
-    # summary-only kvtest signals must be rendered (not just in data.js)
-    assert "值校验失败" in out["cards_text"]
-    assert "队列等待均" in out["cards_text"]
+    # summary-only kvtest signals must be rendered (not just in data.js);
+    # kvtest-pipeline renders per-role blocks (rolecards), not a merged card
+    cards = out["cards_text"] + " " + (out.get("rolecards_text") or "")
+    assert "值校验失败" in cards
+    assert "队列等待均" in cards
 
 
 def test_kvtest_cleanup_keeps_stats_and_report(tmp_path):
