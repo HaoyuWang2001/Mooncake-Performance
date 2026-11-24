@@ -40,7 +40,7 @@ from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    controller_run, controller_stream, ensure_utf8_stdio,
                    get_node, is_k8s_node,
                    kubectl_exec_line, kubectl_prefix, load_json, log,
-                   log_detail, parse_data_size, percentile,
+                   log_detail, log_phase, parse_data_size, percentile,
                    close_detail_log, request_stop, run_ssh, scp_pull,
                    scp_push, set_detail_log, set_stop_file, set_verbose,
                    ssh_check_output, stop_requested, verbose_enabled)
@@ -628,7 +628,7 @@ def discover_store_capacity(cluster, globals_cfg):
         printed.append("{}{}={}".format(
             k, " ({} series summed)".format(n_series) if n_series > 1 else "",
             _fmt_gib(t)))
-    log_detail("[benchmark] store metrics ({}): {}".format(source, ", ".join(printed)))
+    log_detail("store metrics ({}): {}".format(source, ", ".join(printed)))
     total = _metric_total(vals, "master_total_capacity_bytes")
     if total is None:
         total = _metric_total(vals, "segment_total_capacity_bytes")
@@ -643,7 +643,8 @@ def discover_store_capacity(cluster, globals_cfg):
     if allocated is None:
         allocated = _metric_total(vals, "master_allocated_bytes")
     free = (total - allocated) if allocated is not None else None
-    log("[benchmark] store capacity (probed): total={}{}".format(
+    globals_cfg["_store_free_auto"] = int(free) if free is not None else None
+    log_detail("store capacity (probed): total={}{}".format(
         _fmt_gib(total),
         "" if free is None else ", free={}".format(_fmt_gib(free))))
     return int(total)
@@ -654,6 +655,14 @@ def _fmt_gib(n):
     if n is None:
         return "<unset>"
     return "{:.2f} GiB".format(n / 1024.0 ** 3)
+
+
+def _fmt_mb(n):
+    if not n:
+        return "0 MB"
+    if n >= 1024 ** 3:
+        return "{:.2f} GiB".format(n / 1024.0 ** 3)
+    return "{:.0f} MB".format(n / 1024.0 ** 2)
 
 
 def _store_capacity_resolution(globals_cfg):
@@ -917,7 +926,8 @@ def _wait_store_released(cluster, globals_cfg, cfg_name, when):
 
 def _remove_keys_stage(cluster, globals_cfg, host, node, runner,
                        remote_log_dir, cfg_name, log_name, scope, when,
-                       dry=False, pull_to=None, node_name=None, label=None):
+                       dry=False, pull_to=None, node_name=None, label=None,
+                       tag=None):
     """The single orchestrator entry for every remove-keys execution.
 
     Wraps the gates around the one execution path:
@@ -932,6 +942,8 @@ def _remove_keys_stage(cluster, globals_cfg, host, node, runner,
     a plain ungated stage. Returns True when the stage ran, False when the
     pre-check skipped it.
     """
+    if label is None and tag:
+        label = "[{}] remove-keys".format(tag)
     if dry:
         run_stage(host, node, runner, "remove-keys", remote_log_dir, log_name,
                   extra="--scope " + scope, dry_run=True, pull_to=pull_to,
@@ -1560,18 +1572,24 @@ def _resolve_host(host, cluster):
         return host          # already an IP
     except ValueError:
         pass
+    cache = cluster.setdefault("_dns_cache", {}) if cluster is not None else {}
+    if host in cache:
+        log_detail("[k8s] dns: {} -> {} (cached)".format(host, cache[host]))
+        return cache[host]
     svc, ns = _svc_ns_from_host(host)
     if svc:
         k8s = cluster.get("k8s") or {}
         ip = _resolve_k8s_svc(svc, ns, k8s.get("kubecontext", ""),
                               cluster.get("_controller"))
         if ip:
-            log("k8s dns: {} -> {} (kubectl svc {})".format(host, ip, svc))
+            cache[host] = ip
+            log("[k8s] dns: {} -> {} (kubectl svc {})".format(host, ip, svc))
             return ip
     try:
         infos = socket.getaddrinfo(host, None, socket.AF_INET)
         ip = infos[0][4][0]
-        log("k8s dns: {} -> {} (resolver)".format(host, ip))
+        cache[host] = ip
+        log("[k8s] dns: {} -> {} (resolver)".format(host, ip))
         return ip
     except Exception:
         return None
@@ -1717,7 +1735,7 @@ def k8s_workspace_dirs(cluster, dry_run=False):
         return root
     for sub in subs:
         controller_mkdir(c, posixpath.join(root, sub))
-    log("[k8s] workspace ready on {}: {} ({})".format(
+    log("[k8s] workspace 就绪: {}:{} ({})".format(
         controller_desc(c), root, ",".join(subs)))
     return root
 
@@ -1737,13 +1755,13 @@ def k8s_prerun(cluster, dry_run=False):
         log("[k8s] (dry-run) would run pre-run script -> {}:{}".format(
             controller_desc(c), remote_path))
         return
-    log("[k8s] pre-run script: {} -> {}:{}".format(
+    log_detail("[k8s] pre-run upload: {} -> {}:{}".format(
         os.path.relpath(script, ROOT), controller_desc(c), remote_path))
     controller_put(c, [script], k8s["controller_workspace"])
-    log("[k8s] prerun: bash {}".format(remote_path))
+    log("[k8s] 预运行: bash {}".format(remote_path))
     t0 = time.time()
     out, rc = controller_exec(c, "bash " + remote_path)
-    log("[k8s] pre-run done rc={} elapsed={:.1f}s".format(
+    log("[k8s] 预运行完成 rc={} ({:.1f}s)".format(
         rc, time.time() - t0))
     if rc != 0:
         raise RuntimeError("k8s pre-run script failed (rc={}): {}".format(
@@ -1807,8 +1825,8 @@ def ensure_k8s_namespace(cluster, ts, dry_run=False):
     state_append([{"type": "k8s-namespace", "controller": c.get("ip"),
                    "context": c.get("_ctx", ""), "namespace": ns, "ts": ts,
                    "controller_workspace": k8s.get("controller_workspace", "")}])
-    log("[k8s] namespace {} created".format(ns))
-    log("[k8s] pods:     {} get pods -o wide".format(" ".join(
+    log("[k8s] namespace {} 已创建".format(ns))
+    log_detail("[k8s] pods:     {} get pods -o wide".format(" ".join(
         kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns}))))
 
 
@@ -2015,16 +2033,16 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
             if rc != 0:
                 raise RuntimeError("kubectl apply failed for {}: {}"
                                    "".format(pod, out.strip()[:400]))
-            log("[k8s] describe: {} describe pod {}".format(" ".join(
+            log_detail("[k8s] describe: {} describe pod {}".format(" ".join(
                 kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns})), pod))
         finally:
             shutil.rmtree(local_dir, ignore_errors=True)
         ip, k8s_node = wait_k8s_pod_ready(cluster, pod)
-        log("[k8s] pod {} ready (ns={}, ip={}, node={}, elapsed={:.1f}s)"
-            "".format(pod, ns, ip, k8s_node or "?", time.time() - t0))
-        _view = " ".join(kubectl_prefix({"_ctx": c.get("_ctx", ""),
-                                          "_ns": ns}))
-        log("[k8s] shell:    {} exec -it {} -- bash".format(_view, pod))
+        log("[k8s] pod {} 已就绪 (ns={}, ip={}, node={}, {:.1f}s)".format(
+            pod, ns, ip, k8s_node or "?", time.time() - t0))
+        log_detail("[k8s] shell:    {} exec -it {} -- bash".format(
+            " ".join(kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns})),
+            pod))
     host_ip = "" if dry_run else _k8s_pod_host_ip(c, ns, pod)
     node = {"kind": "k8s-pod", "_pod": pod, "_ns": ns,
             "_ctx": c.get("_ctx", ""), "_controller": c,
@@ -2036,7 +2054,7 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         log("[k8s] (dry-run) pod {} would be ready "
             "(ns={}, ip=placeholder)".format(pod, ns))
     else:
-        log("[k8s] pod {} ready (ns={}, ip={})".format(pod, ns, ip))
+        log("[k8s] pod {} 已就绪 (ns={}, ip={})".format(pod, ns, ip))
     return pod
 
 
@@ -2087,7 +2105,6 @@ def _ub_probe_lines():
         "        exit 1",
         "    fi",
         "    export SETUP_UB_DEVICE",
-        "    echo \"[INFO] SETUP_UB_DEVICE=$SETUP_UB_DEVICE\"",
         "else",
         "    echo \"[ERROR] urma_admin command not found\" >&2",
         "    exit 1",
@@ -2230,7 +2247,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                   encoding="utf-8", newline="\n") as f:
             f.write(env_content)
         staged = sorted(os.listdir(local_stage))
-        log("[k8s] staging {} files (run={}) -> {}:{}".format(
+        log("[k8s] 上传脚本 {} files (run={}) -> {}:{}".format(
             len(staged), run_label, controller_desc(c), stage_remote))
         for fname in staged:
             log_detail("[k8s]   + {}".format(fname))
@@ -2247,8 +2264,8 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
     if rc != 0:
         raise RuntimeError("kubectl create configmap {} failed: {}"
                            "".format(cm_name, out.strip()[:400]))
-    log("[k8s] configmap {} created (ns={}, keys={})".format(
-        cm_name, ns, ",".join(staged)))
+    log("[k8s] configmap {} 已创建 *{}".format(cm_name, len(staged)))
+    log_detail("[k8s] configmap {} keys: {}".format(cm_name, ",".join(staged)))
     return cm_name
 
 def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
@@ -3392,6 +3409,50 @@ def format_duration(seconds):
     return "{}分{}秒".format(m, s)
 
 
+def _fmt_hms(seconds):
+    s = int(max(0, seconds))
+    return "{:02d}:{:02d}:{:02d}".format(s // 3600, (s % 3600) // 60, s % 60)
+
+
+def _heartbeat_interval(globals_cfg):
+    """Heartbeat period for long measurement waits (0 disables)."""
+    try:
+        v = int((globals_cfg or {}).get("heartbeat_interval_s", 60) or 0)
+    except (TypeError, ValueError):
+        v = 60
+    return max(0, v)
+
+
+class _Heartbeat(object):
+    """Periodic progress line for long waits (all engines x scenarios).
+
+    Not thread-safe by design: each wait loop owns one instance (pipeline
+    writers share one across their sequential waits)."""
+
+    def __init__(self, tag, total_s=None, interval_s=60):
+        self.tag = tag
+        self.total_s = float(total_s) if total_s else None
+        self.interval_s = int(interval_s or 0)
+        self.t0 = time.time()
+        self.last = self.t0
+
+    def tick(self):
+        if self.interval_s <= 0:
+            return
+        now = time.time()
+        if now - self.last < self.interval_s:
+            return
+        self.last = now
+        elapsed = now - self.t0
+        if self.total_s:
+            remain = max(0.0, self.total_s - elapsed)
+            log("[{}] 测试已进行 {}，剩余 {}，预计结束于 {}".format(
+                self.tag, _fmt_hms(elapsed), _fmt_hms(remain),
+                time.strftime("%H:%M:%S", time.localtime(now + remain))))
+        else:
+            log("[{}] 测试已进行 {}".format(self.tag, _fmt_hms(elapsed)))
+
+
 def _fmt_dur_en(seconds):
     """Seconds -> 'x min x s' / 'x h x min x s' style duration string."""
     seconds = int(max(0, round(seconds)))
@@ -3415,7 +3476,7 @@ def _wait_suffix(t0, expected_s):
 
 
 def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
-                      expected_s=None, marker=None):
+                      expected_s=None, marker=None, heartbeat=None):
     """Poll the remote process until it exits or times out.
 
     marker: when given, `kill -0` alone is not trusted — a container's pid
@@ -3447,6 +3508,8 @@ def wait_process_exit(cluster, node_name, pid, what, timeout_s, dry_run=False,
             log_detail("{} exited after {} ({:.0f}s)".format(
                 what, format_duration(time.time() - t0), time.time() - t0))
             return True
+        if heartbeat is not None:
+            heartbeat.tick()
         time.sleep(1)
     log("[WARN] {} ({}, pid {}) still running after {} ({}s timeout)".format(
         what, where, pid, format_duration(timeout_s), timeout_s))
@@ -3684,7 +3747,7 @@ def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry, workers=None):
                 errors.append("{}: {}".format(os.path.basename(f), exc))
         return label, _missing(group), errors
 
-    workers = max(1, min(workers or 4, len(groups)))
+    workers = max(1, min(workers or 6, len(groups)))
     pending = list(groups)
     last_errors = {}
     for attempt in range(_LOG_PULL_ATTEMPTS):
@@ -3881,7 +3944,8 @@ def _record_pids(host, node, pids_file, label, cfg_name, node_name,
 
 def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=False,
                           pids_file=None, cfg_name=None, node_name=None,
-                          marker="mooncake_benchmark_client", quiet=False):
+                          marker="mooncake_benchmark_client", quiet=False,
+                          heartbeat=None):
     """run_ssh variant for long-blocking commands (e.g. the basic benchmark
     stage): logs ONE 'running...' line (expected duration + ETA when
     expected_s is given). rc!=0 raises like run_ssh. ssh nodes run over the
@@ -3929,6 +3993,8 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
                 if _record_pids(host, node, pids_file, label, cfg_name,
                                 node_name, marker):
                     recorded = True
+            if heartbeat is not None:
+                heartbeat.tick()
             time.sleep(1)
         th.join()
         if holder.get("stop") or stop_requested():
@@ -3956,6 +4022,8 @@ def run_ssh_with_progress(host, node, command, label, expected_s=None, dry_run=F
                 if _record_pids(host, node, pids_file, label, cfg_name,
                                 node_name, marker):
                     recorded = True
+            if heartbeat is not None:
+                heartbeat.tick()
             time.sleep(1)
         grace = time.time() + 5
         while (chan.recv_ready() or chan.recv_stderr_ready()
@@ -4129,7 +4197,7 @@ def reap_state_entries(cluster):
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
               dry_run=False, pull_to=None, cfg_name=None, node_name=None,
-              quiet=False, label=None):
+              quiet=False, label=None, tag=None):
     _check_stop()
     # k8s: stage logs land in the pod's OWN subdirectory of the hostPath
     # log dir (<root>/<run_id>/<pod>/…); ssh keeps the flat layout
@@ -4138,8 +4206,10 @@ def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
     command = "bash {} {} {}".format(runner, mode, remote_log)
     if extra:
         command += " " + extra
+    if not label:
+        label = "[{}] {}".format(tag, mode) if tag else log_prefix
     run_ssh_with_progress(
-        host, node, command, label=label or log_prefix, dry_run=dry_run,
+        host, node, command, label=label, dry_run=dry_run,
         pids_file=remote_log + ".pids", cfg_name=cfg_name or log_prefix,
         node_name=node_name, quiet=quiet)
     if pull_to is not None:
@@ -4179,6 +4249,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     _basic_store_check(globals_cfg, cfg)
     cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
     dry = args.dry_run
+    hb_interval = _heartbeat_interval(globals_cfg)
+    log_phase("场景 {} (engine=python, scenario=basic)".format(
+        os.path.splitext(os.path.basename(cfg.get("__cfg_path__", "basic")))[0]))
     op = cfg.get("operation", "")
     work_mode = cfg.get("work_mode", cfg.get("mode", ""))
     is_k8s = cluster.get("_controller") is not None
@@ -4208,41 +4281,18 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     profile_sess = None  # profiling session (set below when matrix is on)
     stage = "configmap/scripts"
     try:
-        ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
-        stage = "deploy pods"
-        if is_k8s:
-            # k8s: pods are created AFTER the ConfigMap they mount
-            primary_node_name = ensure_k8s_pod(cluster, ts, cfg_name, dry)
-            involved_nodes = [primary_node_name]
-        else:
-            ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
-        cfg["_primary_node"] = primary_node_name
-        node = get_node(cluster, primary_node_name)
-        host = node["ip"]
-        if is_k8s:
-            # master/store are external Services; client pods are always remote
-            topology = "remote_node"
-        else:
+        # ssh: the client node is known from cluster.json (no pod yet);
+        # k8s: the pod materializes below and the topology is always
+        # remote_node (store is an external Service).
+        if not is_k8s:
+            node = get_node(cluster, primary_node_name)
+            host = node["ip"]
             store_node_ips = resolve_store_node_ips(
                 cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
-            topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
-        log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
-            cfg_name, op, topology, cfg["protocol"], host))
-        stage = "stage scripts"
-        deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                       remote_scripts, remote_log_dir, dry)
-        # STOP context: lets the StopRequested handler pull logs while the
-        # remote side is still alive and render a partial (early_stop) report.
-        _STOP_CTX["report"] = {
-            "cfg": cfg, "cfg_name": cfg_name, "result_dir": local_result_dir,
-            "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
-            "involved_nodes": involved_nodes, "mode": "basic",
-        }
-        stage = "remove-keys (pre-run)"
-        _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
-                           remote_log_dir, cfg_name, cfg_name, "full",
-                           "pre-run", dry=dry, pull_to=local_log_dir,
-                           node_name=primary_node_name)
+            topology = ("local_node" if node["ip"] in store_node_ips
+                        else "remote_node")
+        else:
+            topology = "remote_node"
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_remove_before_run = op in PIPELINE_PUT_IFACES or "/" in op
@@ -4264,30 +4314,61 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
         if cpu_shard > 0 and not numa_bind:
             numa_bind = True
-        k8s_numa_node = basic_k8s_numa_node(cfg) if is_k8s_node(node) else None
-        if is_k8s_node(node):
+        k8s_numa_node = basic_k8s_numa_node(cfg) if is_k8s else None
+        if is_k8s:
             numa_bind = False
             cpu_shard = 0
-            if k8s_numa_node is None:
-                log("k8s pod node {}: numa/cpu binding disabled (no "
-                    "k8s_numa_node)".format(primary_node_name))
-            else:
-                log("k8s pod node {}: bind basic clients to NUMA {}"
-                    "".format(primary_node_name, k8s_numa_node))
         # numactl policy: membind (strict, default) | preferred | off, and
         # strict/auto behavior when numactl is missing on the node
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
         numa_k = 0
         numa_topo = {}
         numactl_ok = False
-        exclude = node_exclude(cluster, node)
+        exclude = "" if is_k8s else node_exclude(cluster, node)
         if numa_bind and not dry:
             numa_k, numa_topo = probe_numa_topology(host, node)
             numactl_ok = probe_numactl(host, node)
             if not numactl_ok:
                 numa_node_check(primary_node_name, numa_strict)
-        log("scenario {}: {} run combos, warmup={}, need_remove_before_run={}, target_qps={}".format(
-            cfg_name, len(runs), warmup, need_remove_before_run, total_target_qps or "max-speed"))
+        if is_k8s:
+            _numa_txt = ("NUMA {}".format(k8s_numa_node)
+                         if k8s_numa_node is not None else "禁用(容器)")
+        else:
+            _numa_txt = "启用" if numa_bind else "禁用"
+        log("[basic] 参数: op={} topo={} protocol={} run_combos={} warmup={} "
+            "need_remove_before_run={} target_qps={} NUMA/绑核={}{}".format(
+                op, topology, cfg["protocol"], len(runs), warmup,
+                need_remove_before_run, total_target_qps or "max-speed",
+                _numa_txt,
+                "" if is_k8s else " primary_node={}".format(host)))
+        log_phase("资源创建", level=2)
+        ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
+        stage = "deploy pods"
+        if is_k8s:
+            # k8s: pods are created AFTER the ConfigMap they mount
+            primary_node_name = ensure_k8s_pod(cluster, ts, cfg_name, dry)
+            involved_nodes = [primary_node_name]
+            node = get_node(cluster, primary_node_name)
+            host = node["ip"]
+        else:
+            ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+        cfg["_primary_node"] = primary_node_name
+        stage = "stage scripts"
+        deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
+                       remote_scripts, remote_log_dir, dry)
+        # STOP context: lets the StopRequested handler pull logs while the
+        # remote side is still alive and render a partial (early_stop) report.
+        _STOP_CTX["report"] = {
+            "cfg": cfg, "cfg_name": cfg_name, "result_dir": local_result_dir,
+            "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
+            "involved_nodes": involved_nodes, "mode": "basic",
+        }
+        stage = "remove-keys (pre-run)"
+        log_phase("清库 remove-keys", level=2)
+        _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
+                           remote_log_dir, cfg_name, cfg_name, "full",
+                           "pre-run", dry=dry, pull_to=local_log_dir,
+                           node_name=primary_node_name, tag="basic")
         # profiling lifecycle (both triggers wrap the combo loop in basic;
         # whole_run additionally covers the per-ds setup stages inside it)
         if matrix and not dry and prof_core:
@@ -4297,6 +4378,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                     remote_profiling_dir(remote_log_dir, cfg_name))
             except Exception as exc:
                 log("[WARN] [profile] start failed: {}".format(exc))
+        log_phase("基准测试", level=2)
         current_ds = None
         for c, t, ds in runs:
             _check_stop()
@@ -4312,13 +4394,13 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                               "generate-data", remote_log_dir, cfg_name,
                               extra="--data-size {}".format(ds), dry_run=dry,
                               pull_to=local_log_dir,
-                              node_name=primary_node_name)
+                              node_name=primary_node_name, tag="basic")
                 if op in PIPELINE_GET_IFACES:
                     stage = "prepare-store ({})".format(ds)
                     run_stage(host, node, remote_runner,
                               "prepare-store", remote_log_dir, cfg_name,
                               dry_run=dry, pull_to=local_log_dir,
-                              node_name=primary_node_name)
+                              node_name=primary_node_name, tag="basic")
                 current_ds = ds
             if need_remove_before_run:
                 stage = "remove-keys (run {}, {})".format(c, ds)
@@ -4326,7 +4408,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                                    remote_runner, remote_log_dir, cfg_name,
                                    cfg_name, "full", stage, dry=dry,
                                    pull_to=local_log_dir,
-                                   node_name=primary_node_name)
+                                   node_name=primary_node_name, tag="basic")
             # data_size is always part of the run file name, so different
             # sizes under the same (c, t) never collide
             name = "benchmark_c{}_t{}_{}".format(c, t, ds)
@@ -4363,11 +4445,14 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             if cfg_duration > 0:
                 expected = cfg_duration + (5 if warmup == "true" else 0) + 10
             stage = "benchmark ({}, c{} t{})".format(ds, c, t)
+            _hb = (_Heartbeat("basic", expected, hb_interval)
+                   if hb_interval else None)
             run_ssh_with_progress(host, node, command,
-                                  "benchmark {} c{} t{} ({})".format(name, c, t, ds),
+                                  "[basic] benchmark c{} t{} ({})".format(c, t, ds),
                                   expected_s=expected, dry_run=dry,
                                   pids_file=remote_log + ".pids",
-                                  cfg_name=cfg_name, node_name=primary_node_name)
+                                  cfg_name=cfg_name, node_name=primary_node_name,
+                                  heartbeat=_hb)
             # map (remote logstats) + stats-only pull by default — the
             # CSV/report consume *.stats.json; raw logs (+pids) only when
             # explicitly requested (--pull-raw-logs / --png)
@@ -4412,9 +4497,10 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         # name is distinct (<cfg>.remove-keys-end.log) so it sits next to the
         # config-start remove-keys log instead of overwriting it.
         stage = "remove-keys (config end)"
+        log_phase("清理收尾", level=2)
         _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
                            remote_log_dir, cfg_name, "remove-keys-end",
-                           "key-prefix", "config end", dry=dry)
+                           "key-prefix", "config end", dry=dry, tag="basic")
         # raw-log full pull only on explicit request (stats already pulled
         # per run combo; failure paths pull raw for diagnosis separately)
         if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
@@ -4674,8 +4760,8 @@ def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
         log_detail("[k8s] deployment manifest: template={} -> {}:{}".format(
             os.path.relpath(_deployment_template_path(cluster), ROOT),
             controller_desc(c), remote_yaml))
-        log("[k8s] deployment {} create: ns={} role={} replicas={} image={}"
-            "".format(deploy, ns, role, replicas, k8s["image"]))
+        log("[k8s] deployment {} 开始创建: role={} replicas={}".format(
+            deploy, role, replicas))
         out, rc = controller_run(
             c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
         if rc != 0:
@@ -4685,8 +4771,8 @@ def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
         shutil.rmtree(local_dir, ignore_errors=True)
     t0 = time.time()
     wait_k8s_deployment_ready(cluster, deploy, run_label)
-    log("[k8s] deployment {} ready (role={}, replicas={}, elapsed={:.1f}s)"
-        "".format(deploy, role, replicas, time.time() - t0))
+    log("[k8s] deployment {} 已就绪 (role={}, {} 副本, {:.1f}s)".format(
+        deploy, role, replicas, time.time() - t0))
     return deploy, run_label
 
 
@@ -4955,8 +5041,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     remote_runner = remote_runner_pipeline
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
-    log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
-        cfg_name, op, topology, cfg["protocol"], host))
+    log_phase("场景 {} (engine=python, scenario=pipeline)".format(cfg_name))
     # ---- key-space budget, resolved BEFORE any cluster resource is touched
     # (configmap/deployment/staging): a missing store source or a too-small
     # store fails in seconds with zero leftovers. One cap per sweep size.
@@ -4968,18 +5053,45 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             globals_cfg, len(plan["writers"]), parse_data_size(_ds),
             int(cfg.get("batch_size", 1) or 1), _ds)
     cfg["_key_space"] = {str(_ds): _kc for _ds, _kc in _caps.items()}
-    log("pipeline key space (store source={}, configured={}, probed={}, "
-        "effective={}, ratio={}):".format(_src, _fmt_gib(_a), _fmt_gib(_b),
-                                          _fmt_gib(_eff),
-                                          _pipeline_key_space_ratio(globals_cfg)))
+    log("key 空间 (容量来源={}, 生效容量={}):".format(_src, _fmt_gib(_eff)))
     for _ds in sizes:
         _kc = _caps[_ds]
-        log("    {}: {} writers x {} keys = {} (of {} effective, "
-            "{} headroom)".format(
-                _ds, len(plan["writers"]), _kc,
-                _fmt_gib(len(plan["writers"]) * _kc * parse_data_size(_ds)),
-                _fmt_gib(_eff),
-                "{:g}".format(_pipeline_key_space_ratio(globals_cfg))))
+        log("    {}: 每 writer {} keys × {} writers = {} (预算比例 {:g})".format(
+            _ds, _kc, len(plan["writers"]),
+            _fmt_gib(len(plan["writers"]) * _kc * parse_data_size(_ds)),
+            _pipeline_key_space_ratio(globals_cfg)))
+    # Parameter block (engine x scenario, no cluster resource touched yet);
+    # resolved here so the console order is 参数 -> 资源创建.
+    warmup = "false" if args.no_warmup else "true"
+    client_timeout_s = _pipeline_client_timeout(
+        cfg, rendezvous_timeout_s, warmup_enabled=(warmup == "true"))
+    if getattr(args, "parallel_ready_dir", None):
+        client_timeout_s += _PARALLEL_READY_TIMEOUT_S
+    reader_threads = plan["reader_threads"]
+    hb_interval = _heartbeat_interval(globals_cfg)
+    _pl_total = (float(cfg.get("warmup", {}).get("duration", 0) or 0)
+                 + float(cfg.get("duration", 30)))
+    numa_bind = cfg.get("numa_bind")
+    if numa_bind is None:
+        numa_bind = globals_cfg.get("numa_bind")
+    numa_bind = True if numa_bind is None else bool(numa_bind)
+    cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
+    if cpu_shard > 0 and not numa_bind:
+        numa_bind = True
+    if is_k8s:
+        numa_bind = False
+        cpu_shard = 0
+    log("[pipeline] 参数: writer_op={} reader_op={} topo={} protocol={}{} "
+        "N={} writers={} readers={} notify_count={} total_qps={} "
+        "per_writer_qps={} traffic={} run_id={} client_timeout={}s sizes={} "
+        "NUMA/绑核={}".format(
+            writer_op, reader_op, topology, cfg["protocol"],
+            "" if is_k8s else " primary_node={}".format(host),
+            n_nodes, len(plan["writers"]), len(plan["readers"]),
+            plan["notify_count"], int(plan["total_qps"]),
+            plan["per_writer_qps"], cfg.get("traffic_mode", "pulse"),
+            run_id, client_timeout_s, ",".join(sizes),
+            "禁用(容器)" if is_k8s else ("启用" if numa_bind else "禁用")))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     scenario_params.update({
         "BENCH_WRITER_COUNT": str(len(plan["writers"])),
@@ -5015,6 +5127,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     writer_pids = []
     profile_sess = None  # profiling session (started at Step 1 or Step 3)
     stage = "configmap/scripts"
+    log_phase("资源创建", level=2)
     try:
         ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
         stage = "deploy pods"
@@ -5058,14 +5171,19 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             node = get_node(cluster, primary_node_name)
             host = node["ip"]
             if plan.get("dual"):
-                log("[k8s] pipeline pods ready: {} dual clients "
-                    "(N={}, spread maxSkew=1, run={})".format(
-                        len(plan["clients"]), n_nodes, _run_label))
+                _total, _extra = len(plan["clients"]), " (dual)"
             else:
-                log("[k8s] pipeline pods ready: {} writers + {} readers "
-                    "(N={}, spread maxSkew=1, run={})".format(
-                        len(plan["writers"]), len(plan["readers"]),
-                        n_nodes, _run_label))
+                _total = len(plan["writers"]) + len(plan["readers"])
+                _extra = " ({} writers + {} readers)".format(
+                    len(plan["writers"]), len(plan["readers"]))
+            if n_nodes and _total % n_nodes == 0:
+                log("[k8s] pipeline pods 已就绪: {}Pod/Node * {}Nodes = "
+                    "{}Pods{} (run={})".format(
+                        _total // n_nodes, n_nodes, _total, _extra,
+                        _run_label))
+            else:
+                log("[k8s] pipeline pods 已就绪: {}Pods / {}Nodes{} "
+                    "(run={})".format(_total, n_nodes, _extra, _run_label))
         stage = "stage scripts"
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
@@ -5074,29 +5192,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
             "involved_nodes": involved_nodes, "mode": "pipeline",
         }
-        # optional NUMA binding: per node, round-robin the node's client
-        # processes (readers launched first, then writers) across its NUMA nodes.
-        # Resolution: case/layer explicit value > global.json ("numa_bind",
-        # default true) > code default true; explicit false disables.
-        numa_bind = cfg.get("numa_bind")
-        if numa_bind is None:
-            numa_bind = globals_cfg.get("numa_bind")
-        numa_bind = True if numa_bind is None else bool(numa_bind)
-        # per-client core count (NUMA-aware sharding). When set it takes
-        # precedence over plain numa round-robin: each client process gets a
-        # consecutive cpu_shard-core slice of its NUMA node's allowed pool
-        # (exclude_cpus subtracted here), wrapping when the pool is smaller
-        # than clients x shard.
-        cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
-        if cpu_shard > 0 and not numa_bind:
-            numa_bind = True  # sharding needs the NUMA topology probes
-        if is_k8s and (numa_bind or cpu_shard > 0):
-            # containers do not do numactl: binding disabled for pipeline pods
-            numa_bind = False
-            cpu_shard = 0
-            log("k8s pipeline pods: numa/cpu binding disabled (containers)")
-        # numactl policy: membind (strict, default) | preferred | off, and
-        # strict/auto behavior when numactl is missing on a node
+        # NUMA probes (resolution already happened in the parameter block;
+        # k8s containers never bind).
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
         numa_node_count = {}
         numa_counter = {}
@@ -5128,23 +5225,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     numa_topo[node_name] = {0: "0"}
                     numactl_ok[node_name] = False
                 numa_counter[node_name] = 0
-        warmup = "false" if args.no_warmup else "true"
-        client_timeout_s = _pipeline_client_timeout(
-            cfg, rendezvous_timeout_s, warmup_enabled=(warmup == "true"))
-        # Parallel rank+recall: registered clients idle at the cross-child
-        # /start gate while the peer child finishes data-gen/smoke/boot.
-        # Reserve the ready-barrier ceiling on top of the normal lifetime
-        # (safety ceiling only: /shutdown still ends successful runs early).
-        if getattr(args, "parallel_ready_dir", None):
-            client_timeout_s += _PARALLEL_READY_TIMEOUT_S
-        reader_threads = plan["reader_threads"]
-        log("scenario {} (pipeline, {}): N={}, writers={}, readers={}, "
-            "notify_count={}, total_qps={}, per_writer_qps={}, traffic={}, "
-            "run_id={}, client_timeout={}s, sizes={}".format(
-                cfg_name, work_mode, n_nodes, len(plan["writers"]),
-                len(plan["readers"]), plan["notify_count"], plan["total_qps"],
-                plan["per_writer_qps"], cfg.get("traffic_mode", "pulse"),
-                run_id, client_timeout_s, sizes))
         current_ds = None
         for ds in sizes:
             if ds != current_ds:
@@ -5163,7 +5243,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   "generate-data", remote_log_dir, cfg_name,
                                   extra="--data-size {}".format(ds), dry_run=dry,
                                   pull_to=local_log_dir, node_name=node_name,
-                                  quiet=True)
+                                  quiet=True, tag="pipeline")
                         _gen += 1
                     else:
                         _cached += 1
@@ -5178,11 +5258,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             kc = _caps[ds]
             kc_arg = " --key-count {}".format(kc)
             stage = "remove-keys (pre-run, {})".format(ds)
+            log_phase("清库 remove-keys", level=2)
             _remove_keys_stage(cluster, globals_cfg, host, node,
                                remote_runner, remote_log_dir, cfg_name,
                                cfg_name, "full", "{} start".format(ds),
                                dry=dry, pull_to=local_log_dir,
-                               node_name=primary_node_name)
+                               node_name=primary_node_name, tag="pipeline")
             # fresh rendezvous state per size iteration (stale registrations
             # from a previous size must never leak into this one)
             reader_pids = []
@@ -5190,6 +5271,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             if not dry:
                 _etcd_delete_prefix(cluster, etcd_endpoints,
                                     "mcbench/{}/".format(run_id))
+            log_phase("启动实例", level=2)
             # data_size is always part of the run file name, so different
             # sizes never share writer/reader logs
             run_name = "benchmark_c1_t{}_{}".format(reader_threads, ds)
@@ -5256,7 +5338,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-                log("launched {} dual clients".format(len(plan["clients"])))
+                log("[pipeline] 已启动 {} dual clients，等待注册屏障".format(
+                    len(plan["clients"])))
                 # barriers: every client registered BOTH roles, then trigger
                 stage = "rendezvous ({})".format(ds)
                 if not dry:
@@ -5269,7 +5352,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "mcbench/{}/writers/".format(run_id),
                                       len(plan["clients"]), rendezvous_timeout_s,
                                       "dual writers", run_id)
-                    log("pipeline rendezvous: {}/{} dual clients registered "
+                    log("[pipeline] 屏障: {}/{} dual clients 注册完成 "
                         "({:.1f}s)".format(len(plan["clients"]),
                                            len(plan["clients"]),
                                            time.time() - t0))
@@ -5289,7 +5372,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "pipeline trigger failed for {}/{} clients: {} "
                             "({})".format(len(_fail), len(_items),
                                           _fail[0][0], _fail[0][2]))
-                    log("pipeline trigger: /start sent to {} dual clients "
+                    log("[pipeline] /start 已发送至 {} dual clients "
                         "(parallel x{})".format(
                             len(_items), min(_PIPELINE_PARALLEL,
                                              len(_items))))
@@ -5297,6 +5380,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     # Keep all reader endpoints alive until every writer is
                     # done, including warmup drain and measured drain time.
                     stage = "measurement ({})".format(ds)
+                    log_phase("测量", level=2)
                     completion_timeout = client_timeout_s
                     log("pipeline dual: waiting for all writers and notify drain")
                     _pipeline_barrier(cluster, etcd_endpoints,
@@ -5315,13 +5399,15 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                         if not _ok:
                             log("[WARN] {} shutdown: {}".format(_what, _err))
                     _w_t0, _w_exited = time.time(), 0
+                    _hb = (_Heartbeat("pipeline", _pl_total, hb_interval)
+                           if hb_interval else None)
                     for c, pid in writer_pids:
                         if not dry and pid:
                             exited = wait_process_exit(
                                 cluster, c["node"], pid,
                                 "dual c{}".format(c["id"]),
                                 60, dry_run=dry, expected_s=60,
-                                marker=_PIPELINE_PID_MARKER)
+                                marker=_PIPELINE_PID_MARKER, heartbeat=_hb)
                             if exited:
                                 _w_exited += 1
                                 _check_exitrc(
@@ -5334,6 +5420,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     if not dry:
                         log("clients exited: {}/{} ({:.1f}s)".format(
                             _w_exited, len(writer_pids), time.time() - _w_t0))
+                    log_phase("收集", level=2)
                     _groups = []
                     for c in plan["clients"]:
                         _rn = get_node(cluster, c["node"])
@@ -5404,7 +5491,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-                log("launched {} readers".format(len(plan["readers"])))
+                log("[pipeline] 已启动 {} readers，等待注册屏障".format(
+                    len(plan["readers"])))
                 # Step 2: etcd barrier — wait for the FULL reader pool to
                 # self-register before any writer starts (readers that fail to
                 # boot surface here as a timeout with the missing list)
@@ -5415,7 +5503,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "mcbench/{}/readers/".format(run_id),
                                       len(plan["readers"]), rendezvous_timeout_s,
                                       "readers", run_id)
-                    log("pipeline rendezvous: {}/{} readers registered ({:.1f}s)"
+                    log("[pipeline] 屏障: {}/{} readers 注册完成 ({:.1f}s)"
                         "".format(len(plan["readers"]), len(plan["readers"]),
                                   time.time() - t0))
                 # Step 3: start all writers in parallel (one invocation per writer; the
@@ -5463,7 +5551,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-                log("launched {} writers".format(len(plan["writers"])))
+                log("[pipeline] 已启动 {} writers，等待注册屏障".format(
+                    len(plan["writers"])))
                 # Step 4: etcd barrier — every writer registered (= reader list
                 # pulled from etcd + HTTP /start server bound), then TRIGGER the
                 # run: POST /start to each writer (k8s: direct pod IP; ssh:
@@ -5476,7 +5565,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "mcbench/{}/writers/".format(run_id),
                                       len(plan["writers"]), rendezvous_timeout_s,
                                       "writers", run_id)
-                    log("pipeline rendezvous: {}/{} writers registered ({:.1f}s)"
+                    log("[pipeline] 屏障: {}/{} writers 注册完成 ({:.1f}s)"
                         "".format(len(plan["writers"]), len(plan["writers"]),
                                   time.time() - t0))
                     # Cross-child rank+recall /start alignment (see the dual
@@ -5493,15 +5582,18 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "pipeline trigger failed for {}/{} writers: {} "
                             "({})".format(len(_fail), len(_items),
                                           _fail[0][0], _fail[0][2]))
-                    log("pipeline trigger: /start sent to {} writers "
+                    log("[pipeline] /start 已发送至 {} writers "
                         "(parallel x{})".format(
                             len(_items), min(_PIPELINE_PARALLEL,
                                              len(_items))))
                 # Step 5: wait for all writers to finish (warmup + measured run)
                 stage = "measurement ({})".format(ds)
+                log_phase("测量", level=2)
                 warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
                 duration = float(cfg.get("duration", 30))
                 _wt0, _wex = time.time(), 0
+                _hb = (_Heartbeat("pipeline", _pl_total, hb_interval)
+                       if hb_interval else None)
                 for w, pid in writer_pids:
                     if not dry and pid:
                         exited = wait_process_exit(
@@ -5509,7 +5601,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "writer w{}".format(w["gid"]),
                             client_timeout_s, dry_run=dry,
                             expected_s=warmup_duration + duration,
-                            marker=_PIPELINE_PID_MARKER)
+                            marker=_PIPELINE_PID_MARKER, heartbeat=_hb)
                         if exited:
                             _wex += 1
                             _check_exitrc(
@@ -5523,6 +5615,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("writers exited: {}/{} ({:.1f}s)".format(
                         _wex, len(writer_pids), time.time() - _wt0))
                 stage = "collect (writers, {})".format(ds)
+                log_phase("收集 (writers)", level=2)
                 _groups = [(get_node(cluster, w["node"]),
                             [("{}.writer_{}_w{}.log".format(
                                 _pod_base(base_noext, get_node(cluster, w["node"])),
@@ -5576,6 +5669,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     log("readers exited: {}/{} ({:.1f}s)".format(
                         _rex, len(reader_pids), time.time() - _rt0))
                 stage = "collect (readers, {})".format(ds)
+                log_phase("收集 (readers)", level=2)
                 _groups = [(get_node(cluster, r["node"]),
                             [("{}.reader_{}_r{}_p{}.log".format(
                                 _pod_base(base_noext, get_node(cluster, r["node"])),
@@ -5635,9 +5729,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         # enough. The log name is distinct (<cfg>.remove-keys-end.log) so it
         # sits next to the config-start remove-keys log.
         stage = "remove-keys (config end)"
+        log_phase("清理收尾", level=2)
         _remove_keys_stage(cluster, globals_cfg, host, node, remote_runner,
                            remote_log_dir, cfg_name, "remove-keys-end",
-                           "full", "config end", dry=dry)
+                           "full", "config end", dry=dry, tag="pipeline")
         # raw-log full pull only on explicit request (per-role stats were
         # pulled right after each role exited; failure paths pull raw)
         if getattr(args, "pull_raw_logs", False) or getattr(args, "png", False):
@@ -5908,7 +6003,7 @@ def _kvtest_health_gate(cluster, entries, timeout_s, what):
         except Exception:
             return False
 
-    log("kvtest health gate: waiting for {} {} (timeout {}s)".format(
+    log("[kvtest] 已启动 {} {}，等待健康门 (timeout {}s)".format(
         len(pending), what, timeout_s))
     while pending:
         _check_stop()
@@ -5925,7 +6020,7 @@ def _kvtest_health_gate(cluster, entries, timeout_s, what):
                     ", ".join("i{} on {}".format(e["iid"], e["node"])
                               for e in pending[:8])))
         time.sleep(2)
-    log("kvtest health gate: {}/{} {} healthy ({:.1f}s)".format(
+    log("[kvtest] 健康门: {}/{} {} 通过 ({:.1f}s)".format(
         len(entries), len(entries), what, time.time() - t0))
 
 
@@ -5947,7 +6042,7 @@ def _kvtest_kill_tree(cluster, node_name, pid):
 
 
 def _wait_kvtest_processes(cluster, instance_pids, timeout_s, expected_s=None,
-                           label_prefix="kvtest"):
+                           label_prefix="kvtest", progress_interval=None):
     """Wait for kvtest wrappers in parallel under one shared deadline.
 
     The old per-instance loop multiplied the timeout by the number of
@@ -5957,7 +6052,7 @@ def _wait_kvtest_processes(cluster, instance_pids, timeout_s, expected_s=None,
     """
     if not instance_pids:
         return []
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _one(pair):
         entry, pid = pair
@@ -5969,8 +6064,27 @@ def _wait_kvtest_processes(cluster, instance_pids, timeout_s, expected_s=None,
             expected_s=expected_s, marker=_KVTEST_PID_MARKER)
 
     workers = max(1, min(_PIPELINE_PARALLEL, len(instance_pids)))
+    results = [False] * len(instance_pids)
+    done_count = 0
+    t0 = time.time()
+    last = t0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(_one, instance_pids))
+        futs = {pool.submit(_one, pair): idx
+                for idx, pair in enumerate(instance_pids)}
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            try:
+                results[idx] = bool(fut.result())
+            except Exception:
+                results[idx] = False
+            done_count += 1
+            now = time.time()
+            if (progress_interval and now - last >= progress_interval
+                    and done_count < len(results)):
+                last = now
+                log("[kvtest] 实例正在退出: {}/{} ({:.0f}s)".format(
+                    done_count, len(results), now - t0))
+    return results
 
 
 def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
@@ -6663,9 +6777,20 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     remote_runner_kvtest = remote_scripts + "/run_kvtest.sh"
     if not dry:
         os.makedirs(local_log_dir, exist_ok=True)
-    log("=== scenario {} (kvtest, op={}+{}, topo={}, protocol={}) "
-        "primary_node={} ===".format(cfg_name, writer_op, reader_op,
-                                     topology, cfg["protocol"], host))
+    # NUMA/binding resolution is parameter info (k8s always disables it);
+    # resolved before the scenario header so it can be printed there.
+    numa_bind = cfg.get("numa_bind")
+    if numa_bind is None:
+        numa_bind = globals_cfg.get("numa_bind")
+    numa_bind = True if numa_bind is None else bool(numa_bind)
+    cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
+    if cpu_shard > 0 and not numa_bind:
+        numa_bind = True  # sharding needs the NUMA topology probes
+    if is_k8s:
+        numa_bind = False
+        cpu_shard = 0
+    log_phase("场景 {} (engine=kvtest, scenario={})".format(
+        cfg_name, cfg.get("report_scenario") or "pipeline"))
     # ---- key pool per sweep size, resolved BEFORE any cluster resource is
     # touched (a missing store source or a too-small store fails in seconds
     # with zero leftovers) ----
@@ -6677,16 +6802,25 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             cfg, globals_cfg, plan, len(plan["writers"]),
             parse_data_size(_ds), _ds)
     cfg["_kvtest_key_pool"] = {str(_ds): _p for _ds, _p in pools.items()}
-    log("kvtest key pool (store source={}, configured={}, probed={}, "
-        "effective={}):".format(_src, _fmt_gib(_a), _fmt_gib(_b), _fmt_gib(_eff)))
+    log("[kvtest] 参数: N={} writers={} readers={} notify_count={} "
+        "total_qps={} per_node_qps={} binary={} warmup={}s duration={}s "
+        "health_timeout={}s "
+        "sizes={} NUMA/绑核={}".format(
+            n_nodes, len(plan["writers"]), len(plan["readers"]),
+            plan["notify_count"], int(plan["total_qps"]),
+            plan["per_node_qps"], kv_binary, warmup_duration,
+            float(cfg.get("duration", 30)), health_timeout_s,
+            ",".join(sizes),
+            ("禁用(容器)" if is_k8s
+             else ("启用" if numa_bind else "禁用"))))
     for _ds in sizes:
         if pools[_ds] == 0:
-            log("    {}: unbounded new keys (key_pool_size=0)".format(_ds))
+            log("key 池: {} 每 writer 无上限 (key_pool_size=0)".format(_ds))
         else:
-            log("    {}: {} writers x {} keys = {}".format(
-                _ds, len(plan["writers"]), pools[_ds],
+            log("key 池: {} 每 writer {} keys × {} writers = {} (容量来源={})".format(
+                _ds, pools[_ds], len(plan["writers"]),
                 _fmt_gib(len(plan["writers"]) * pools[_ds] *
-                         parse_data_size(_ds))))
+                         parse_data_size(_ds)), _src))
     scenario_params = base_scenario_params(cfg, work_mode, topology,
                                            primary_node_name)
     scenario_params.update({
@@ -6701,6 +6835,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     instance_pids = []
     duration = float(cfg.get("duration", 30))
+    hb_interval = _heartbeat_interval(globals_cfg)
+    log_phase("资源创建", level=2)
     stage = "configmap/scripts"
     try:
         ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
@@ -6747,19 +6883,22 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             node = get_node(cluster, primary_node_name)
             host = node["ip"]
             if plan.get("dual"):
-                log("[k8s] kvtest pods ready: {} dual instances "
-                    "(N={}, spread maxSkew=1, run={})".format(
-                        len(plan["clients"]), n_nodes, _run_label))
+                _total, _extra = len(plan["clients"]), " (dual)"
             elif plan.get("split_pod"):
-                log("[k8s] kvtest pods ready: {} client pods, each with "
-                    "one writer + one reader (N={}, spread maxSkew=1, "
-                    "run={})".format(
-                        len(plan["clients"]), n_nodes, _run_label))
+                _total = len(plan["clients"])
+                _extra = " (每 pod 1 writer + 1 reader)"
             else:
-                log("[k8s] kvtest pods ready: {} writers + {} readers "
-                    "(N={}, spread maxSkew=1, run={})".format(
-                        len(plan["writers"]), len(plan["readers"]),
-                        n_nodes, _run_label))
+                _total = len(plan["writers"]) + len(plan["readers"])
+                _extra = " ({} writers + {} readers)".format(
+                    len(plan["writers"]), len(plan["readers"]))
+            if n_nodes and _total % n_nodes == 0:
+                log("[k8s] kvtest pods 已就绪: {}Pod/Node * {}Nodes = "
+                    "{}Pods{} (run={})".format(
+                        _total // n_nodes, n_nodes, _total, _extra,
+                        _run_label))
+            else:
+                log("[k8s] kvtest pods 已就绪: {}Pods / {}Nodes{} "
+                    "(run={})".format(_total, n_nodes, _extra, _run_label))
         # Artifact filenames no longer carry the full node/Pod name. Preserve
         # the iid -> real node mapping in the in-memory scenario config so CSV
         # aggregation can still resolve node IP/topology after files are
@@ -6809,17 +6948,6 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # optional NUMA binding (ssh only): same machinery as pipeline —
         # numactl prefix for cpu+mem binding, cpu_affinity in the JSON so the
         # binary re-confirms the affinity itself
-        numa_bind = cfg.get("numa_bind")
-        if numa_bind is None:
-            numa_bind = globals_cfg.get("numa_bind")
-        numa_bind = True if numa_bind is None else bool(numa_bind)
-        cpu_shard = int(cfg.get("cpu_shard", 0) or 0)
-        if cpu_shard > 0 and not numa_bind:
-            numa_bind = True  # sharding needs the NUMA topology probes
-        if is_k8s and (numa_bind or cpu_shard > 0):
-            numa_bind = False
-            cpu_shard = 0
-            log("k8s kvtest pods: numa/cpu binding disabled (containers)")
         stage = "numa probe"
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
         numa_node_count = {}
@@ -6874,13 +7002,6 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                  "role": "reader", "host": _entry_host(r)})
             return view
 
-        log("scenario {} (kvtest, {}): N={}, writers={}, readers={}, "
-            "notify_count={}, total_qps={}, per_node_qps={}, binary={}, "
-            "warmup={}s, duration={}s, health_timeout={}s, sizes={}".format(
-                cfg_name, work_mode, n_nodes, len(plan["writers"]),
-                len(plan["readers"]), plan["notify_count"], plan["total_qps"],
-                plan["per_node_qps"], kv_binary, warmup_duration, duration,
-                health_timeout_s, sizes))
 
         def _prepare_instance(entry, role, ds, key_pool, all_instances,
                               lhost_counter):
@@ -7009,17 +7130,19 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             # fresh store per size: full remove-all (kvtest keys use the
             # hardcoded mooncake_kvtest_ prefix, but scope=full clears them)
             stage = "remove-keys (pre-run, {})".format(ds)
+            log_phase("清库 remove-keys", level=2)
             _remove_keys_stage(cluster, globals_cfg, host, node,
                                remote_runner_pipeline, remote_log_dir,
                                cfg_name, cfg_name, "full",
                                "{} start".format(ds), dry=dry,
                                pull_to=local_log_dir,
-                               node_name=primary_node_name)
+                               node_name=primary_node_name, tag="kvtest")
             current_ds = ds
             instance_pids = []
             key_pool = pools[ds]
             all_instances = _instance_view()
             lhost_counter = {}
+            log_phase("启动实例", level=2)
             if plan.get("dual"):
                 stage = "launch dual instances ({})".format(ds)
                 # one process hosts writer+reader: prepare all configs (and
@@ -7030,8 +7153,6 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _prepare_instance(c, "dual", ds, key_pool, all_instances,
                                       lhost_counter)
                 _fire_instances(plan["clients"])
-                log("launched {} dual kvtest instances".format(
-                    len(plan["clients"])))
                 stage = "health gate (dual, {})".format(ds)
                 if not dry:
                     _kvtest_health_gate(cluster, plan["clients"],
@@ -7044,7 +7165,6 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _prepare_instance(r, "reader", ds, key_pool, all_instances,
                                       lhost_counter)
                 _fire_instances(plan["readers"])
-                log("launched {} kvtest readers".format(len(plan["readers"])))
                 stage = "health gate (readers, {})".format(ds)
                 if not dry:
                     _kvtest_health_gate(cluster, plan["readers"],
@@ -7056,7 +7176,6 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _prepare_instance(w, "writer", ds, key_pool, all_instances,
                                       lhost_counter)
                 _fire_instances(plan["writers"])
-                log("launched {} kvtest writers".format(len(plan["writers"])))
                 stage = "health gate (writers, {})".format(ds)
                 if not dry:
                     _kvtest_health_gate(cluster, plan["writers"],
@@ -7079,16 +7198,21 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             def _wait_window(seconds, label):
                 if dry or seconds <= 0:
                     return
-                log("kvtest {} window: {}s (ETA {})".format(
+                log("[kvtest] {} window: {}s (ETA {})".format(
                     label, seconds,
                     time.strftime("%H:%M:%S",
                                   time.localtime(time.time() + seconds))))
+                hb = (_Heartbeat("kvtest", seconds, hb_interval)
+                      if label == "measurement" else None)
                 started = time.time()
                 while time.time() - started < seconds:
                     _check_stop()
+                    if hb is not None:
+                        hb.tick()
                     time.sleep(min(
                         1.0, max(0.05, seconds - (time.time() - started))))
 
+            log_phase("测量", level=2)
             stage = "/start ({})".format(ds)
             try:
                 _parallel_start_barrier(args)
@@ -7123,7 +7247,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                             "_kvtest_start_epochs", {})[str(ds)] = time.time()
                     _control("/resume", "measurement /resume",
                              transition_timeout)
-                    log("kvtest warmup complete: queues drained, metrics "
+                    log("[kvtest] warmup complete: queues drained, metrics "
                         "reset, measurement armed")
 
                 # ---- measurement window: /start (no warmup) or /arm (warmup)
@@ -7143,6 +7267,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
             stage = "/stop ({})".format(ds)
+            log("[kvtest] /stop: 通知 {} 个实例停机并落盘...".format(len(items)))
             for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
                                                             "/stop",
                                                             timeout=10):
@@ -7159,7 +7284,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _exit_results = [True for _ in instance_pids]
             else:
                 _exit_results = _wait_kvtest_processes(
-                    cluster, instance_pids, 30, expected_s=30)
+                    cluster, instance_pids, 30, expected_s=30,
+                    progress_interval=10)
                 _remaining = [pair for pair, exited in
                               zip(instance_pids, _exit_results) if not exited]
                 if _remaining:
@@ -7195,7 +7321,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         + ".log.exitrc",
                         "kvtest i{}".format(entry["iid"]))
             if not dry:
-                log("kvtest instances exited: {}/{} ({:.1f}s)".format(
+                log("[kvtest] 实例已退出: {}/{} ({:.1f}s)".format(
                     _exited, len(instance_pids), time.time() - _t0))
                 if _exited != len(instance_pids):
                     _alive = ["i{} on {}".format(entry["iid"], entry["node"])
@@ -7206,6 +7332,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         "still alive: {}".format(", ".join(_alive)))
             # ---- flatten artifacts + remote trace map + compact pull ----
             stage = "collect artifacts ({})".format(ds)
+            log_phase("收集", level=2)
+            _t_pull = time.time()
             # 对齐 pipeline 的 stats-only 策略：原始 .log（空）与 .log.glog
             # （可达数百 MB/实例）一律不传输，留在各节点 hostPath 现场；
             # glog 的 trace 统计在 pod 内算好后只回传小 trace.json。
@@ -7244,6 +7372,16 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _groups.append((n, _files,
                                 "kvtest i{}".format(entry["iid"])))
             _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+            _pulled_bytes = 0
+            if not dry:
+                for _n, _files, _l in _groups:
+                    for _f in _files:
+                        try:
+                            _pulled_bytes += os.path.getsize(
+                                os.path.join(local_log_dir,
+                                             os.path.basename(_f)))
+                        except OSError:
+                            pass
             if not dry:
                 # keep node mapping + this size's /start epoch local for the
                 # report map and for --rebuild-report after a later failure
@@ -7252,9 +7390,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     local_log_dir, cfg,
                     _kvtest_report_context(cluster, ts, remote_log_dir,
                                            is_k8s))
-            log("logs: {} files / {} instances pulled (raw logs stay on "
-                "nodes)".format(sum(len(f) for _n, f, _l in _groups),
-                                len(_groups)))
+            log("[kvtest] 拉取完成: {} files / {} instances ({:.1f} min, {}; "
+                "raw logs stay on nodes)".format(
+                    sum(len(f) for _n, f, _l in _groups), len(_groups),
+                    (time.time() - _t_pull) / 60.0, _fmt_mb(_pulled_bytes)))
             # remove empty .nohup redirect files (non-empty kept for
             # diagnostics on the node)
             if not dry:
@@ -7273,10 +7412,11 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # Config end: remove-all — clears everything this config's writers
         # wrote (kvtest keys share the store with nothing else here)
         stage = "remove-keys (config end)"
+        log_phase("清理收尾", level=2)
         _remove_keys_stage(cluster, globals_cfg, host, node,
                            remote_runner_pipeline, remote_log_dir, cfg_name,
                            "remove-keys-end", "full", "config end",
-                           dry=dry, pull_to=local_log_dir)
+                           dry=dry, pull_to=local_log_dir, tag="kvtest")
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
@@ -9161,17 +9301,36 @@ def main(args, cfg_paths):
         set_stop_file(stop_file)
     set_verbose(getattr(args, "verbose", False)
                 or os.environ.get("MC_BENCH_VERBOSE", "") == "1")
+    log_phase("run 参数与环境")
     cluster = load_json(args.cluster)
     if args.mode == "k8s":
         cluster["_controller"] = build_controller(cluster)
         k8s_settings(cluster)      # fail fast on missing ns/image/workspaces
         try:
             info = controller_diagnose(cluster["_controller"])
-            log("[k8s] controller info: " + " | ".join(info.splitlines()))
+            keep, extra = [], []
+            for ln in info.splitlines():
+                if ln.startswith(("HOME=", "PATH=")):
+                    extra.append(ln)
+                    continue
+                k, _, v = ln.partition("=")
+                keep.append("{}={}".format(k, v or "<unset>"))
+            log("[k8s] controller: {} | {}".format(
+                controller_desc(cluster["_controller"]), " | ".join(keep)))
+            if extra:
+                log_detail("[k8s] controller env: " + " | ".join(extra))
         except Exception as exc:
             log("[WARN] k8s controller info: {}".format(exc))
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
+    # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
+    # run prefix is also wiped per scenario/size; this covers the rest).
+    # Done BEFORE the capacity probe so both k8s DNS resolutions print as
+    # one adjacent pair.
+    try:
+        _pipeline_wipe_etcd(cluster, globals_cfg)
+    except Exception as exc:
+        log("[WARN] etcd stale-key wipe failed: {}".format(exc))
     # store capacity: ALWAYS probe the master metrics (B) — even when
     # store_total_size (A) is set — so the effective capacity can follow the
     # min(A, B) rule. Probe failure only WARNs (A still stands).
@@ -9180,15 +9339,10 @@ def main(args, cfg_paths):
     except Exception as exc:
         log("[WARN] store capacity auto-discovery: {}".format(exc))
     _a, _b, _eff, _src = _store_capacity_resolution(globals_cfg)
-    log("[benchmark] store capacity: configured={}, probed={}, "
-        "effective={} ({})".format(
-            _fmt_gib(_a), _fmt_gib(_b), _fmt_gib(_eff), _src))
-    # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
-    # run prefix is also wiped per scenario/size; this covers the rest)
-    try:
-        _pipeline_wipe_etcd(cluster, globals_cfg)
-    except Exception as exc:
-        log("[WARN] etcd stale-key wipe failed: {}".format(exc))
+    _free = globals_cfg.get("_store_free_auto")
+    log("store 容量: 探测得 总空间={} 可用空间={}; 预配置可用容量={}; "
+        "本测试实际将使用容量={}".format(
+            _fmt_gib(_b), _fmt_gib(_free), _fmt_gib(_a), _fmt_gib(_eff)))
     if args.mode == "k8s":
         globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
     # startup summary (mode, config paths, k8s settings)
@@ -9198,10 +9352,10 @@ def main(args, cfg_paths):
         os.path.relpath(args.profile, ROOT) if args.profile else "-"))
     if args.mode == "k8s":
         _ks = k8s_settings(cluster)
-        log("[k8s] settings: namespace={} template={}".format(
-            _ks["namespace"], os.path.relpath(_pod_template_path(cluster), ROOT)))
-        log("[k8s] image: {}".format(_ks["image"]))
-        log("[k8s] workspaces: controller={} pod={}".format(
+        log("[k8s] 设置: namespace={} | 镜像={} | 模板={}".format(
+            _ks["namespace"], _ks["image"],
+            os.path.relpath(_pod_template_path(cluster), ROOT)))
+        log("[k8s] 工作区: controller={} pod={}".format(
             _ks["controller_workspace"], _ks["pod_workspace"]))
     _validate_master_mode(globals_cfg)
     _STOP_CTX.update(cluster=cluster, globals_cfg=globals_cfg, args=args)
@@ -9214,7 +9368,7 @@ def main(args, cfg_paths):
         matrix = prof_core.load_matrix(profile_path)
     args._matrix = matrix
     if matrix:
-        log("profiling profile active: {} (trigger={})".format(
+        log("profiling 已启用: {} (触发={})".format(
             profile_path, matrix.get("trigger")))
     # .state ledger check: reap any leftovers from previous runs
     # (crashed/killed orchestrator) BEFORE anything else touches nodes.
@@ -9265,9 +9419,10 @@ def main(args, cfg_paths):
         # console (WebUI) keeps the summary + verbose adds detail to it
         set_detail_log(os.path.join(ts_dir, "benchmark.log"))
         atexit.register(close_detail_log)
-        log("results root: {}".format(ts_dir))
-        log("full log: {}".format(os.path.join(ts_dir, "benchmark.log")))
+        log("结果目录: {} (完整日志: {})".format(
+            ts_dir, os.path.join(ts_dir, "benchmark.log")))
     if args.mode == "k8s":
+        log_phase("run 初始化")
         k8s_workspace_dirs(cluster, dry_run=args.dry_run)
         k8s_prerun(cluster, dry_run=args.dry_run)
         ensure_k8s_namespace(cluster, ts, dry_run=args.dry_run)
@@ -9417,6 +9572,7 @@ def main(args, cfg_paths):
     # store is a no-op (safe), and failure here must not fail the whole sweep
     # — hence WARN-only. The log is scp'd out because it does not match the
     # per-config glob used by pull_logs.
+    log_phase("运行收尾")
     if sweep_remove:
         try:
             nd = get_node(cluster, sweep_remove["node"])
@@ -9424,7 +9580,7 @@ def main(args, cfg_paths):
                 cluster, globals_cfg, sweep_remove["host"], nd,
                 sweep_remove["runner"], sweep_remove["remote_log_dir"],
                 "final", "final", "full", "sweep end", dry=False,
-                node_name=sweep_remove["node"])
+                node_name=sweep_remove["node"], label="[remove-keys] final")
             if not ran:
                 log("sweep-end remove-keys skipped (store already clean)")
             else:
@@ -9566,7 +9722,7 @@ def _run_legacy_plots(log_dir):
     for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
                 "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         plot_env[var] = "1"
-    log("[benchmark] plotting locally on this machine (orchestrator): "
+    log("plotting locally on this machine (orchestrator): "
         "{} {} --log {}".format(sys.executable, plot_script, log_dir))
     try:
         proc = subprocess.run([sys.executable, plot_script, "--log", log_dir],

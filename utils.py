@@ -28,6 +28,24 @@ import threading
 import time
 
 
+def log_phase(name, level=1):
+    """Print a phase divider (blank line + untimestamped rule line).
+
+    level 1 = run/scenario phase, level 2 = stage inside a scenario. Written
+    to the console and the full detail log under the logging lock; no
+    timestamp/prefix so the divider stands out visually."""
+    line = ("──── {} ────".format(name) if level <= 1
+            else "  ── {} ──".format(name))
+    with _LOG_LOCK:
+        print("\n" + line, flush=True)
+        if _DETAIL_FH is not None:
+            try:
+                _DETAIL_FH.write("\n" + line + "\n")
+                _DETAIL_FH.flush()
+            except Exception:
+                pass
+
+
 def ensure_utf8_stdio():
     """Force redirected stdout/stderr to UTF-8.
 

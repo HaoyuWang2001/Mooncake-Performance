@@ -58,6 +58,20 @@ CLI 的 `--protocol` 可选值为 `tcp / rdma / ub`，优先级最高、可覆�
 
 接口清单、签名与梯队分类详见 **`Mooncake-api.md`**。
 
+### 3.0 统一口径：引擎（engine）× 场景（scenario）
+
+测试矩阵按两个正交维度描述（报表 `meta` 同名）：
+
+- **引擎 engine**：`python`（Python client）｜`kvtest`（C++ `mooncake_kvtest`）——决定“谁来发请求”；
+- **场景 scenario**：`basic`（接口级逐接口扫描）｜`pipeline`（writer→reader 生产消费）——决定“报表版式与负载形态”。
+
+2×2 组合即 `python:basic` / `python:pipeline` / `kvtest:basic` / `kvtest:pipeline`。
+配置里沿用历史字段 `scenario: "basic"|"pipeline"|"kvtest"`：`"kvtest"` 表示 **引擎 kvtest + 形态默认
+pipeline**（可用 `report_scenario` 覆盖形态）；报表读取时统一归一化为 `scenario=pipeline|basic`
++ `engine=kvtest|python`。日志标签按「操作归属」：`[kvtest]` = kvtest 引擎专属操作，
+`[pipeline]`/`[basic]` = 场景专属操作，`[k8s]` = 集群动作，其余为 `[verify]`/`[remove-keys]`/
+`[parallel]`/`[report]` 等语义标签。
+
 ### 3.1 并发维度（params 组合）
 
 并发维度由场景配置中的 `params` 数组显式指定，每个元素为一个
@@ -546,13 +560,21 @@ env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），�
 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`；CLI 重定向时入口会
 `reconfigure` 非 tty 的 stdout/stderr，因此 Windows 下中文日志不再乱码。
 
-**编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头。
+**编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头；阶段分割行
+（`──── 阶段 ────` / `  ── 子阶段 ──`）不带时间戳，且前置一个空行，便于快速定位
+「参数与环境 / run 初始化 / 场景 … / 资源创建 / 清库 / 启动实例 / 测量 / 收集 / 清理收尾 /
+运行收尾」。中文只用于阶段名、难以理解的说明（store 容量、key 池、心跳、退出进度）
+和少量动词；标识符/命令/标签保持英文。
 **verbose 开关**：CLI `--verbose`/`-v`、环境变量 `MC_BENCH_VERBOSE=1`、
-WebUI 运行框勾选 `verbose`。默认打印：启动摘要（mode/配置路径/k8s 设置）、
-workspace 创建、脚本 staging 目录与文件清单（upload → controller 路径）、
-ConfigMap 创建（ns + keys）、pod 创建/挂载/ready（含 k8s node 与耗时）、
-每个 stage 的 done rc/elapsed、日志拉取汇总（源→目标）。verbose 额外输出：
-逐文件上传大小、逐文件拉取、完整 kubectl 命令、失败时 `kubectl describe pod` 尾部。
+WebUI 运行框勾选 `verbose`。默认打印：参数与环境摘要（controller/镜像/namespace/配置路径）、
+容量探测结论、workspace/预运行/namespace、脚本上传与 ConfigMap、deployment/pod 就绪、
+每个 stage 的 `running.../done rc=…`（标签带引擎/场景，如 `[kvtest] remove-keys`）、
+健康门/屏障、测量心跳、日志拉取汇总（文件数/实例数/耗时/字节）。细节（逐文件清单、
+kubectl 命令、describe 尾部、多次 DNS 解析）只进 `benchmark.log`（log_detail）。
+**测量心跳**：`global.json` 的 `heartbeat_interval_s`（默认 60，0=关闭）对全部 2×2
+引擎×场景生效，格式 `[<tag>] 测试已进行 hh:mm:ss，剩余 hh:mm:ss，预计结束于 hh:mm:ss`
+（无固定时长时只打已进行时间）。kvtest 退出等待每 10s 打一行
+`[kvtest] 实例正在退出: x/n (xs)`。
 
 **client 启动环境快照**：每个 benchmark client 进程启动的最开始会打印一行
 `[client-env] pid=... argv=...`，包含 `POD_IP / NODE_NAME / LD_LIBRARY_PATH /

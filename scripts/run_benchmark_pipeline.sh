@@ -62,7 +62,12 @@ PYTHON="${ORCH_VENV:-python3}"
 CLIENT="$SCRIPT_DIR/mooncake_benchmark_client.py"
 mkdir -p "$(dirname "$LOG_FILE")"
 
-print_client_env "mode=$MODE"
+# Environment snapshot only for the actual benchmark run (the C++ kvtest
+# runner has no such line at all); stage modes (remove-keys / generate-data /
+# prepare-store) keep the console quiet.
+if [ "$MODE" = "pipeline" ]; then
+  print_client_env "mode=$MODE"
+fi
 # Three-stream separation (read / writer / client-glog): the client writes its
 # Python stream (RESULT/META/SUMMARY/progress) DIRECTLY into MC_WRITER_LOG
 # (dual readers additionally use MC_READER_LOG, both exported by the

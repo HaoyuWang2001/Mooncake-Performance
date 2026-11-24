@@ -227,7 +227,10 @@ else
     LAUNCH_CMD=()
     BIND_ARGS=""
   fi
-  print_client_env "client-id=1 mode=$MODE"
+  # Environment snapshot only for the actual benchmark run; stage modes stay quiet.
+  if [ "$MODE" = "benchmark" ]; then
+    print_client_env "client-id=1 mode=$MODE"
+  fi
   # three-stream separation: Python stream -> MC_WRITER_LOG (= LOG_FILE);
   # fd1+fd2 (SDK glog + fatal) -> LOG_FILE.glog
   MC_WRITER_LOG="$LOG_FILE" \
