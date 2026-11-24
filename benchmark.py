@@ -5984,6 +5984,38 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
     }
 
 
+def _kvtest_split_launch_order(cfg):
+    """kvtest.reader_first_launch=true restores the legacy two-phase
+    reader-then-writer stagger. Default False: with start_paused the C++
+    writer stays inert until /start (and only connects/sends then, main.cpp
+    /start -> writer->Start), so both roles can be prepared, fired and
+    health-gated as ONE batch — the readers-first contract holds as long as
+    the combined gate passes before the /start fan-out."""
+    return bool((cfg.get("kvtest", {}) or {}).get("reader_first_launch"))
+
+
+def _kvtest_launch_split_roles(plan, split, prepare, fire, gate):
+    """Choreograph the split-role launch/gate sequence (unit tested).
+
+    prepare(role, entries) pushes per-instance configs (role = reader |
+    writer); fire(entries) launches the prepared paused processes;
+    gate(entries, what) health-gates them. The two staggers differ only in
+    grouping — the caller's closures keep the scenario's `stage`
+    attribution and the dry-run skip in sync."""
+    if split:
+        prepare("readers", plan["readers"])
+        fire(plan["readers"])
+        gate(plan["readers"], "readers")
+        prepare("writers", plan["writers"])
+        fire(plan["writers"])
+        gate(plan["writers"], "writers")
+    else:
+        prepare("readers", plan["readers"])
+        prepare("writers", plan["writers"])
+        fire(plan["readers"] + plan["writers"])
+        gate(plan["readers"] + plan["writers"], "instances")
+
+
 def _kvtest_health_gate(cluster, entries, timeout_s, what):
     """Poll GET /health on every kvtest instance until all respond. The
     binary starts its HTTP server only AFTER the store client setup, so
@@ -7158,28 +7190,32 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _kvtest_health_gate(cluster, plan["clients"],
                                         health_timeout_s, "dual instances")
             else:
-                # kvtest README rule: readers before writers, so the first
-                # writer notify already finds every consumer bound
-                stage = "launch readers ({})".format(ds)
-                for r in plan["readers"]:
-                    _prepare_instance(r, "reader", ds, key_pool, all_instances,
-                                      lhost_counter)
-                _fire_instances(plan["readers"])
-                stage = "health gate (readers, {})".format(ds)
-                if not dry:
-                    _kvtest_health_gate(cluster, plan["readers"],
-                                        health_timeout_s, "readers")
-                # Hold at the cross-child barrier after inert config pushes;
-                # processes remain paused until the later /start fan-out.
-                stage = "launch writers ({})".format(ds)
-                for w in plan["writers"]:
-                    _prepare_instance(w, "writer", ds, key_pool, all_instances,
-                                      lhost_counter)
-                _fire_instances(plan["writers"])
-                stage = "health gate (writers, {})".format(ds)
-                if not dry:
-                    _kvtest_health_gate(cluster, plan["writers"],
-                                        health_timeout_s, "writers")
+                # start_paused keeps writer threads inert until the /start
+                # fan-out below, and a C++ writer only starts sending at
+                # /start (main.cpp /start -> writer->Start) — so the classic
+                # "readers before writers" ordering contract is satisfied
+                # as long as every health gate passes before /start. Default:
+                # prepare+fire both roles in one batch and gate them together
+                # (saves one serial config-push round and one whole gate,
+                # ~35s at recall scale); kvtest.reader_first_launch=true
+                # restores the legacy two-phase stagger.
+                def _prepare_role(role, entries):
+                    nonlocal stage
+                    stage = "launch {}s ({})".format(role, ds)
+                    for e in entries:
+                        _prepare_instance(e, role, ds, key_pool,
+                                          all_instances, lhost_counter)
+
+                def _gate_role(entries, what):
+                    nonlocal stage
+                    stage = "health gate ({}, {})".format(what, ds)
+                    if not dry:
+                        _kvtest_health_gate(cluster, entries,
+                                            health_timeout_s, what)
+
+                _kvtest_launch_split_roles(
+                    plan, _kvtest_split_launch_order(cfg),
+                    _prepare_role, _fire_instances, _gate_role)
             # All processes are healthy but start_paused=true keeps writer
             # threads inert. /start releases the same deployment for warmup
             # (when configured) or directly for measurement.

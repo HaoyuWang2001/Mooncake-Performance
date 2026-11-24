@@ -122,7 +122,11 @@ pod/节点后经 `scripts/run_kvtest.sh` 启动；运行窗口 = `duration`，�
 - **完全分离模式**（无 `client` 块）：writer/reader 各自创建 Deployment 和 Pod，
   数量分别为各自的 `count_per_node × N`。
 
-后两种模式都会先启动全部 reader 并通过 `/health` 健康门，再启动 writer。
+后两种模式默认**一次拉起全部 reader+writer 并过一道合并健康门**：`start_paused`
+下 writer 直到 `/start` 才开始连接/发送（`/start` → `writer->Start`），因此
+"reader 先于 writer"的次序约束只需"所有健康门在 `/start` 之前通过"即可满足，
+省去一段串行配置推送与一整道健康门。`kvtest.reader_first_launch=true` 恢复
+传统的"先启动全部 reader 过门、再启动 writer"两段式。
 Pod 内分进程模式中，`local_buffer_size` 对每个进程分别生效，因此一个 Pod 的
 内存预算至少要覆盖两个 client buffer 加进程额外开销。
 
