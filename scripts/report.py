@@ -2018,6 +2018,8 @@ margin-bottom:16px}
 border:1px solid var(--grid);background:transparent;color:var(--ink);
 cursor:pointer}
 .lat-sel-btns button.off{opacity:.35;text-decoration:line-through}
+.lat-sel>button.off{opacity:.35}
+.lat-sel-btns button.rect{border-radius:4px;font-weight:600;padding:2px 9px}
 .lat-sel-btns button .dot{display:inline-block;width:8px;height:8px;
 border-radius:99px;margin-right:5px;vertical-align:middle}
 /* ---- 端点标识：细线指向端点，标识纵向排开 ---- */
@@ -2519,6 +2521,21 @@ const latShown={p99:true,p50:true,avg:true,p999:true,max:true,
 function renderLatSel(){
   const box=document.getElementById('latSel'); if(!box) return;
   box.innerHTML='';
+  /* 操作按钮（矩形，与指标 pill 区分）固定在指标之前 */
+  const allb=el('button','mini rect','全选');
+  allb.title='显示全部指标（含队列等待）';
+  allb.onclick=function(){
+    LAT_LINES.forEach(function(L){latShown[L[0]]=true;});
+    renderLatSel(); buildChart();
+  };
+  const clrb=el('button','mini rect','清空');
+  clrb.title='关闭全部指标（保留 avg 防止空图）';
+  clrb.onclick=function(){
+    LAT_LINES.forEach(function(L){latShown[L[0]]=false;});
+    latShown.avg=true;
+    renderLatSel(); buildChart();
+  };
+  box.appendChild(allb); box.appendChild(clrb);
   LAT_LINES.forEach(function(L){
     const k=L[0];
     const b=el('button',latShown[k]?'':'off');
@@ -2532,20 +2549,6 @@ function renderLatSel(){
     };
     box.appendChild(b);
   });
-  const allb=el('button','mini','全选');
-  allb.title='显示全部指标（含队列等待）';
-  allb.onclick=function(){
-    LAT_LINES.forEach(function(L){latShown[L[0]]=true;});
-    renderLatSel(); buildChart();
-  };
-  const clrb=el('button','mini','清空');
-  clrb.title='关闭全部指标（保留 avg 防止空图）';
-  clrb.onclick=function(){
-    LAT_LINES.forEach(function(L){latShown[L[0]]=false;});
-    latShown.avg=true;
-    renderLatSel(); buildChart();
-  };
-  box.appendChild(allb); box.appendChild(clrb);
 }
 function ensureSel(){
   const all=objAll();
@@ -4562,11 +4565,12 @@ function renderControls(){
   const ob=document.getElementById('outlierBtn');
   if(ob){
     const z=Z(); const hasOut=!!(z&&(z.outliers||[]).length);
-    ob.className=outlierOn?'on':'';
-    ob.textContent=outlierOn?'剔除离群点':'显示离群点';
+    /* 默认选中（显示离群点）；点击后变灰 = 不显示 */
+    ob.className=outlierOn?'on':'off';
+    ob.textContent='离群点';
     ob.title=hasOut
       ?('离群点 = 单请求 > 客户端 p99×10（共 '+(z.outliers||[]).length+
-         ' 个）；桶统计已剔除，此处仅控制散点显隐')
+         ' 个）；桶统计已剔除，此处仅控制散点显隐（默认选中，点击变灰即不显示）')
       :'本次没有离群请求（单请求 > 客户端 p99×10）';
     ob.disabled=!hasOut;
   }
@@ -6551,13 +6555,13 @@ _SEC_LATENCY = """<div class="card"><h2>端到端时延曲线</h2>
 </div>
 <div class="toolbar" id="latToolbar">
 <span id="tierBtns" class="toolbar"></span>
-<button id="outlierBtn">剔除离群值</button>
-<button id="resetBtn" title="恢复初始缩放范围">重置视图</button>
 </div>
 <div class="objtree-strip">
 <div class="objtree-body" id="objTree"></div>
 </div>
 <div class="lat-sel" id="latSelWrap">
+<button id="resetBtn" title="恢复初始缩放范围">重置视图</button>
+<button id="outlierBtn">离群点</button>
 <span class="tl-label">时延曲线选择</span>
 <span id="latSel" class="lat-sel-btns"></span>
 </div>

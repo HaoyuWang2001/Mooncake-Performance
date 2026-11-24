@@ -1227,7 +1227,9 @@ def test_outlier_scatter_toggle_and_merge(tmp_path):
         res.get("outlier_before")
     assert not any("离群" in n for n in (res.get("outlier_after") or [])), \
         res.get("outlier_after")
-    assert "显示离群点" in (res.get("outlier_btn") or ""), res.get("outlier_btn")
+    # 固定标签「离群点」；点击后置灰（off）表示不再选中/不显示
+    assert (res.get("outlier_btn") or "").strip() == "离群点", res.get("outlier_btn")
+    assert res.get("outlier_btn_off") is True, res
 
 
 def test_y_zoom_slider_factor_valid(tmp_path):
@@ -3423,6 +3425,10 @@ def test_a06_metric_list_locked_to_spec(tmp_path):
     # 全选 / 清空 两个操作按钮存在（指标清单本身仍锁定）
     allt = [b["t"].strip() for b in (res.get("lat_btns") or [])]
     assert "全选" in allt and "清空" in allt, allt
+    # 操作按钮固定在指标之前，且用矩形按钮（与指标 pill 区分）
+    assert allt[:2] == ["全选", "清空"], allt
+    for b in (res.get("lat_btns") or [])[:2]:
+        assert "rect" in b["cls"], b
 
 
 def test_a07_anomalies_capped_at_50(tmp_path):
@@ -3624,6 +3630,29 @@ def test_a19_outlier_button_enabled_with_outliers(tmp_path):
     assert res["errors"] == []
     ob = res.get("outlier_btn_state") or {}
     assert ob.get("disabled") is False, ob
+    # 默认选中：固定标签「离群点」+ on 态
+    assert (ob.get("text") or "").strip() == "离群点", ob
+    assert ob.get("on") is True, ob
+
+
+def test_reset_and_outlier_buttons_live_in_latency_selection_row(tmp_path):
+    """重置视图 / 离群点 移至「时延曲线选择」行，位于标签之前。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "out"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    i0 = src.index('id="latSelWrap"')
+    i1 = src.index("</div>", i0)
+    seg = src[i0:i1]
+    assert 'id="resetBtn"' in seg, seg
+    assert 'id="outlierBtn"' in seg, seg
+    assert (seg.index('id="resetBtn"') < seg.index('id="outlierBtn"')
+            < seg.index("时延曲线选择")), seg
+    # 旧的工具栏行不再包含这两个按钮
+    j0 = src.index('id="latToolbar"')
+    j1 = src.index("</div>", j0)
+    assert 'id="resetBtn"' not in src[j0:j1]
+    assert 'id="outlierBtn"' not in src[j0:j1]
 
 
 # ===========================================================================

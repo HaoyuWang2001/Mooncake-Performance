@@ -302,7 +302,9 @@ if (!errs.length) {
   })(getEl("stageObjTree"));
   out.stage_tree_text = textOf(getEl("stageObjTree"));
   out.lat_btns = (getEl("latSel").children || []).map(function (c) {
-    return {t: textOf(c), off: String(c.className || "").indexOf("off") >= 0};
+    return {t: textOf(c),
+            cls: String(c.className || ""),
+            off: String(c.className || "").indexOf("off") >= 0};
   });
   out.main_colors = ((mainOpt() && mainOpt().series) || []).map(function (s) {
     return {name: s.name, color: (s.lineStyle || {}).color};
@@ -536,6 +538,8 @@ if (!errs.length) {
     ? { display: String(_ob.style.display || ""),
         disabled: !!_ob.disabled,
         text: textOf(_ob),
+        on: String(_ob.className || "").indexOf("on") >= 0,
+        off: String(_ob.className || "").indexOf("off") >= 0,
         title: String(_ob.title || "") }
     : null;
 
@@ -623,6 +627,10 @@ if (!errs.length) {
       btn.onclick();
       out.outlier_after = names();
       out.outlier_btn = textOf(btn);
+      out.outlier_btn_off =
+        String(btn.className || "").indexOf("off") >= 0;
+      out.outlier_btn_on =
+        String(btn.className || "").indexOf("on") >= 0;
     } catch (e) { errs.push("outlier: " + String(e && e.stack || e)); }
   }
 

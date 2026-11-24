@@ -265,7 +265,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C5.I3 多对象标签 = 对象名**锚定该对象 p99 曲线在当前窗口的末端**（endLabelLayout 防重叠：19px 间距/顶底钳制，相对上下顺序与曲线一致）；无引线、不绑单点（无可见点退化整体末点）；超长截断，**悬浮时用详情框展示全名**（`data-full` + `.mc-label-tip`，不用原生 title）；单序列不出标签 —— R-LAT-18 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_anchor_follows_curve, test_label_focus_hover_restores〕
 - C5.I4 标签聚焦 = **纯悬浮预览**：悬浮压暗其他对象（opacity 0.15）；**离开标签/移入画布/移出图表（globalout）都必须恢复**；不做点击锁定。清除机制三重兜底：标签 mouseleave + 画布 mousemove + **document mousemove（指针不在标签上即清）+ globalout**——修复长截断标签向右移出后事件不再命中而聚焦残留 —— R-LAT-16/19 〔test_endlabel_fixed_slots_and_cluster_focus, test_label_focus_hover_restores, test_trace_curve_fixed_labels_and_focus〕
 - C5.I5 单对象标签 = 指标名+引线；标签与引线两端钳制在绘图区、聚集不重叠；**hover 用 mcFocus 压暗其他指标**（与多对象/分级同一机制，不依赖 emphasis） —— R-LAT-7/14/16 〔test_end_label_layout_stays_inside_plot, test_endlabel_focus_single_object〕
-- C5.I6 离群点 = 散点 + **从底部到该点的旗杆虚线**（上端止于离群点，便于定位其位置）；「剔除离群点」开关在无可命中离群时置灰（title 说明判定条件，不隐藏） —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge, test_anomaly_lines_low_weight_and_outlier_flagpole〕
+- C5.I6 离群点 = 散点 + **从底部到该点的旗杆虚线**（上端止于离群点，便于定位其位置）；开关固定标签「离群点」、**默认选中（显示散点）**、点击变灰即不显示；位于「时延曲线选择」行（重置视图之后），无可命中离群时仍置灰（title 说明判定条件，不隐藏） —— R-LAT-4 〔test_a18_outlier_button_disabled_without_outliers, test_a19_outlier_button_enabled_with_outliers, test_outlier_scatter_toggle_and_merge, test_anomaly_lines_low_weight_and_outlier_flagpole, test_reset_and_outlier_buttons_live_in_latency_selection_row〕
 - C5.D1 离群 = 单请求 > 客户端 p99×10（样本≥1000）；从桶标量剔除、计数/直方图全量 —— R-LAT-4 〔test_outlier_scatter_toggle_and_merge〕
 - C5.D2 总计 = 同桶按请求数加权平均，max 取最大 —— R-SHELL-15 〔◐ 页脚文字被 test_section_order_and_footer_note 覆盖〕
 - C5.D3 时间口径统一 `ts_epoch`（节点 UTC vs 宿主 CST 的时区归一） —— R-SLOW-2 〔test_slowest_ts_epoch_matches_buckets, test_c02_slow_tooltip_epoch_not_undefined〕
@@ -281,9 +281,9 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 - C6.V1 工具栏单行 `nowrap`+横向滚动、无竖向分割线、子项垂直居中 —— R-LAT-13 〔◐〕
 - C6.V2 粒度档：自适应固定最左、不可用档隐藏、tooltip 标注折叠方案；当前档失效回落自适应 —— R-LAT-2 〔test_tier_buttons_and_ladder, test_tier_policy_by_span〕
-- C6.I1 时延曲线选择 = 指标 toggle + 全选/清空（清空保底 avg，防空图） —— R-LAT-3 〔test_latency_metric_select_all_clear〕
+- C6.I1 时延曲线选择行从左到右 = 重置视图 / 离群点 /「时延曲线选择」标签 / **全选 清空（矩形按钮，与指标 pill 区分，固定在指标之前）** / 指标 toggle（清空保底 avg，防空图） —— R-LAT-3 〔test_latency_metric_select_all_clear, test_a06_metric_list_locked_to_spec, test_reset_and_outlier_buttons_live_in_latency_selection_row〕
 - C6.I2 「队列等待」默认不展示 —— R-LAT-3 〔test_a06_metric_list_locked_to_spec〕
-- C6.I3 重置视图 = 时间轴回 0..100、y 倍率回 1x（不改档位/选择；档位由「自适应」按钮恢复） —— R-LAT-2 〔test_reset_view_restores_zoom〕
+- C6.I3 重置视图 = 时间轴回 0..100、y 倍率回 1x（不改档位/选择；档位由「自适应」按钮恢复）；按钮位于「时延曲线选择」行首（与离群点同排，不再留在粒度档工具栏） —— R-LAT-2 〔test_reset_view_restores_zoom, test_reset_and_outlier_buttons_live_in_latency_selection_row〕
 - C6.D1 分桶常量前后端一致：59 / 8192 / 2048 / 4096 —— R-LAT-2 〔test_tier_policy_by_span, test_adaptive_tier_folds_time_buckets〕
 - C6.B1 等样本桶已删除（只有时间片桶 + 自适应折叠） —— DR-? 〔test_tier_policy_by_span〕
 - C6.B2 嵌套 `.toolbar` margin 未清 → 按钮整体上移/错行 —— R-LAT-13 〔◐〕
