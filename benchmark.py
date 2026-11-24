@@ -37,7 +37,8 @@ from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    clear_stop, controller_desc, controller_diagnose,
                    controller_exec, controller_mkdir, controller_put,
                    controller_remove,
-                   controller_run, controller_stream, get_node, is_k8s_node,
+                   controller_run, controller_stream, ensure_utf8_stdio,
+                   get_node, is_k8s_node,
                    kubectl_exec_line, kubectl_prefix, load_json, log,
                    log_detail, parse_data_size, percentile,
                    close_detail_log, request_stop, run_ssh, scp_pull,
@@ -3755,14 +3756,13 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
                           involved_nodes, remote_log_dir, cfg_name, local_log_dir,
                           etcd_endpoints=None, run_id=None,
                           remove_host=None, remove_node=None, remove_runner=None,
-                          globals_cfg=None):
-    """Best-effort cleanup after a pipeline scenario failure, so remote logs
-    (including the reader SUMMARY/RESULT that is only flushed at exit) are
-    preserved for diagnosis and ports are freed. Every step is guarded so the
-    original exception is never masked. Order: graceful reader shutdown ->
-    wait for exit -> kill stragglers -> store remove-all (so a failed run
-    leaves no residue) -> pull all logs -> wipe the etcd rendezvous prefix."""
-    log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
+                          globals_cfg=None, failed_stage=""):
+    """Best-effort cleanup after a pipeline scenario failure. Every step is
+    guarded so the original exception is never masked. Order: graceful reader
+    shutdown -> wait for exit -> kill stragglers -> store remove-all (skipped
+    when the failing stage was itself a remove-keys) -> wipe the etcd
+    rendezvous prefix. No log pull: raw logs stay on the nodes (the scenario's
+    _scenario_failure_report printed their directories)."""
     # 1. graceful reader shutdown so each reader flushes SUMMARY/RESULT
     _pid_by_obj = {id(e): (pid or "").strip() for e, pid in reader_pids}
     for r in plan["readers"]:
@@ -3797,39 +3797,34 @@ def fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
     # only clears on the NEXT run's pre-launch remove). Runs after the
     # clients are dead so no writer can re-create keys mid-sweep.
     if remove_host and remove_node and remove_runner:
-        try:
-            run_stage(remove_host, get_node(cluster, remove_node),
-                      remove_runner, "remove-keys", remote_log_dir, cfg_name,
-                      extra="--scope full", dry_run=False,
-                      node_name=remove_node)
-            log("[FAIL] fail-cleanup: store remove-all issued")
-            if globals_cfg is not None:
-                _verify_store_clean(cluster, globals_cfg, cfg_name,
-                                    "fail cleanup")
-        except Exception as exc:
-            log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
-    # 5. pull every log of this scenario (stage logs + reader/writer + nohup)
-    try:
-        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
-    except Exception as exc:
-        log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
-    # 6. wipe this run's etcd rendezvous prefix
+        if str(failed_stage).startswith("remove-keys"):
+            log("[FAIL] store remove-all skipped (failing stage was {})"
+                .format(failed_stage))
+        elif globals_cfg is not None and _remove_keys_precheck(
+                cluster, globals_cfg, cfg_name, "fail cleanup"):
+            log("[FAIL] fail-cleanup: store already clean — "
+                "remove-all skipped")
+        else:
+            try:
+                run_stage(remove_host, get_node(cluster, remove_node),
+                          remove_runner, "remove-keys", remote_log_dir,
+                          cfg_name, extra="--scope full", dry_run=False,
+                          node_name=remove_node,
+                          label="{} (fail-cleanup remove-all)".format(
+                              cfg_name))
+                log("[FAIL] fail-cleanup: store remove-all issued")
+                if globals_cfg is not None:
+                    _wait_store_released(cluster, globals_cfg, cfg_name,
+                                         "fail cleanup")
+            except Exception as exc:
+                log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
+    # 5. wipe this run's etcd rendezvous prefix
     if etcd_endpoints and run_id:
         try:
             _etcd_delete_prefix(cluster, etcd_endpoints,
                                 "mcbench/{}/".format(run_id))
         except Exception as exc:
             log("[WARN] fail-cleanup: etcd prefix wipe failed: {}".format(exc))
-
-
-def fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir):
-    """Best-effort log pull after a basic scenario failure (foreground
-    processes exit by themselves; only the evidence needs to be preserved)."""
-    log("[FAIL] scenario {} failed; pulling remote logs for diagnosis ...".format(cfg_name))
-    try:
-        pull_logs(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir, False)
-    except Exception as exc:
-        log("[WARN] fail-cleanup: log pull failed: {}".format(exc))
 
 
 def _record_pids(host, node, pids_file, label, cfg_name, node_name,
@@ -4104,7 +4099,7 @@ def reap_state_entries(cluster):
 
 def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
               dry_run=False, pull_to=None, cfg_name=None, node_name=None,
-              quiet=False):
+              quiet=False, label=None):
     _check_stop()
     # k8s: stage logs land in the pod's OWN subdirectory of the hostPath
     # log dir (<root>/<run_id>/<pod>/…); ssh keeps the flat layout
@@ -4114,7 +4109,7 @@ def run_stage(host, node, runner, mode, remote_log_dir, log_prefix, extra=None,
     if extra:
         command += " " + extra
     run_ssh_with_progress(
-        host, node, command, label=log_prefix, dry_run=dry_run,
+        host, node, command, label=label or log_prefix, dry_run=dry_run,
         pids_file=remote_log + ".pids", cfg_name=cfg_name or log_prefix,
         node_name=node_name, quiet=quiet)
     if pull_to is not None:
@@ -4176,48 +4171,53 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         cfg, work_mode, "k8s_pod" if is_k8s else "ssh",
         "client" if is_k8s else primary_node_name)
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
-    ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
-    if is_k8s:
-        # k8s: pods are created AFTER the ConfigMap they mount
-        primary_node_name = ensure_k8s_pod(cluster, ts, cfg_name, dry)
-        involved_nodes = [primary_node_name]
-    else:
-        ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
-    cfg["_primary_node"] = primary_node_name
-    node = get_node(cluster, primary_node_name)
-    host = node["ip"]
-    if is_k8s:
-        # master/store are external Services; client pods are always remote
-        topology = "remote_node"
-    else:
-        store_node_ips = resolve_store_node_ips(
-            cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
-        topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
-    log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
-        cfg_name, op, topology, cfg["protocol"], host))
-    deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
-                   remote_scripts, remote_log_dir, dry)
-    # STOP context: lets the StopRequested handler pull logs while the remote
-    # side is still alive and render a partial (early_stop) report.
-    _STOP_CTX["report"] = {
-        "cfg": cfg, "cfg_name": cfg_name, "result_dir": local_result_dir,
-        "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
-        "involved_nodes": involved_nodes, "mode": "basic",
-    }
     # Resolved BEFORE the try: the FAIL handler passes it to the report, and
     # a failure in the very first stage would otherwise mask the real error
     # with UnboundLocalError (re-assigned inside the try below).
     total_target_qps = float(cfg.get("target_qps", 0) or 0)
-    # The try MUST start here (before any stage): a failure in generate-data /
-    # remove-keys / prepare-store previously raised before the try block, so
-    # the FAIL path never pulled the remote logs — silent failure with no
-    # diagnosable evidence. All stages are now covered.
+    profile_sess = None  # profiling session (set below when matrix is on)
+    stage = "configmap/scripts"
     try:
-        profile_sess = None  # profiling session (set below when matrix is on)
-        run_stage(host, node, remote_runner,
-                  "remove-keys", remote_log_dir, cfg_name,
-                  extra="--scope full", dry_run=dry, pull_to=local_log_dir,
-                  node_name=primary_node_name)
+        ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
+        stage = "deploy pods"
+        if is_k8s:
+            # k8s: pods are created AFTER the ConfigMap they mount
+            primary_node_name = ensure_k8s_pod(cluster, ts, cfg_name, dry)
+            involved_nodes = [primary_node_name]
+        else:
+            ensure_pods(cluster, involved_nodes, ts, cfg_name, dry)
+        cfg["_primary_node"] = primary_node_name
+        node = get_node(cluster, primary_node_name)
+        host = node["ip"]
+        if is_k8s:
+            # master/store are external Services; client pods are always remote
+            topology = "remote_node"
+        else:
+            store_node_ips = resolve_store_node_ips(
+                cluster, globals_cfg.get("mooncake_store_nodes", []) or [])
+            topology = "local_node" if node["ip"] in store_node_ips else "remote_node"
+        log("=== scenario {} (op={}, topo={}, protocol={}) primary_node={} ===".format(
+            cfg_name, op, topology, cfg["protocol"], host))
+        stage = "stage scripts"
+        deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
+                       remote_scripts, remote_log_dir, dry)
+        # STOP context: lets the StopRequested handler pull logs while the
+        # remote side is still alive and render a partial (early_stop) report.
+        _STOP_CTX["report"] = {
+            "cfg": cfg, "cfg_name": cfg_name, "result_dir": local_result_dir,
+            "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
+            "involved_nodes": involved_nodes, "mode": "basic",
+        }
+        stage = "remove-keys (pre-run)"
+        if dry or not _remove_keys_precheck(cluster, globals_cfg, cfg_name,
+                                            "pre-run"):
+            run_stage(host, node, remote_runner,
+                      "remove-keys", remote_log_dir, cfg_name,
+                      extra="--scope full", dry_run=dry, pull_to=local_log_dir,
+                      node_name=primary_node_name)
+            if not dry:
+                _wait_store_released(cluster, globals_cfg, cfg_name,
+                                     "pre-run")
         warmup = "false" if args.no_warmup else "true"
         runs = build_runs(cfg)
         need_remove_before_run = op in PIPELINE_PUT_IFACES or "/" in op
@@ -4282,12 +4282,14 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 check_cmd = value_check_cmd(cluster_session["BENCH_REMOTE_DATA_DIR"], scenario, ds_bytes)
                 data_status = ssh_check_output(host, node, check_cmd, dry_run=dry)
                 if data_status != "EXISTS":
+                    stage = "generate-data ({})".format(ds)
                     run_stage(host, node, remote_runner,
                               "generate-data", remote_log_dir, cfg_name,
                               extra="--data-size {}".format(ds), dry_run=dry,
                               pull_to=local_log_dir,
                               node_name=primary_node_name)
                 if op in PIPELINE_GET_IFACES:
+                    stage = "prepare-store ({})".format(ds)
                     run_stage(host, node, remote_runner,
                               "prepare-store", remote_log_dir, cfg_name,
                               dry_run=dry, pull_to=local_log_dir,
@@ -4340,6 +4342,7 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             cfg_duration = float(cfg.get("duration", 0) or 0)
             if cfg_duration > 0:
                 expected = cfg_duration + (5 if warmup == "true" else 0) + 10
+            stage = "benchmark ({}, c{} t{})".format(ds, c, t)
             run_ssh_with_progress(host, node, command,
                                   "benchmark {} c{} t{} ({})".format(name, c, t, ds),
                                   expected_s=expected, dry_run=dry,
@@ -4417,27 +4420,32 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 "_report_kwargs": {"nodes": len(involved_nodes),
                                    "qps_target": total_target_qps,
                                    "mode": "basic"}}
-    except Exception:
-        # FAIL path: preserve the remote logs for diagnosis, then re-raise.
-        # Basic clients may have been orphaned mid-run -> reap the ledger.
+    except Exception as exc:
+        # FAIL path: one line names scenario + failing stage + reason, then
+        # the pod table and the raw-log directories. No log extraction.
         if not dry:
-            fail_cleanup_basic(cluster, involved_nodes, remote_log_dir, cfg_name, local_log_dir)
-            # profiling collect BEFORE the report so monitor CSVs reach it
-            if profile_sess is not None:
-                prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
-            _generate_reports(cfg, local_log_dir, args, early_stop=True,
-                              nodes=len(involved_nodes),
-                              qps_target=total_target_qps, mode="basic")
-            reap_state_entries(cluster)
+            class1 = is_k8s and stage.startswith("deploy")
+            _scenario_failure_report(cluster, cfg_name, stage, exc,
+                                     involved_nodes, remote_log_dir, ts,
+                                     is_k8s, class1=class1)
+            if class1:
+                log("[FAIL] cleanup skipped (pods never started)")
+            else:
+                # profiling collect BEFORE the report so monitor CSVs reach it
+                if profile_sess is not None:
+                    prof_core.stop_and_collect(cluster, profile_sess,
+                                               os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+                _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                                  nodes=len(involved_nodes),
+                                  qps_target=total_target_qps, mode="basic")
+                reap_state_entries(cluster)
             if is_k8s:
                 # pod was Ready; the benchmark command failed -> keep pod and
                 # namespace for troubleshooting (STOP / --clean-up tears down)
                 cluster["_k8s_keep_ns"] = True
-                _k8s_scene_dump(cluster)
-                _k8s_debug_hints(cluster, involved_nodes, cfg_name)
             else:
                 cleanup_pods(cluster, involved_nodes, dry)
+            cfg["_fail_reported"] = True
         raise
 
 
@@ -4986,11 +4994,13 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     # k8s: ConfigMap (scripts + shared env.sh) must exist before pods mount it
-    ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
     reader_pids = []
     writer_pids = []
     profile_sess = None  # profiling session (started at Step 1 or Step 3)
+    stage = "configmap/scripts"
     try:
+        ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
+        stage = "deploy pods"
         if is_k8s:
             # ---- per-role Deployments (pod = process): replicas = cpn x N ----
             _k8s = k8s_settings(cluster)
@@ -5039,6 +5049,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "(N={}, spread maxSkew=1, run={})".format(
                         len(plan["writers"]), len(plan["readers"]),
                         n_nodes, _run_label))
+        stage = "stage scripts"
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
         _STOP_CTX["report"] = {
@@ -5130,6 +5141,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     n = get_node(cluster, node_name)
                     data_status = ssh_check_output(n["ip"], n, check_cmd, dry_run=dry)
                     if data_status != "EXISTS":
+                        stage = "generate-data ({})".format(ds)
                         run_stage(n["ip"], n, remote_runner,
                                   "generate-data", remote_log_dir, cfg_name,
                                   extra="--data-size {}".format(ds), dry_run=dry,
@@ -5182,6 +5194,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
             if plan.get("dual"):
+                stage = "launch clients ({})".format(ds)
                 # ---- dual-role flow: every client hosts writer+reader behind
                 # one HTTP port; pids ledger into BOTH lists so the shared
                 # fail-path (graceful /shutdown + kill + pull) just works ----
@@ -5233,6 +5246,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
                 log("launched {} dual clients".format(len(plan["clients"])))
                 # barriers: every client registered BOTH roles, then trigger
+                stage = "rendezvous ({})".format(ds)
                 if not dry:
                     t0 = time.time()
                     _pipeline_barrier(cluster, etcd_endpoints,
@@ -5251,6 +5265,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     # client pool is registered; hold /start until the peer
                     # child reaches the same gate so both children's
                     # measured windows overlap.
+                    stage = "/start ({})".format(ds)
                     _parallel_start_barrier(args)
                     _items = [(get_node(cluster, c["node"]), c["port"], "",
                                "dual c{}".format(c["id"]))
@@ -5269,6 +5284,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     # Writers publish completion only after draining notify.
                     # Keep all reader endpoints alive until every writer is
                     # done, including warmup drain and measured drain time.
+                    stage = "measurement ({})".format(ds)
                     completion_timeout = client_timeout_s
                     log("pipeline dual: waiting for all writers and notify drain")
                     _pipeline_barrier(cluster, etcd_endpoints,
@@ -5281,6 +5297,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                _pid_by_obj.get(id(c), ""),
                                "dual c{}".format(c["id"]))
                               for c in plan["clients"]]
+                    stage = "stop/collect ({})".format(ds)
                     for _what, _ok, _err in _pipeline_http_parallel(
                             cluster, _items, "/shutdown"):
                         if not _ok:
@@ -5337,6 +5354,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # are injected by the orchestrator anymore. Log names carry the
                 # node segment: per-node port numbering (9201+i) is no longer
                 # globally unique once several nodes each run x readers.
+                stage = "launch readers ({})".format(ds)
                 for r in plan["readers"]:
                     rn = get_node(cluster, r["node"])
                     merged_log = "{}.reader_{}_r{}_p{}.log".format(
@@ -5378,6 +5396,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # Step 2: etcd barrier — wait for the FULL reader pool to
                 # self-register before any writer starts (readers that fail to
                 # boot surface here as a timeout with the missing list)
+                stage = "rendezvous (readers, {})".format(ds)
                 if not dry:
                     t0 = time.time()
                     _pipeline_barrier(cluster, etcd_endpoints,
@@ -5399,6 +5418,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             remote_profiling_dir(remote_log_dir, cfg_name))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
+                stage = "launch writers ({})".format(ds)
                 for w in plan["writers"]:
                     wn = get_node(cluster, w["node"])
                     merged_log = "{}.writer_{}_w{}.log".format(
@@ -5437,6 +5457,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 # run: POST /start to each writer (k8s: direct pod IP; ssh:
                 # loopback curl on the writer's node). All writers enter their
                 # warmup + measured phases only after this synchronized start.
+                stage = "rendezvous (writers, {})".format(ds)
                 if not dry:
                     t0 = time.time()
                     _pipeline_barrier(cluster, etcd_endpoints,
@@ -5448,6 +5469,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                   time.time() - t0))
                     # Cross-child rank+recall /start alignment (see the dual
                     # branch above for rationale).
+                    stage = "/start ({})".format(ds)
                     _parallel_start_barrier(args)
                     _items = [(get_node(cluster, w["node"]), w["port"], "",
                                "writer w{}".format(w["gid"]))
@@ -5464,6 +5486,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             len(_items), min(_PIPELINE_PARALLEL,
                                              len(_items))))
                 # Step 5: wait for all writers to finish (warmup + measured run)
+                stage = "measurement ({})".format(ds)
                 warmup_duration = float(cfg.get("warmup", {}).get("duration", 0) or 0)
                 duration = float(cfg.get("duration", 30))
                 _wt0, _wex = time.time(), 0
@@ -5487,6 +5510,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 if not dry:
                     log("writers exited: {}/{} ({:.1f}s)".format(
                         _wex, len(writer_pids), time.time() - _wt0))
+                stage = "collect (writers, {})".format(ds)
                 _groups = [(get_node(cluster, w["node"]),
                             [("{}.writer_{}_w{}.log".format(
                                 _pod_base(base_noext, get_node(cluster, w["node"])),
@@ -5539,6 +5563,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 if not dry:
                     log("readers exited: {}/{} ({:.1f}s)".format(
                         _rex, len(reader_pids), time.time() - _rt0))
+                stage = "collect (readers, {})".format(ds)
                 _groups = [(get_node(cluster, r["node"]),
                             [("{}.reader_{}_r{}_p{}.log".format(
                                 _pod_base(base_noext, get_node(cluster, r["node"])),
@@ -5635,37 +5660,45 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     "launch_mode": ("rank_recall" if plan.get("dual")
                                     else "single"),
                     "mode": "pipeline"}}
-    except Exception:
-        # FAIL path: preserve every remote log (reader SUMMARY/RESULT is only
-        # flushed on exit) and free ports, then re-raise for main's [FAIL]
+    except Exception as exc:
+        # FAIL path: one line names scenario + failing stage + reason, then
+        # the pod table and the raw-log directories. No log extraction.
         if not dry:
-            fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
-                                  involved_nodes, remote_log_dir, cfg_name,
-                                  local_log_dir, etcd_endpoints=etcd_endpoints,
-                                  run_id=run_id,
-                                  remove_host=locals().get("host"),
-                                  remove_node=locals().get("primary_node_name"),
-                                  remove_runner=locals().get("remote_runner"),
-                                  globals_cfg=globals_cfg)
-            # profiling collect BEFORE the report so monitor CSVs reach it
-            if profile_sess is not None:
-                prof_core.stop_and_collect(cluster, profile_sess,
-                                           os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
-            _generate_reports(cfg, local_log_dir, args, early_stop=True,
-                              nodes=len(involved_nodes),
-                              qps_target=plan["total_qps"],
-                              launch_mode="rank_recall" if plan.get("dual") else "single",
-                              mode="pipeline")
-            # 复核台账：已死删行、杀不死的保留待下次 reap
-            reap_state_entries(cluster)
+            class1 = is_k8s and stage.startswith("deploy")
+            _scenario_failure_report(cluster, cfg_name, stage, exc,
+                                     involved_nodes, remote_log_dir, ts,
+                                     is_k8s, class1=class1)
+            if class1:
+                log("[FAIL] cleanup skipped (pods never started)")
+            else:
+                fail_cleanup_pipeline(cluster, plan, reader_pids, writer_pids,
+                                      involved_nodes, remote_log_dir, cfg_name,
+                                      local_log_dir,
+                                      etcd_endpoints=etcd_endpoints,
+                                      run_id=run_id,
+                                      remove_host=locals().get("host"),
+                                      remove_node=locals().get("primary_node_name"),
+                                      remove_runner=locals().get("remote_runner"),
+                                      globals_cfg=globals_cfg,
+                                      failed_stage=stage)
+                # profiling collect BEFORE the report so monitor CSVs reach it
+                if profile_sess is not None:
+                    prof_core.stop_and_collect(cluster, profile_sess,
+                                               os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+                _generate_reports(cfg, local_log_dir, args, early_stop=True,
+                                  nodes=len(involved_nodes),
+                                  qps_target=plan["total_qps"],
+                                  launch_mode="rank_recall" if plan.get("dual") else "single",
+                                  mode="pipeline")
+                # 复核台账：已死删行、杀不死的保留待下次 reap
+                reap_state_entries(cluster)
             if is_k8s:
                 # pods were Ready (or rolled out); keep Deployments + pods +
                 # namespace for troubleshooting (STOP / --clean-up tears down)
                 cluster["_k8s_keep_ns"] = True
-                _k8s_scene_dump(cluster)
-                _k8s_debug_hints(cluster, involved_nodes, cfg_name)
             else:
                 cleanup_pods(cluster, involved_nodes, dry)
+            cfg["_fail_reported"] = True
         raise
 
 
@@ -6066,14 +6099,14 @@ def _maybe_cleanup_kvtest_intermediates(log_dir, failed_scenarios,
 def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
                         cfg_name, local_log_dir, remove_host=None,
                         remove_node=None, remove_runner=None, globals_cfg=None,
-                        remote_scripts=None, ts=None, is_k8s=False):
-    """Best-effort cleanup after a kvtest scenario failure: graceful /stop
-    (flushes summary.json) -> short exit wait -> tree-kill stragglers ->
-    flatten + store remove-all -> pull compact artifacts only。原始 log/glog/
-    ylt 一律不传输，留在各节点 hostPath 现场（[FAIL] 给出 ssh 指引）。
-    Mirrors fail_cleanup_pipeline minus the etcd rendezvous wipe."""
-    log("[FAIL] scenario {} failed; collecting compact artifacts "
-        "(raw logs stay on nodes)".format(cfg_name))
+                        remote_scripts=None, ts=None, is_k8s=False,
+                        failed_stage=""):
+    """Best-effort cleanup after a kvtest scenario failure.
+
+    No log/artifact extraction: raw logs stay on the nodes and the scenario's
+    _scenario_failure_report has already printed their directories. Only the
+    graceful /stop, a short exit wait, tree-kills and — unless the failing
+    stage was itself a remove-keys — the store remove-all are performed."""
     # 1. graceful /stop so summary.json is flushed where still possible
     items = []
     for entry, pid in instance_pids:
@@ -6099,75 +6132,31 @@ def fail_cleanup_kvtest(cluster, instance_pids, involved_nodes, remote_log_dir,
     for (entry, pid), exited in zip(instance_pids, exit_results):
         if pid and not exited:
             _kvtest_kill_tree(cluster, entry["node"], pid)
-    # 4. flatten per-instance artifacts best-effort (pull_logs' {cfg}.* glob
-    # only sees flat names; the raw output dirs live under kvtest_out/)
-    for entry, _pid in instance_pids:
-        base = entry.get("_base")
-        if not base or "node" not in entry:
-            continue
-        try:
-            entry["_out_dir"] = entry.get("_out_dir") or \
-                "{}/kvtest_out/{}".format(remote_log_dir, base)
-            ok, status = _kvtest_flatten_artifacts(
-                cluster, entry, remote_log_dir, attempts=5, retry_s=1)
-            if not ok:
-                log("[WARN] fail-cleanup: kvtest i{} artifacts unavailable: "
-                    "{} ({})".format(entry.get("iid", "?"), status,
-                                     entry["_out_dir"]))
-        except Exception as exc:
-            log("[WARN] fail-cleanup: artifact flatten failed for kvtest "
-                "i{}: {}".format(entry.get("iid", "?"), exc))
-    # 5. best-effort store remove-all: a FAILED run must not leave objects
-    # behind (the success path removes at config end)
+    # 4. store remove-all — skipped when the failing stage was a remove-keys:
+    #    the retry would fail identically (another full RPC timeout) and the
+    #    operator already has the raw log directory for the first failure.
     if remove_host and remove_node and remove_runner:
-        try:
-            run_stage(remove_host, get_node(cluster, remove_node),
-                      remove_runner, "remove-keys", remote_log_dir, cfg_name,
-                      extra="--scope full", dry_run=False,
-                      node_name=remove_node)
-            log("[FAIL] fail-cleanup: store remove-all issued")
-            if globals_cfg is not None:
-                _verify_store_clean(cluster, globals_cfg, cfg_name,
-                                    "fail cleanup")
-        except Exception as exc:
-            log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
-    # 6. Compact artifacts only（summary/samples/trace）。原始日志不传输：
-    #    k8s 留存于 <host_log_root>/<run_id>/<pod>/，ssh 模式在 remote_log_dir。
-    for entry, _pid in instance_pids:
-        if "node" not in entry:
-            continue
-        try:
-            n = get_node(cluster, entry["node"])
-            pbase = _kvtest_pod_base(remote_log_dir, entry["_base"], n)
-            files = [pbase + ".summary.json", pbase + ".samples.csv"]
-            if remote_scripts and globals_cfg is not None:
-                files.extend(_kvtest_remote_trace_map(
-                    cluster, entry, remote_log_dir, remote_scripts,
-                    globals_cfg, best_effort=True))
-            _pipeline_pull_parallel(
-                cluster, [(n, files, "kvtest i{}".format(entry["iid"]))],
-                local_log_dir, False)
-        except Exception as exc:
-            log("[WARN] fail-cleanup: kvtest i{} compact pull failed: {}"
-                .format(entry.get("iid", "?"), exc))
-    # 7. 现场指引：原始日志目录（log/glog/ylt/exitrc 同目录，每 pod 一目录）
-    try:
-        host_root = ""
-        if is_k8s:
-            host_root = (k8s_settings(cluster).get("host_log_root") or "")
-        for node_name in involved_nodes:
-            n = get_node(cluster, node_name)
-            if is_k8s and host_root and ts:
-                where = "{}/{}/{}/".format(host_root.rstrip("/"), ts,
-                                           n.get("_pod") or "<pod>")
-                ssh_to = n.get("host_ip") or n.get("ip") or node_name
-                log("[FAIL] 原始日志现场: ssh {} -> {}".format(ssh_to, where))
-            else:
-                log("[FAIL] 原始日志现场: ssh {} -> {}/".format(
-                    n.get("ip") or node_name,
-                    _kvtest_pod_dir(remote_log_dir, n)))
-    except Exception as exc:
-        log_detail("[FAIL] 现场目录提示失败: {}".format(exc))
+        if str(failed_stage).startswith("remove-keys"):
+            log("[FAIL] store remove-all skipped (failing stage was {})"
+                .format(failed_stage))
+        elif globals_cfg is not None and _remove_keys_precheck(
+                cluster, globals_cfg, cfg_name, "fail cleanup"):
+            log("[FAIL] fail-cleanup: store already clean — "
+                "remove-all skipped")
+        else:
+            try:
+                run_stage(remove_host, get_node(cluster, remove_node),
+                          remove_runner, "remove-keys", remote_log_dir,
+                          cfg_name, extra="--scope full", dry_run=False,
+                          node_name=remove_node,
+                          label="{} (fail-cleanup remove-all)".format(
+                              cfg_name))
+                log("[FAIL] fail-cleanup: store remove-all issued")
+                if globals_cfg is not None:
+                    _wait_store_released(cluster, globals_cfg, cfg_name,
+                                         "fail cleanup")
+            except Exception as exc:
+                log("[WARN] fail-cleanup: store remove-all failed: {}".format(exc))
 
 
 # kvtest map/reduce: the C++ binary emits request-level samples, so the same
@@ -6629,10 +6618,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         "BENCH_OPERATION": "",
     })
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
-    ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
     instance_pids = []
     duration = float(cfg.get("duration", 30))
+    stage = "configmap/scripts"
     try:
+        ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
+        stage = "deploy client pods"
         if is_k8s:
             # ---- Deployments: normally pod=process; split-pod mode creates
             # one client Deployment and later binds two processes per pod. ----
@@ -6722,8 +6713,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             "involved_nodes": list(involved_nodes),
             "mode": "kvtest", "skip_pull": False,
         }
+        stage = "stage scripts"
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                        remote_scripts, remote_log_dir, dry)
+        stage = "push binary"
         # kvtest.binary_local: push the C++ binary to every node/pod; the
         # pushed path then overrides kvtest.binary for the launch commands
         _pushed_binary = _kvtest_deploy_binary(
@@ -6746,6 +6739,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             numa_bind = False
             cpu_shard = 0
             log("k8s kvtest pods: numa/cpu binding disabled (containers)")
+        stage = "numa probe"
         membind_mode, numa_strict = resolve_numa_policy(cfg, globals_cfg)
         numa_node_count = {}
         numa_counter = {}
@@ -6950,6 +6944,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             all_instances = _instance_view()
             lhost_counter = {}
             if plan.get("dual"):
+                stage = "launch dual instances ({})".format(ds)
                 # one process hosts writer+reader: prepare all configs (and
                 # the peer child's remove-keys/setup) BEFORE any process
                 # exists, then fire paused processes. The cross-child barrier
@@ -6960,27 +6955,32 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _fire_instances(plan["clients"])
                 log("launched {} dual kvtest instances".format(
                     len(plan["clients"])))
+                stage = "health gate (dual, {})".format(ds)
                 if not dry:
                     _kvtest_health_gate(cluster, plan["clients"],
                                         health_timeout_s, "dual instances")
             else:
                 # kvtest README rule: readers before writers, so the first
                 # writer notify already finds every consumer bound
+                stage = "launch readers ({})".format(ds)
                 for r in plan["readers"]:
                     _prepare_instance(r, "reader", ds, key_pool, all_instances,
                                       lhost_counter)
                 _fire_instances(plan["readers"])
                 log("launched {} kvtest readers".format(len(plan["readers"])))
+                stage = "health gate (readers, {})".format(ds)
                 if not dry:
                     _kvtest_health_gate(cluster, plan["readers"],
                                         health_timeout_s, "readers")
                 # Hold at the cross-child barrier after inert config pushes;
                 # processes remain paused until the later /start fan-out.
+                stage = "launch writers ({})".format(ds)
                 for w in plan["writers"]:
                     _prepare_instance(w, "writer", ds, key_pool, all_instances,
                                       lhost_counter)
                 _fire_instances(plan["writers"])
                 log("launched {} kvtest writers".format(len(plan["writers"])))
+                stage = "health gate (writers, {})".format(ds)
                 if not dry:
                     _kvtest_health_gate(cluster, plan["writers"],
                                         health_timeout_s, "writers")
@@ -7012,6 +7012,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     time.sleep(min(
                         1.0, max(0.05, seconds - (time.time() - started))))
 
+            stage = "/start ({})".format(ds)
             try:
                 _parallel_start_barrier(args)
                 _control("/start", "/start")
@@ -7023,6 +7024,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         time.time()
 
                 if warmup_duration > 0:
+                    stage = "warmup ({})".format(ds)
                     _wait_window(warmup_duration, "warmup")
                     # Match the Python pipeline warmup boundary: stop new
                     # writes, drain every outbound notify, then drain every
@@ -7033,6 +7035,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _control("/pause", "warmup /pause", transition_timeout)
                     _control("/drain", "warmup /drain", transition_timeout)
                     _control("/reset", "warmup /reset", transition_timeout)
+                    stage = "measurement arm ({})".format(ds)
                     _parallel_measure_barrier(args)
                     _control("/arm", "measurement /arm", transition_timeout)
                     if not dry:
@@ -7049,6 +7052,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # ---- measurement window: /start (no warmup) or /arm (warmup)
                 # established the measured epoch. summary elapsed_seconds
                 # therefore excludes launch, health gates and warmup.
+                stage = "measurement ({})".format(ds)
                 _wait_window(duration, "measurement")
             except StopRequested:
                 # /stop first: the C++ collector flushes its request samples
@@ -7061,12 +7065,14 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 raise
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
+            stage = "/stop ({})".format(ds)
             for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
                                                             "/stop",
                                                             timeout=10):
                 if not _ok:
                     log("[WARN] {} /stop: {}".format(_what, _err))
             # ---- wait for exit + exit-code ledger ----
+            stage = "wait exit ({})".format(ds)
             # One shared 30s grace period replaces the old serial 120s per
             # instance waits.  A second /stop is an idempotent recovery probe
             # for older kvtest binaries whose blocking accept() needed a wake
@@ -7122,6 +7128,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         "kvtest shutdown timed out after two /stop attempts; "
                         "still alive: {}".format(", ".join(_alive)))
             # ---- flatten artifacts + remote trace map + compact pull ----
+            stage = "collect artifacts ({})".format(ds)
             # 对齐 pipeline 的 stats-only 策略：原始 .log（空）与 .log.glog
             # （可达数百 MB/实例）一律不传输，留在各节点 hostPath 现场；
             # glog 的 trace 统计在 pod 内算好后只回传小 trace.json。
@@ -7208,26 +7215,34 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         _STOP_CTX.pop("report", None)   # normal end: no partial report pending
         return {"host": host, "node": primary_node_name, "runner": remote_runner_pipeline,
                 "remote_log_dir": remote_log_dir}
-    except Exception:
+    except Exception as exc:
         _STOP_CTX.pop("report", None)   # failure path, not a STOP report
-        # FAIL path: preserve every remote log (summary.json is flushed by
-        # /stop) and free ports, then re-raise for main's [FAIL]
+        # FAIL path: one line names scenario + failing stage + reason, then
+        # the pod table and the raw-log directories. No log extraction, no
+        # describe/event dumps (see _scenario_failure_report).
         if not dry:
-            fail_cleanup_kvtest(cluster, instance_pids, involved_nodes,
-                                remote_log_dir, cfg_name, local_log_dir,
-                                remove_host=locals().get("host"),
-                                remove_node=locals().get("primary_node_name"),
-                                remove_runner=locals().get("remote_runner_pipeline"),
-                                globals_cfg=globals_cfg,
-                                remote_scripts=locals().get("remote_scripts"),
-                                ts=locals().get("ts"), is_k8s=is_k8s)
-            reap_state_entries(cluster)
+            class1 = is_k8s and stage.startswith("deploy")
+            _scenario_failure_report(cluster, cfg_name, stage, exc,
+                                     involved_nodes, remote_log_dir, ts,
+                                     is_k8s, class1=class1)
+            if class1:
+                log("[FAIL] cleanup skipped (pods never started)")
+            else:
+                fail_cleanup_kvtest(cluster, instance_pids, involved_nodes,
+                                    remote_log_dir, cfg_name, local_log_dir,
+                                    remove_host=locals().get("host"),
+                                    remove_node=locals().get("primary_node_name"),
+                                    remove_runner=locals().get("remote_runner_pipeline"),
+                                    globals_cfg=globals_cfg,
+                                    remote_scripts=locals().get("remote_scripts"),
+                                    ts=locals().get("ts"), is_k8s=is_k8s,
+                                    failed_stage=stage)
+                reap_state_entries(cluster)
             if is_k8s:
                 cluster["_k8s_keep_ns"] = True
-                _k8s_scene_dump(cluster)
-                _k8s_debug_hints(cluster, involved_nodes, cfg_name)
             else:
                 cleanup_pods(cluster, involved_nodes, dry)
+            cfg["_fail_reported"] = True
         raise
 
 
@@ -7244,28 +7259,84 @@ def ensure_pods(cluster, involved_nodes, ts, cfg_name, dry_run):
     return
 
 
-def _k8s_scene_dump(cluster):
-    """Best-effort: dump the WHOLE namespace state into the orchestrator log
-    on any k8s scenario failure — pod list and events are what diagnostics
-    are read from downstream (the log is what gets shared for analysis)."""
+def _k8s_pods_wide(cluster):
+    """Print the full namespace pod list (-o wide) on failure."""
     c = cluster.get("_controller")
     if c is None:
         return
     try:
         ns = k8s_settings(cluster)["namespace"]
-        view = " ".join(kubectl_prefix(
-            {"_ctx": c.get("_ctx", ""), "_ns": ns}))
-        log("[k8s] scene: {} get pods -o wide".format(view))
         out, rc = controller_run(c, ["-n", ns, "get", "pods", "-o", "wide"],
                                  check=False)
         if rc == 0 and out.strip():
-            log("[k8s] scene pods:\n{}".format(out.strip()))
-        log("[k8s] scene: {} get events --sort-by=.lastTimestamp".format(view))
-        events = _k8s_all_events(c, ns)
-        if events:
-            log("[k8s] scene events (tail):\n{}".format("\n".join(events)))
+            log("[k8s] pods (ns={}):\n{}".format(ns, out.strip()))
+        else:
+            log("[WARN] cannot list pods in namespace {}: {}".format(
+                ns, out.strip()[:300]))
     except Exception as exc:
-        log("[WARN] k8s scene dump failed: {}".format(exc))
+        log("[WARN] pod list failed: {}".format(exc))
+
+
+def _k8s_run_pods(cluster, ts, cfg_name):
+    """Pod names created for this run (by the run label), for describe hints."""
+    c = cluster.get("_controller")
+    if c is None:
+        return []
+    try:
+        ns = k8s_settings(cluster)["namespace"]
+        out, rc = controller_run(
+            c, ["-n", ns, "get", "pods", "-l",
+                "run=" + k8s_run_label(ts, cfg_name), "-o", "name"],
+            check=False)
+        if rc != 0:
+            return []
+        return [ln.split("/", 1)[1] for ln in out.splitlines() if "/" in ln]
+    except Exception:
+        return []
+
+
+def _raw_log_dirs(cluster, involved_nodes, remote_log_dir, ts):
+    """One line per pod/node: where its raw logs (log/glog/exitrc) stay."""
+    for node_name in involved_nodes:
+        try:
+            n = get_node(cluster, node_name)
+        except Exception:
+            continue
+        if is_k8s_node(n):
+            host_root = (k8s_settings(cluster).get("host_log_root") or "")
+            where = "{}/{}/{}/".format(host_root.rstrip("/"), ts,
+                                       n.get("_pod") or "<pod>")
+            ssh_to = n.get("host_ip") or n.get("ip") or node_name
+        else:
+            where = "{}/".format(_kvtest_pod_dir(remote_log_dir, n))
+            ssh_to = n.get("ip") or node_name
+        log("[FAIL] raw logs: ssh {} -> {}".format(ssh_to, where))
+
+
+def _scenario_failure_report(cluster, cfg_name, stage, exc, involved_nodes,
+                             remote_log_dir, ts, is_k8s, class1=False):
+    """Unified failure output for every scenario type (kvtest/basic/pipeline).
+
+    Case 1 (class1: pods never became ready): name the failing deploy stage
+    and the detected reason, print the full pod list and the inspect commands
+    only — no describe/events content. Case 2 (a stage failed after the pods
+    were up): name scenario + stage + exception, print the full pod list and
+    the per-pod raw-log directories. Nothing is pulled or truncated."""
+    log("[FAIL] scenario {} failed at stage '{}': {}".format(
+        cfg_name, stage, exc))
+    if is_k8s:
+        _k8s_pods_wide(cluster)
+        if class1:
+            ns = k8s_settings(cluster)["namespace"]
+            pods = _k8s_run_pods(cluster, ts, cfg_name)
+            pod = pods[0] if pods else "<pod>"
+            view = " ".join(kubectl_prefix(
+                {"_ctx": cluster["_controller"].get("_ctx", ""), "_ns": ns}))
+            log("[FAIL] inspect: {} describe pod {}".format(view, pod))
+            log("[FAIL] inspect: {} get events --sort-by=.lastTimestamp"
+                .format(view))
+            return
+    _raw_log_dirs(cluster, involved_nodes, remote_log_dir, ts)
 
 
 def _log_pod_state(cluster, node_name, why):
@@ -7290,42 +7361,6 @@ def _log_pod_state(cluster, node_name, why):
                 n["_pod"], why, "\n".join(lines[-25:])))
     except Exception:
         pass
-
-
-def _k8s_debug_hints(cluster, involved_nodes, cfg_name):
-    """Print copy-pasteable debug commands for the kept scene. When pods were
-    materialized: per-pod exec/describe hints. When the failure happened
-    BEFORE materialization (e.g. a failed Deployment rollout) pods have no
-    node entries yet — fall back to namespace-level commands so the kept
-    scene is still inspectable (pods/events/deployments)."""
-    k8s = k8s_settings(cluster)
-    ns = k8s["namespace"]
-    view = " ".join(kubectl_prefix(
-        {"_ctx": cluster["_controller"].get("_ctx", ""), "_ns": ns}))
-    printed = False
-    for name in involved_nodes:
-        n = get_node(cluster, name)
-        if not is_k8s_node(n) or not n.get("_pod"):
-            continue
-        printed = True
-        pod = n["_pod"]
-        log("[k8s][DEBUG] scenario {} failed; pod {} kept for troubleshooting"
-            "".format(cfg_name, pod))
-        log("[k8s][DEBUG]   {} exec -it {} -- bash".format(view, pod))
-        log("[k8s][DEBUG]   {} describe pod {}".format(view, pod))
-        log("[k8s][DEBUG]   {} exec {} -- bash -c {}".format(
-            view, pod, shlex.quote(
-                "ls -lt {}/logs | head".format(k8s["pod_workspace"]))))
-    if not printed:
-        log("[k8s][DEBUG] scenario {} failed before pods became ready; "
-            "namespace {} kept for troubleshooting".format(cfg_name, ns))
-        log("[k8s][DEBUG]   {} get pods -o wide".format(view))
-        log("[k8s][DEBUG]   {} get events --sort-by=.lastTimestamp"
-            "".format(view))
-        for deploy in (cluster.get("_k8s_deployments") or []):
-            log("[k8s][DEBUG]   {} describe deployment {}".format(view, deploy))
-    log("[k8s][DEBUG] cleanup: STOP / --clean-up deletes namespace {}; "
-        "next run auto-reaps it".format(ns))
 
 
 def cleanup_pods(cluster, involved_nodes, dry_run):
@@ -9196,7 +9231,10 @@ def main(args, cfg_paths):
                            (sweep_remove or {}).get("_report_kwargs") or {},
                            args)
         except Exception as exc:
-            log("[FAIL] scenario {}: {}".format(name, exc))
+            # the scenario's failure handler already printed the stage-aware
+            # [FAIL] line (with pods + raw-log dirs); do not repeat it
+            if not cfg.get("_fail_reported"):
+                log("[FAIL] scenario {}: {}".format(name, exc))
             failed_scenarios.append(name)
     if args.dry_run:
         log("dry-run complete, no artifacts written")
@@ -9370,7 +9408,7 @@ def _k8s_hold_for_debug(cluster):
     last = time.time()
     while not stop_requested():
         time.sleep(1.0)
-        if time.time() - last >= 30:
+        if time.time() - last >= 300:
             last = time.time()
             log("[k8s][DEBUG] still holding namespace {} (STOP to tear down)"
                 "".format(ns))
@@ -9462,6 +9500,7 @@ def _run_legacy_plots(log_dir):
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     _install_stop_handlers()
     args, cfg_paths = parse_arguments()
     try:

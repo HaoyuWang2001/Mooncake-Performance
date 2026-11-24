@@ -28,6 +28,24 @@ import threading
 import time
 
 
+def ensure_utf8_stdio():
+    """Force redirected stdout/stderr to UTF-8.
+
+    On Windows a Python child whose stdio is redirected to a file (the WebUI
+    run log) otherwise encodes print() with the active ANSI code page
+    (CP936/GBK). The WebUI reads logs as UTF-8, so Chinese orchestrator lines
+    turned into mojibake. Interactive consoles (tty) are left untouched;
+    PYTHONIOENCODING/PYTHONUTF8 (set by the WebUI launcher) already cover the
+    normal path — this is the defensive fallback for direct CLI redirection."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None and not stream.isatty():
+                reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 # --- dual-sink logging: console summary + full benchmark.log --------------
 # log()        console (summary) AND the full log file
 # log_detail() the full log file ALWAYS; console only when verbose

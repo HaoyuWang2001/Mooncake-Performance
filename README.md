@@ -465,18 +465,25 @@ device plugin 按集群自行维护。
 `RUN_LABEL` = `<ts>-<cfg>`（写 `labels.run`，用于清理）；`ROLE_LABEL` 是 pod 的逻辑角色
 （如 `client-0`），**不是** k8s 节点名。
 
-**k8s 失败处理**：**任何场景失败都会把现场证据自动写进编排器日志**——`get pods -o wide`
-（全量 pod 状态/节点）+ `get events --sort-by=.lastTimestamp`（真实原因）自动 dump；客户端
-`exitrc` 非零或等待超时再自动 dump 对应 pod 的 `describe` 尾部（容器重启/OOMKilled）；
-启动时单独打印镜像名；创建 ns 后给出 `get pods` 命令、pod 创建后
-给出 `describe` 命令、Ready 后给出 `exec` 命令。pod 60s 内未 Ready 会识别
-`ErrImageNeverPull`/`ImagePullBackOff`/`CreateContainerError`/`FailedScheduling`
-等事件并立即报错终止。**Deployment rollout（pipeline）同样秒级快速失败**：每 3s 轮询
-pod 致命状态与 namespace 事件，失败或 60s 超时都 dump **证据三件套**——`get pods -o wide`
-+ `get events --sort-by=.lastTimestamp`（pod 级事件承载真实原因）+ `describe deployment`，
-并给出可直接复制的排查命令。**任何失败（含部署失败）都保留现场**：pod、Deployment 与
-namespace 全部保留，打印 exec/describe/events 命令并进入等待（不自动退出）：按
-STOP/Ctrl+C 或 `--clean-up` 收场；下次运行会自动回收遗留 namespace。
+**k8s 失败处理（kvtest / basic / pipeline 统一）**：失败分两类，输出都很短：
+
+- **容器没起来**（镜像/调度问题：`ErrImageNeverPull`/`ImagePullBackOff`/
+  `CreateContainerError`/`FailedCreatePodSandBox`/`FailedScheduling`/`CrashLoopBackOff`）：
+  先打印一行 `[FAIL] scenario <cfg> failed at stage 'deploy ...': <reason>`，随后是
+  `kubectl get pods -o wide` 的全量 pod 列表，以及可直接复制的
+  `kubectl describe pod <pod>` / `kubectl get events` 命令。**不打印 describe/events 内容**，
+  并跳过 fail-cleanup（没有实例/数据需要清理）。
+- **容器正常、某个执行阶段失败**：先打印一行
+  `[FAIL] scenario <cfg> failed at stage '<阶段>': <异常>`（阶段如
+  `remove-keys (pre-run, 3.5MB)` / `launch writers` / `measurement`），随后是全量 pod 列表
+  与每个 pod 一行原始日志目录（`ssh <host> -> <host_log_root>/<run>/<pod>/`）。
+  **不再拉取/截取任何日志**，也没有每 pod 的 exec/describe 提示；原始 log/glog/exitrc
+  留在节点现场。失败阶段本身是 `remove-keys` 时不会再重试 store remove-all（避免再等一个
+  RPC 超时）。
+
+任何失败（含部署失败）都保留 pod、Deployment 与 namespace，打印上述信息后进入等待
+（不自动退出）：按 STOP/Ctrl+C 或 `--clean-up` 收场，挂起期间每 5 分钟提示一次；
+下次运行会自动回收遗留 namespace。
 
 ### 7.2 configs/global.json（业务无关全局超参）
 
@@ -534,6 +541,10 @@ env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），�
 `MC_TCP_BIND_ADDRESS` 写 `$POD_IP`（晚绑定，pod spec downward API 提供）；
 `SETUP_UB_DEVICE` 由容器内 `urma_admin show` 自动探测（取首个 bonding_dev_*，
 仅 ub 协议时）；绑核相关变量不注入（容器不做 numactl）。
+
+**日志编码**：run 日志统一 UTF-8。WebUI 启动的进程由 runmgr 注入
+`PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`；CLI 重定向时入口会
+`reconfigure` 非 tty 的 stdout/stderr，因此 Windows 下中文日志不再乱码。
 
 **编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头。
 **verbose 开关**：CLI `--verbose`/`-v`、环境变量 `MC_BENCH_VERBOSE=1`、

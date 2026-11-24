@@ -15,6 +15,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import benchmark as bm
+from utils import ensure_utf8_stdio
 
 
 def _csv(value):
@@ -158,6 +159,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    ensure_utf8_stdio()
     args = parse_args(argv)
     owned_stop_file = not args.stop_file
     if owned_stop_file:

@@ -23,7 +23,7 @@ def test_fail_path_keeps_original_error(tmp_path, monkeypatch):
         png=False, mode="ssh", _result_dir_path=str(tmp_path), profile=None,
         clean_up=False, _matrix=None)
     for name in ("ensure_pods", "deploy_scripts", "ensure_configmap",
-                 "fail_cleanup_basic", "reap_state_entries"):
+                 "_scenario_failure_report", "reap_state_entries"):
         monkeypatch.setattr(bm, name, lambda *a, **k: None)
     monkeypatch.setattr(bm, "_generate_reports", lambda *a, **k: None)
 
@@ -32,3 +32,6 @@ def test_fail_path_keeps_original_error(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "run_stage", boom)
     with pytest.raises(RuntimeError, match="stage boom"):
         bm.run_basic_scenario(cluster, globals_cfg, cfg, "20261115-9999", args)
+    # the scenario reported the stage-aware FAIL line itself -> main must not
+    # print the generic duplicate
+    assert cfg["_fail_reported"] is True

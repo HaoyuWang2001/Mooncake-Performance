@@ -165,7 +165,10 @@ writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node
 以及 `summary.json` / `samples.csv`。后两者是 `--rebuild-report` 补跑 map 的
 **唯一输入**，因此默认保留；确认系统稳定后可设
 `MC_KVTEST_CLEAN_INTERMEDIATES=1`，在 run 全部成功且绘图成功后清掉它们
-（失败或绘图失败时该开关也不会删除）。注意：
+（失败或绘图失败时该开关也不会删除）。失败 run 不再自动拉取原始日志：编排器只打印
+失败场景/阶段/异常、全量 pod 列表（`get pods -o wide`）和每个 pod 一行原始日志目录
+（k8s: `<host_log_root>/<run_id>/<pod>/`，ssh: `remote_log_dir`），原始 log/glog/exitrc
+留在节点上；失败阶段本身是 `remove-keys` 时不会重试 store remove-all。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。配置 warmup 时，`/start` 先释放 warmup；到时后编排器依次执行
 `/pause`（停 writer 并排空出站通知）、`/drain`（排空 reader 入站队列）、
