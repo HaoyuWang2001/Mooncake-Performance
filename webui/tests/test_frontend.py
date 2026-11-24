@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """前端回归测试：防止 app.js 引用未定义的组件常量导致整页白屏。"""
+import json
 import os
 import re
 import shutil
@@ -280,6 +281,64 @@ def test_instance_reconnect_after_webui_restart():
     css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
                encoding="utf-8").read()
     assert ".ilog-conn" in css
+
+
+def test_instance_report_dropdown_for_rank_recall():
+    """查看报表：单任务直开 overview.html；rank+recall 下拉选择角色报表。"""
+    src = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+               encoding="utf-8").read()
+    assert "function _reportLoc(" in src and "function _pickReport(" in src
+    assert "function openRoleReport(" in src
+    assert '<el-dropdown v-if="isCombined"' in src
+    assert 'command="rank"' in src and 'command="recall"' in src
+    assert "rank 报表（overview.html）" in src
+    assert "recall 报表（overview.html）" in src
+    assert '@click="openReport">查看报表' in src   # 单任务仍走直开
+    assert "report/overview.html" in src
+
+
+def test_report_picker_pure_logic():
+    """_reportLoc/_pickReport 纯逻辑（root/base 拆分 + 角色隔离 + 单任务兜底）。"""
+    node = shutil.which("node")
+    if not node:
+        print("  [skip] node not found")
+        return
+    path = os.path.join(JS_DIR, "views", "instance-view.js")
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const ctx = { Vue: {}, console };
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8") +
+  ";globalThis.L=_reportLoc;globalThis.P=_pickReport;", ctx);
+const L = ctx.L, P = ctx.P;
+const files = [
+  "rank/report/overview.html", "rank/report/report.html",
+  "recall/report/overview.html", "report/overview.html",
+];
+const out = {
+  loc_parent: L("outputs/20260101-0000"),
+  loc_child: L("outputs/20260101-0000/rank"),
+  single: P(files, "", false),
+  rank: P(files, "rank/", true),
+  recall: P(files, "recall/", true),
+  strict_missing: P(["rank/report/overview.html"], "recall/", true),
+  fallback_report: P(["report/report.html"], "", false),
+  none: P([], "", false),
+};
+console.log(JSON.stringify(out));
+"""
+    r = subprocess.run([node, "-e", script, path],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["loc_parent"] == {"root": "20260101-0000", "base": ""}
+    assert out["loc_child"] == {"root": "20260101-0000", "base": "rank"}
+    assert out["single"] == "report/overview.html"
+    assert out["rank"] == "rank/report/overview.html"
+    assert out["recall"] == "recall/report/overview.html"
+    assert out["strict_missing"] == ""
+    assert out["fallback_report"] == "report/report.html"
+    assert out["none"] == ""
 
 
 def test_shared_status_module():

@@ -7,6 +7,31 @@ function _instResultsTarget(tsDir) {
   return rel.split("/")[0];
 }
 
+/* 报表定位：run 产物目录拆分（root = outputs 下的一级目录；base = ts_dir 的
+   子路径，可为空或已含 rank/recall）。 */
+function _reportLoc(tsDir) {
+  const rel = String(tsDir || "").replace(/^outputs[\\/]/, "");
+  const parts = rel.split("/").filter(Boolean);
+  return { root: parts[0] || "", base: parts.slice(1).join("/") };
+}
+
+/* 在 outputs/<root>/tree 的 files 里挑报表：优先本前缀的 overview.html，
+   其次 report.html；strict=true 时不在前缀外兜底（双任务按角色隔离）。 */
+function _pickReport(files, pref, strict) {
+  pref = pref || "";
+  const list = files || [];
+  const inPref = f => !pref || f.startsWith(pref);
+  const hit =
+    list.find(f => f === pref + "report/overview.html") ||
+    list.find(f => inPref(f) && /(^|\/)report\/overview\.html$/.test(f)) ||
+    list.find(f => inPref(f) && /(^|\/)report\/report\.html$/.test(f)) ||
+    list.find(f => inPref(f) && /(^|\/)report\/[^/]+\/report\.html$/.test(f));
+  if (hit) return hit;
+  if (strict) return "";
+  return list.find(f => /(^|\/)report\/overview\.html$/.test(f)) ||
+         list.find(f => /(^|\/)report\/report\.html$/.test(f)) || "";
+}
+
 /* 单个日志流面板（rank / recall / all 各一份），自带分页、搜索、换行。
    两种形态（同一组件，fs prop 切换，参考结果页 res-pane 先例）：
    - 行内：300px 高、紧凑工具栏（复制 / 换行 / 搜索 ↑↓）
@@ -456,7 +481,22 @@ const InstanceView = {
           <el-button size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      @click="gotoResults">跳转至结果详情</el-button>
-          <el-button size="small" plain :disabled="!latestRun"
+          <el-dropdown v-if="isCombined" trigger="click" @command="openRoleReport"
+                       :disabled="!latestRun || !latestRun.ts_dir">
+            <el-button size="small" plain :disabled="!latestRun || !latestRun.ts_dir"
+                       :title="latestRun && latestRun.ts_dir ? '' : '该运行还没有产物（未运行或已清理）'">
+              查看报表
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="rank">rank 报表（overview.html）</el-dropdown-item>
+                <el-dropdown-item command="recall">recall 报表（overview.html）</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <el-button v-else size="small" plain
+                     :disabled="!latestRun || !latestRun.ts_dir"
+                     :title="latestRun && latestRun.ts_dir ? '' : '该运行还没有产物（未运行或已清理）'"
                      @click="openReport">查看报表</el-button>
         </div>
       </el-card>
@@ -679,32 +719,46 @@ const InstanceView = {
       store.resultsTarget = _instResultsTarget(r.ts_dir);
       store.view = "results";
     }
-    /* 报表与 WebUI 解耦：定位该 run 的 report.html 并在新标签页打开 */
+    function _openRawReport(root, pick) {
+      window.open("/api/file?path=" + encodeURIComponent(
+        "outputs/" + root + "/" + pick) + "&mode=raw", "_blank");
+    }
+    async function _treeOf(root) {
+      try {
+        return (await api("GET", "/api/outputs/" +
+          encodeURIComponent(root) + "/tree")).files || [];
+      } catch (e) { return []; }
+    }
+    /* 单任务：直接打开 report/overview.html（旧产物兜底 report.html） */
     async function openReport() {
       const r = latestRun.value;
       if (!r || !r.ts_dir) return;
-      const rel = String(r.ts_dir).replace(/^outputs[\\/]/, "");
-      const parts = rel.split("/");
-      const root = parts[0];
-      const sub = parts.slice(1).join("/");
-      let files = [];
-      try {
-        files = (await api("GET", "/api/outputs/" +
-          encodeURIComponent(root) + "/tree")).files || [];
-      } catch (e) { files = []; }
-      const pref = sub ? sub + "/" : "";
-      const pick =
-        files.find(f => f === pref + "report/overview.html") ||
-        files.find(f => f.startsWith(pref) && /(^|\/)report\/report\.html$/.test(f)) ||
-        files.find(f => f.startsWith(pref) && /(^|\/)report\/[^/]+\/report\.html$/.test(f)) ||
-        files.find(f => /(^|\/)report\/overview\.html$/.test(f)) ||
-        files.find(f => /(^|\/)report\/report\.html$/.test(f));
+      const loc = _reportLoc(r.ts_dir);
+      const files = await _treeOf(loc.root);
+      const pick = _pickReport(files, loc.base ? loc.base + "/" : "", false);
       if (!pick) {
         ElementPlus.ElMessage.warning("该 run 还没有报表（未生成或已清理）");
         return;
       }
-      window.open("/api/file?path=" + encodeURIComponent(
-        "outputs/" + root + "/" + pick) + "&mode=raw", "_blank");
+      _openRawReport(loc.root, pick);
+    }
+    /* 双任务（rank + recall）：按角色打开 <role>/report/overview.html */
+    async function openRoleReport(role) {
+      const r = latestRun.value;
+      if (!r || !r.ts_dir) return;
+      const loc = _reportLoc(r.ts_dir);
+      const base = loc.base;
+      // ts_dir 可能已是 outputs/<parent>/rank（子目录）：角色目录在父目录下
+      const parent = (base === "rank" || base === "recall")
+        ? base.split("/").slice(0, -1).join("/") : base;
+      const pref = (parent ? parent + "/" : "") + role + "/";
+      const files = await _treeOf(loc.root);
+      const pick = _pickReport(files, pref, true);
+      if (!pick) {
+        ElementPlus.ElMessage.warning(role + " 还没有报表（未生成或已清理）");
+        return;
+      }
+      _openRawReport(loc.root, pick);
     }
 
     const latestRun = Vue.computed(() => {
@@ -732,6 +786,6 @@ const InstanceView = {
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, closeMissingTab, activate, closeTab,
              statusType, statusText, run, stop, remove, rename,
-             reconnectRun, gotoResults, openReport };
+             reconnectRun, gotoResults, openReport, openRoleReport };
   },
 };
