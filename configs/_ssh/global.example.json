@@ -15,6 +15,11 @@
     }
   },
   "local_buffer_size": 1073741824,
+  "_parallel_comment": "并发旋钮（可选）：fanout_workers = kubectl exec / HTTP fan-out / 配置推送 / 启动 / 退出等待 / 产物整理(flatten+trace) 的并发上限（默认 16；kubectl exec 无 MaxSessions 限制，压力大可下调）；pull_workers = controller SFTP 拉回并发（默认 10，受 sshd MaxSessions≈10 约束，勿超过）。",
+  "parallel": {
+    "fanout_workers": 16,
+    "pull_workers": 10
+  },
   "_pipeline_comment": "pipeline 可选调优：key_space_ratio = 可写 key 空间占 effective store 的比例（默认 0.9，必须 0<r<1，越小越安全）；require_clean_store=true 时 remove-keys 后 store 仍非空（超过 1% 容差）会直接失败（默认仅 WARN，用于排查跨 run 残留）；remove_skip_when_clean=true（默认）时执行前先探测 master 指标，已分配空间 <= 1% 容差即跳过 remove-keys（探测不可用则照常执行，绝不懈怠）；remove_release_timeout_s=等待 master oplog 回放 remove-all 的最长秒数（默认 120，0 关闭等待，退化成立即校验）。",
   "pipeline": {
     "key_space_ratio": 0.9,

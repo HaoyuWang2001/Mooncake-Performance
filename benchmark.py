@@ -3669,7 +3669,32 @@ def _pipeline_http_call(node_entry, port, path, timeout=5, dry=False,
     return str(out).strip() == "200"
 
 
-_PIPELINE_PARALLEL = 8
+# bounded-parallelism knobs (global.json "parallel" block, applied once at
+# startup by apply_parallel_knobs; every min(_PIPELINE_PARALLEL, n) call
+# site honors them without globals_cfg plumbing). fanout covers kubectl
+# exec / HTTP fan-out / config push / launch / exit-wait / flatten+trace —
+# no controller session cap applies to those. pull covers controller SFTP
+# pulls — sshd MaxSessions (~10) caps concurrent channels, stay at/below.
+_PIPELINE_PARALLEL = 16
+_PULL_WORKERS = 10
+
+
+def apply_parallel_knobs(globals_cfg):
+    """Startup: global.json parallel.fanout_workers / parallel.pull_workers
+    override the module defaults. Kept as module globals so the many
+    min(_PIPELINE_PARALLEL, n) sites stay untouched."""
+    global _PIPELINE_PARALLEL, _PULL_WORKERS
+    block = (globals_cfg or {}).get("parallel") or {}
+    try:
+        _PIPELINE_PARALLEL = max(1, int(
+            block.get("fanout_workers", _PIPELINE_PARALLEL)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        _PULL_WORKERS = max(1, int(
+            block.get("pull_workers", _PULL_WORKERS)))
+    except (TypeError, ValueError):
+        pass
 
 
 def _pipeline_http_parallel(cluster, items, path, timeout=5, dry=False,
@@ -3747,7 +3772,7 @@ def _pipeline_pull_parallel(cluster, groups, local_log_dir, dry, workers=None):
                 errors.append("{}: {}".format(os.path.basename(f), exc))
         return label, _missing(group), errors
 
-    workers = max(1, min(workers or 6, len(groups)))
+    workers = max(1, min(workers or _PULL_WORKERS, len(groups)))
     pending = list(groups)
     last_errors = {}
     for attempt in range(_LOG_PULL_ATTEMPTS):
@@ -6039,7 +6064,8 @@ def _kvtest_health_gate(cluster, entries, timeout_s, what):
         len(pending), what, timeout_s))
     while pending:
         _check_stop()
-        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+        with ThreadPoolExecutor(max_workers=min(_PIPELINE_PARALLEL,
+                                               len(pending))) as pool:
             results = list(pool.map(_probe, pending))
         pending = [e for e, ok in zip(pending, results) if not ok]
         if not pending:
@@ -6153,6 +6179,41 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
         if attempt + 1 < attempts and retry_s:
             time.sleep(retry_s)
     return False, last
+
+
+def _kvtest_gzip_remote_files(cluster, node_name, files):
+    """gzip files in place on the pod (samples.csv / trace.json compress
+    ~8-12x, cutting the pod->controller transfer). Returns the .gz paths on
+    success; on ANY failure returns the original paths so the pull keeps
+    working uncompressed (transparent fallback, never a hard error)."""
+    if not files:
+        return []
+    n = get_node(cluster, node_name)
+    script = "; ".join("gzip -f {}".format(shlex.quote(f)) for f in files)
+    try:
+        ssh_check_output(n["ip"], n, script, quiet=True)
+        return [f + ".gz" for f in files]
+    except Exception as exc:
+        log_detail("[kvtest] in-pod gzip skipped ({}): {}".format(
+            os.path.basename(files[0]), exc))
+        return list(files)
+
+
+def _gunzip_local_dir(local_dir):
+    """Decompress every *.gz artifact pulled into local_dir back to the
+    original file names, so the map/report glob surface stays unchanged
+    (*.samples.csv / *.trace.json). Best-effort per file."""
+    import gzip as _gzip
+    import shutil as _shutil
+    for path in sorted(glob.glob(os.path.join(local_dir, "*.gz"))):
+        target = path[:-len(".gz")]
+        try:
+            with _gzip.open(path, "rb") as src, open(target, "wb") as dst:
+                _shutil.copyfileobj(src, dst)
+            os.remove(path)
+        except OSError as exc:
+            log("[WARN] gunzip {} failed: {}".format(
+                os.path.basename(path), exc))
 
 
 def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
@@ -7108,16 +7169,33 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         len(payload), entry["_qps"], explicit_numa_node,
                         entry["_out_dir"]))
             else:
-                ssh_check_output(
-                    n["ip"], n,
+                # the push itself is deferred to _push_instances: the serial
+                # build above owns the order-sensitive port/NUMA slot
+                # assignment, only the per-instance execs overlap.
+                entry["_push_cmd"] = (
                     "mkdir -p '{d}' && printf '%s' '{b}' | base64 -d > '{f}'"
                     .format(d=_kvtest_pod_dir(remote_log_dir, n),
-                            b=payload, f=cfg_file), quiet=True)
+                            b=payload, f=cfg_file))
             entry["_role"] = role
             entry["_ccmd"] = ("nohup {p}bash {runner} {log} {cfgf} {bin} "
                               "> {nohup} 2>&1 & echo $!").format(
                 p=launch_prefix, runner=remote_runner_kvtest, log=log_file,
                 cfgf=cfg_file, bin=kv_binary, nohup=nohup_log)
+
+        def _push_instances(entries):
+            """Push the PREPARED per-instance configs with bounded
+            parallelism (54 serial execs ~= 13.5s -> ~2s at 16 workers)."""
+            if dry or not entries:
+                return
+
+            def _push(entry):
+                n = get_node(cluster, entry["node"])
+                ssh_check_output(n["ip"], n, entry["_push_cmd"], quiet=True)
+
+            from concurrent.futures import ThreadPoolExecutor
+            workers = max(1, min(_PIPELINE_PARALLEL, len(entries)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_push, entries))
 
         def _fire_instances(entries):
             """Fire PREPARED kvtest instances with bounded parallelism.
@@ -7184,6 +7262,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 for c in plan["clients"]:
                     _prepare_instance(c, "dual", ds, key_pool, all_instances,
                                       lhost_counter)
+                _push_instances(plan["clients"])
                 _fire_instances(plan["clients"])
                 stage = "health gate (dual, {})".format(ds)
                 if not dry:
@@ -7205,6 +7284,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     for e in entries:
                         _prepare_instance(e, role, ds, key_pool,
                                           all_instances, lhost_counter)
+                    _push_instances(entries)
 
                 def _gate_role(entries, what):
                     nonlocal stage
@@ -7374,8 +7454,13 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             # （可达数百 MB/实例）一律不传输，留在各节点 hostPath 现场；
             # glog 的 trace 统计在 pod 内算好后只回传小 trace.json。
             _extra_bytes = {}
-            _groups = []
-            for entry, _pid in instance_pids:
+
+            def _collect_one(pair):
+                """Per-instance artifact pass: flatten (in-pod cp) + in-pod
+                tracestats + gzip + byte stat. Runs for every instance with
+                bounded parallelism — the former serial loop cost one exec
+                round per instance (~0.3-0.5s x 54)."""
+                entry, _pid = pair
                 n = get_node(cluster, entry["node"])
                 base = entry["_base"]
                 pbase = _kvtest_pod_base(remote_log_dir, base, n)
@@ -7395,29 +7480,62 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         globals_cfg)
                     _extra_bytes[base] = _kvtest_small_log_bytes(
                         cluster, entry, remote_log_dir)
+                    # 压缩大件再传输（~8-12x）；失败时透明回退原文件名
+                    _trace_files = _kvtest_gzip_remote_files(
+                        cluster, entry["node"], _trace_files)
+                    samples_file = pbase + ".samples.csv"
                 else:
                     _trace_files = []
+                    samples_file = None
                 # 只请求确实存在的文件（trace map 失败时不拉、不因此判失败）
                 _files = [pbase + ".summary.json"] + list(_trace_files)
-                if dry or "samples=OK" in status:
+                if dry:
                     _files.append(pbase + ".samples.csv")
-                elif not dry:
+                elif "samples=OK" in status:
+                    _files.extend(_kvtest_gzip_remote_files(
+                        cluster, entry["node"], [samples_file]))
+                else:
                     log("[WARN] kvtest i{} uses an older binary without "
                         "latency_samples.csv; request-level plot unavailable"
                         "".format(entry["iid"]))
-                _groups.append((n, _files,
-                                "kvtest i{}".format(entry["iid"])))
+                return n, _files, "kvtest i{}".format(entry["iid"])
+
+            _groups = []
+            if dry:
+                _groups = [_collect_one(p) for p in instance_pids]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                _workers = max(1, min(_PIPELINE_PARALLEL,
+                                      len(instance_pids) or 1))
+                with ThreadPoolExecutor(max_workers=_workers) as pool:
+                    _groups = list(pool.map(_collect_one, instance_pids))
             _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
+            # gunzip the pulled .gz back to original names so the map/report
+            # glob surface stays unchanged, THEN account bytes per category.
+            if not dry:
+                _gunzip_local_dir(local_log_dir)
             _pulled_bytes = 0
+            _cat_bytes = {"samples": 0, "trace": 0, "summary": 0, "other": 0}
             if not dry:
                 for _n, _files, _l in _groups:
                     for _f in _files:
+                        _name = os.path.basename(_f)
+                        if _name.endswith(".gz"):
+                            _name = _name[:-len(".gz")]
                         try:
-                            _pulled_bytes += os.path.getsize(
-                                os.path.join(local_log_dir,
-                                             os.path.basename(_f)))
+                            _sz = os.path.getsize(
+                                os.path.join(local_log_dir, _name))
                         except OSError:
-                            pass
+                            continue
+                        _pulled_bytes += _sz
+                        if ".samples.csv" in _name:
+                            _cat_bytes["samples"] += _sz
+                        elif ".trace.json" in _name:
+                            _cat_bytes["trace"] += _sz
+                        elif ".summary.json" in _name:
+                            _cat_bytes["summary"] += _sz
+                        else:
+                            _cat_bytes["other"] += _sz
             if not dry:
                 # keep node mapping + this size's /start epoch local for the
                 # report map and for --rebuild-report after a later failure
@@ -7427,9 +7545,14 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _kvtest_report_context(cluster, ts, remote_log_dir,
                                            is_k8s))
             log("[kvtest] 拉取完成: {} files / {} instances ({:.1f} min, {}; "
-                "raw logs stay on nodes)".format(
+                "samples={:.1f}MB trace={:.1f}MB summary={:.1f}MB "
+                "other={:.1f}MB; raw logs stay on nodes)".format(
                     sum(len(f) for _n, f, _l in _groups), len(_groups),
-                    (time.time() - _t_pull) / 60.0, _fmt_mb(_pulled_bytes)))
+                    (time.time() - _t_pull) / 60.0, _fmt_mb(_pulled_bytes),
+                    _cat_bytes["samples"] / 1048576.0,
+                    _cat_bytes["trace"] / 1048576.0,
+                    _cat_bytes["summary"] / 1048576.0,
+                    _cat_bytes["other"] / 1048576.0))
             # remove empty .nohup redirect files (non-empty kept for
             # diagnostics on the node)
             if not dry:
@@ -9359,6 +9482,7 @@ def main(args, cfg_paths):
             log("[WARN] k8s controller info: {}".format(exc))
     enrich_k8s_nodes(cluster)
     globals_cfg = load_json(args.global_cfg)
+    apply_parallel_knobs(globals_cfg)
     # pipeline rendezvous: wipe stale mcbench/ keys from crashed runs (the
     # run prefix is also wiped per scenario/size; this covers the rest).
     # Done BEFORE the capacity probe so both k8s DNS resolutions print as
