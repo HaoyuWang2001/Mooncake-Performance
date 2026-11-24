@@ -804,7 +804,12 @@ def scp_pull(host, node, remote_glob, local_dir, dry_run=False, timeout=300):
             raise RuntimeError("kubectl cp pull failed: no such file on {}: {}".format(
                 node["_pod"], remote_glob))
         c = node["_controller"]
-        stage = posixpath.join(node.get("_controller_workspace") or "/tmp", "pull-tmp")
+        # per-POD staging subdir: concurrent pulls of same-named files
+        # (monitor CSVs: mem.host.csv / mem.err.log) from different pods
+        # would otherwise collide in the shared pull-tmp/ and trip the
+        # post-copy size verification.
+        stage = posixpath.join(node.get("_controller_workspace") or "/tmp",
+                               "pull-tmp", node.get("_pod") or "node")
         if not dry_run:
             controller_mkdir(c, stage)
         for f in files:
