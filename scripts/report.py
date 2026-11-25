@@ -432,6 +432,7 @@ def _summary_of(stats, pools=None):
         "avg_ms": round(lat_sum / ok_rows, 4) if ok_rows else 0.0,
         "min_ms": round(gmin, 4) if gmin is not None else 0.0,
         "p50_ms": pct(0.50, "p50_ms"),
+        "p90_ms": pct(0.90, "p90_ms"),
         "p95_ms": pct(0.95, "p95_ms"),
         "p99_ms": pct(0.99, "p99_ms"),
         "p999_ms": pct(0.999, "p999_ms"),

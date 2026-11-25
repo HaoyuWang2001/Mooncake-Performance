@@ -45,6 +45,21 @@ def _stats(tmp_path, name, role, node="n1", lat=1.0, n=40, secs=4):
     return p + ".stats.json"
 
 
+def test_summary_of_computes_p90_exact_pools():
+    stats = [{
+        "global": {"key_total": 10, "key_ok": 10, "key_fail": 0,
+                   "ok": 10, "avg_ms": 5.5, "max_ms": 10.0, "min_ms": 1.0},
+        "meta": {"ts_from": 100.0, "ts_to": 110.0},
+    }]
+    lats = [float(i) for i in range(1, 11)]
+    out = rp._summary_of(stats, {"lats": lats, "missing": False})
+    assert out["p90_ms"] == round(ls._exact_percentile(lats, 0.90), 4)
+    assert out["p50_ms"] is not None
+    # unavailable raw samples -> N/A, never an approximation
+    n_a = rp._summary_of(stats, {"missing": True})
+    assert n_a["p90_ms"] is None
+
+
 def test_reduce_roles_clients_sources(tmp_path):
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.reader", "reader", node="n2")

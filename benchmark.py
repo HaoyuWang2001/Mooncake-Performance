@@ -958,6 +958,10 @@ def _apply_monitor_overrides(matrix, args):
 
 
 _REMOVE_SVC_PORT = 9401
+# The warm store client needs ~40s to initialize; a measurement window shorter
+# than this cannot hide it (the config-end remove happens right after the
+# window), so short smoke runs skip the prewarm entirely.
+_REMOVE_SVC_MIN_WINDOW_S = 90
 _REMOVE_SVC_REQUESTS = {"cpu": "10m", "memory": "32Mi"}
 _REMOVE_SVC_LIMITS = {"cpu": "200m", "memory": "256Mi"}
 
@@ -1059,6 +1063,9 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
         log("[remove-service] (dry-run) would create {} (ns={})".format(
             name, k8s["namespace"]))
         return False
+    t_start = time.time()
+    log("[remove-service] creating Deployment {} (ns={}, pod_ws={})".format(
+        name, k8s["namespace"], k8s.get("pod_workspace") or "?"))
     import tempfile
     local_dir = tempfile.mkdtemp(prefix="mc-remove-")
     local_yaml = os.path.join(local_dir, name + ".yaml")
@@ -1066,11 +1073,14 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
         with open(local_yaml, "w", encoding="utf-8", newline="\n") as f:
             f.write(yaml_text)
         yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
+        log_detail("[remove-service] uploading manifest -> {}:{}".format(
+            controller_desc(c), yaml_dir))
         controller_put(c, [local_yaml], yaml_dir)
         remote_yaml = posixpath.join(yaml_dir, name + ".yaml")
+        log_detail("[remove-service] kubectl apply")
         out, rc = controller_run(
             c, ["-n", k8s["namespace"], "apply", "-f", remote_yaml],
-            check=False)
+            check=False, timeout=60)
         if rc != 0:
             raise RuntimeError("kubectl apply failed for {}: {}".format(
                 name, (out or "").strip()[:300]))
@@ -1078,11 +1088,12 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
         shutil.rmtree(local_dir, ignore_errors=True)
     cluster.setdefault("_k8s_deployments", []).append(name)
     t0 = time.time()
-    wait_k8s_deployment_ready(cluster, name, run_label)
+    log_detail("[remove-service] waiting rollout (timeout 90s)")
+    wait_k8s_deployment_ready(cluster, name, run_label, timeout=90)
     out, rc = controller_run(
         c, ["-n", k8s["namespace"], "get", "pods", "-l",
             "app=mc-remove,run=" + run_label, "-o",
-            "jsonpath={.items[0].metadata.name}"], check=False)
+            "jsonpath={.items[0].metadata.name}"], check=False, timeout=30)
     pod = (out or "").strip()
     if rc != 0 or not pod:
         raise RuntimeError("remove-service pod not found for {}".format(name))
@@ -1106,7 +1117,9 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
             svc=shlex.quote(posixpath.join(scripts_dir, "remove_service.py")),
             port=_REMOVE_SVC_PORT,
             log=shlex.quote(posixpath.join(log_dir, "remove_service.log")))
-    ssh_check_output(ip, entry, launch, quiet=True)
+    log_detail("[remove-service] launching service on {}:{} (pod={})".format(
+        ip, _REMOVE_SVC_PORT, pod))
+    ssh_check_output(ip, entry, launch, quiet=True, timeout=30)
     deadline = time.time() + 120
     while time.time() < deadline:
         _check_stop()
@@ -1115,7 +1128,7 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
                 ip, entry,
                 "curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 "
                 "http://127.0.0.1:{}/health".format(_REMOVE_SVC_PORT),
-                quiet=True)
+                quiet=True, timeout=10)
             if str(code).strip() == "200":
                 st["ok"] = True
                 st["cold_start_s"] = round(time.time() - t0, 1)
@@ -1129,14 +1142,21 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
 
 
 def _remove_service_prewarm_async(cluster, globals_cfg, ts, cfg_name,
-                                  dry=False):
+                                  dry=False, window_s=None):
     """Start the remove pod + warm store client in the background.
 
     Called at the kvtest measurement start so the ~40s client cold start is
     hidden under the (long) measured window; config-end remove then pays only
-    the drain itself. Failures are recorded and remove stages fall back to
-    the legacy per-stage path."""
+    the drain itself. A window shorter than _REMOVE_SVC_MIN_WINDOW_S cannot
+    fit the cold start, so it is skipped (logged, not an error). Failures are
+    recorded and remove stages fall back to the legacy per-stage path."""
     if dry or not _remove_service_enabled(cluster, globals_cfg):
+        return
+    if window_s is not None and float(window_s) < _REMOVE_SVC_MIN_WINDOW_S:
+        log("[remove-service] skipped: measurement window {:.0f}s < {}s "
+            "(cold start ~40s cannot finish before config-end remove); "
+            "remove stages use the legacy path".format(
+                float(window_s), _REMOVE_SVC_MIN_WINDOW_S))
         return
     st = cluster.setdefault("_remove_svc", {})
     if st.get("event") is not None:
@@ -1171,6 +1191,8 @@ def _remove_service_call(cluster, globals_cfg, scope, when, timeout_s=120.0):
     st = (cluster or {}).get("_remove_svc") or {}
     ev = st.get("event")
     if ev is None:
+        log_detail("[remove-service] {}: no prewarm event (not started); "
+                   "legacy path".format(when))
         return None
     if not ev.wait(max(0.0, timeout_s)):
         log("[WARN] [remove-service] {}: not ready after {:.0f}s; legacy "
@@ -8215,7 +8237,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # measurement window: config-end remove then pays only the
                 # drain (~2s), not a fresh ~40s store-client cold start.
                 _remove_service_prewarm_async(cluster, globals_cfg, ts,
-                                              cfg_name, dry)
+                                              cfg_name, dry,
+                                              window_s=duration)
                 stage = "measurement ({})".format(ds)
                 _wait_window(duration, "measurement")
             except StopRequested:

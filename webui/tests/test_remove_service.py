@@ -114,6 +114,34 @@ def test_stage_precheck_skip_uses_nothing(monkeypatch):
     assert calls["run"] == [] and calls["svc"] == []
 
 
+def test_prewarm_skips_short_window(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bm, "_remove_service_enabled", lambda *a: True)
+    monkeypatch.setattr(bm, "_remove_service_ensure",
+                        lambda *a, **k: calls.append(a) or True)
+    cluster = {"_controller": {"host": "c"}}
+    bm._remove_service_prewarm_async(cluster, {}, "ts", "cfg", False,
+                                     window_s=30)
+    assert calls == [] and "_remove_svc" not in cluster
+
+
+def test_prewarm_starts_long_window(monkeypatch):
+    calls = []
+
+    def _ensure(cluster, *a, **k):
+        calls.append(cluster)
+        cluster["_remove_svc"]["ok"] = True
+        return True
+
+    monkeypatch.setattr(bm, "_remove_service_enabled", lambda *a: True)
+    monkeypatch.setattr(bm, "_remove_service_ensure", _ensure)
+    cluster = {"_controller": {"host": "c"}}
+    bm._remove_service_prewarm_async(cluster, {}, "ts", "cfg", False,
+                                     window_s=600)
+    assert cluster["_remove_svc"]["event"].wait(5)
+    assert calls and cluster["_remove_svc"]["ok"] is True
+
+
 def test_cleanup_is_idempotent(monkeypatch):
     calls = []
     monkeypatch.setattr(
