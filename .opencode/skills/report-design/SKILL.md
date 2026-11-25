@@ -395,11 +395,11 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 - C15.V1 标题「慢点追踪（trace）」；柱按端到端时延**降序**排列，轴标签=时延值（可读出聚集簇） —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
 - C15.V2 柱高=端到端时延，自下而上=一级阶段（含残差）；**每阶段不同颜色** —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo, test_trace_cards_stack_and_breakdown_js〕
-- C15.V3 表格 Top-N（当前 100，参数化）；行点击展开该请求阶段构成的块图：**无 total 行**、单行压缩、横向滚动 —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.V3 表格 Top-N（当前 100，参数化）；**表格跟随当前写/读组，与图取同一组 Top-K 集合（行数与柱数 1:1）**；行点击展开该请求阶段构成的块图：**无 total 行**、单行压缩、横向滚动 —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo, test_slow_tracking_table_and_chart_follow_group〕
 - C15.V4 tooltip：时刻 + op + 端到端 + 节点/实例 + 各阶段分项 —— R-TRACE-7/13 〔◐〕
 - C15.V5 说明文字：采样门控 / memwrite 副本口径 / -1 哨兵 / slice 仅计数 —— R-TRACE-7 〔◐〕
 - C15.I1 图例点击 = **solo**：点某阶段只保留它；再点同一图例恢复全部；点其它图例切换 solo 对象 —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
-- C15.D1 图/表共用 reduce 合并后的 Top-N（按 total_us 降序，跨节点跨 op） —— R-TRACE-13 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C15.D1 **每组各自 Top-N**：reduce 先按写/读组过滤慢请求，再组内按 total_us 降序截断 K=100（跨节点跨 op 合并；图/表同集；根级全局榜不保留） —— R-TRACE-13 〔test_trace_top_is_per_group_topk, test_slow_tracking_ranked_colors_and_legend_solo〕
 - C15.B1 图例 solo 依赖事件回传状态会误判（点击已 solo 项被当成「全隐」）；用自身 solo 状态机 + 防重入锁 —— DR-29 〔test_slow_tracking_ranked_colors_and_legend_solo〕
 - C15.B2 灰阶阶段色导致相邻阶段无法区分 —— DR-29 〔test_trace_cards_stack_and_breakdown_js〕
 
