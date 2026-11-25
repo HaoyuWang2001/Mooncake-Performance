@@ -566,15 +566,18 @@ env.mooncake.sh（面板）全部为 `MC_` 前缀（Mooncake 进程直读），�
 
 **编排器日志带时间戳**：所有 `[benchmark]` 日志行以 `[HH:MM:SS]` 开头；阶段分割行
 （`──── 阶段 ────` / `  ── 子阶段 ──`）不带时间戳，且前置一个空行，便于快速定位
-「参数与环境 / run 初始化 / 场景 … / 资源创建 / 清库 / 启动实例 / 测量 / 收集 / 清理收尾 /
-运行收尾」。中文只用于阶段名、难以理解的说明（store 容量、key 池、心跳、退出进度）
-和少量动词；标识符/命令/标签保持英文。
+「run 参数与环境 / run 初始化 / 场景 engine×scenario / 资源创建 / 清库 remove-keys /
+启动实例 / 测量 / 收集 / 清理收尾 / 运行收尾」。中文只保留在分割行、`store mem` 的
+`本测试实际将使用容量` 与 `[探测]/[配置]`、心跳、kvtest 退出进度和 `/stop` 通知；
+其余一律英文（`Results` / `benchmark log`、`params:`、`key pool` / `key space`、
+upload/configmap/deployment/pod 的动作词、`health gate` / `rendezvous`、`NUMA/bind` 等）。
 **verbose 开关**：CLI `--verbose`/`-v`、环境变量 `MC_BENCH_VERBOSE=1`、
 WebUI 运行框勾选 `verbose`。默认打印：参数与环境摘要（controller/镜像/namespace/配置路径）、
-容量探测结论、workspace/预运行/namespace、脚本上传与 ConfigMap、deployment/pod 就绪、
-每个 stage 的 `running.../done rc=…`（标签带引擎/场景，如 `[kvtest] remove-keys`）、
-健康门/屏障、测量心跳、日志拉取汇总（文件数/实例数/耗时/字节）。细节（逐文件清单、
-kubectl 命令、describe 尾部、多次 DNS 解析）只进 `benchmark.log`（log_detail）。
+`store mem` 两行容量结论、workspace/pre-run/namespace、upload scripts 与 configmap、
+deployment/pod ready、每个 stage 的 `running.../done rc=…`（标签带引擎/场景，如
+`[kvtest] remove-keys`）、health gate/rendezvous、测量心跳、日志拉取汇总（文件数/实例数/
+耗时/字节）。细节（逐文件清单、kubectl 命令、describe 尾部、多次 DNS 解析）只进
+`benchmark.log`（log_detail）。
 **测量心跳**：`global.json` 的 `heartbeat_interval_s`（默认 60，0=关闭）对全部 2×2
 引擎×场景生效，格式 `[<tag>] 测试已进行 hh:mm:ss，剩余 hh:mm:ss，预计结束于 hh:mm:ss`
 （无固定时长时只打已进行时间）。kvtest 退出等待每 10s 打一行

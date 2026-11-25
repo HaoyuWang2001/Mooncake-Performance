@@ -938,18 +938,19 @@ def _apply_monitor_overrides(matrix, args):
                  "urma": getattr(args, "monitor_urma", None)}
     if matrix is None:
         if any(v == "on" for v in overrides.values()):
-            log("[profile] 监控开关要求开启，但 profile 矩阵无可用工具；保持关闭")
+            log("[profile] monitor override requested but the profile "
+                "matrix has no available tools; staying off")
         return None
     for tool, val in sorted(overrides.items()):
         if val not in ("on", "off"):
             continue
         cfg = matrix["tools"].setdefault(tool, {})
         cfg["enabled"] = (val == "on")
-        log("[profile] {} 监控: {}".format(
-            "内存" if tool == "mem" else "URMA 端口",
-            "开" if cfg["enabled"] else "关"))
+        log("[profile] {} monitor: {}".format(
+            "memory" if tool == "mem" else "URMA port",
+            "on" if cfg["enabled"] else "off"))
     if not any(c.get("enabled") for c in matrix["tools"].values()):
-        log("[profile] 所有监控已关闭，本轮不启动监控 DaemonSet")
+        log("[profile] all monitors off; not starting the monitor DaemonSet")
         return None
     return matrix
 
@@ -1765,7 +1766,7 @@ def k8s_workspace_dirs(cluster, dry_run=False):
         return root
     for sub in subs:
         controller_mkdir(c, posixpath.join(root, sub))
-    log("[k8s] workspace 就绪: {}:{} ({})".format(
+    log("[k8s] workspace created: {}:{} ({})".format(
         controller_desc(c), root, ",".join(subs)))
     return root
 
@@ -1788,10 +1789,10 @@ def k8s_prerun(cluster, dry_run=False):
     log_detail("[k8s] pre-run upload: {} -> {}:{}".format(
         os.path.relpath(script, ROOT), controller_desc(c), remote_path))
     controller_put(c, [script], k8s["controller_workspace"])
-    log("[k8s] 预运行: bash {}".format(remote_path))
+    log("[k8s] pre-run: bash {}".format(remote_path))
     t0 = time.time()
     out, rc = controller_exec(c, "bash " + remote_path)
-    log("[k8s] 预运行完成 rc={} ({:.1f}s)".format(
+    log("[k8s] pre-run: rc={} ({:.1f}s)".format(
         rc, time.time() - t0))
     if rc != 0:
         raise RuntimeError("k8s pre-run script failed (rc={}): {}".format(
@@ -1855,7 +1856,7 @@ def ensure_k8s_namespace(cluster, ts, dry_run=False):
     state_append([{"type": "k8s-namespace", "controller": c.get("ip"),
                    "context": c.get("_ctx", ""), "namespace": ns, "ts": ts,
                    "controller_workspace": k8s.get("controller_workspace", "")}])
-    log("[k8s] namespace {} 已创建".format(ns))
+    log("[k8s] namespace created: {}".format(ns))
     log_detail("[k8s] pods:     {} get pods -o wide".format(" ".join(
         kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns}))))
 
@@ -2068,7 +2069,7 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         finally:
             shutil.rmtree(local_dir, ignore_errors=True)
         ip, k8s_node = wait_k8s_pod_ready(cluster, pod)
-        log("[k8s] pod {} 已就绪 (ns={}, ip={}, node={}, {:.1f}s)".format(
+        log("[k8s] pod {} ready (ns={}, ip={}, node={}, {:.1f}s)".format(
             pod, ns, ip, k8s_node or "?", time.time() - t0))
         log_detail("[k8s] shell:    {} exec -it {} -- bash".format(
             " ".join(kubectl_prefix({"_ctx": c.get("_ctx", ""), "_ns": ns})),
@@ -2084,7 +2085,7 @@ def ensure_k8s_pod(cluster, ts, cfg_name, dry_run=False):
         log("[k8s] (dry-run) pod {} would be ready "
             "(ns={}, ip=placeholder)".format(pod, ns))
     else:
-        log("[k8s] pod {} 已就绪 (ns={}, ip={})".format(pod, ns, ip))
+        log("[k8s] pod {} ready (ns={}, ip={})".format(pod, ns, ip))
     return pod
 
 
@@ -2277,7 +2278,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                   encoding="utf-8", newline="\n") as f:
             f.write(env_content)
         staged = sorted(os.listdir(local_stage))
-        log("[k8s] 上传脚本 {} files (run={}) -> {}:{}".format(
+        log("[k8s] upload scripts {} files (run={}) -> {}:{}".format(
             len(staged), run_label, controller_desc(c), stage_remote))
         for fname in staged:
             log_detail("[k8s]   + {}".format(fname))
@@ -2294,7 +2295,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
     if rc != 0:
         raise RuntimeError("kubectl create configmap {} failed: {}"
                            "".format(cm_name, out.strip()[:400]))
-    log("[k8s] configmap {} 已创建 *{}".format(cm_name, len(staged)))
+    log("[k8s] configmap {} created *{}".format(cm_name, len(staged)))
     log_detail("[k8s] configmap {} keys: {}".format(cm_name, ",".join(staged)))
     return cm_name
 
@@ -2755,7 +2756,7 @@ def _log_node_volumes(node_bytes, what):
     parts = ["{}={}".format(n, _fmt_gib(b)) for n, b in
              sorted(node_bytes.items()) if b]
     if parts:
-        log("[stats] {} 节点日志量: {}".format(what, ", ".join(parts)))
+        log("[stats] {} log volume: {}".format(what, ", ".join(parts)))
 
 
 _REPORT_MOD = [None]
@@ -4387,11 +4388,12 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 numa_node_check(primary_node_name, numa_strict)
         if is_k8s:
             _numa_txt = ("NUMA {}".format(k8s_numa_node)
-                         if k8s_numa_node is not None else "禁用(容器)")
+                         if k8s_numa_node is not None else "off (container)")
         else:
-            _numa_txt = "启用" if numa_bind else "禁用"
-        log("[basic] 参数: op={} topo={} protocol={} run_combos={} warmup={} "
-            "need_remove_before_run={} target_qps={} NUMA/绑核={}{}".format(
+            _numa_txt = "on" if numa_bind else "off"
+        log("[basic] params: op={} topo={} protocol={} run_combos={} "
+            "warmup={} need_remove_before_run={} target_qps={} "
+            "NUMA/bind={}{}".format(
                 op, topology, cfg["protocol"], len(runs), warmup,
                 need_remove_before_run, total_target_qps or "max-speed",
                 _numa_txt,
@@ -4818,7 +4820,7 @@ def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
         log_detail("[k8s] deployment manifest: template={} -> {}:{}".format(
             os.path.relpath(_deployment_template_path(cluster), ROOT),
             controller_desc(c), remote_yaml))
-        log("[k8s] deployment {} 开始创建: role={} replicas={}".format(
+        log("[k8s] deployment {} create: role={} replicas={}".format(
             deploy, role, replicas))
         out, rc = controller_run(
             c, ["-n", ns, "apply", "-f", remote_yaml], check=False)
@@ -4829,7 +4831,7 @@ def ensure_k8s_deployment(cluster, ts, cfg_name, role, replicas, dry_run=False):
         shutil.rmtree(local_dir, ignore_errors=True)
     t0 = time.time()
     wait_k8s_deployment_ready(cluster, deploy, run_label)
-    log("[k8s] deployment {} 已就绪 (role={}, {} 副本, {:.1f}s)".format(
+    log("[k8s] deployment {} ready (role={}, replicas={}, {:.1f}s)".format(
         deploy, role, replicas, time.time() - t0))
     return deploy, run_label
 
@@ -5144,13 +5146,13 @@ def ensure_k8s_monitor_daemonset(cluster, ts, cfg_name, involved_nodes,
         raise RuntimeError(
             "monitor DaemonSet {} has no Running pods".format(name))
     cache[cfg_name] = list(nodes)
-    log("[k8s] 节点级监控 DaemonSet {} 就绪: {} Pod / {} 节点 @{:.1f}s{}"
+    log("[k8s] node monitor DaemonSet {} ready: {} Pods / {} nodes @{:.1f}s{}"
         .format(name, len(nodes),
                 len({(cluster["nodes"].get(p) or {}).get("host_ip")
                      for p in nodes}),
                 time.time() - t0,
-                "（宿主工具经 {!r} 借用）".format(host_exec)
-                if host_exec else "（仅容器内工具）"))
+                " (host tools borrowed via {!r})".format(host_exec)
+                if host_exec else " (container tools only)"))
     return list(nodes)
 
 
@@ -5373,10 +5375,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
             globals_cfg, len(plan["writers"]), parse_data_size(_ds),
             int(cfg.get("batch_size", 1) or 1), _ds)
     cfg["_key_space"] = {str(_ds): _kc for _ds, _kc in _caps.items()}
-    log("key 空间 (容量来源={}, 生效容量={}):".format(_src, _fmt_gib(_eff)))
+    log("key space (capacity source={}, effective={}):".format(
+        _src, _fmt_gib(_eff)))
     for _ds in sizes:
         _kc = _caps[_ds]
-        log("    {}: 每 writer {} keys × {} writers = {} (预算比例 {:g})".format(
+        log("    {}: {} keys/writer × {} writers = {} (budget ratio {:g})"
+            .format(
             _ds, _kc, len(plan["writers"]),
             _fmt_gib(len(plan["writers"]) * _kc * parse_data_size(_ds)),
             _pipeline_key_space_ratio(globals_cfg)))
@@ -5401,17 +5405,17 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
     if is_k8s:
         numa_bind = False
         cpu_shard = 0
-    log("[pipeline] 参数: writer_op={} reader_op={} topo={} protocol={}{} "
+    log("[pipeline] params: writer_op={} reader_op={} topo={} protocol={}{} "
         "N={} writers={} readers={} notify_count={} total_qps={} "
         "per_writer_qps={} traffic={} run_id={} client_timeout={}s sizes={} "
-        "NUMA/绑核={}".format(
+        "NUMA/bind={}".format(
             writer_op, reader_op, topology, cfg["protocol"],
             "" if is_k8s else " primary_node={}".format(host),
             n_nodes, len(plan["writers"]), len(plan["readers"]),
             plan["notify_count"], int(plan["total_qps"]),
             plan["per_writer_qps"], cfg.get("traffic_mode", "pulse"),
             run_id, client_timeout_s, ",".join(sizes),
-            "禁用(容器)" if is_k8s else ("启用" if numa_bind else "禁用")))
+            "off (container)" if is_k8s else ("on" if numa_bind else "off")))
     scenario_params = base_scenario_params(cfg, work_mode, topology, primary_node_name)
     scenario_params.update({
         "BENCH_WRITER_COUNT": str(len(plan["writers"])),
@@ -5497,12 +5501,12 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                 _extra = " ({} writers + {} readers)".format(
                     len(plan["writers"]), len(plan["readers"]))
             if n_nodes and _total % n_nodes == 0:
-                log("[k8s] pipeline pods 已就绪: {}Pod/Node * {}Nodes = "
+                log("[k8s] pipeline pods ready: {}Pod/Node * {}Nodes = "
                     "{}Pods{} (run={})".format(
                         _total // n_nodes, n_nodes, _total, _extra,
                         _run_label))
             else:
-                log("[k8s] pipeline pods 已就绪: {}Pods / {}Nodes{} "
+                log("[k8s] pipeline pods ready: {}Pods / {}Nodes{} "
                     "(run={})".format(_total, n_nodes, _extra, _run_label))
         stage = "stage scripts"
         deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
@@ -5662,8 +5666,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-                log("[pipeline] 已启动 {} dual clients，等待注册屏障".format(
-                    len(plan["clients"])))
+                log("[pipeline] launched {} dual clients, waiting rendezvous"
+                    .format(len(plan["clients"])))
                 # barriers: every client registered BOTH roles, then trigger
                 stage = "rendezvous ({})".format(ds)
                 if not dry:
@@ -5676,10 +5680,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "mcbench/{}/writers/".format(run_id),
                                       len(plan["clients"]), rendezvous_timeout_s,
                                       "dual writers", run_id)
-                    log("[pipeline] 屏障: {}/{} dual clients 注册完成 "
-                        "({:.1f}s)".format(len(plan["clients"]),
-                                           len(plan["clients"]),
-                                           time.time() - t0))
+                    log("[pipeline] rendezvous: {}/{} dual clients "
+                        "registered ({:.1f}s)".format(
+                            len(plan["clients"]), len(plan["clients"]),
+                            time.time() - t0))
                     # Cross-child rank+recall /start alignment: the full
                     # client pool is registered; hold /start until the peer
                     # child reaches the same gate so both children's
@@ -5696,7 +5700,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "pipeline trigger failed for {}/{} clients: {} "
                             "({})".format(len(_fail), len(_items),
                                           _fail[0][0], _fail[0][2]))
-                    log("[pipeline] /start 已发送至 {} dual clients "
+                    log("[pipeline] /start sent to {} dual clients "
                         "(parallel x{})".format(
                             len(_items), min(_PIPELINE_PARALLEL,
                                              len(_items))))
@@ -5815,8 +5819,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-                log("[pipeline] 已启动 {} readers，等待注册屏障".format(
-                    len(plan["readers"])))
+                log("[pipeline] launched {} readers, waiting rendezvous"
+                    .format(len(plan["readers"])))
                 # Step 2: etcd barrier — wait for the FULL reader pool to
                 # self-register before any writer starts (readers that fail to
                 # boot surface here as a timeout with the missing list)
@@ -5827,9 +5831,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "mcbench/{}/readers/".format(run_id),
                                       len(plan["readers"]), rendezvous_timeout_s,
                                       "readers", run_id)
-                    log("[pipeline] 屏障: {}/{} readers 注册完成 ({:.1f}s)"
-                        "".format(len(plan["readers"]), len(plan["readers"]),
-                                  time.time() - t0))
+                    log("[pipeline] rendezvous: {}/{} readers registered "
+                        "({:.1f}s)".format(
+                            len(plan["readers"]), len(plan["readers"]),
+                            time.time() - t0))
                 # Step 3: start all writers in parallel (one invocation per writer; the
                 # explicit --client-id in EXTRA overrides the per-invocation default
                 # and gives each writer a globally unique id). ALL writers run the
@@ -5879,8 +5884,8 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "marker": "run_benchmark_pipeline.sh",
                             "cfg": cfg_name,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}])
-                log("[pipeline] 已启动 {} writers，等待注册屏障".format(
-                    len(plan["writers"])))
+                log("[pipeline] launched {} writers, waiting rendezvous"
+                    .format(len(plan["writers"])))
                 # Step 4: etcd barrier — every writer registered (= reader list
                 # pulled from etcd + HTTP /start server bound), then TRIGGER the
                 # run: POST /start to each writer (k8s: direct pod IP; ssh:
@@ -5893,9 +5898,10 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                                       "mcbench/{}/writers/".format(run_id),
                                       len(plan["writers"]), rendezvous_timeout_s,
                                       "writers", run_id)
-                    log("[pipeline] 屏障: {}/{} writers 注册完成 ({:.1f}s)"
-                        "".format(len(plan["writers"]), len(plan["writers"]),
-                                  time.time() - t0))
+                    log("[pipeline] rendezvous: {}/{} writers registered "
+                        "({:.1f}s)".format(
+                            len(plan["writers"]), len(plan["writers"]),
+                            time.time() - t0))
                     # Cross-child rank+recall /start alignment (see the dual
                     # branch above for rationale).
                     stage = "/start ({})".format(ds)
@@ -5910,7 +5916,7 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                             "pipeline trigger failed for {}/{} writers: {} "
                             "({})".format(len(_fail), len(_items),
                                           _fail[0][0], _fail[0][2]))
-                    log("[pipeline] /start 已发送至 {} writers "
+                    log("[pipeline] /start sent to {} writers "
                         "(parallel x{})".format(
                             len(_items), min(_PIPELINE_PARALLEL,
                                              len(_items))))
@@ -6363,7 +6369,7 @@ def _kvtest_health_gate(cluster, entries, timeout_s, what):
         except Exception:
             return False
 
-    log("[kvtest] 已启动 {} {}，等待健康门 (timeout {}s)".format(
+    log("[kvtest] launched {} {}, waiting health gate (timeout {}s)".format(
         len(pending), what, timeout_s))
     while pending:
         _check_stop()
@@ -6381,7 +6387,7 @@ def _kvtest_health_gate(cluster, entries, timeout_s, what):
                     ", ".join("i{} on {}".format(e["iid"], e["node"])
                               for e in pending[:8])))
         time.sleep(2)
-    log("[kvtest] 健康门: {}/{} {} 通过 ({:.1f}s)".format(
+    log("[kvtest] health gate: {}/{} {} healthy ({:.1f}s)".format(
         len(entries), len(entries), what, time.time() - t0))
 
 
@@ -7423,22 +7429,23 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             cfg, globals_cfg, plan, len(plan["writers"]),
             parse_data_size(_ds), _ds)
     cfg["_kvtest_key_pool"] = {str(_ds): _p for _ds, _p in pools.items()}
-    log("[kvtest] 参数: N={} writers={} readers={} notify_count={} "
+    log("[kvtest] params: N={} writers={} readers={} notify_count={} "
         "total_qps={} per_node_qps={} binary={} warmup={}s duration={}s "
         "health_timeout={}s "
-        "sizes={} NUMA/绑核={}".format(
+        "sizes={} NUMA/bind={}".format(
             n_nodes, len(plan["writers"]), len(plan["readers"]),
             plan["notify_count"], int(plan["total_qps"]),
             plan["per_node_qps"], kv_binary, warmup_duration,
             float(cfg.get("duration", 30)), health_timeout_s,
             ",".join(sizes),
-            ("禁用(容器)" if is_k8s
-             else ("启用" if numa_bind else "禁用"))))
+            ("off (container)" if is_k8s
+             else ("on" if numa_bind else "off"))))
     for _ds in sizes:
         if pools[_ds] == 0:
-            log("key 池: {} 每 writer 无上限 (key_pool_size=0)".format(_ds))
+            log("key pool: {} unbounded per writer (key_pool_size=0)".format(_ds))
         else:
-            log("key 池: {} 每 writer {} keys × {} writers = {} (容量来源={})".format(
+            log("key pool: {} {} keys/writer × {} writers = {} "
+                "(capacity source={})".format(
                 _ds, pools[_ds], len(plan["writers"]),
                 _fmt_gib(len(plan["writers"]) * pools[_ds] *
                          parse_data_size(_ds)), _src))
@@ -7513,12 +7520,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _extra = " ({} writers + {} readers)".format(
                     len(plan["writers"]), len(plan["readers"]))
             if n_nodes and _total % n_nodes == 0:
-                log("[k8s] kvtest pods 已就绪: {}Pod/Node * {}Nodes = "
+                log("[k8s] kvtest pods ready: {}Pod/Node * {}Nodes = "
                     "{}Pods{} (run={})".format(
                         _total // n_nodes, n_nodes, _total, _extra,
                         _run_label))
             else:
-                log("[k8s] kvtest pods 已就绪: {}Pods / {}Nodes{} "
+                log("[k8s] kvtest pods ready: {}Pods / {}Nodes{} "
                     "(run={})".format(_total, n_nodes, _extra, _run_label))
         # Artifact filenames no longer carry the full node/Pod name. Preserve
         # the iid -> real node mapping in the in-memory scenario config so CSV
@@ -7995,7 +8002,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         + ".log.exitrc",
                         "kvtest i{}".format(entry["iid"]))
             if not dry:
-                log("[kvtest] 实例已退出: {}/{} ({:.1f}s)".format(
+                log("[kvtest] instances exited: {}/{} ({:.1f}s)".format(
                     _exited, len(instance_pids), time.time() - _t0))
                 if _exited != len(instance_pids):
                     _alive = ["i{} on {}".format(entry["iid"], entry["node"])
@@ -8079,12 +8086,13 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         _extra_bytes, qps_target=plan.get("total_qps") or 0,
                         nodes=int(cfg.get("_kvtest_nodes") or 0))
                     _ctrl_done = True
-                    log("[kvtest] controller 数据面完成: {:.1f}s（pod→controller 单跳，"
-                        "编排机零中间产物，只回传 reduced/meta/summary）".format(
+                    log("[kvtest] controller data-plane done in {:.1f}s "
+                        "(pod->controller single hop; orchestrator keeps no "
+                        "intermediates, only reduced/meta/summary)".format(
                             time.time() - _t_red))
                 except Exception as exc:
-                    log("[WARN] controller map+reduce 失败，回退本地拉取链路: {}"
-                        "".format(exc))
+                    log("[WARN] controller map+reduce failed, falling back "
+                        "to local pull: {}".format(exc))
             if not _ctrl_done:
                 _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
                 # gunzip the pulled .gz back to original names so the map/report
@@ -8121,7 +8129,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     local_log_dir, cfg,
                     _kvtest_report_context(cluster, ts, remote_log_dir,
                                            is_k8s))
-            log("[kvtest] 拉取完成: {} files / {} instances ({:.1f} min, {}; "
+            log("[kvtest] pulled: {} files / {} instances ({:.1f} min, {}; "
                 "samples={:.1f}MB trace={:.1f}MB summary={:.1f}MB "
                 "other={:.1f}MB; raw logs stay on nodes)".format(
                     sum(len(f) for _n, f, _l in _groups), len(_groups),
@@ -8374,8 +8382,8 @@ def cleanup_cluster(cluster, globals_cfg, dry_run=False):
         # 各节点，给出逐节点清理命令提示。
         try:
             root = k8s_settings(cluster)["host_log_root"]
-            log("[k8s] 宿主机日志留存于各节点 {}/<run_id>/<pod>/ "
-                "（CLEAN-UP 不删除）；如需释放请逐节点执行： "
+            log("[k8s] host logs kept on each node at {}/<run_id>/<pod>/ "
+                "(CLEAN-UP does not delete them); free space per node with: "
                 "rm -rf {}/*".format(root, root))
         except Exception:
             pass
@@ -9322,9 +9330,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                         row[k] = round(float(_red[k]), 4)
                     else:
                         row[k] = ""
-                        log("[WARN] kvtest TOTAL 分位不可得（无原始样本且无 "
-                            "controller reduce 产物），置空: {} {} {}"
-                            "".format(ds, role, k))
+                        log("[WARN] kvtest TOTAL quantile unavailable (no raw "
+                            "samples and no controller reduce product); left "
+                            "empty: {} {} {}".format(ds, role, k))
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
@@ -9852,10 +9860,11 @@ def rebuild_reports(ts):
                 for x in os.listdir(rep)
                 if os.path.isdir(os.path.join(rep, x)))
             if has_report:
-                log("[ERROR] {}: 中间产物已按成功清理（仅保留 report/ 与 "
-                    "profiling/），无法重建；报表与 data.js 仍可用。如需重建，"
-                    "请在跑测时加 --keep-intermediates（或 "
-                    "MC_KEEP_INTERMEDIATES=1）".format(name))
+                log("[ERROR] {}: intermediates were cleaned after success "
+                    "(only report/ and profiling/ kept); rebuild unavailable. "
+                    "Reports and data.js remain usable. Use "
+                    "--keep-intermediates (or MC_KEEP_INTERMEDIATES=1) when "
+                    "running".format(name))
                 continue
         _have_kvtest_stats = any(
             os.path.basename(p).endswith(".stats.json") and
@@ -10120,9 +10129,9 @@ def main(args, cfg_paths):
         log("[WARN] store capacity auto-discovery: {}".format(exc))
     _a, _b, _eff, _src = _store_capacity_resolution(globals_cfg)
     _free = globals_cfg.get("_store_free_auto")
-    log("store 容量: 探测得 总空间={} 可用空间={}; 预配置可用容量={}; "
-        "本测试实际将使用容量={}".format(
-            _fmt_gib(_b), _fmt_gib(_free), _fmt_gib(_a), _fmt_gib(_eff)))
+    log("store mem: [探测] total={} available={}; [配置]use={}".format(
+        _fmt_gib(_b), _fmt_gib(_free), _fmt_gib(_a)))
+    log("store mem: 本测试实际将使用容量={}".format(_fmt_gib(_eff)))
     if args.mode == "k8s":
         globals_cfg["_pod_workspace"] = k8s_settings(cluster)["pod_workspace"]
     # startup summary (mode, config paths, k8s settings)
@@ -10132,10 +10141,10 @@ def main(args, cfg_paths):
         os.path.relpath(args.profile, ROOT) if args.profile else "-"))
     if args.mode == "k8s":
         _ks = k8s_settings(cluster)
-        log("[k8s] 设置: namespace={} | 镜像={} | 模板={}".format(
+        log("[k8s] namespace={} | image={} | yaml={}".format(
             _ks["namespace"], _ks["image"],
             os.path.relpath(_pod_template_path(cluster), ROOT)))
-        log("[k8s] 工作区: controller={} pod={}".format(
+        log("[k8s] workspace: controller={} pod={}".format(
             _ks["controller_workspace"], _ks["pod_workspace"]))
     _validate_master_mode(globals_cfg)
     _STOP_CTX.update(cluster=cluster, globals_cfg=globals_cfg, args=args)
@@ -10149,7 +10158,7 @@ def main(args, cfg_paths):
         matrix = _apply_monitor_overrides(matrix, args)
     args._matrix = matrix
     if matrix:
-        log("profiling 已启用: {} (触发={})".format(
+        log("profiling active: {} (trigger={})".format(
             profile_path, matrix.get("trigger")))
     # .state ledger check: reap any leftovers from previous runs
     # (crashed/killed orchestrator) BEFORE anything else touches nodes.
@@ -10200,8 +10209,9 @@ def main(args, cfg_paths):
         # console (WebUI) keeps the summary + verbose adds detail to it
         set_detail_log(os.path.join(ts_dir, "benchmark.log"))
         atexit.register(close_detail_log)
-        log("结果目录: {} (完整日志: {})".format(
-            ts_dir, os.path.join(ts_dir, "benchmark.log")))
+        log("Results: {}".format(ts_dir))
+        log("benchmark log: {}".format(
+            os.path.join(ts_dir, "benchmark.log")))
     if args.mode == "k8s":
         log_phase("run 初始化")
         k8s_workspace_dirs(cluster, dry_run=args.dry_run)

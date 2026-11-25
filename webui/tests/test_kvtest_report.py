@@ -407,7 +407,8 @@ def test_rebuild_reports_explains_cleaned_intermediates(tmp_path, monkeypatch):
     msgs = []
     monkeypatch.setattr(bm, "log", lambda m: msgs.append(str(m)))
     assert bm.rebuild_reports("run1") == 1
-    assert any("中间产物已按成功清理" in m for m in msgs), msgs
+    assert any("intermediates were cleaned after success" in m
+               for m in msgs), msgs
 
 
 def test_kvtest_report_meta_roundtrip(tmp_path):

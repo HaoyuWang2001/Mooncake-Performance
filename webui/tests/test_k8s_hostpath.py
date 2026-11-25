@@ -114,8 +114,8 @@ def test_pull_logs_k8s_pod_glob(monkeypatch, tmp_path):
 
 def test_cleanup_mentions_host_log_root():
     src = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
-    assert "宿主机日志留存于各节点" in src
-    assert "CLEAN-UP 不删除" in src
+    assert "host logs kept on each node" in src
+    assert "CLEAN-UP does not delete them" in src
 
 
 def test_basic_log_paths_include_pod_subdir():
