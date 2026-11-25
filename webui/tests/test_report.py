@@ -1920,7 +1920,7 @@ def test_control_style_consistency():
 
 
 def test_client_site_tree_readonly_rows(tmp_path):
-    """实例与日志现场：节点行可展开/收起，客户端行为只读（点击无交互）。"""
+    """日志现场：节点行可展开/收起（实例默认折叠），客户端行为只读（点击无交互）。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.reader", "reader", node="n2")
     data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"})
@@ -1929,6 +1929,10 @@ def test_client_site_tree_readonly_rows(tmp_path):
         return
     assert res["errors"] == []
     assert res["node_row_clickable"] is True
+    # 默认折叠所有实例：点击前没有客户端行
+    assert res["client_row_present_before"] is False
+    # 点击节点后实例行出现，且客户端行只读（无 onclick）
+    assert res["client_row_present"] is True
     assert res["client_row_clickable"] is False
     assert res["rows_after_nodes"] != res["rows_before"]   # 展开/收起生效
     # 对图表无副作用（不叠加曲线、不改选择）
@@ -1937,12 +1941,12 @@ def test_client_site_tree_readonly_rows(tmp_path):
 
 
 def test_client_site_header_and_columns(tmp_path):
-    """合并卡：实例与日志现场（角色/节点/总数/成功/失败/日志 + 贡献列）。"""
+    """合并卡：日志现场（角色/节点/总数/成功/失败/日志 + 贡献列）。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
     html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
     src = open(html, encoding="utf-8").read()
-    assert "<h2>实例与日志现场</h2>" in src
+    assert "<h2>日志现场</h2>" in src
     # 性能指标列已移出本卡（段1/曲线负责）：旧表头不得回潮
     for bad in ('<th class="n">p50</th>', '<th class="n">p99</th>',
                 '<th class="n">队列等待均值</th>'):
@@ -1969,7 +1973,7 @@ def test_pipeline_and_basic_templates_split(tmp_path):
     assert "Pipeline 场景报表" in sp.split("<title>")[1]
     for sec in ("性能统计", "参数配置", "端到端时延曲线",
                 "时延分布", "慢点捕捉", "SDK 全链路",
-                "错误与异常", "实例与日志现场"):
+                "错误与异常", "日志现场"):
         assert sec in sb, (sec, "basic")
         assert sec in sp, (sec, "pipeline")
 
@@ -2776,22 +2780,33 @@ def test_errors_split_by_role_and_client(tmp_path):
     assert "写路径（writer）" in et and "读路径（reader）" in et, et
     assert et.index("写路径（writer）") < et.index("读路径（reader）"), et
     assert "503×3" in et and "500×1" in et, et
-    assert "a.writer" in et and "b.reader" in et, et
     assert "n1" in et and "n2" in et, et
+    # 节点级收放按钮，实例默认折叠（客户端名不可见）
+    assert res["err_toggles"] == res["err_nodes_default"] == 2, res
+    assert res["err_clients_default"] == 0, res
+    assert "a.writer" not in et and "b.reader" not in et, et
+    # 展开后客户端明细出现
+    rx = _js_check(tmp_path, data, "--expand-errors")
+    if rx is None:
+        return
+    ex = rx["errors_text_expanded"]
+    assert rx["err_clients_expanded"] == 2, rx
+    assert "a.writer" in ex and "b.reader" in ex, ex
 
 
 def test_client_site_contribution_and_writer_first(tmp_path):
-    """实例与日志现场：同节点内 writer 在 reader 前；有 trace 才显示贡献列。"""
+    """日志现场：同节点内 writer 在 reader 前；有 trace 才显示贡献列。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.reader", "reader", node="n1")
     tr = _trace_stats2(tmp_path, "x.glog", node="n1", pod="p1")
     data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"},
                               traces=[tr])
-    res = _js_check(tmp_path, data)
+    res = _js_check(tmp_path, data, "--expand-clients")
     if res is None:
         return
     assert res["errors"] == []
-    ct = res["clients_text"]
+    ct = res["clients_text_expanded"]
+    assert res["client_rows_expanded"] == 2, res
     assert "对慢点追踪的贡献" in ct, ct
     assert ct.index("a.writer") < ct.index("b.reader"), ct
     # 无 trace：整个贡献列隐藏
@@ -2803,7 +2818,7 @@ def test_client_site_contribution_and_writer_first(tmp_path):
 
 
 def test_section_order_and_footer_note(tmp_path):
-    """章节顺序：SDK → 错误与异常 → 实例与日志现场 →（监控）→ 页脚；
+    """章节顺序：SDK → 错误与异常 → 日志现场 →（监控）→ 页脚；
     页脚解释 map-reduce 与数据正确性并在最底部。"""
     a = _stats(tmp_path, "a.writer", "writer")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
@@ -3895,7 +3910,7 @@ def test_c01_dr24_alignment_lock(tmp_path):
         assert dead not in src, "死 CSS 回潮: {}".format(dead)
     # 3) 表头命名（skill 文案规则6：指标名 avg/max；队列等待均值不截断）
     assert "总数" in src and "成功" in src and "失败" in src
-    assert "实例与日志现场" in src and "对慢点追踪的贡献" in src
+    assert "<h2>日志现场</h2>" in src and "对慢点追踪的贡献" in src
     assert "队列等待均</th>" not in src
     # 4) h3 标题无交互括号注记（说明移入 title 属性）
     import re as _re

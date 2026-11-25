@@ -126,14 +126,14 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
   **不含 total 行**、单行压缩、横向滚动；Top-N 参数化（当前 100，后续 1000 需同步
   map `--top-n` 与抽稀/虚拟化）。
 
-### 4i. 尾部章节（错误 / 实例与日志现场 / 页脚）
+### 4i. 尾部章节（错误 / 日志现场 / 页脚）
 
-- 章节顺序：SDK 全链路 → 错误与异常 → 实例与日志现场 → 节点监控 → 页脚（最底部）。
+- 章节顺序：SDK 全链路 → 错误与异常 → 日志现场 → 节点监控 → 页脚（最底部）。
 - **错误与异常**：写→读平铺，节点→客户端两级表（含状态码前 3），保留首错误摘录；
-  异常窗口带「角色 · 节点 · 实例」归属。
-- **实例与日志现场**：节点树（节点行可展开；客户端行只读）→ 客户端行 writer 前
-  reader 后；列=角色/节点/客户端/总数/成功/失败/日志 + **对慢点追踪的贡献**
-  （无 trace 整列隐藏）；不含性能指标列；现场索引（节点汇总/登录命令/glog 产物）并入。
+  **节点行带收放按钮（▸/▾），实例行默认折叠**；异常窗口带「角色 · 节点 · 实例」归属。
+- **日志现场**（原「实例与日志现场」）：节点树（节点行可展开，**实例默认折叠**；
+  客户端行只读）→ 客户端行 writer 前 reader 后；列=角色/节点/客户端/总数/成功/失败/日志 +
+  **对慢点追踪的贡献**（无 trace 整列隐藏）；不含性能指标列；现场索引（节点汇总/登录命令/glog 产物）并入。
 - **页脚**：数据文件（report.html 自包含 + data.js）、map→reduce 流程、正确性口径
   （总计=同桶按请求数加权平均、max 取最大、直方图全量、离群剔除口径）。
 
@@ -154,7 +154,8 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### 6. 交互边界
 
 - **曲线叠加只由对象树勾选控制**；其他位置（实例明细表等）不得改变曲线/选中集。
-- 实例与日志现场：**客户端行只读**（不点击、不嵌小图）；仅**节点行**可展开/收起。
+- 日志现场：**客户端行只读**（不点击、不嵌小图）；仅**节点行**可展开/收起，**实例默认折叠**；
+  错误与异常的节点行也带收放按钮且实例默认折叠。
 - 允许的展开交互：慢点追踪表行（展开该请求的块图）、实例节点行、分级时延块图聚焦（下一级展开）。分级时延块展开：树序全部 L1 + 残差；所有有二级子区间且值>0 的 L1 同时展开二级（含「未归因」）。
 - QPS 副图图例可看不可点（`selectedMode:false`，固定显示）；副图上方无小标题。
 - 平移/缩放滑块窗口不加描边；zslider 把手为填充色（不是描边）。
@@ -163,7 +164,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### 7. 文案
 
-- 卡片标题不加**交互**括号注记（例：「实例与日志现场」）；仅 SDK 三段命名允许带技术标识：`分级时延块图（trace）`、`分级时延曲线（trace）`、`慢点追踪（trace）`。
+- 卡片标题不加**交互**括号注记（例：「日志现场」）；仅 SDK 三段命名允许带技术标识：`分级时延块图（trace）`、`分级时延曲线（trace）`、`慢点追踪（trace）`。
 - 指标名统一 avg / p50 / p95 / p99 / p999 / p9999 / min / max；不要用「平均」「最大」作为曲线名（段1 的「平均时延」卡片除外）。
 - 说明文字极简：直方图仅保留「p9999 需样本 ≥ 10000」；不写教程式长段落。
 - 图注必须与实际行为一致（颜色/交互变化时同步更新，例：「橙色为该组最慢」）。
@@ -186,7 +187,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 230 条 · ✓203 · ◐25 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 230 条 · ✓204 · ◐24 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -405,7 +406,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 
 ### C16 错误与异常
 
-- C16.V1 按**写路径 → 读路径**平铺（basic 单块）；每块为「节点 → 客户端」两级表：节点汇总行（实例数/总数/失败/状态码前 3）+ 客户端行（总数/失败/状态码明细） —— R-ERR-1 〔test_errors_split_by_role_and_client〕
+- C16.V1 按**写路径 → 读路径**平铺（basic 单块）；每块为「节点 → 客户端」两级表：节点汇总行（实例数/总数/失败/状态码前 3）+ 客户端行（总数/失败/状态码明细）；**节点行带收放按钮（▸/▾），实例行默认折叠** —— R-ERR-1 〔test_errors_split_by_role_and_client〕
 - C16.V2 保留首错误原文摘录（≤16KB）与全局「状态分布」；无错误显示「无错误」 —— R-ERR-1 〔◐〕
 - C16.V3 异常窗口列表（≤100）：时刻 + 类型（错误突发/时延突增）+ 数值 + **归属（角色 · 节点 · 实例）** —— R-ERR-2 〔◐〕
 - C16.I1 状态码按次数降序，取前 3 个显示（`503×3 / 500×1`） —— R-ERR-1 〔test_errors_split_by_role_and_client〕
@@ -414,9 +415,9 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C16.B1 全局错误地图丢失节点/客户端精度 —— DR-29 〔test_errors_split_by_role_and_client〕
 - C16.B2 异常窗口时刻的时区错位（节点 UTC vs 宿主 CST） —— DR-18 〔test_slowest_ts_epoch_matches_buckets〕
 
-### C17 实例与日志现场（合并卡）
+### C17 日志现场（合并卡；原「实例与日志现场」）
 
-- C17.V1 节点树：节点行可展开/收起 → 客户端行；同一节点内 **writer 在前、reader 在后** —— R-INST-1 〔test_client_site_tree_readonly_rows, test_client_site_contribution_and_writer_first〕
+- C17.V1 节点树：节点行可展开/收起（**实例默认折叠**）→ 客户端行；同一节点内 **writer 在前、reader 在后** —— R-INST-1 〔test_client_site_tree_readonly_rows, test_client_site_contribution_and_writer_first〕
 - C17.V7 **节点身份 = 节点 IP**（k8s=宿主机 `status.hostIP`，ssh=管理 IP；同主机多 pod 节点级合并；pod 名保留在 `meta.pod`）—— 节点标签直接取数据，不做前端映射 —— R-INST-4 〔test_node_display_k8s_uses_host_ip, test_node_display_ssh_uses_management_ip, test_reduce_monitors_labels_by_node_ip_and_dedupes_host〕
 - C17.V2 列 = 角色 / 节点 / 客户端 / 总数 / 成功 / 失败 / 日志 + **对慢点追踪的贡献**（Top-N 条数） —— R-INST-1 〔test_client_site_header_and_columns, test_client_site_contribution_and_writer_first〕
 - C17.V3 无 C++ trace 时「贡献」整列隐藏 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
@@ -424,7 +425,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C17.V5 不再展示性能指标（avg/p50/p99/队列等待） —— R-INST-1 〔test_client_site_header_and_columns〕
 - C17.V6 「节点与登录现场」小节：节点汇总 + 登录命令 + 非客户端产物（glog/monitor）索引 —— R-SRC-1 〔◐〕
 - C17.I1 客户端行只读（无点击/不叠加曲线）；仅节点行可点击展开 —— R-INST-3 〔test_client_site_tree_readonly_rows〕
-- C17.I2 节点行展开状态跨重渲染保持（clientOpen 记忆） —— R-INST-1 〔◐〕
+- C17.I2 节点行展开状态跨重渲染保持（clientOpen 记忆；初始为折叠） —— R-INST-1 〔test_client_site_tree_readonly_rows〕
 - C17.D1 贡献 = 该客户端（名称/pod）在慢点追踪 Top-N 中的条数 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
 - C17.B1 性能指标列残留（旧 13 列表格） —— DR-29 〔test_client_site_header_and_columns〕
 - C17.B2 实例表点击曾叠加主图曲线 —— R-INST-3 〔test_client_site_tree_readonly_rows〕
@@ -469,7 +470,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C20.V3 数字 `tabular-nums`；时延 `fmtUs` 自适应 µs/ms/s —— R-SHELL-10 〔test_a16_theme_and_numeric_css, test_a17_fmt_us_adaptive_units〕
 - C20.V4 中文全角标点、省略号 `…`、中英混排保留技术词 —— 设计基调 〔◐〕
 - C20.V5 卡片仅 1px 描边或底色区分（无阴影/渐变/装饰图形） —— 设计基调 〔test_c01_dr24_alignment_lock〕
-- C20.V6 章节顺序与标题：SDK → 错误与异常 → 实例与日志现场 → 节点监控 → **数据量与优化** → 页脚 —— R-SHELL-15 〔test_section_order_and_footer_note, test_section_order_and_renames〕
+- C20.V6 章节顺序与标题：SDK → 错误与异常 → 日志现场 → 节点监控 → **数据量与优化** → 页脚 —— R-SHELL-15 〔test_section_order_and_footer_note, test_section_order_and_renames〕
 - C20.V7 body 卡片层级完整（`div` 闭合平衡） —— 模板架构 〔test_body_div_balance_cards_inside_wrap〕
 - C20.V8 **控件风格统一**：新控件必须复用既有形态（`.toolbar` 行 / `.tl-label` 标签 / `.objtree-strip` 树条 / `.tree-*` 树行 / 既有按钮）；**禁止引入新的容器底色或描边风格**；多栏布局只允许无样式 grid（先例 `.stage-split`/`.trace-cols`） —— 设计基调 〔test_control_style_consistency〕
 - C20.D1 正确性口径：总计=同桶按请求数加权平均、max 取最大、直方图全量合并、离群剔除口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕

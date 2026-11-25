@@ -679,7 +679,7 @@ if (!errs.length) {
         return (o && o.series) ? o.series.length : null;
       })();
       out.node_row_clickable = !!(nodeRow && nodeRow.onclick);
-      out.client_row_clickable = !!(clientRow && clientRow.onclick);
+      out.client_row_present_before = !!clientRow;
       out.rows_before = rows.length;
       if (nodeRow && nodeRow.onclick) nodeRow.onclick();
       const body2 = (function () {
@@ -689,6 +689,10 @@ if (!errs.length) {
         return tbl && (tbl.children || [])[1];
       })();
       out.rows_after_nodes = ((body2 && body2.children) || []).length;
+      const clientRow2 = ((body2 && body2.children) || []).find(function (r) {
+        return String(r.className || "").indexOf("client-row") >= 0;});
+      out.client_row_present = !!clientRow2;
+      out.client_row_clickable = !!(clientRow2 && clientRow2.onclick);
       out.selobjs_before = before;
       out.selobjs_after = JSON.stringify(sel());
       out.main_series_after = (function () {
@@ -1198,9 +1202,60 @@ if (!errs.length) {
   }
   out.legend_selmode = (mainOpt()&&mainOpt().legend)
     ? mainOpt().legend.selectedMode : null;
-  // 错误与异常 / 实例与日志现场（Phase 2）
+  // 错误与异常 / 日志现场（Phase 2）
   out.errors_text = textOf(getEl("errors"));
   out.clients_text = textOf(getEl("clients"));
+
+  function _rowsByClass(root, cls) {
+    const acc = [];
+    (function walk(n) {
+      (n.children || []).forEach(function (c) {
+        if (String(c.className || "").indexOf(cls) >= 0) acc.push(c);
+        walk(c);
+      });
+    })(root);
+    return acc;
+  }
+  function _errToggles() {
+    const acc = [];
+    (function walk(n) {
+      (n.children || []).forEach(function (c) {
+        if (String(c.className || "").indexOf("err-toggle") >= 0) acc.push(c);
+        walk(c);
+      });
+    })(getEl("errors"));
+    return acc;
+  }
+  out.err_toggles = _errToggles().length;
+  out.err_nodes_default = _rowsByClass(getEl("errors"), "node-row").length;
+  out.err_clients_default = _rowsByClass(getEl("errors"), "client-row").length;
+  out.client_nodes_default = _rowsByClass(getEl("clients"), "node-row").length;
+  out.client_rows_default = _rowsByClass(getEl("clients"), "client-row").length;
+  if (process.argv.includes("--expand-errors")) {
+    let guard = 0;
+    while (guard++ < 100) {
+      const b = _errToggles().find(function (x) {
+        return textOf(x).trim() === "▸";});
+      if (!b || !b.onclick) break;
+      b.onclick();
+    }
+    out.errors_text_expanded = textOf(getEl("errors"));
+    out.err_clients_expanded =
+      _rowsByClass(getEl("errors"), "client-row").length;
+    out.err_toggles_expanded = _errToggles().length;
+  }
+  if (process.argv.includes("--expand-clients")) {
+    let guard = 0;
+    while (guard++ < 100) {
+      const row = _rowsByClass(getEl("clients"), "node-row").find(function (r) {
+        return textOf(r).indexOf("▸") >= 0;});
+      if (!row || !row.onclick) break;
+      row.onclick();
+    }
+    out.clients_text_expanded = textOf(getEl("clients"));
+    out.client_rows_expanded =
+      _rowsByClass(getEl("clients"), "client-row").length;
+  }
   out.sources_text = textOf(getEl("sources"));
   out.volume_text = textOf(getEl("volume"));
   out.volume_note = textOf(getEl("volumeNote"));
