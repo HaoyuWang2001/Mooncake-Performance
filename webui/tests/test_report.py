@@ -291,20 +291,20 @@ WRITE_FAIL_TRACE = (GLOG + "trace_id[2] breakdown[put] key[bench/bad] status[TRA
                     "prep_total_us[55] checksum_us[30] prepare_us[5] query_us[0] "
                     "put_start_us[63] memwrite_total_us[40012] memwrite_urma_min_us[-1] "
                     "put_end_us[0] total_us[40170]")
-TRACE_READ = (GLOG + "trace_id[18446744073] breakdown[get_buffer] key[bench/obj] "
-              "status[ok] size[262144] type[memory_remote] replica_count[2] "
-              "remote_endpoint[10.20.1.9:50051] local_endpoint[10.20.1.7:50051] "
-              "start_time[2026-11-12 10:23:41.882310] query_total_us[50] "
-              "query_route_us[12] query_rpc_us[38] select_us[4] buf_alloc_us[6] "
-              "memread_total_us[206] read_submit_us[16] read_queue_us[12] "
-              "read_urma_us[166] read_teardown_us[12] slice_count[4] "
-              "read_urma_min_us[140] read_urma_avg_us[154] memcpy_us[0] total_us[266]")
+TRACE_READ = (GLOG + "trace_id[18446744073] get_breakdown key[bench/obj] "
+              "start_time[2026-11-25 10:23:41.882310] query_us[50] select_us[18] "
+              "local_endpoints_us[12] select_replica_us[6] alloc_us[5] "
+              "read_us[196] total_us[269] read_a_us[58] read_b_us[12] "
+              "read_transfer_window_us[126] read_ab_valid[1] "
+              "read_transfer_count[1] type[memory_remote] replica_count[2] "
+              "selected_type[memory_remote] local_endpoint[10.20.1.7:50051] "
+              "remote_endpoint[10.20.1.9:50051] status[ok]")
 TRACE_WRITE = (GLOG + "trace_id[18446744073] breakdown[put] key[bench/obj] "
                "status[ok] size[1048576] replicas[2] "
                "start_time[2026-11-12 10:23:43.110220] prep_total_us[54] "
                "prep_buf_alloc_us[9] prep_memcpy_us[42] prep_split_us[3] "
                "checksum_us[31] prepare_us[4] query_us[0] put_start_us[58] "
-               "memwrite_total_us[188] memwrite_submit_us[11] "
+               "engine[classic] memwrite_total_us[188] memwrite_submit_us[11] "
                "memwrite_queue_us[14] memwrite_urma_us[152] memwrite_teardown_us[11] "
                "slice_count[2] memwrite_urma_min_us[148] memwrite_urma_avg_us[150] "
                "put_end_us[66] finalize_us[0] cache_invalidate_us[0] revoke_us[0] "
@@ -422,8 +422,8 @@ def test_reduce_trace_block_and_sources(tmp_path):
     read = tr["groups"]["read"]["ops"]["get_buffer"]
     assert read["count"] == 1
     tot = read["fields"]["total_us"]
-    assert tot["max"] == 266 and tot["p50"] > 0
-    assert "p99" in read["fields"]["memread_total_us"]
+    assert tot["max"] == 269 and tot["p50"] > 0
+    assert "p99" in read["fields"]["read_us"]
     write = tr["groups"]["write"]["ops"]["put"]
     assert write["fields"]["memwrite_total_us"]["max"] == 188
     # residual row present (~0 for both samples)
@@ -964,8 +964,8 @@ def test_trace_field_sigma_and_reduce_merge(tmp_path):
     tot = read["fields"]["total_us"]
     assert tot["sigma"] is not None and tot["sigma"] >= 0
     assert read["fminutes"].get("total_us") is None or True  # total 不在 fminutes
-    assert "query_total_us" in read["fminutes"]
-    merged = read["fminutes"]["query_total_us"]
+    assert "query_us" in read["fminutes"]
+    merged = read["fminutes"]["query_us"]
     assert len(merged) >= 1
     # 合并后样本数翻倍（两个相同 glog）
     assert sum(r[1] for r in merged) == 2
@@ -981,9 +981,9 @@ def test_trace_three_charts_js(tmp_path):
         return
     assert res["errors"] == []
     lv = res.get("levels_text") or ""
-    assert "total" in lv and "memread_total_us" in lv and "残差" in lv
+    assert "total" in lv and "read_us" in lv and "残差" in lv
     tree = res.get("tree_text") or ""
-    assert "total" in tree and "memread_total_us" in tree
+    assert "total" in tree and "read_us" in tree
     # 细节在右半部分（不再是弹窗）
     assert res.get("modal_visible") is None
     mt = res.get("detail_text") or ""
@@ -1250,15 +1250,15 @@ def test_levels_focus_expand_and_residual(tmp_path):
     tr = _trace_stats(tmp_path, "c.glog")
     a = _stats(tmp_path, "a.reader", "reader")
     data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
-    res = _js_check(tmp_path, data, "--focus", "query_total_us")
+    res = _js_check(tmp_path, data, "--focus", "select_us")
     if res is None:
         return
     assert res["errors"] == []
     lv = res.get("focus_text") or ""
     assert "残差" in lv, lv[:200]
-    assert "query_total_us" in lv
-    assert "query_route_us" in lv, lv[:400]     # 聚焦后下一级在新行展开
-    assert "query_rpc_us" in lv, lv[:400]
+    assert "select_us" in lv
+    assert "local_endpoints_us" in lv, lv[:400]  # 聚焦后下一级在新行展开
+    assert "select_replica_us" in lv, lv[:400]
 
 
 def test_trace_field_has_p9999(tmp_path):
@@ -1268,7 +1268,7 @@ def test_trace_field_has_p9999(tmp_path):
     read = z["groups"]["read"]["ops"]["get_buffer"]
     tot = read["fields"]["total_us"]
     assert "p9999" in tot and tot["p9999"] is not None
-    for key in ("query_total_us", "select_us"):
+    for key in ("query_us", "select_us"):
         assert "p9999" in read["fields"][key]
 
 
@@ -1348,7 +1348,7 @@ def test_stage_buckets_use_seconds_and_multitier(tmp_path):
           "groups": {"read": {"ops": {"get_buffer": {
               "count": 600, "ok": 600, "fail": 0, "status": {"ok": 600},
               "fields": {}, "ftier": 1,
-              "fminutes": {"query_total_us": [
+              "fminutes": {"query_us": [
                   [1000000 + i * 10, 4, 100.0 + i, 400.0 + i]
                   for i in range(60)]},
           }}}}}
@@ -1357,7 +1357,7 @@ def test_stage_buckets_use_seconds_and_multitier(tmp_path):
     assert "128KB" in data["sizes"] and "trace" in data["sizes"]["128KB"]
     op = data["sizes"]["128KB"]["trace"]["groups"]["read"]["ops"]["get_buffer"]
     assert op["ftier"] == 1
-    assert len(op["fminutes"]["query_total_us"]) == 60
+    assert len(op["fminutes"]["query_us"]) == 60
 
 
 # ---------------------------------------------------------------------------
@@ -1796,7 +1796,7 @@ def test_trace_cards_stack_and_breakdown_js(tmp_path):
     t = res["tbreak_text"]
     assert "残差" in t, t
     assert t.count("二级：") >= 2, t        # 有子区间的 L1 全部展开
-    l2 = ("query_route_us", "read_urma_us",
+    l2 = ("local_endpoints_us", "read_a_us",
           "prep_buf_alloc_us", "memwrite_urma_us")
     assert any(k in t for k in l2), t
     # 0% 块宽度 = 最宽一行文字 + 标准 padding（不是拼接串长度）
@@ -1817,7 +1817,7 @@ def _trace_stats_span(tmp_path, name, span_s):
         "%Y-%m-%d %H:%M:%S")
     lines = []
     for i, ts in enumerate((t0, t1)):
-        lines.append(TRACE_READ.replace("2026-11-12 10:23:41.882310", ts))
+        lines.append(TRACE_READ.replace("2026-11-25 10:23:41.882310", ts))
     p = tmp_path / name
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return compute_trace_stats(str(p), node="n1", size="8MB")
@@ -2996,7 +2996,7 @@ def test_label_anchor_follows_curve(tmp_path):
     ml = res.get("main_labels") or []
     assert len(ml) == 2, ml
     assert ml[0]["name"] == "n1" and ml[0]["top"] < ml[1]["top"], ml
-    # 阶段图：total(266µs) 高于 query_total_us(50µs)
+    # 阶段图：total(269µs) 高于 query_us(50µs)
     sl = res.get("stage_labels") or []
     last = res.get("stage_last") or {}
     assert len(sl) >= 2, sl

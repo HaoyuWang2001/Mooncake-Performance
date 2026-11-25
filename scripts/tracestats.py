@@ -10,13 +10,20 @@ SDK 把高频 trace 打到 glog（`<glog 前缀> trace_id[...] breakdown[op] k[v
 数值字段按 int/float 解析，`-1` 为"该阶段拿不到时间戳"的哨兵（不参与时延统计，
 仅计 neg）；start_time 为本地日期时间（含空格），转 epoch 用于时间桶。
 
-阶段树（数据自检用，report 按此展示）：
-  读: total ≈ query_total(route+rpc) + select + buf_alloc + memread_total
-            (read_submit + read_queue + read_urma + read_teardown)
-  写: total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare + query
-            + put_start + memwrite_total(submit+queue+urma+teardown)
-            + put_end + finalize + cache_invalidate + revoke
-  辅助（不参与加和）: slice_count, *_urma_min/avg_us, replicas, memcpy_us
+阶段树（数据自检用，report 按此展示；对齐当前 Mooncake 源码，TE/TENT 双引擎）：
+  读 get_buffer（get_breakdown 行）:
+    total ≈ query + select(local_endpoints+select_replica) + alloc + read
+            (read = read_a + read_transfer_window + read_b)
+  读 get_into（breakdown[get_into]）:
+    total ≈ query + select(local_endpoints+select_replica) + read
+            (read = offload_rpc + transfer_data + release_buffer + read_overhead)
+  写 put/put_from/upsert/upsert_from（breakdown[op]，engine[tent|classic]）:
+    total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare
+            + query(upsert) | put_start(put) + <传输段>
+            + put_end(put) | finalize(upsert) + cache_invalidate + revoke
+    <传输段> classic: memwrite_total(submit+queue+urma+teardown)
+             tent:    admit + queue_prep + wire_span + propagate
+  辅助（不参与加和）: slice_count, replicas, bytes, engine 分布
 
 采样门控（报表需标注）：主行仅在采样命中或失败时出现；样本数 ≠ 请求总数。
 
@@ -39,21 +46,31 @@ import logstats as ls   # noqa: E402  (bin ladder + histogram percentile shared)
 
 PAIR_RE = re.compile(r"(\w+)\[([^\]]*)\]")
 STRING_FIELDS = {"trace_id", "breakdown", "key", "status", "type",
-                 "remote_endpoint", "local_endpoint", "src", "dst"}
+                 "remote_endpoint", "local_endpoint", "src", "dst",
+                 "engine"}
 META_FIELDS = {"start_time", "slice_idx", "offset", "bytes"}
 
 READ_OPS = {"get", "get_batch", "get_into", "get_buffer", "batch_get"}
 WRITE_OPS = {"put", "put_batch", "put_from", "upsert", "upsert_from",
              "batch_put"}
 
-READ_TOP = ("query_total_us", "select_us", "buf_alloc_us", "memread_total_us")
+# 读侧（get_breakdown / breakdown[get_into]）：query+select+alloc+read 四个 L1；
+# select 拆 local_endpoints/select_replica，read 拆 A/B 分段（get_buffer）或
+# offload 三段+overhead（get_into）。
+READ_TOP = ("query_us", "select_us", "alloc_us", "read_us")
 # L2 子阶段：慢请求展开明细要回答「慢的一块里哪个子区间慢」——top 条目
 # 除 L1 外一并保留这些字段（与 report.py 的 TREAD/TWRITE 树一致）。
-READ_SUB = ("query_route_us", "query_rpc_us",
-            "read_submit_us", "read_queue_us", "read_urma_us",
-            "read_teardown_us")
+READ_SUB = ("local_endpoints_us", "select_replica_us",
+            "read_a_us", "read_transfer_window_us", "read_b_us",
+            "offload_rpc_us", "transfer_data_us", "release_buffer_us",
+            "read_overhead_us")
+# 写侧公共段 + 双引擎传输段：classic 的 memwrite_*（字段名不变）与 TENT 四相位
+# admit/queue_prep/wire_span/propagate 并列；逐行缺省字段跳过，残差各自成立。
 WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
-             "put_start_us", "memwrite_total_us", "put_end_us", "finalize_us",
+             "put_start_us",
+             "memwrite_total_us",
+             "admit_us", "queue_prep_us", "wire_span_us", "propagate_us",
+             "put_end_us", "finalize_us",
              "cache_invalidate_us", "revoke_us")
 WRITE_SUB = ("prep_buf_alloc_us", "prep_memcpy_us", "prep_split_us",
              "memwrite_submit_us", "memwrite_queue_us",
@@ -121,6 +138,8 @@ def _truncated(line):
     if i < 0:
         i = text.find("breakdown[")
     if i < 0:
+        i = text.find("get_breakdown")
+    if i < 0:
         return False
     seg = text[i:]
     return seg.count("[") != seg.count("]") or not seg.endswith("]")
@@ -134,9 +153,11 @@ def _group_of(pairs):
     is the fallback — otherwise a failed put silently lands in 'other' and
     loses its residual."""
     bd = pairs.get("breakdown", "")
-    if "memread_total_us" in pairs:
+    if ("read_a_us" in pairs or "read_transfer_window_us" in pairs
+            or "offload_rpc_us" in pairs):
         return "read"
-    if "memwrite_total_us" in pairs:
+    if ("admit_us" in pairs or "wire_span_us" in pairs
+            or "memwrite_total_us" in pairs):
         return "write"
     if bd in READ_OPS:
         return "read"
@@ -146,15 +167,24 @@ def _group_of(pairs):
 
 
 def parse_line(line):
-    """One glog line -> (pairs, trace_start_epoch) or None when not a trace
-    line. Bracket-aware: values may contain spaces (start_time)."""
-    if "breakdown[" not in line:
+    """One glog line -> pairs or None when not a trace line.
+
+    Two families (both bracket-pair `name[value]` payloads):
+      - `breakdown[<op>] ...` (put family, get_into, batch ops, .slice/.slice_stats)
+      - `get_breakdown key[...] ...` (get_buffer; normalized to
+        breakdown="get_buffer" so the rest of the pipeline is unchanged)"""
+    is_get = " get_breakdown " in line
+    if not is_get and "breakdown[" not in line:
         return None
     i = line.find("trace_id[")
     if i < 0:
-        i = line.find("breakdown[")
+        i = line.find("get_breakdown") if is_get else line.find("breakdown[")
     pairs = dict(PAIR_RE.findall(line[i:]))
-    if "breakdown" not in pairs:
+    if is_get:
+        if "key" not in pairs:
+            return None
+        pairs["breakdown"] = "get_buffer"
+    elif "breakdown" not in pairs:
         return None
     return pairs
 
@@ -393,6 +423,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 "field_minutes": {},   # chart field -> {epoch_s: [n, sum, max]}
                 "seconds": {}, "minutes": {},
                 "size_values": {}, "replicas": {}, "slice_count": {},
+                "engine": {},
                 "top": [], "_top_seq": 0,
             }
         return st
@@ -406,17 +437,19 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             lines_total += 1
-            if "breakdown[" in line and _truncated(line):
+            if ("breakdown[" in line or " get_breakdown " in line) \
+                    and _truncated(line):
                 parse_errors += 1
                 continue
             pairs = parse_line(line)
             if pairs is None:
                 continue
             bd = pairs.get("breakdown", "")
-            if bd.endswith(".slice"):
+            if bd.endswith(".slice") or bd.endswith(".slice_stats"):
                 lines_slice += 1
-                continue           # P1: slice 明细仅计数（后续补充）
+                continue           # P1: slice 明细/统计行仅计数（后续补充）
             lines_trace += 1
+            eng = pairs.get("engine", "")
             status = pairs.get("status", "")
             ok = status == "ok"
             group = _group_of(pairs)
@@ -435,6 +468,8 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             if phase != "measured":
                 continue
             st = op_state(group, bd)
+            if eng:
+                st["engine"][eng] = st["engine"].get(eng, 0) + 1
             st["count"] += 1
             if ok:
                 st["ok"] += 1
@@ -563,6 +598,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             "size_values": _value_hist(st["size_values"]),
             "replicas": _value_hist(st["replicas"]),
             "slice_count": _value_hist(st["slice_count"]),
+            "engine": dict(st.get("engine") or {}),
             "top": [e for _t, _s, e in sorted(st["top"], key=lambda x: -x[0])],
         }
         # 段3：阶段时间桶（图2）；同一 op 内统一档位（= op_step）
@@ -583,7 +619,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 if pairs is None:
                     continue
                 bd = pairs.get("breakdown", "")
-                if bd.endswith(".slice"):
+                if bd.endswith(".slice") or bd.endswith(".slice_stats"):
                     continue
                 group = _group_of(pairs)
                 if group == "read":

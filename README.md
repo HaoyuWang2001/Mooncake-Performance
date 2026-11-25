@@ -1002,14 +1002,23 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
 
 #### SDK 全链路（C++ trace）—— 报表内的第二层统计
 
-在 Python 侧打点（RESULT）之外，报表还解析 **Mooncake SDK 自己打到 glog 的
-`breakdown[<op>]` trace 行**（`scripts/tracestats.py`，map 阶段就地统计）：
-`trace_id[...] breakdown[get_buffer|put|upsert|...] name[value] ...`（括号感知解析，
-`start_time` 含空格、`-1` 为拿不到时间戳的哨兵）。它给出每个样本请求的**端到端时延
-与各阶段时延的树状分解**，远细于 Python 侧的单点时延：
+在 Python 侧打点（RESULT）之外，报表还解析 **Mooncake SDK 自己打到 glog 的请求级
+trace 行**（`scripts/tracestats.py`，map 阶段就地统计），两族格式：
+`trace_id[...] breakdown[<op>] name[value] ...`（写 put 家族 / get_into / batch / slice）
+与 `trace_id[...] get_breakdown name[value] ...`（读 get_buffer，解析时归一化为
+`breakdown[get_buffer]`）。括号感知解析，`start_time` 含空格、`-1` 为拿不到时间戳的
+哨兵。它给出每个样本请求的**端到端时延与各阶段时延的树状分解**，远细于 Python 侧的
+单点时延：
 
-- **读**（get_buffer）：`total ≈ query_total(route+rpc) + select + buf_alloc + memread_total(submit+queue+urma+teardown)`
-- **写**（put/upsert 家族）：`total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare + query/put_start + memwrite_total(submit+queue+urma+teardown) + put_end/finalize + cache_invalidate + revoke`
+- **读 get_buffer**（`get_breakdown` 行）：`total ≈ query + select(local_endpoints+select_replica) + alloc + read`，
+  其中 `read ≈ read_a + read_transfer_window + read_b`（A/B 分段；`read_ab_valid=0` 时 A/B 为 -1/0）
+- **读 get_into**（`breakdown[get_into]`）：`total ≈ query + select(local_endpoints+select_replica) + read`，
+  其中 `read = offload_rpc + transfer_data + release_buffer + read_overhead`
+- **写 put/put_from/upsert/upsert_from**（`breakdown[op]`，行内带 `engine[tent|classic]` 标记）：
+  `total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare + query(upsert)/put_start(put) + <传输段> + put_end(put)/finalize(upsert) + cache_invalidate + revoke`
+  - `engine[classic]` 传输段：`memwrite_total(submit+queue+urma+teardown)`
+  - `engine[tent]` 传输段四相位（加和 ≈ 传输总跨度）：`admit + queue_prep + wire_span + propagate`
+    （`admit=dispatch−start`、`queue_prep=first_post−dispatch`、`wire_span=terminal−first_post`、`propagate=ready−terminal`）
 - 报表展示：方向页签（读/写/其它）+ op 选择、样本/分位卡、**阶段 p50 堆叠构成**、
   独立 1s/1min 时间线（样本数柱 + 端到端 p50/p99）、**树形阶段分位表（含残差
   total−阶段和）**、Top-50 慢请求（含前三耗时阶段）、状态分布；未知的 `*_us` 字段
@@ -1024,7 +1033,10 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   并在真实环境确认该变量的采样语义。
 - **多副本限制**：put/upsert 的 `memwrite_*` 与 slice 明细仅代表最后一个副本的传输，
   `memwrite_total_us` 为全部副本合计（SDK 侧限制，报表脚注说明）。
-- **slice 明细行**（`breakdown[<op>.slice]`）P1 仅计数，逐 slice 分析后续补充。
+- **slice 明细/统计行**（`breakdown[<op>.slice]` 慢块、`breakdown[<op>.slice_stats]` TENT 每请求聚合）
+  P1 仅计 `slice_lines`（不进 op 聚合），逐 slice 分析后续补充。
+- **引擎维度**：每个写 op 在 trace.json 记录 `engine` 分布（tent/classic 计数），供报表脚注核对；
+  两引擎的传输字段并列在树中，逐行缺省字段自动跳过（残差按行各自成立）。
 - 原始 `.glog` 默认留远端（hostPath），报表「现场索引」列出其路径/体积与登录命令；
   `--rebuild-report` 也能从本地 `.glog` 重算 trace 统计。
 

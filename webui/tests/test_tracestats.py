@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """tracestats（C++ SDK trace 主行）单测——fixtures 严格取自 SDK 日志格式样例。
 
-P1 范围：breakdown[<op>] 主行（slice 明细行仅计数）；方向 read/write；
-阶段树加和/残差；-1 哨兵；失败早退字段为 0；OBJECT_ALREADY_EXISTS 幂等。
+覆盖当前打点体系（对齐 Mooncake 源码，TE/TENT 双引擎）：
+- 写 put 家族 breakdown[op]：engine[classic] memwrite_* / engine[tent] 四相位
+- 读 get_buffer 的 get_breakdown 行（A/B 分段）、get_into 的 breakdown[get_into]
+- slice / slice_stats 明细行仅计数；方向 read/write；阶段树加和/残差；
+  -1 哨兵；失败早退字段为 0；engine 分布
 """
 import json
 import os
@@ -16,70 +19,106 @@ import tracestats as ts  # noqa: E402
 
 GLOG = "I20261112 10:23:41.000000 12345 transfer_engine.cc:88] "
 
-READ_OK = (GLOG + "trace_id[18446744073] breakdown[get_buffer] key[bench/obj_000123] "
-           "status[ok] size[262144] type[memory_remote] replica_count[2] "
-           "remote_endpoint[10.20.1.9:50051] local_endpoint[10.20.1.7:50051] "
-           "start_time[2026-11-12 10:23:41.882310] query_total_us[50] "
-           "query_route_us[12] query_rpc_us[38] select_us[4] buf_alloc_us[6] "
-           "memread_total_us[206] read_submit_us[16] read_queue_us[12] "
-           "read_urma_us[166] read_teardown_us[12] slice_count[4] "
-           "read_urma_min_us[140] read_urma_avg_us[154] memcpy_us[0] total_us[266]")
+READ_OK = (GLOG + "trace_id[18446744073] get_breakdown key[bench/obj_000123] "
+           "start_time[2026-11-25 10:23:41.882310] query_us[50] select_us[18] "
+           "local_endpoints_us[12] select_replica_us[6] alloc_us[5] read_us[196] "
+           "total_us[269] read_a_us[58] read_b_us[12] "
+           "read_transfer_window_us[126] read_ab_valid[1] "
+           "read_transfer_count[1] type[memory_remote] replica_count[2] "
+           "selected_type[memory_remote] local_endpoint[10.20.1.7:50051] "
+           "remote_endpoint[10.20.1.9:50051] status[ok]")
 
-READ_MISS = (GLOG + "trace_id[18446744073] breakdown[get_buffer] key[bench/missing_9] "
-             "status[OBJECT_NOT_FOUND] size[0] type[unknown] replica_count[0] "
-             "remote_endpoint[-] local_endpoint[10.20.1.7:50051] "
-             "start_time[2026-11-12 10:23:42.015004] query_total_us[37] "
-             "query_route_us[0] query_rpc_us[37] select_us[0] buf_alloc_us[0] "
-             "memread_total_us[0] read_submit_us[0] read_queue_us[0] read_urma_us[0] "
-             "read_teardown_us[0] slice_count[0] read_urma_min_us[0] "
-             "read_urma_avg_us[0] memcpy_us[0] total_us[37]")
+READ_MISS = (GLOG + "trace_id[18446744073] get_breakdown key[bench/missing_9] "
+             "start_time[2026-11-25 10:23:42.015004] query_us[37] select_us[0] "
+             "local_endpoints_us[0] select_replica_us[0] alloc_us[0] read_us[0] "
+             "total_us[37] read_a_us[-1] read_b_us[0] "
+             "read_transfer_window_us[-1] read_ab_valid[0] "
+             "read_transfer_count[0] type[unknown] replica_count[0] "
+             "selected_type[unknown] local_endpoint[10.20.1.7:50051] "
+             "remote_endpoint[-] status[OBJECT_NOT_FOUND]")
+
+# get_into：read 拆 offload_rpc/transfer_data/release_buffer/read_overhead
+GET_INTO_OK = (GLOG + "trace_id[18446744073] breakdown[get_into] "
+               "key[bench/obj_000123] start_time[2026-11-25 10:23:44.000000] "
+               "query_us[40] select_us[10] local_endpoints_us[6] "
+               "select_replica_us[4] read_us[120] offload_rpc_us[20] "
+               "transfer_data_us[80] release_buffer_us[10] "
+               "read_overhead_us[10] total_us[170] type[memory_remote] "
+               "mode[full] replica_count[2] selected_type[memory_remote] "
+               "local_endpoint[10.20.1.7:50051] "
+               "remote_endpoint[10.20.1.9:50051] status[ok]")
 
 WRITE_OK = (GLOG + "trace_id[18446744073] breakdown[put] key[bench/obj_000123] "
-            "status[ok] size[1048576] replicas[2] start_time[2026-11-12 10:23:43.110220] "
-            "prep_total_us[54] prep_buf_alloc_us[9] prep_memcpy_us[42] prep_split_us[3] "
+            "status[ok] size[1048576] replicas[2] "
+            "start_time[2026-11-25 10:23:43.110220] prep_total_us[54] "
+            "prep_buf_alloc_us[9] prep_memcpy_us[42] prep_split_us[3] "
             "checksum_us[31] prepare_us[4] query_us[0] put_start_us[58] "
-            "memwrite_total_us[188] memwrite_submit_us[11] memwrite_queue_us[14] "
-            "memwrite_urma_us[152] memwrite_teardown_us[11] slice_count[2] "
-            "memwrite_urma_min_us[148] memwrite_urma_avg_us[150] put_end_us[66] "
-            "finalize_us[0] cache_invalidate_us[0] revoke_us[0] total_us[401]")
+            "engine[classic] memwrite_total_us[188] memwrite_submit_us[11] "
+            "memwrite_queue_us[14] memwrite_urma_us[152] "
+            "memwrite_teardown_us[11] slice_count[2] memwrite_urma_min_us[148] "
+            "memwrite_urma_avg_us[150] put_end_us[66] finalize_us[0] "
+            "cache_invalidate_us[0] revoke_us[0] total_us[401]")
 
 WRITE_FAIL = (GLOG + "trace_id[18446744073] breakdown[put] key[bench/obj_000124] "
               "status[TRANSFER_FAIL] size[1048576] replicas[2] "
-              "start_time[2026-11-12 10:23:44.002981] prep_total_us[55] "
+              "start_time[2026-11-25 10:23:44.002981] prep_total_us[55] "
               "prep_buf_alloc_us[9] prep_memcpy_us[43] prep_split_us[3] "
               "checksum_us[30] prepare_us[5] query_us[0] put_start_us[63] "
-              "memwrite_total_us[40012] memwrite_submit_us[9] "
-              "memwrite_queue_us[40000] memwrite_urma_us[0] memwrite_teardown_us[0] "
-              "slice_count[1] memwrite_urma_min_us[-1] memwrite_urma_avg_us[0] "
-              "put_end_us[0] finalize_us[0] cache_invalidate_us[0] revoke_us[0] "
-              "total_us[40170]")
+              "engine[classic] memwrite_total_us[40012] memwrite_submit_us[9] "
+              "memwrite_queue_us[40000] memwrite_urma_us[0] "
+              "memwrite_teardown_us[0] slice_count[1] memwrite_urma_min_us[-1] "
+              "memwrite_urma_avg_us[0] put_end_us[0] finalize_us[0] "
+              "cache_invalidate_us[0] revoke_us[0] total_us[40170]")
 
 UPSERT_OK = (GLOG + "trace_id[18446744073] breakdown[upsert] key[bench/obj_000123] "
-             "status[ok] size[262144] replicas[2] start_time[2026-11-12 10:23:45.223417] "
-             "prep_total_us[52] prep_buf_alloc_us[8] prep_memcpy_us[41] prep_split_us[3] "
+             "status[ok] size[262144] replicas[2] "
+             "start_time[2026-11-25 10:23:45.223417] prep_total_us[52] "
+             "prep_buf_alloc_us[8] prep_memcpy_us[41] prep_split_us[3] "
              "checksum_us[29] prepare_us[4] query_us[57] put_start_us[0] "
-             "memwrite_total_us[191] memwrite_submit_us[12] memwrite_queue_us[13] "
-             "memwrite_urma_us[154] memwrite_teardown_us[12] slice_count[1] "
-             "memwrite_urma_min_us[154] memwrite_urma_avg_us[154] put_end_us[0] "
-             "finalize_us[63] cache_invalidate_us[2] revoke_us[0] total_us[398]")
+             "engine[classic] memwrite_total_us[191] memwrite_submit_us[12] "
+             "memwrite_queue_us[13] memwrite_urma_us[154] "
+             "memwrite_teardown_us[12] slice_count[1] "
+             "memwrite_urma_min_us[154] memwrite_urma_avg_us[154] "
+             "put_end_us[0] finalize_us[63] cache_invalidate_us[2] revoke_us[0] "
+             "total_us[398]")
+
+# TENT 引擎写主行（Mooncake 文档示例；四相位加和 = 458，残差 0）
+TENT_UPSERT = (GLOG + "trace_id[18446744073] breakdown[upsert] "
+               "key[mooncake_kvtest_0_0] status[ok] size[131072] replicas[2] "
+               "start_time[2026-11-25 10:23:41.882310] prep_total_us[52] "
+               "prep_buf_alloc_us[8] prep_memcpy_us[41] prep_split_us[3] "
+               "checksum_us[29] prepare_us[4] query_us[57] put_start_us[0] "
+               "engine[tent] admit_us[10] queue_prep_us[90] wire_span_us[150] "
+               "propagate_us[4] slice_count[2] bytes[131072] put_end_us[0] "
+               "finalize_us[60] cache_invalidate_us[2] revoke_us[0] "
+               "total_us[458]")
 
 SLICE_LINES = (
-    GLOG + "trace_id[18446744073] breakdown[get_buffer.slice] key[bench/obj_000123] "
-    "slice_idx[0/4] offset[0] bytes[65536] src[10.20.1.7:50051] "
-    "dst[10.20.1.9:50051] slice_queue_us[12] slice_urma_us[140] status[ok]\n"
-    + GLOG + "trace_id[18446744073] breakdown[put.slice] key[bench/obj_000123] "
-    "slice_idx[0/2] offset[0] bytes[524288] src[10.20.1.7:50051] "
-    "dst[10.20.1.9:50051] slice_queue_us[14] slice_urma_us[148] status[ok]\n")
+    GLOG + "trace_id[18446744073] breakdown[upsert.slice] key[bench/obj] "
+    "engine[tent] slice_idx[1/2] offset[65536] bytes[65536] "
+    "src[10.20.1.7:50051] dst[seg2/dev0] slice_queue_us[14] "
+    "prep_route_us[12] prep_path_us[5] prep_seg_us[9] post_call_us[4] "
+    "wire_us[160] attempt[1] defer[0] status[ok]\n"
+    + GLOG + "trace_id[18446744073] breakdown[upsert.slice_stats] "
+    "key[bench/obj] engine[tent] status[ok] slices[2] bytes[131072] "
+    "slice_queue_us_max[14] prep_route_us_sum[21] prep_route_us_max[12] "
+    "prep_path_us_sum[9] prep_path_us_max[5] prep_seg_us_sum[16] "
+    "prep_seg_us_max[9] post_call_us_sum[7] post_call_us_max[4] "
+    "wire_us_p50[148] wire_us_p95[158] wire_us_max[160] wire_us_sum[308] "
+    "defer_total[0] attempt_total[2] slow_count[0] slowest_idx[1] "
+    "slowest_offset[65536] slowest_wire_us[160]\n")
 
 ALREADY_EXISTS = (GLOG + "trace_id[18446744073] breakdown[put] key[bench/dup] "
                   "status[ok] size[1048576] replicas[0] "
-                  "start_time[2026-11-12 10:23:46.000000] prep_total_us[10] "
+                  "start_time[2026-11-25 10:23:46.000000] prep_total_us[10] "
                   "prep_buf_alloc_us[10] prep_memcpy_us[0] prep_split_us[0] "
                   "checksum_us[5] prepare_us[1] query_us[0] put_start_us[20] "
-                  "memwrite_total_us[0] memwrite_submit_us[0] memwrite_queue_us[0] "
-                  "memwrite_urma_us[0] memwrite_teardown_us[0] slice_count[0] "
-                  "memwrite_urma_min_us[-1] memwrite_urma_avg_us[0] put_end_us[0] "
-                  "finalize_us[0] cache_invalidate_us[0] revoke_us[0] total_us[36]")
+                  "engine[classic] memwrite_total_us[0] memwrite_submit_us[0] "
+                  "memwrite_queue_us[0] memwrite_urma_us[0] "
+                  "memwrite_teardown_us[0] slice_count[0] "
+                  "memwrite_urma_min_us[-1] memwrite_urma_avg_us[0] "
+                  "put_end_us[0] finalize_us[0] cache_invalidate_us[0] "
+                  "revoke_us[0] total_us[36]")
 
 
 def _write(tmp_path, name, lines):
@@ -94,9 +133,10 @@ def _field_percentile(fd, q):
 
 def test_parse_pairs_with_spaces_and_glog_prefix():
     p = ts.parse_line(READ_OK)
+    # get_breakdown 行归一化为 breakdown="get_buffer"（下游零改动）
     assert p["breakdown"] == "get_buffer"
-    assert p["start_time"] == "2026-11-12 10:23:41.882310"
-    assert p["total_us"] == "266" and p["type"] == "memory_remote"
+    assert p["start_time"] == "2026-11-25 10:23:41.882310"
+    assert p["total_us"] == "269" and p["type"] == "memory_remote"
     assert ts.parse_line("plain log line without trace") is None
 
 
@@ -110,21 +150,23 @@ def test_read_tree_and_direction(tmp_path):
     assert op["status"] == {"ok": 1, "OBJECT_NOT_FOUND": 1}
     # total_us statistics exclude nothing here (miss total 37 is a valid value)
     assert op["fields"]["total_us"]["n"] == 2
-    assert op["fields"]["total_us"]["max"] == 266
-    # tree sums for the OK sample
+    assert op["fields"]["total_us"]["max"] == 269
+    # tree sums for the OK sample（get_breakdown 新树）
     f = op["fields"]
-    assert (f["query_route_us"]["max"] + f["query_rpc_us"]["max"]) == \
-        f["query_total_us"]["max"]
-    assert (f["read_submit_us"]["max"] + f["read_queue_us"]["max"] +
-            f["read_urma_us"]["max"] + f["read_teardown_us"]["max"]) == \
-        f["memread_total_us"]["max"]
+    assert (f["query_us"]["max"] + f["select_us"]["max"] +
+            f["alloc_us"]["max"] + f["read_us"]["max"]) == \
+        f["total_us"]["max"]
+    assert (f["local_endpoints_us"]["max"] +
+            f["select_replica_us"]["max"]) == f["select_us"]["max"]
+    assert (f["read_a_us"]["max"] + f["read_transfer_window_us"]["max"] +
+            f["read_b_us"]["max"]) == f["read_us"]["max"]
     # residual: both samples total == stage sum -> ~0
     assert op["residual"]["n"] == 2
     assert abs(op["residual"]["max"]) <= 1
-    # size distribution
-    assert op["size_values"] == {"262144": 1, "0": 1}
+    # get_breakdown 无 size/slice_count 字段；replica_count 归一为 replicas
+    assert op["size_values"] == {}
     assert op["replicas"] == {"2": 1, "0": 1}
-    assert op["slice_count"] == {"4": 1, "0": 1}
+    assert op["slice_count"] == {}
 
 
 def test_write_ops_and_failure_early_exit(tmp_path):
@@ -157,6 +199,9 @@ def test_write_ops_and_failure_early_exit(tmp_path):
     # OBJECT_ALREADY_EXISTS idempotent put: ok but replicas/memwrite are 0
     assert "0" in put["replicas"]
     assert put["fields"]["memwrite_total_us"]["min"] == 0
+    # 引擎分布：这些 fixture 全是 classic
+    assert put["engine"] == {"classic": 3}
+    assert up["engine"] == {"classic": 1}
 
 
 def test_slice_lines_counted_not_aggregated(tmp_path):
@@ -164,9 +209,14 @@ def test_slice_lines_counted_not_aggregated(tmp_path):
         _write(tmp_path, "c.glog", [READ_OK, SLICE_LINES]))
     m = st["meta"]
     assert m["slice_lines"] == 2 and m["trace_lines"] == 1
-    # no slice op leaked into the aggregates
-    assert "get_buffer.slice" not in st["groups"].get("read", {}).get("ops", {})
-    assert "put.slice" not in st["groups"].get("write", {}).get("ops", {})
+    # slice_stats 行同样仅计数（不产生 "upsert.slice_stats" 假 op）
+    st2 = ts.compute_trace_stats(
+        _write(tmp_path, "c2.glog", [TENT_UPSERT, SLICE_LINES]))
+    m2 = st2["meta"]
+    assert m2["slice_lines"] == 2 and m2["trace_lines"] == 1
+    ops = st2["groups"]["write"]["ops"]
+    assert set(ops) == {"upsert"}
+    assert ops["upsert"]["count"] == 1
 
 
 def test_time_buckets_and_topn(tmp_path):
@@ -182,10 +232,10 @@ def test_time_buckets_and_topn(tmp_path):
     assert "stages" in op["top"][0]
     # 展开明细需要 L1+L2：top 条目必须保留二级子阶段
     st0 = op["top"][0]["stages"]
-    for k in ("query_total_us", "memread_total_us"):
+    for k in ("query_us", "select_us", "alloc_us", "read_us"):
         assert k in st0
-    for k in ("query_route_us", "query_rpc_us", "read_urma_us",
-              "read_teardown_us"):
+    for k in ("local_endpoints_us", "select_replica_us", "read_a_us",
+              "read_transfer_window_us", "read_b_us"):
         assert k in st0, (k, st0)
 
 
@@ -278,7 +328,7 @@ GLOGP = "I20261115 09:27:33.000000 1 te.cc:1] "
 
 def _trace(t, op, total=100):
     return (GLOGP + "trace_id[1] breakdown[{}] key[k] status[ok] size[1] "
-            "start_time[{}] total_us[{}] query_total_us[{}]"
+            "start_time[{}] total_us[{}] query_us[{}]"
             .format(op, t, total, total))
 
 
@@ -359,20 +409,20 @@ def test_field_minutes_l1_and_residual(tmp_path):
     read = st["groups"]["read"]["ops"]["get_buffer"]
     fm = read["fminutes"]
     # L1 顶层 + residual；L2 不逐时间采样（体积控制）
-    assert set(fm) == {"query_total_us", "select_us", "buf_alloc_us",
-                       "memread_total_us", "residual"}
-    assert "query_route_us" not in fm
-    rows = fm["query_total_us"]
+    assert set(fm) == {"query_us", "select_us", "alloc_us", "read_us",
+                       "residual"}
+    assert "read_a_us" not in fm
+    rows = fm["query_us"]
     assert len(rows) == 1
     t, n, avg, mx = rows[0]
     assert n == 1 and avg == 50 and mx == 50
     # 阶段桶按 1 秒采集（旧版写死 1 分钟，短 run 只剩 2 个点、曲线退化成
     # 一条直线）；降档由 _fmb_rows 按桶数决定，短 run 保持 1 秒
     assert read["ftier"] == 1
-    # residual = 266 - (50+4+6+206) = 0
+    # residual = 269 - (50+18+5+196) = 0
     assert fm["residual"][0][2] == 0
     # σ 需要的平方和已累计
-    assert read["fields"]["total_us"]["sumsq"] == 266 ** 2
+    assert read["fields"]["total_us"]["sumsq"] == 269 ** 2
 
 
 def test_emit_step_collection_rule():
@@ -411,3 +461,47 @@ def test_field_buckets_coarsen_when_dense():
     assert sum(r[1] for r in rows) == 9000
 
 
+
+
+# ---------------------------------------------------------------------------
+# TE / TENT 双引擎适配（当前打点体系）
+# ---------------------------------------------------------------------------
+
+def test_tent_engine_tree_and_distribution(tmp_path):
+    st = ts.compute_trace_stats(_write(tmp_path, "tent.glog", [TENT_UPSERT]))
+    op = st["groups"]["write"]["ops"]["upsert"]
+    assert op["count"] == 1 and op["ok"] == 1
+    f = op["fields"]
+    # TENT 四相位 + 公共段
+    for k in ("admit_us", "queue_prep_us", "wire_span_us", "propagate_us"):
+        assert f[k]["max"] >= 0, (k, f.get(k))
+    assert f["finalize_us"]["max"] == 60
+    # 四相位加和 ≈ transfer；残差 = total − Σ(公共段 + 四相位) = 0
+    assert op["residual"]["n"] == 1 and op["residual"]["max"] == 0
+    assert op["engine"] == {"tent": 1}
+    # classic 专属字段不出现
+    assert "memwrite_total_us" not in f
+
+
+def test_engine_mixed_distribution(tmp_path):
+    st = ts.compute_trace_stats(
+        _write(tmp_path, "mix.glog", [UPSERT_OK, TENT_UPSERT]))
+    op = st["groups"]["write"]["ops"]["upsert"]
+    assert op["count"] == 2
+    assert op["engine"] == {"classic": 1, "tent": 1}
+    # 两行字段各自统计，互不污染
+    assert "memwrite_total_us" in op["fields"]
+    assert "admit_us" in op["fields"]
+
+
+def test_get_into_offload_tree(tmp_path):
+    st = ts.compute_trace_stats(_write(tmp_path, "into.glog", [GET_INTO_OK]))
+    op = st["groups"]["read"]["ops"]["get_into"]
+    assert op["count"] == 1
+    f = op["fields"]
+    assert (f["query_us"]["max"] + f["select_us"]["max"] +
+            f["read_us"]["max"]) == f["total_us"]["max"]
+    assert (f["offload_rpc_us"]["max"] + f["transfer_data_us"]["max"] +
+            f["release_buffer_us"]["max"] +
+            f["read_overhead_us"]["max"]) == f["read_us"]["max"]
+    assert op["residual"]["n"] == 1 and op["residual"]["max"] == 0

@@ -4804,12 +4804,14 @@ function mount(){
   });
 }
 /* ---------------- SDK 全链路（C++ trace）：分级时延 / 阶段曲线 / 阶段树 ---------------- */
-const TREAD=[["total_us",0,""],["query_total_us",1,"total_us"],
- ["query_route_us",2,"query_total_us"],["query_rpc_us",2,"query_total_us"],
- ["select_us",1,"total_us"],["buf_alloc_us",1,"total_us"],
- ["memread_total_us",1,"total_us"],["read_submit_us",2,"memread_total_us"],
- ["read_queue_us",2,"memread_total_us"],["read_urma_us",2,"memread_total_us"],
- ["read_teardown_us",2,"memread_total_us"],["residual",1,"total_us"]];
+const TREAD=[["total_us",0,""],["query_us",1,"total_us"],
+ ["select_us",1,"total_us"],["local_endpoints_us",2,"select_us"],
+ ["select_replica_us",2,"select_us"],["alloc_us",1,"total_us"],
+ ["read_us",1,"total_us"],["read_a_us",2,"read_us"],
+ ["read_transfer_window_us",2,"read_us"],["read_b_us",2,"read_us"],
+ ["offload_rpc_us",2,"read_us"],["transfer_data_us",2,"read_us"],
+ ["release_buffer_us",2,"read_us"],["read_overhead_us",2,"read_us"],
+ ["residual",1,"total_us"]];
 const TWRITE=[["total_us",0,""],["prep_total_us",1,"total_us"],
  ["prep_buf_alloc_us",2,"prep_total_us"],["prep_memcpy_us",2,"prep_total_us"],
  ["prep_split_us",2,"prep_total_us"],["checksum_us",1,"total_us"],
@@ -4819,6 +4821,8 @@ const TWRITE=[["total_us",0,""],["prep_total_us",1,"total_us"],
  ["memwrite_queue_us",2,"memwrite_total_us"],
  ["memwrite_urma_us",2,"memwrite_total_us"],
  ["memwrite_teardown_us",2,"memwrite_total_us"],
+ ["admit_us",1,"total_us"],["queue_prep_us",1,"total_us"],
+ ["wire_span_us",1,"total_us"],["propagate_us",1,"total_us"],
  ["put_end_us",1,"total_us"],["finalize_us",1,"total_us"],
  ["cache_invalidate_us",1,"total_us"],["revoke_us",1,"total_us"],
  ["residual",1,"total_us"]];
