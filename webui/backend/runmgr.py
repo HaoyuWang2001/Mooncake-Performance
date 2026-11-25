@@ -264,8 +264,11 @@ class Run(object):
         try:
             with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    if "results root: " in line:
-                        val = line.split("results root: ", 1)[1].strip()
+                    # 兼容两种文案：旧 "results root: <abs>" / 新 "Results: <abs>"
+                    for marker in ("results root: ", "Results: "):
+                        if marker not in line:
+                            continue
+                        val = line.split(marker, 1)[1].strip()
                         if val.startswith(ROOT):
                             val = os.path.relpath(val, ROOT).replace("\\", "/")
                         self.ts_dir = val

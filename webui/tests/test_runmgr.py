@@ -282,6 +282,21 @@ def test_recover_keeps_fresh_log_running_then_finalizes_stale(tmp_path, monkeypa
     assert json.load(open(d / "rSTALE.json"))["status"] == "aborted"
 
 
+def test_parse_ts_dir_accepts_old_and_new_log_markers(tmp_path, monkeypatch):
+    """日志文案改版（results root -> Results）后 ts_dir 仍能解析（产物/报表入口）。"""
+    from webui.backend.paths import ROOT
+    d = tmp_path / "runs"
+    monkeypatch.setattr(runmgr, "RUNS_DIR", str(d))
+    abs_ts = os.path.join(ROOT, "outputs", "20260101-0000")
+    for rid, marker in (("rOLD", "results root: "), ("rNEW", "Results: ")):
+        log = d / (rid + ".log")
+        log.write_text("[benchmark] {} {}\n".format(marker, abs_ts),
+                       encoding="utf-8")
+        run = runmgr.Run(rid, "benchmark", "x", [], str(log))
+        run.parse_ts_dir()
+        assert run.ts_dir == "outputs/20260101-0000", rid
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
