@@ -13,9 +13,9 @@ RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟�
 
 kvtest C++ 客户端把逐请求样本批量落到 ``*.kvtest_*.samples.csv``，脚本按
 operation 绘制一请求一点的 ``.latency.png`` / ``.queuewait.png``。
-自动读取同目录 kvtest_report_meta.json 的 report 区间：全程 OK 请求都绘制，
-区间外点变浅，avg/P99/P999/P9999/Pmax 仅按区间内 OK 样本计算。
-有统计区间时不生成剔除离群值的 trimmed 图，避免改变统计样本或遗漏启动长尾。
+自动读取同目录 kvtest_report_meta.json 的 report 区间：只绘制区间内 OK 请求，
+avg/P99/P999/P9999/Pmax 同样仅按区间内 OK 样本计算。
+有统计区间时不生成剔除离群值的 trimmed 图，避免改变统计样本。
 
 用法：
   python plot_latency.py --log <日志文件|目录> [--out DIR] [--outlier MS] [--type both]
@@ -196,8 +196,28 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
         # defensive: a mismatched time axis would misalign every sample
         # (and crash the request#i secondary axis) -> fall back to index
         times = None
+    if report_window is not None:
+        if times is None:
+            raise ValueError("a report window requires per-request timestamps")
+        selected_points = [(v, t) for v, t in zip(vals, times)
+                           if t >= report_window[0] and
+                           (report_window[1] is None or t < report_window[1])]
+        vals = [v for v, _ in selected_points]
+        times = [t for _, t in selected_points]
     n = len(vals)
     fig, ax = plt.subplots(figsize=(12, 6))
+    if not n:
+        ax.text(0.5, 0.5, "No OK samples in stats window", transform=ax.transAxes,
+                ha="center", va="center")
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("elapsed time (s)")
+        start, end = report_window
+        ax.set_xlim(start, end if end is not None else start + 1)
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+        return
     if times and time_axis == "wall":
         t0 = times[0]
         xs = [t - t0 for t in times]  # 相对秒（底部刻度再渲染回绝对 HH:MM:SS）
@@ -211,8 +231,7 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
         report_window[0] <= x and (report_window[1] is None or x < report_window[1])
         for x in xs]
     # Mask each category independently. No line connects a gap in the window.
-    for inside, alpha, label in ((False, 0.16, "outside stats window"),
-                                 (True, 0.85, "stats samples")):
+    for inside, alpha, label in ((True, 0.85, "stats samples"),):
         main = [(x, v) for x, v, keep in zip(xs, vals, selected)
                 if keep == inside and (not include_outliers or v <= outlier_ms)]
         outliers = [(x, v) for x, v, keep in zip(xs, vals, selected)
@@ -297,7 +316,10 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                 lambda value, _: f"{value:.2g}" if n < 10 else f"{value:,.0f}"))
     else:
         ax.set_xlabel("request #i")
-    if len(xs) == 1:
+    if report_window is not None:
+        start, end = report_window
+        ax.set_xlim(start, end if end is not None else max(start + 1, max(xs)))
+    elif len(xs) == 1:
         ax.set_xlim(xs[0] - 0.5, xs[0] + 0.5)
     else:
         ax.set_xlim(min(xs) if times else 0, max(xs))
@@ -469,7 +491,7 @@ def process_kvtest_samples(path, args):
                 "{:g}".format(report_window[1]), len(stat_vals))
         outputs.extend(_emit_plots(
             title, file_stem, kind, vals, times, out_dir, threshold,
-            "{} OK samples  ERR:{}".format(len(vals), failed),
+            "{} OK samples plotted  ERR:{}".format(len(stat_vals), failed),
             time_axis="elapsed", report_window=report_window))
     return outputs
 

@@ -148,7 +148,7 @@ def test_plot_series_exposes_percentiles_in_legend(tmp_path, monkeypatch):
         original_close("all")
 
 
-def test_kvtest_window_shows_all_points_but_only_window_stats(tmp_path, monkeypatch):
+def test_kvtest_window_shows_only_window_points_and_stats(tmp_path, monkeypatch):
     import json
     pl = _load_plot_module()
     path = tmp_path / 'case.i0_p9101.kvtest_8MB.samples.csv'
@@ -168,23 +168,22 @@ def test_kvtest_window_shows_all_points_but_only_window_stats(tmp_path, monkeypa
             out=None, type='both', outlier=10))
         assert len(outputs) == 1   # no trimmed plot drops startup/tail points
         ax = pl.plt.gcf().axes[0]
-        assert sum(len(c.get_offsets()) for c in ax.collections) == 4
+        assert sum(len(c.get_offsets()) for c in ax.collections) == 2
         outside = [c for c in ax.collections if 'outside' in c.get_label()]
         inside = [c for c in ax.collections if c.get_label().startswith('stats samples')]
-        assert sum(len(c.get_offsets()) for c in outside) == 2
+        assert not outside
         assert sum(len(c.get_offsets()) for c in inside) == 2
-        assert max(c.get_alpha() for c in outside) < min(c.get_alpha() for c in inside)
         lines = {l.get_label().split('=')[0]:l for l in ax.lines if '=' in l.get_label()}
         assert set(lines) == {'avg','p99','p999','p9999','Pmax'}
         assert lines['avg'].get_ydata()[0] == 3
         assert lines['Pmax'].get_ydata()[0] == 4
-        assert ax.get_xlim() == (119,330)
+        assert ax.get_xlim() == (120,330)
         assert path.read_bytes() == raw
     finally:
         original_close('all')
 
 
-def test_empty_window_draws_full_timeline_without_stats(tmp_path, monkeypatch):
+def test_empty_window_draws_no_requests_or_stats(tmp_path, monkeypatch):
     pl = _load_plot_module()
     original_close = pl.plt.close
     monkeypatch.setattr(pl.plt, 'close', lambda fig: None)
@@ -192,7 +191,8 @@ def test_empty_window_draws_full_timeline_without_stats(tmp_path, monkeypatch):
         pl.plot_series([10,20], [0,360], 'empty window', str(tmp_path/'empty.png'),
                        100, True, time_axis='elapsed', report_window=(120,330))
         ax=pl.plt.gcf().axes[0]
-        assert sum(len(c.get_offsets()) for c in ax.collections) == 2
+        assert not ax.collections
+        assert ax.get_xlim() == (120,330)
         assert not any('=' in l.get_label() for l in ax.lines)
         assert any('No OK samples' in t.get_text() for t in ax.texts)
     finally:
