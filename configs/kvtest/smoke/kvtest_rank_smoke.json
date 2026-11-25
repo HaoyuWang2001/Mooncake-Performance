@@ -22,9 +22,9 @@
   "data_size": [
     "8MB"
   ],
-  "duration": 30,
+  "duration": 780,
   "kvtest": {
-    "key_pool_size": 256,
+    "key_pool_size": "auto",
     "local_port_base": 12345,
     "numa_bindings": [
       {

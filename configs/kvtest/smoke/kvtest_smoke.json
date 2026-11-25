@@ -23,6 +23,10 @@
     "8MB"
   ],
   "duration": 30,
+  "report": {
+    "start_s": 0,
+    "end_s": null
+  },
   "kvtest": {
     "key_pool_size": 256,
     "local_port_base": 12345,

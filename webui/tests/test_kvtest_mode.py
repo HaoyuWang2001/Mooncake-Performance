@@ -349,8 +349,9 @@ def test_kvtest_success_cleanup_keeps_logs_and_png(tmp_path):
     for path in disposable + keep:
         path.write_text("x", encoding="utf-8")
 
-    assert bm._cleanup_kvtest_success_intermediates(str(tmp_path / "logs")) == 3
-    assert all(not path.exists() for path in disposable)
+    assert bm._cleanup_kvtest_success_intermediates(str(tmp_path / "logs")) == 1
+    assert all(path.exists() == (not path.name.endswith(".timeseries.csv"))
+               for path in disposable)
     assert all(path.exists() for path in keep)
 
 

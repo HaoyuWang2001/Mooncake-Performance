@@ -146,3 +146,66 @@ def test_plot_series_exposes_percentiles_in_legend(tmp_path, monkeypatch):
         assert any(label.startswith("p9999=") for label in labels)
     finally:
         original_close("all")
+
+
+def test_kvtest_window_shows_all_points_but_only_window_stats(tmp_path, monkeypatch):
+    import json
+    pl = _load_plot_module()
+    path = tmp_path / 'case.i0_p9101.kvtest_8MB.samples.csv'
+    path.write_text(
+        'elapsed_us,instance_id,operation,request_index,latency_ms,status,bytes\n'
+        '119000000,0,get_buffer,0,999,OK,8\n'
+        '120000000,0,get_buffer,1,2,OK,8\n'
+        '329000000,0,get_buffer,2,4,OK,8\n'
+        '330000000,0,get_buffer,3,888,OK,8\n', encoding='utf-8')
+    (tmp_path/'kvtest_report_meta.json').write_text(json.dumps({
+        'duration':360, 'report':{'start_s':120,'end_s':330}}))
+    raw = path.read_bytes()
+    original_close = pl.plt.close
+    monkeypatch.setattr(pl.plt, 'close', lambda fig: None)
+    try:
+        outputs = pl.process_kvtest_samples(str(path), SimpleNamespace(
+            out=None, type='both', outlier=10))
+        assert len(outputs) == 1   # no trimmed plot drops startup/tail points
+        ax = pl.plt.gcf().axes[0]
+        assert sum(len(c.get_offsets()) for c in ax.collections) == 4
+        outside = [c for c in ax.collections if 'outside' in c.get_label()]
+        inside = [c for c in ax.collections if c.get_label().startswith('stats samples')]
+        assert sum(len(c.get_offsets()) for c in outside) == 2
+        assert sum(len(c.get_offsets()) for c in inside) == 2
+        assert max(c.get_alpha() for c in outside) < min(c.get_alpha() for c in inside)
+        lines = {l.get_label().split('=')[0]:l for l in ax.lines if '=' in l.get_label()}
+        assert set(lines) == {'avg','p99','p999','p9999','Pmax'}
+        assert lines['avg'].get_ydata()[0] == 3
+        assert lines['Pmax'].get_ydata()[0] == 4
+        assert ax.get_xlim() == (119,330)
+        assert path.read_bytes() == raw
+    finally:
+        original_close('all')
+
+
+def test_empty_window_draws_full_timeline_without_stats(tmp_path, monkeypatch):
+    pl = _load_plot_module()
+    original_close = pl.plt.close
+    monkeypatch.setattr(pl.plt, 'close', lambda fig: None)
+    try:
+        pl.plot_series([10,20], [0,360], 'empty window', str(tmp_path/'empty.png'),
+                       100, True, time_axis='elapsed', report_window=(120,330))
+        ax=pl.plt.gcf().axes[0]
+        assert sum(len(c.get_offsets()) for c in ax.collections) == 2
+        assert not any('=' in l.get_label() for l in ax.lines)
+        assert any('No OK samples' in t.get_text() for t in ax.texts)
+    finally:
+        original_close('all')
+
+
+def test_plot_window_cli_overrides_sidecar(tmp_path):
+    import json
+    pl = _load_plot_module()
+    path=tmp_path/'case.samples.csv'
+    (tmp_path/'kvtest_report_meta.json').write_text(json.dumps({
+        'duration':780,'report':{'start_s':120,'end_s':720}}))
+    assert pl._report_window(str(path),SimpleNamespace()) == (120,720)
+    assert pl._report_window(str(path),SimpleNamespace(report_start_s=150,report_end_s=600)) == (150,600)
+    with pytest.raises(ValueError):
+        pl._report_window(str(path),SimpleNamespace(report_start_s=750))

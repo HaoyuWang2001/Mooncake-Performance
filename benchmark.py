@@ -4720,15 +4720,101 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
     return False, last
 
 
-def _cleanup_kvtest_success_intermediates(log_dir):
-    """Remove raw kvtest inputs after aggregation and plotting succeed.
+KVTEST_REPORT_META = "kvtest_report_meta.json"
+_KVTEST_WINDOW_STATS_MOD = [None]
 
-    Basic/Python mode leaves logs and figures, not a second set of raw metric
-    files. kvtest needs summary/samples temporarily, but they are not final
-    user-facing artifacts. Failed runs intentionally retain these inputs.
-    """
-    patterns = ("*.kvtest_*.summary.json", "*.kvtest_*.samples.csv",
-                "*.kvtest_*.timeseries.csv")
+
+def _kvtest_window_stats_module():
+    """Load the request-sample window aggregator."""
+    if _KVTEST_WINDOW_STATS_MOD[0] is None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "kvtest_window_stats", os.path.join(SCRIPTS_DIR, "kvtest_window_stats.py"))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _KVTEST_WINDOW_STATS_MOD[0] = mod
+    return _KVTEST_WINDOW_STATS_MOD[0]
+
+
+def _kvtest_report_window(cfg, args=None):
+    report = cfg.setdefault("report", {})
+    for field in ("start_s", "end_s"):
+        override = getattr(args, "report_" + field, None) if args else None
+        if override is not None:
+            report[field] = override
+    start = float(report.get("start_s", 0))
+    end = report.get("end_s")
+    end = float(end) if end is not None else None
+    import math
+    duration = float(cfg.get("duration", 0) or 0)
+    if (not math.isfinite(start) or start < 0 or
+            (end is not None and (not math.isfinite(end) or end <= start)) or
+            (duration and (start >= duration or (end is not None and end > duration)))):
+        raise ValueError("report window requires 0 <= start_s < end_s <= duration")
+    if start or end is not None:
+        if end is None and not duration:
+            raise ValueError("report end_s or duration required")
+        return start, end if end is not None else duration
+    return None
+
+
+def _kvtest_summary_doc(path):
+    """Parse one instance summary.json (None when missing/corrupt)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _kvtest_window_summary(path, cfg):
+    doc = _kvtest_summary_doc(path)
+    window = _kvtest_report_window(cfg)
+    if window and doc is not None:
+        samples = path[:-len(".summary.json")] + ".samples.csv"
+        return _kvtest_window_stats_module().window_summary(samples, doc, *window)
+    return doc
+
+
+def _kvtest_write_report_meta(local_log_dir, cfg, context=None):
+    """Keep measurement origin, node mapping and report window with raw data."""
+    payload = {
+        "format": "kvtest_report_meta",
+        "duration": cfg.get("duration"),
+        "report": cfg.get("report", {}),
+        "nodes": cfg.get("_kvtest_nodes"),
+        "iid_nodes": cfg.get("_kvtest_iid_nodes") or {},
+        "iid_pods": cfg.get("_kvtest_iid_pods") or {},
+        "start_epochs": cfg.get("_kvtest_start_epochs") or {},
+        "writer_operation": _kvtest_writer_operation(cfg),
+        "reader_operation": _kvtest_reader_operation(cfg),
+    }
+    if context:
+        payload.update({k: v for k, v in context.items() if v})
+    path = os.path.join(local_log_dir, KVTEST_REPORT_META)
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log("[WARN] kvtest report meta write failed: {}".format(exc))
+
+
+def _kvtest_generate_window_report(local_log_dir, cfg, rows):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "kvtest_window_report", os.path.join(SCRIPTS_DIR, "kvtest_window_report.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _kvtest_write_report_meta(local_log_dir, cfg)
+    return module.generate(local_log_dir, cfg, rows)
+
+
+def _cleanup_kvtest_success_intermediates(log_dir):
+    """Remove obsolete timeseries only; raw samples/summary/context stay."""
+    patterns = ("*.kvtest_*.timeseries.csv",)
     removed = 0
     for pattern in patterns:
         for path in glob.glob(os.path.join(log_dir, "**", pattern),
@@ -4885,6 +4971,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     if not cfg_duration or float(cfg_duration) <= 0:
         raise RuntimeError("kvtest config requires duration > 0 "
                            "(missing or invalid)")
+    _kvtest_report_window(cfg, args)
     warmup_duration = _kvtest_warmup_duration(cfg, args)
     cfg["_kvtest_warmup_duration"] = warmup_duration
     writer_op = _kvtest_writer_operation(cfg)
@@ -5307,6 +5394,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         1.0, max(0.05, seconds - (time.time() - started))))
 
             _parallel_start_barrier(args)
+            cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = time.time()
+            _kvtest_write_report_meta(local_log_dir, cfg)
             _control("/start", "/start")
 
             if warmup_duration > 0:
@@ -5320,6 +5409,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _control("/drain", "warmup /drain", transition_timeout)
                 _control("/reset", "warmup /reset", transition_timeout)
                 _parallel_measure_barrier(args)
+                cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = time.time()
+                _kvtest_write_report_meta(local_log_dir, cfg)
                 _control("/arm", "measurement /arm", transition_timeout)
                 _control("/resume", "measurement /resume",
                          transition_timeout)
@@ -6345,7 +6436,7 @@ def _kvtest_latency_stats(values):
     }
 
 
-def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None):
+def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None, window=None):
     """Load request-level OK latencies keyed by (size, iid, node, op)."""
     legacy_re = re.compile(
         r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
@@ -6371,6 +6462,8 @@ def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None):
         try:
             with open(path, newline="", encoding="utf-8") as stream:
                 for row in csv.DictReader(stream):
+                    if window and not window[0] <= float(row["elapsed_us"]) / 1e6 < window[1]:
+                        continue
                     if row.get("status") != "OK":
                         continue
                     operation = row.get("operation", "")
@@ -6860,14 +6953,19 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             try:
                 with open(p, encoding="utf-8") as f:
                     summary = json.load(f)
+                if _kvtest_report_window(cfg):
+                    summary = _kvtest_window_summary(p, cfg)
             except (OSError, ValueError) as exc:
+                if _kvtest_report_window(cfg):
+                    raise RuntimeError("windowed CSV requires request samples") from exc
                 log("[WARN] kvtest summary {}: {} (skipped)".format(
                     os.path.basename(p), exc))
                 continue
             summaries.setdefault(m.group("ds"), []).append(
                 (iid, nodename, summary))
         ok_samples = _load_kvtest_ok_samples(
-            local_log_dir, name, iid_nodes=iid_nodes)
+            local_log_dir, name, iid_nodes=iid_nodes,
+            window=_kvtest_report_window(cfg))
 
         def sample_values(ds, iid, nodename, operation, expected):
             values = ok_samples.get((ds, iid, nodename, operation), [])
@@ -6879,7 +6977,8 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             return values
 
         for ds in data_size_list(cfg):
-            wall = duration
+            window = _kvtest_report_window(cfg)
+            wall = window[1] - window[0] if window else duration
             writer_rows, reader_rows = [], []
             writer_pooled, reader_pooled = [], []
             writer_exact = reader_exact = True
@@ -7190,6 +7289,10 @@ def parse_arguments(argv=None):
     # Internal orchestration hook used by the WebUI rank+recall launcher.
     # Keeping it out of --help avoids presenting an implementation detail as
     # a normal benchmark knob.
+    parser.add_argument("--report-start-s", type=float, default=None,
+                        help="kvtest report start seconds, inclusive")
+    parser.add_argument("--report-end-s", type=float, default=None,
+                        help="kvtest report end seconds, exclusive")
     parser.add_argument("--result-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--parallel-ready-dir", default=None,
                         help=argparse.SUPPRESS)
@@ -7472,6 +7575,9 @@ def main(args, cfg_paths):
                     rows = write_scenario_csv(
                         os.path.join(ts_dir, "logs", name), cfg, ts, cfg_path,
                         cluster, store_nodes, result_dir=ts_dir)
+                if cfg.get("scenario") == "kvtest":
+                    _kvtest_generate_window_report(
+                        os.path.join(ts_dir, "logs", name), cfg, rows)
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows
@@ -7608,10 +7714,8 @@ def main(args, cfg_paths):
                     plot_succeeded = True
             except Exception as exc:
                 log("[WARN] auto-plot failed: {}".format(exc))
-    # kvtest's summary/samples are implementation details needed only until
-    # the normal CSV and PNG outputs exist. Match the Python/basic result
-    # layout by removing them after a completely successful run. On any
-    # scenario or plotting failure, preserve them for diagnosis/replotting.
+    # Keep all original request samples, summaries and report context.
+    # Only obsolete timeseries artifacts may be removed after success.
     if not failed_scenarios and plot_succeeded:
         removed = _cleanup_kvtest_success_intermediates(
             os.path.join(ts_dir, "logs"))

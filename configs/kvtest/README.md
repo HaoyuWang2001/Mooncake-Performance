@@ -193,3 +193,28 @@ kvtest 实例文件使用紧凑名称
 日志、summary/sample 或 PNG 文件名；instance 到真实节点/Pod 的映射保存在运行时
 配置中并写入最终 CSV，从而避免 Windows 260/264 字符路径限制。旧版
 `<cfg>.<node>_i...` 文件仍可被汇总和绘图脚本读取。
+
+
+### kvtest 报告区间与原始数据保留（YLT）
+
+`configs/kvtest/_configs.json` 中的 `report.start_s` / `report.end_s`
+统一控制 kvtest（含 rank+recall）的 CSV 和 HTML 统计区间。
+可用 `--report-start-s 120 --report-end-s 330` 覆盖；rank+recall 入口也支持这两个参数。
+区间相对正式测量开始（不含 warmup），左闭右开，按请求完成时间 `elapsed_us` 归窗。
+流量仍运行完整 duration；QPS/吞吐以区间时长为分母，提前停止则截到实际测量结束。
+读写、通知发送和通知队列等待都从区间样本重算，不使用全程 summary 的延迟/计数。
+没有逐请求时间的校验失败、队列峰值等全程计数无法准确归窗，不继承到区间汇总。
+
+报告输出：`logs/<配置名>/report/report.html` 与 `report/stats.json`，使用同一组 CSV 行，
+不增加 C++ breakdown 日志解析，不引入其他分支的 WebUI 或报告框架。
+`*.samples.csv`、原始 `*.summary.json`、`kvtest_report_meta.json` 成功后也始终保留，
+不裁剪、不改写原始请求数据。旁挂文件记录统计区间、正式测量起点和实例/节点对应关系。
+短测试在子配置中以 `"report":{"start_s":0,"end_s":null}` 覆盖为全程统计。
+此处的新保留策略取代上文旧的 samples/summary 成功后删除说明。
+
+
+区间绘图：`plot_latency.py` 自动读取同目录 `kvtest_report_meta.json`，
+全程 OK 请求仍逐点绘制，区间外点用浅色显示，统计区间边界用竖线标出。
+avg/P99/P999/P9999/Pmax 只使用区间内 OK 样本，标题给出区间和样本量；
+区间内无 OK 样本时不画统计线。有区间配置时只生成全程图，不生成删除离群值的 trimmed 图。
+旧原始数据也可通过 `--report-start-s 120 --report-end-s 330` 指定绘图区间口径。

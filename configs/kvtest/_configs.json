@@ -2,9 +2,13 @@
   "scenario": "kvtest",
   "protocol": "ub",
   "warmup": {
-    "duration": 5
+    "duration": 0
   },
   "duration": 30,
+  "report": {
+    "start_s": 120,
+    "end_s": 720
+  },
   "batch_size": 1,
   "kvtest": {
     "binary": "/home/Mooncake/outputs/bin/mooncake_kvtest",

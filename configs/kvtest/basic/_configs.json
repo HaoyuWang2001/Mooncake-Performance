@@ -6,6 +6,10 @@
   "key_count": 1000,
   "target_qps": 1,
   "duration": 10,
+  "report": {
+    "start_s": 0,
+    "end_s": null
+  },
   "warmup": {
     "duration": 5
   },

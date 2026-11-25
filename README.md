@@ -948,3 +948,21 @@ run 级异常值台账 `outputs/<ts>/profiling/outliers.json` 与时间窗切片
   匹配则跳过 generate-data，避免重复生成浪费。种子变更或数据大小变更时自动触发重新生成；
 - `--clean-up` 参数：删除 cluster.json 中**全部节点**的远程测试目录（`rm -rf $MC_REMOTE_DIR`）。
   独立使用（不带 --config/--config-dir）时仅执行清理即退出；与运行参数共现时在跑完全部配置后追加清理。
+
+
+### kvtest 报告区间与原始数据保留（YLT）
+
+`configs/kvtest/_configs.json` 中的 `report.start_s` / `report.end_s`
+统一控制 kvtest（含 rank+recall）的 CSV 和 HTML 统计区间。
+可用 `--report-start-s 120 --report-end-s 330` 覆盖；rank+recall 入口也支持这两个参数。
+区间相对正式测量开始（不含 warmup），左闭右开，按请求完成时间 `elapsed_us` 归窗。
+流量仍运行完整 duration；QPS/吞吐以区间时长为分母，提前停止则截到实际测量结束。
+读写、通知发送和通知队列等待都从区间样本重算，不使用全程 summary 的延迟/计数。
+没有逐请求时间的校验失败、队列峰值等全程计数无法准确归窗，不继承到区间汇总。
+
+报告输出：`logs/<配置名>/report/report.html` 与 `report/stats.json`，使用同一组 CSV 行，
+不增加 C++ breakdown 日志解析，不引入其他分支的 WebUI 或报告框架。
+`*.samples.csv`、原始 `*.summary.json`、`kvtest_report_meta.json` 成功后也始终保留，
+不裁剪、不改写原始请求数据。旁挂文件记录统计区间、正式测量起点和实例/节点对应关系。
+短测试在子配置中以 `"report":{"start_s":0,"end_s":null}` 覆盖为全程统计。
+此处的新保留策略取代上文旧的 samples/summary 成功后删除说明。

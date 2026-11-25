@@ -13,6 +13,9 @@ RESULT 行三种格式（tab 分隔，首字段为 HH:MM:SS.micro 本地墙钟�
 
 kvtest C++ 客户端把逐请求样本批量落到 ``*.kvtest_*.samples.csv``，脚本按
 operation 绘制一请求一点的 ``.latency.png`` / ``.queuewait.png``。
+自动读取同目录 kvtest_report_meta.json 的 report 区间：全程 OK 请求都绘制，
+区间外点变浅，avg/P99/P999/P9999/Pmax 仅按区间内 OK 样本计算。
+有统计区间时不生成剔除离群值的 trimmed 图，避免改变统计样本或遗漏启动长尾。
 
 用法：
   python plot_latency.py --log <日志文件|目录> [--out DIR] [--outlier MS] [--type both]
@@ -31,6 +34,8 @@ benchmark.py 主流程结束后会自动以 --log <本次 run 的 logs/> 调用�
 """
 import argparse
 import csv
+import json
+import math
 import os
 import re
 import sys
@@ -181,7 +186,7 @@ def _fmt_hms(seconds, base):
 
 
 def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
-                ylabel="Latency (ms)", time_axis="wall"):
+                ylabel="Latency (ms)", time_axis="wall", report_window=None):
     """Dot-line plot with stat hlines, absolute reference lines and outliers.
 
     times: wall-clock seconds per sample (None -> request#i axis). When
@@ -202,39 +207,58 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
     else:
         t0 = None
         xs = list(range(n))
-    if include_outliers:
-        main = [(x, v) for x, v in zip(xs, vals) if v <= outlier_ms]
-        outliers = [(x, v) for x, v in zip(xs, vals) if v > outlier_ms]
+    selected = [True] * n if report_window is None else [
+        report_window[0] <= x and (report_window[1] is None or x < report_window[1])
+        for x in xs]
+    # Mask each category independently. No line connects a gap in the window.
+    for inside, alpha, label in ((False, 0.16, "outside stats window"),
+                                 (True, 0.85, "stats samples")):
+        main = [(x, v) for x, v, keep in zip(xs, vals, selected)
+                if keep == inside and (not include_outliers or v <= outlier_ms)]
+        outliers = [(x, v) for x, v, keep in zip(xs, vals, selected)
+                    if keep == inside and include_outliers and v > outlier_ms]
+        if main and report_window is None:
+            ax.plot([x for x, _ in main], [v for _, v in main],
+                    linewidth=0.5, markersize=2, marker=".", color="tab:gray",
+                    label=f"samples (n={len(main)})")
+        elif main:
+            ax.scatter([x for x, _ in main], [v for _, v in main],
+                       s=4, marker=".", color="tab:gray", alpha=alpha,
+                       label=f"{label} (n={len(main)})", rasterized=True)
+        if outliers:
+            ax.scatter([x for x, _ in outliers], [v for _, v in outliers],
+                       s=28, marker="x", color="red", alpha=alpha, zorder=5,
+                       label=f"{label} outliers ({len(outliers)}, >{outlier_ms:g}ms)",
+                       rasterized=True)
+    stat_vals = sorted(v for v, keep in zip(vals, selected) if keep)
+    stat_n = len(stat_vals)
+    if stat_n:
+        computed = {"avg": sum(stat_vals) / stat_n, "max": stat_vals[-1],
+                    "p99": percentile(stat_vals, 0.99),
+                    "p999": percentile(stat_vals, 0.999),
+                    "p9999": percentile(stat_vals, 0.9999)}
+        lines = list(STAT_HLINES_ALWAYS) + [
+            (name, color) for name, color, min_n in STAT_HLINES_GATED
+            if report_window is not None or stat_n >= min_n]
+        for name, color in lines:
+            v = computed[name]
+            display = "Pmax" if name == "max" and report_window is not None else name
+            ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
+                       label=f"{display}={v:.4f}ms")
+            # The legend carries exact values. Avoid overlapping labels when
+            # several tail percentiles coincide or startup spikes stretch y.
+            if report_window is None:
+                ax.annotate(f"{display}={v:.4f}", xy=(0.998, v),
+                            xycoords=("axes fraction", "data"),
+                            ha="right", va="bottom", fontsize=9, color=color)
     else:
-        main = list(zip(xs, vals))
-        outliers = []
-    if main:
-        ax.plot([x for x, _ in main], [v for _, v in main],
-                linewidth=0.5, markersize=2, marker=".", color="tab:gray",
-                label=f"samples (n={len(main)})")
-    if outliers:
-        ax.scatter([x for x, _ in outliers], [v for _, v in outliers],
-                   s=28, marker="x", color="red", zorder=5,
-                   label=f"outliers ({len(outliers)}, >{outlier_ms:g}ms)")
-    stat_vals = sorted(vals)
-    computed = {"avg": sum(stat_vals) / n, "max": stat_vals[-1],
-                "p99": percentile(stat_vals, 0.99),
-                "p999": percentile(stat_vals, 0.999),
-                "p9999": percentile(stat_vals, 0.9999)}
-    for name, color in STAT_HLINES_ALWAYS:
-        v = computed[name]
-        ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
-                   label=f"{name}={v:.4f}ms")
-        ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
-                    ha="right", va="bottom", fontsize=9, color=color)
-    for name, color, min_n in STAT_HLINES_GATED:
-        if n < min_n:
-            continue  # 样本量不达标：分位数无意义，不加线
-        v = computed[name]
-        ax.axhline(v, linestyle="--", linewidth=1.2, color=color,
-                   label=f"{name}={v:.4f}ms")
-        ax.annotate(f"{name}={v:.4f}", xy=(0.998, v), xycoords=("axes fraction", "data"),
-                    ha="right", va="bottom", fontsize=9, color=color)
+        ax.text(0.5, 0.95, "No OK samples in stats window", transform=ax.transAxes,
+                ha="center", va="top")
+    if report_window is not None:
+        start, end = report_window
+        ax.axvline(start, color="steelblue", linewidth=0.8, alpha=0.5)
+        if end is not None:
+            ax.axvline(end, color="steelblue", linewidth=0.8, alpha=0.5)
     for v, label in REF_LINES:
         if max(vals) >= v:
             ax.axhline(v, linestyle="-.", linewidth=1.0, color="gray", alpha=0.8)
@@ -264,6 +288,13 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
                 lambda i, _xt=np.array(xs), _xi=np.arange(len(vals)):
                 np.interp(i, _xi, _xt)))
         sec.set_xlabel("request #i")
+        if report_window is not None and len(xs) > 1:
+            # Place ticks uniformly in time, avoiding clustered request-index
+            # ticks when sparse samples surround a long steady-state window.
+            sec.set_xticks(np.interp(np.linspace(min(xs), max(xs), 5),
+                                      np.array(xs), np.arange(len(vals))))
+            sec.xaxis.set_major_formatter(plt.FuncFormatter(
+                lambda value, _: f"{value:.2g}" if n < 10 else f"{value:,.0f}"))
     else:
         ax.set_xlabel("request #i")
     if len(xs) == 1:
@@ -276,7 +307,7 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
 
 
 def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note,
-                time_axis="wall"):
+                time_axis="wall", report_window=None):
     """Write the latency/queue-wait figure(s): full view always; trimmed view
     additionally when outliers exist (stats recomputed on trimmed data)."""
     suffix = "latency" if kind == "latency" else "queuewait"
@@ -286,10 +317,10 @@ def _emit_plots(stem, file_stem, kind, vals, times, out_dir, outlier_ms, note,
     has_out = len(trimmed) != len(vals)
     png = os.path.join(out_dir, f"{file_stem}.{suffix}.png")
     plot_series(vals, times, base_title, png, outlier_ms, include_outliers=True,
-                ylabel=ylabel, time_axis=time_axis)
+                ylabel=ylabel, time_axis=time_axis, report_window=report_window)
     outputs = [png]
     print(f"  -> {png}")
-    if has_out:
+    if has_out and report_window is None:
         png = os.path.join(out_dir, f"{file_stem}.{suffix}.trimmed.png")
         plot_series(trimmed, _trim_times(times, vals, outlier_ms),
                     f"{stem}  ({note}, outliers removed)", png, outlier_ms,
@@ -368,8 +399,35 @@ def parse_kvtest_samples(path):
     return groups
 
 
+def _report_window(path, args):
+    meta_path = os.path.join(os.path.dirname(os.path.abspath(path)),
+                             "kvtest_report_meta.json")
+    try:
+        with open(meta_path, encoding="utf-8") as stream:
+            meta = json.load(stream)
+    except FileNotFoundError:
+        meta = {}
+    report = meta.get("report") or {}
+    start = report.get("start_s", 0)
+    end = report.get("end_s")
+    if end is None:
+        end = meta.get("duration")
+    start_override = getattr(args, "report_start_s", None)
+    end_override = getattr(args, "report_end_s", None)
+    if not report and start_override is None and end_override is None:
+        return None
+    start = float(start_override if start_override is not None else start)
+    end = float(end_override if end_override is not None else end) if (
+        end_override is not None or end is not None) else None
+    if (not math.isfinite(start) or start < 0 or
+            (end is not None and (not math.isfinite(end) or end <= start))):
+        raise ValueError("plot report window requires 0 <= start_s < end_s")
+    return start, end
+
+
 def process_kvtest_samples(path, args):
     groups = parse_kvtest_samples(path)
+    report_window = _report_window(path, args)
     if not groups:
         print("[{}] skip (no valid kvtest request samples)".format(
             os.path.basename(path)))
@@ -395,17 +453,24 @@ def process_kvtest_samples(path, args):
             print("[{}] {} skip (no OK request samples)".format(
                 name, operation))
             continue
+        stat_vals = [v for v, t in zip(vals, times) if report_window is None or
+                     (t >= report_window[0] and
+                      (report_window[1] is None or t < report_window[1]))]
         threshold = args.outlier or max(
-            round(percentile(sorted(vals), 0.99) * 10), 1)
+            round(percentile(sorted(stat_vals or vals), 0.99) * 10), 1)
         print("[{}] {}: OK={}, failed={}, outlier threshold={}ms".format(
             name, operation, len(vals), failed, threshold))
         kind = "queue-wait" if is_queue_wait else "latency"
         file_stem = "{}.{}".format(base, _safe_plot_component(operation))
         title = "{} — {}".format(base, operation)
+        if report_window is not None:
+            title += " | stats [{:g}, {}) s, n={}".format(
+                report_window[0], "end" if report_window[1] is None else
+                "{:g}".format(report_window[1]), len(stat_vals))
         outputs.extend(_emit_plots(
             title, file_stem, kind, vals, times, out_dir, threshold,
             "{} OK samples  ERR:{}".format(len(vals), failed),
-            time_axis="elapsed"))
+            time_axis="elapsed", report_window=report_window))
     return outputs
 
 
@@ -436,6 +501,8 @@ def main(argv=None):
                              "*.samples.csv scan)")
     parser.add_argument("--out", default=None,
                         help="output dir; default = each log's own directory")
+    parser.add_argument("--report-start-s", type=float, default=None)
+    parser.add_argument("--report-end-s", type=float, default=None)
     parser.add_argument("--outlier", type=float, default=None,
                         help="outlier threshold in ms; default auto = p99 x 10")
     parser.add_argument("--type", choices=["both", "latency", "queue-wait"],

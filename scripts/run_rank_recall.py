@@ -84,6 +84,10 @@ def _child_argv(args, work_mode, files, parent, ready_dir):
                           (args.verbose, "--verbose")):
         if enabled:
             argv.append(flag)
+    for field in ("report_start_s", "report_end_s"):
+        value = getattr(args, field, None)
+        if value is not None:
+            argv += ["--" + field.replace("_", "-"), str(value)]
     if args.protocol:
         argv += ["--protocol", args.protocol]
     if args.stop_file:
@@ -145,6 +149,8 @@ def parse_args(argv=None):
     parser.add_argument("--profile", required=True)
     parser.add_argument("--protocol", choices=("tcp", "rdma", "ub"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--report-start-s", type=float, default=None)
+    parser.add_argument("--report-end-s", type=float, default=None)
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--verbose", action="store_true")

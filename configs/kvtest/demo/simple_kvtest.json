@@ -20,5 +20,9 @@
   "data_size": [
     "3.5MB"
   ],
-  "duration": 30
+  "duration": 30,
+  "report": {
+    "start_s": 0,
+    "end_s": null
+  }
 }
