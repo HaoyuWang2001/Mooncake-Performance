@@ -506,6 +506,32 @@ def _remove_all_checked(store, args, what):
     return passes, total
 
 
+def remove_keys_key_prefix(store, keys):
+    """batch_is_exist + batch_remove with per-key classification.
+
+    Shared by the CLI remove-keys stage and the long-lived remove service so
+    both use ONE implementation. Returns a result dict; never exits."""
+    existence = store.batch_is_exist(keys)
+    statuses = store.batch_remove(keys, force=True)
+    if len(existence) != len(keys) or len(statuses) != len(keys):
+        return {"error": "batch_is_exist/batch_remove returned unexpected "
+                         "result size"}
+    removed = not_found = failed = 0
+    failed_samples = []
+    for k, ex, st in zip(keys, existence, statuses):
+        if ex == 0:
+            not_found += 1
+        elif ex == 1 and st == 0:
+            removed += 1
+        else:
+            failed += 1
+            if len(failed_samples) < 20:
+                failed_samples.append(
+                    "{} (is_exist={}, remove={})".format(k, ex, st))
+    return {"removed": removed, "not_found": not_found, "failed": failed,
+            "failed_samples": failed_samples}
+
+
 def cmd_remove_keys(args, store):
     log("remove-keys start (scope={}, scenario={})".format(args.scope, args.scenario))
     keys = build_keys(args.key_prefix, args.scenario, args.key_count)
@@ -517,24 +543,14 @@ def cmd_remove_keys(args, store):
         emit("META", {"mode": "remove-keys", "scope": "full",
                       "cleared": total, "passes": passes})
         return
-    existence = store.batch_is_exist(keys)
-    statuses = store.batch_remove(keys, force=True)
-    if len(existence) != len(keys) or len(statuses) != len(keys):
-        print("[ERROR] remove-keys failed: batch_is_exist/batch_remove returned unexpected result size")
+    res = remove_keys_key_prefix(store, keys)
+    if "error" in res:
+        print("[ERROR] remove-keys failed: " + res["error"])
         sys.exit(1)
-    removed = 0
-    not_found = 0
-    failed = 0
-    failed_samples = []
-    for k, ex, st in zip(keys, existence, statuses):
-        if ex == 0:
-            not_found += 1
-        elif ex == 1 and st == 0:
-            removed += 1
-        else:
-            failed += 1
-            if len(failed_samples) < 20:
-                failed_samples.append("{} (is_exist={}, remove={})".format(k, ex, st))
+    removed = res["removed"]
+    not_found = res["not_found"]
+    failed = res["failed"]
+    failed_samples = res["failed_samples"]
     emit("META", {"mode": "remove-keys", "scope": "key-prefix",
                   "keys_attempted": len(keys), "keys_removed": removed,
                   "keys_not_found": not_found, "keys_failed": failed})

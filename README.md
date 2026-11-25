@@ -108,6 +108,7 @@ basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字
 | `parallel.fanout_workers` | 并发上限：kubectl exec / HTTP fan-out / 实例配置推送 / 启动 / 退出等待 / 产物整理（flatten+trace） | `16` |
 | `parallel.pull_workers` | 产物拉回并发（controller SFTP，受 sshd MaxSessions≈10 约束，勿超过） | `10` |
 | `k8s.reduce_on_controller` | kvtest 产物 pod→controller 单跳（kubectl cp），map+reduce 在 controller 执行，编排机只收 reduced/meta/summary；失败自动回退本地链路 | `true` |
+| `k8s.remove_service` | run 级 remove 服务：测量期预热一个小 remove pod（常驻一个已初始化的 store 客户端），各 remove 阶段走热调用（~2s 而非每次 ~40s 冷启动）；服务不可用自动回退逐阶段 legacy | `true` |
 | `k8s.controller_keep_data` | 保留 controller 侧 per-run 中间产物（默认成功后清理，失败总是保留） | `false` |
 | `k8s_numa_node` | K8s basic 场景显式 NUMA 节点；通过 `numactl --cpunodebind/--membind` 同时绑定 CPU 和内存，未配置时 K8s basic 不绑定 | 未配置 |
 
@@ -731,6 +732,16 @@ get 家族循环读取预填数据直至到时；put 家族与 mixed 以"完整�
   通过 oplog 异步回放，空间不会立刻归零。执行后每 2s 轮询直到 allocated ≤ 1% 容差或到时；
   到时后仍按 `require_clean_store` 决定 WARN/FAIL（等待使严格模式不再被 oplog 延迟误伤）。
   仅 `--scope full` 做释放等待；`key-prefix` 只做跳过预检（共享 store 等不到归零）。
+
+**k8s remove 服务（`k8s.remove_service`，默认开启）**：kvtest 在**测量窗口开始**
+后台创建极小 remove Deployment（requests 10m/32Mi，limits 200m/256Mi，挂本 run 的
+ConfigMap），进程内只初始化一次 store 客户端（`remove_service.py`，纯客户端不挂
+segment，local_buffer 16MB），监听 loopback `:9401` 的 `/health` 与 `/remove`。
+之后的 remove 阶段（config-end / sweep / fail-cleanup）若 store 非空，直接热调用：
+`full` 复用客户端 drain 循环、`key-prefix` 复用同一分类实现（env 里的
+`BENCH_KEY_PREFIX/SCENARIO/COUNT`）；返回 cleared/passes/elapsed，RPC 失败或未收敛
+按失败处理。服务创建/健康/调用任一步失败 → 记 WARN 并**自动回退**逐阶段 legacy
+（`run_stage`），行为不回归。释放等待仍在编排机（`_wait_store_released`）。
 
 以上闸门与执行统一收敛在编排侧唯一入口 `_remove_keys_stage()`（precheck → `run_stage` →
 释放等待），所有站点（basic/pipeline/kvtest/sweep/fail-cleanup）都经它执行；命令与日志

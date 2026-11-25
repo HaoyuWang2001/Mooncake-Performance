@@ -955,6 +955,280 @@ def _apply_monitor_overrides(matrix, args):
     return matrix
 
 
+_REMOVE_SVC_PORT = 9401
+_REMOVE_SVC_REQUESTS = {"cpu": "10m", "memory": "32Mi"}
+_REMOVE_SVC_LIMITS = {"cpu": "200m", "memory": "256Mi"}
+
+
+def _remove_service_enabled(cluster, globals_cfg):
+    """k8s.remove_service (default true): a tiny per-run remove pod holds one
+    warm store client from the measurement window to the sweep-end remove."""
+    if not cluster or cluster.get("_controller") is None:
+        return False
+    return bool(((globals_cfg or {}).get("k8s") or {})
+                .get("remove_service", True))
+
+
+def _remove_service_name(run_label):
+    name = "mc-{}-remove".format(run_label).lower()
+    name = re.sub(r"[^a-z0-9.-]+", "-", name)
+    return name.strip("-.")[:63].rstrip("-.")
+
+
+def _render_remove_deployment_yaml(cluster, ts, cfg_name):
+    """Tiny 1-replica Deployment hosting the long-lived remove service."""
+    k8s = k8s_settings(cluster)
+    run_label = k8s_run_label(ts, cfg_name)
+    name = _remove_service_name(run_label)
+    ns = k8s["namespace"]
+    image = k8s.get("image") or ""
+    pod_ws = k8s.get("pod_workspace") or "/tmp/Mooncake-Performance"
+    scripts_mount = posixpath.join(pod_ws, "scripts")
+    cm = _configmap_name(run_label)
+    yaml_text = """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app: mc-remove
+    run: "{run_label}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mc-remove
+      run: "{run_label}"
+  template:
+    metadata:
+      labels:
+        app: mc-remove
+        run: "{run_label}"
+    spec:
+      containers:
+      - name: remove
+        image: "{image}"
+        imagePullPolicy: IfNotPresent
+        command: ["sleep", "infinity"]
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        resources:
+          requests:
+            cpu: "{req_cpu}"
+            memory: "{req_mem}"
+          limits:
+            cpu: "{lim_cpu}"
+            memory: "{lim_mem}"
+        volumeMounts:
+        - name: scripts
+          mountPath: {scripts_mount}
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: {cm}
+""".format(name=name, ns=ns, run_label=run_label, image=image,
+           req_cpu=_REMOVE_SVC_REQUESTS["cpu"],
+           req_mem=_REMOVE_SVC_REQUESTS["memory"],
+           lim_cpu=_REMOVE_SVC_LIMITS["cpu"],
+           lim_mem=_REMOVE_SVC_LIMITS["memory"],
+           scripts_mount=scripts_mount, cm=cm)
+    return name, run_label, yaml_text
+
+
+def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
+    """Create the remove Deployment, launch the service and wait /health.
+
+    Returns True once the store client is ready; raises on any setup error
+    (the caller records it and remove stages fall back to the legacy path).
+    """
+    st = cluster.setdefault("_remove_svc", {})
+    if st.get("deploy") and st.get("ok"):
+        return True
+    k8s = k8s_settings(cluster)
+    c = cluster["_controller"]
+    name, run_label, yaml_text = _render_remove_deployment_yaml(
+        cluster, ts, cfg_name)
+    st["deploy"] = name
+    if dry:
+        log("[remove-service] (dry-run) would create {} (ns={})".format(
+            name, k8s["namespace"]))
+        return False
+    import tempfile
+    local_dir = tempfile.mkdtemp(prefix="mc-remove-")
+    local_yaml = os.path.join(local_dir, name + ".yaml")
+    try:
+        with open(local_yaml, "w", encoding="utf-8", newline="\n") as f:
+            f.write(yaml_text)
+        yaml_dir = posixpath.join(k8s["controller_workspace"], "pods")
+        controller_put(c, [local_yaml], yaml_dir)
+        remote_yaml = posixpath.join(yaml_dir, name + ".yaml")
+        out, rc = controller_run(
+            c, ["-n", k8s["namespace"], "apply", "-f", remote_yaml],
+            check=False)
+        if rc != 0:
+            raise RuntimeError("kubectl apply failed for {}: {}".format(
+                name, (out or "").strip()[:300]))
+    finally:
+        shutil.rmtree(local_dir, ignore_errors=True)
+    cluster.setdefault("_k8s_deployments", []).append(name)
+    t0 = time.time()
+    wait_k8s_deployment_ready(cluster, name, run_label)
+    out, rc = controller_run(
+        c, ["-n", k8s["namespace"], "get", "pods", "-l",
+            "app=mc-remove,run=" + run_label, "-o",
+            "jsonpath={.items[0].metadata.name}"], check=False)
+    pod = (out or "").strip()
+    if rc != 0 or not pod:
+        raise RuntimeError("remove-service pod not found for {}".format(name))
+    ip = _k8s_pod_ip(c, k8s["namespace"], pod)
+    entry = {"name": pod, "ip": ip, "_pod": pod, "_ns": k8s["namespace"],
+             "_controller": c,
+             "_controller_workspace": k8s.get("controller_workspace")}
+    st["node"] = entry
+    scripts_dir = posixpath.join(k8s.get("pod_workspace")
+                                 or "/tmp/Mooncake-Performance", "scripts")
+    log_dir = posixpath.join(k8s.get("pod_workspace")
+                             or "/tmp/Mooncake-Performance", "logs")
+    launch = (
+        "set -a; . {env}; if [ -f {envm} ]; then . {envm}; fi; "
+        "export LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:${{LD_LIBRARY_PATH:-}}; "
+        "mkdir -p {logdir}; nohup \"${{ORCH_VENV:-python3}}\" {svc} "
+        "--port {port} > {log} 2>&1 & echo $!").format(
+            env=shlex.quote(posixpath.join(scripts_dir, "env.sh")),
+            envm=shlex.quote(posixpath.join(scripts_dir, "env.mooncake.sh")),
+            logdir=shlex.quote(log_dir),
+            svc=shlex.quote(posixpath.join(scripts_dir, "remove_service.py")),
+            port=_REMOVE_SVC_PORT,
+            log=shlex.quote(posixpath.join(log_dir, "remove_service.log")))
+    ssh_check_output(ip, entry, launch, quiet=True)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        _check_stop()
+        try:
+            code = ssh_check_output(
+                ip, entry,
+                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 "
+                "http://127.0.0.1:{}/health".format(_REMOVE_SVC_PORT),
+                quiet=True)
+            if str(code).strip() == "200":
+                st["ok"] = True
+                st["cold_start_s"] = round(time.time() - t0, 1)
+                log("[remove-service] ready (cold start {:.1f}s, pod={})"
+                    .format(st["cold_start_s"], pod))
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    raise RuntimeError("remove-service /health timed out after 120s")
+
+
+def _remove_service_prewarm_async(cluster, globals_cfg, ts, cfg_name,
+                                  dry=False):
+    """Start the remove pod + warm store client in the background.
+
+    Called at the kvtest measurement start so the ~40s client cold start is
+    hidden under the (long) measured window; config-end remove then pays only
+    the drain itself. Failures are recorded and remove stages fall back to
+    the legacy per-stage path."""
+    if dry or not _remove_service_enabled(cluster, globals_cfg):
+        return
+    st = cluster.setdefault("_remove_svc", {})
+    if st.get("event") is not None:
+        return
+    st["event"] = threading.Event()
+
+    def _run():
+        try:
+            _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry)
+        except StopRequested:
+            st["ok"] = False
+            st["error"] = "stopped"
+        except Exception as exc:
+            st["ok"] = False
+            st["error"] = str(exc)
+            log("[WARN] [remove-service] prewarm failed, remove stages fall "
+                "back to legacy: {}".format(exc))
+        finally:
+            st["event"].set()
+
+    threading.Thread(target=_run, name="remove-svc-prewarm",
+                     daemon=True).start()
+
+
+def _remove_service_call(cluster, globals_cfg, scope, when, timeout_s=120.0):
+    """POST /remove to the warm service. None -> caller uses the legacy path.
+
+    A SERVICE-reported failure (ok=false: RPC error / not drained) raises —
+    that is a real stage failure, exactly like the client CLI exiting 1."""
+    if not _remove_service_enabled(cluster, globals_cfg):
+        return None
+    st = (cluster or {}).get("_remove_svc") or {}
+    ev = st.get("event")
+    if ev is None:
+        return None
+    if not ev.wait(max(0.0, timeout_s)):
+        log("[WARN] [remove-service] {}: not ready after {:.0f}s; legacy "
+            "path".format(when, timeout_s))
+        return None
+    if not st.get("ok"):
+        log("[WARN] [remove-service] {}: unavailable ({}); legacy path"
+            .format(when, st.get("error") or "unknown"))
+        return None
+    entry = st.get("node")
+    if not entry:
+        return None
+    try:
+        max_passes = int(os.environ.get("MC_REMOVE_ALL_MAX_PASSES", "32"))
+    except (TypeError, ValueError):
+        max_passes = 32
+    try:
+        pass_delay = float(os.environ.get("MC_REMOVE_ALL_PASS_DELAY", "1.0"))
+    except (TypeError, ValueError):
+        pass_delay = 1.0
+    payload = {"scope": scope, "max_passes": max(1, max_passes),
+               "pass_delay": max(0.0, pass_delay)}
+    cmd = ("curl -s --noproxy '*' --max-time {} -X POST "
+           "-H 'Content-Type: application/json' --data {} "
+           "http://127.0.0.1:{}/remove").format(
+               int(timeout_s) + 300, shlex.quote(json.dumps(payload)),
+               _REMOVE_SVC_PORT)
+    try:
+        raw = ssh_check_output(entry["ip"], entry, cmd, quiet=True)
+        result = json.loads((raw or "").strip() or "{}")
+    except Exception as exc:
+        log("[WARN] [remove-service] {}: call failed ({}); legacy path"
+            .format(when, exc))
+        return None
+    if not result.get("ok"):
+        raise RuntimeError("remove-service {} failed: {}".format(
+            when, result.get("error") or "unknown"))
+    log("[remove-service] {}: cleared={} passes={} ({}s)".format(
+        when, result.get("cleared"), result.get("passes"),
+        result.get("elapsed_s")))
+    return result
+
+
+def _remove_service_cleanup(cluster):
+    """Delete the remove Deployment (idempotent; namespace teardown兜底)."""
+    st = (cluster or {}).get("_remove_svc") or {}
+    name = st.get("deploy")
+    c = (cluster or {}).get("_controller")
+    if not name or not c:
+        return
+    k8s = k8s_settings(cluster)
+    try:
+        out, rc = controller_run(
+            c, ["-n", k8s["namespace"], "delete", "deployment", name,
+                "--ignore-not-found"], check=False)
+        log_detail("[remove-service] cleanup {} rc={}".format(name, rc))
+    except Exception as exc:
+        log_detail("[remove-service] cleanup failed: {}".format(exc))
+
+
 def _remove_keys_stage(cluster, globals_cfg, host, node, runner,
                        remote_log_dir, cfg_name, log_name, scope, when,
                        dry=False, pull_to=None, node_name=None, label=None,
@@ -983,6 +1257,12 @@ def _remove_keys_stage(cluster, globals_cfg, host, node, runner,
     if globals_cfg is not None and _remove_keys_precheck(
             cluster, globals_cfg, cfg_name, when):
         return False
+    # run 级预热 remove 服务：热调用失败/不可用 -> 透明回退 legacy run_stage
+    res = _remove_service_call(cluster, globals_cfg, scope, when)
+    if res is not None:
+        if scope == "full" and globals_cfg is not None:
+            _wait_store_released(cluster, globals_cfg, cfg_name, when)
+        return True
     run_stage(host, node, runner, "remove-keys", remote_log_dir, log_name,
               extra="--scope " + scope, dry_run=False, pull_to=pull_to,
               cfg_name=cfg_name, node_name=node_name, label=label)
@@ -2266,6 +2546,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                  ("bench_etcd.py", SCRIPTS_DIR),
                  ("logstats.py", SCRIPTS_DIR),
                  ("tracestats.py", SCRIPTS_DIR),
+                 ("remove_service.py", SCRIPTS_DIR),
                  ("env.sh", None)]
         mooncake_env = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
         if os.path.exists(mooncake_env):
@@ -7928,6 +8209,11 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # ---- measurement window: /start (no warmup) or /arm (warmup)
                 # established the measured epoch. summary elapsed_seconds
                 # therefore excludes launch, health gates and warmup.
+                # Pre-warm the run-level remove service under the (long)
+                # measurement window: config-end remove then pays only the
+                # drain (~2s), not a fresh ~40s store-client cold start.
+                _remove_service_prewarm_async(cluster, globals_cfg, ts,
+                                              cfg_name, dry)
                 stage = "measurement ({})".format(ds)
                 _wait_window(duration, "measurement")
             except StopRequested:
@@ -8129,9 +8415,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     local_log_dir, cfg,
                     _kvtest_report_context(cluster, ts, remote_log_dir,
                                            is_k8s))
-            log("[kvtest] pulled: {} files / {} instances ({:.1f} min, {}; "
-                "samples={:.1f}MB trace={:.1f}MB summary={:.1f}MB "
-                "other={:.1f}MB; raw logs stay on nodes)".format(
+            if not _ctrl_done:
+                log("[kvtest] pulled: {} files / {} instances ({:.1f} min, "
+                    "{}; samples={:.1f}MB trace={:.1f}MB summary={:.1f}MB "
+                    "other={:.1f}MB; raw logs stay on nodes)".format(
                     sum(len(f) for _n, f, _l in _groups), len(_groups),
                     (time.time() - _t_pull) / 60.0, _fmt_mb(_pulled_bytes),
                     _cat_bytes["samples"] / 1048576.0,
@@ -10391,6 +10678,8 @@ def main(args, cfg_paths):
                 cleanup_pods(cluster, [sweep_remove["node"]], False)
             except Exception as exc:
                 log("[WARN] k8s pod cleanup after sweep-end: {}".format(exc))
+    if not (args.mode == "k8s" and cluster.get("_k8s_keep_ns")):
+        _remove_service_cleanup(cluster)
     if args.mode == "k8s" and not args.dry_run:
         if cluster.get("_k8s_keep_ns"):
             log("[k8s] namespace {} kept for troubleshooting; teardown "

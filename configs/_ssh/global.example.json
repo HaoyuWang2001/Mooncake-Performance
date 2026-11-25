@@ -20,10 +20,11 @@
     "fanout_workers": 16,
     "pull_workers": 10
   },
-  "_k8s_comment": "k8s 数据面（可选）：reduce_on_controller=true（默认）时 kvtest 产物经 kubectl cp 单跳落 controller，map+reduce 在 controller 完成，编排机只收 reduced/meta/summary（失败自动回退本地链路）；controller_keep_data=true 保留 controller 侧 per-run 中间产物（默认成功后清理，失败总是保留）。",
+  "_k8s_comment": "k8s 数据面（可选）：reduce_on_controller=true（默认）时 kvtest 产物经 kubectl cp 单跳落 controller，map+reduce 在 controller 完成，编排机只收 reduced/meta/summary（失败自动回退本地链路）；controller_keep_data=true 保留 controller 侧 per-run 中间产物（默认成功后清理，失败总是保留）。 remove_service=true（默认）时 run 级创建一个极小 remove pod（测量期预热常驻客户端），各阶段 remove 走热调用；不可用自动回退逐阶段 legacy。",
   "k8s": {
     "reduce_on_controller": true,
-    "controller_keep_data": false
+    "controller_keep_data": false,
+    "remove_service": true
   },
   "_pipeline_comment": "pipeline 可选调优：key_space_ratio = 可写 key 空间占 effective store 的比例（默认 0.9，必须 0<r<1，越小越安全）；require_clean_store=true 时 remove-keys 后 store 仍非空（超过 1% 容差）会直接失败（默认仅 WARN，用于排查跨 run 残留）；remove_skip_when_clean=true（默认）时执行前先探测 master 指标，已分配空间 <= 1% 容差即跳过 remove-keys（探测不可用则照常执行，绝不懈怠）；remove_release_timeout_s=等待 master oplog 回放 remove-all 的最长秒数（默认 120，0 关闭等待，退化成立即校验）。",
   "pipeline": {

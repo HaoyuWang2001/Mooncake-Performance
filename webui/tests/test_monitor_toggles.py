@@ -18,7 +18,7 @@ def _build(flags, mode="ssh", launch_mode="single"):
     runs_mod.os.path.isdir = lambda p: True
     import scripts.run_rank_recall as rr
     orig_part = rr.partition_configs
-    rr.partition_configs = lambda dirs, files: ({}, {})
+    rr.partition_configs = lambda dirs, files, **kw: ({}, {})
     try:
         return runs_mod._build_run_argv(body)
     finally:
