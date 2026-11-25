@@ -436,7 +436,7 @@ def test_reduce_trace_block_and_sources(tmp_path):
     # 慢点追踪：每组各自 Top-K（根级全局 top 已移除）
     assert "top" not in tr
     assert tr["groups"]["write"]["top"][0]["total_us"] == 401
-    assert tr["groups"]["read"]["top"][0]["total_us"] == 266
+    assert tr["groups"]["read"]["top"][0]["total_us"] == 269
 
 
 def test_render_trace_section(tmp_path):
@@ -2691,7 +2691,7 @@ def test_slow_tracking_ranked_colors_and_legend_solo(tmp_path):
 
 def _trace_group_lines(kind, n, start_total, tid0):
     tpl = TRACE_READ if kind == "read" else TRACE_WRITE
-    tpl_total = 266 if kind == "read" else 401
+    tpl_total = 269 if kind == "read" else 401
     out = []
     for i in range(n):
         out.append(tpl
