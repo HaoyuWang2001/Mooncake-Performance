@@ -3866,6 +3866,86 @@ def _kill_remote_process(cluster, node_name, pid):
         log("[WARN] fail-cleanup: kill pid {} on {} failed: {}".format(pid, node_name, exc))
 
 
+def _kvtest_summary_stat(cluster, entry):
+    """Per-instance kvtest_out summary.json (mtime, size), or None.
+
+    Salvage evidence: summary.json is written LAST by MetricsCollector::Stop
+    (WriteSamples -> WriteSummary), so a fresh file proves samples+summary
+    are complete. Both the pre-/stop baseline and the post-timeout probe stat
+    the SAME node filesystem, so the freshness comparison is immune to
+    orchestrator/node clock skew."""
+    n = get_node(cluster, entry["node"])
+    try:
+        out = ssh_check_output(
+            n["ip"], n,
+            "stat -c '%Y %s' {} 2>/dev/null || echo MISSING".format(
+                shlex.quote(entry["_out_dir"] + "/summary.json")),
+            quiet=True)
+    except Exception:
+        return None
+    parts = str(out or "").split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _kvtest_salvage_stuck(cluster, stuck_pairs, baseline):
+    """Salvage /stop-stuck kvtest instances whose metrics already persisted.
+
+    Known Mooncake kvtest shutdown deadlock (image 202611250330.c38d27f6):
+    after MetricsCollector::Stop() the process hangs in NotifyRpcServer::Stop
+    / HttpServer::Stop (keep-alive connection-thread join), so /stop is
+    acknowledged but the binary never exits. The measured data is complete on
+    disk at that point. For every stuck instance whose summary.json is fresh
+    (exists, non-empty and newer than the pre-/stop baseline) SIGKILL the
+    kvtest child: the run_kvtest.sh wrapper then reaps it, writes .exitrc and
+    exits on its own. Returns the salvaged [(entry, pid)]; anything not
+    provably persisted is left to the caller's strict failure path."""
+    salvaged = []
+    for entry, pid in stuck_pairs:
+        iid = entry["iid"]
+        stat = _kvtest_summary_stat(cluster, entry)
+        base = baseline.get(iid)
+        fresh = (stat is not None and stat[1] > 0
+                 and (base is None or stat[0] > base[0]))
+        if not fresh:
+            log("[WARN] [kvtest] i{}: metrics not persisted after /stop "
+                "(summary.json {}) — not salvageable".format(
+                    iid, "missing" if stat is None else "stale"))
+            continue
+        n = get_node(cluster, entry["node"])
+        # SIGKILL bypasses the shutdown deadlock. Kill only the child first
+        # so the wrapper finishes its exitrc ledger; the wrapper fallback is
+        # guarded by the cmdline marker because container pids are recycled
+        # almost immediately after exit (never signal a reused pid).
+        try:
+            ssh_check_output(
+                n["ip"], n,
+                "kill -9 $(pgrep -P {pid} 2>/dev/null) 2>/dev/null; "
+                "sleep 2; if tr '\\0' ' ' < /proc/{pid}/cmdline 2>/dev/null "
+                "| grep -qF {m}; then kill -9 {pid} 2>/dev/null; fi || true"
+                .format(pid=pid, m=_marker_probe(_KVTEST_PID_MARKER)),
+                quiet=True)
+        except Exception as exc:
+            log("[WARN] [kvtest] i{}: salvage kill failed: {}".format(
+                iid, exc))
+            continue
+        if wait_process_exit(cluster, entry["node"], pid,
+                             "kvtest salvage i{}".format(iid), 15,
+                             marker=_KVTEST_PID_MARKER):
+            log("[WARN] [kvtest] i{} on {} salvaged: metrics persisted "
+                "before the shutdown hang; kvtest killed, collecting"
+                .format(iid, entry["node"]))
+            salvaged.append((entry, pid))
+        else:
+            log("[WARN] [kvtest] i{} on {}: kill did not end the wrapper"
+                .format(iid, entry["node"]))
+    return salvaged
+
+
 def _pipeline_etcd_endpoints(globals_cfg):
     """Pipeline rendezvous etcd endpoints (global.json etcd_endpoints).
     Required for pipeline regardless of master_type: readers self-register
@@ -8258,6 +8338,14 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 raise
             # /stop joins in-flight work and MetricsCollector::Stop writes the
             # single final summary. Avoid a racing pre-stop /summary snapshot.
+            # Salvage baseline: summary.json is only written by that Stop, so
+            # "absent -> present" (or a later mtime) proves the data persisted
+            # even when the binary then hangs in its shutdown path.
+            _stop_baseline = {}
+            if not dry:
+                for _entry, _pid in instance_pids:
+                    _stop_baseline[_entry["iid"]] = _kvtest_summary_stat(
+                        cluster, _entry)
             stage = "/stop ({})".format(ds)
             log("[kvtest] /stop: 通知 {} 个实例停机并落盘...".format(len(items)))
             for _what, _ok, _err in _pipeline_http_parallel(cluster, items,
@@ -8316,12 +8404,23 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 log("[kvtest] instances exited: {}/{} ({:.1f}s)".format(
                     _exited, len(instance_pids), time.time() - _t0))
                 if _exited != len(instance_pids):
-                    _alive = ["i{} on {}".format(entry["iid"], entry["node"])
-                              for (entry, _pid), exited in
-                              zip(instance_pids, _exit_results) if not exited]
-                    raise RuntimeError(
-                        "kvtest shutdown timed out after two /stop attempts; "
-                        "still alive: {}".format(", ".join(_alive)))
+                    _stuck = [(entry, pid) for (entry, pid), exited in
+                              zip(instance_pids, _exit_results)
+                              if not exited]
+                    _salvaged = _kvtest_salvage_stuck(
+                        cluster, _stuck, _stop_baseline)
+                    if len(_salvaged) != len(_stuck):
+                        _alive = ["i{} on {}".format(entry["iid"],
+                                                     entry["node"])
+                                  for entry, _pid in _stuck]
+                        raise RuntimeError(
+                            "kvtest shutdown timed out after two /stop "
+                            "attempts; still alive: {}".format(
+                                ", ".join(_alive)))
+                    log("[WARN] [kvtest] salvaged {}/{} /stop-stuck "
+                        "instances ({}) — metrics persisted before the "
+                        "shutdown hang; continuing to collection".format(
+                            len(_salvaged), len(_stuck), ds))
             # ---- flatten artifacts + remote trace map + compact pull ----
             stage = "collect artifacts ({})".format(ds)
             log_phase("收集", level=2)
