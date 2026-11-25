@@ -412,9 +412,30 @@ def controller_put(controller, local_files, remote_dir):
     sftp = _ssh_client(controller).open_sftp()
     try:
         for f in local_files:
-            sftp.put(f, remote_dir.rstrip("/") + "/" + os.path.basename(f))
+            remote = remote_dir.rstrip("/") + "/" + os.path.basename(f)
+            try:
+                sftp.put(f, remote)
+            except IOError as exc:
+                # A concurrent truncate of the same remote path (parallel
+                # children) or a flaky channel can fail paramiko's size
+                # confirmation with zero bytes written; one idempotent retry
+                # on a fresh session. Anything else propagates.
+                if "size mismatch" not in str(exc):
+                    raise
+                log_detail("[k8s] upload {}: size mismatch ({}), retrying "
+                           "on a fresh session".format(
+                               os.path.basename(f), exc))
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+                sftp = _ssh_client(controller).open_sftp()
+                sftp.put(f, remote)
     finally:
-        sftp.close()
+        try:
+            sftp.close()
+        except Exception:
+            pass
 
 
 def controller_get_file(controller, remote_path, local_dir, timeout=None):

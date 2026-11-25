@@ -30,9 +30,11 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 
 from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    clear_stop, controller_desc, controller_diagnose,
@@ -2092,7 +2094,29 @@ def k8s_prerun(cluster, dry_run=False):
         return
     log_detail("[k8s] pre-run upload: {} -> {}:{}".format(
         os.path.relpath(script, ROOT), controller_desc(c), remote_path))
-    controller_put(c, [script], k8s["controller_workspace"])
+    # Parallel rank+recall children share this controller workspace and both
+    # install this file at startup. Uploading straight to the shared name is a
+    # real race: SFTP opens with O_TRUNC, so a peer's truncate landing between
+    # our write and paramiko's confirm-stat fails with
+    # "size mismatch in put!  0 != N" (seen intermittently on real clusters).
+    # Upload to a unique sibling name and atomically mv it into place: same
+    # content, last rename wins, no truncation window on the shared path.
+    tmp_dir = tempfile.mkdtemp(prefix="mc-prerun-")
+    try:
+        tmp_name = "k8s-prerun.sh.{}.{}".format(
+            os.getpid(), uuid.uuid4().hex[:8])
+        tmp_local = os.path.join(tmp_dir, tmp_name)
+        shutil.copy2(script, tmp_local)
+        controller_put(c, [tmp_local], k8s["controller_workspace"])
+        tmp_remote = posixpath.join(k8s["controller_workspace"], tmp_name)
+        _out, _rc = controller_exec(c, "mv -f {} {}".format(
+            shlex.quote(tmp_remote), shlex.quote(remote_path)))
+        if _rc != 0:
+            raise RuntimeError(
+                "k8s pre-run script install failed (rc={}): {}".format(
+                    _rc, (_out or "").strip()[:300]))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     log("[k8s] pre-run: bash {}".format(remote_path))
     t0 = time.time()
     out, rc = controller_exec(c, "bash " + remote_path)
@@ -3501,6 +3525,49 @@ def _generate_reports(cfg, local_log_dir, args, early_stop=False,
         return None
 
 
+def _slim_overview_unit(sc):
+    """Overview-only projection of one unit's reduce payload.
+
+    The parent (rank+recall) overview renders cards from summary fields only,
+    so drop the per-sample bins/series here to keep overview_units.json small;
+    the full payload stays in the unit's own data.js."""
+    out = {}
+    for key, val in sc.items():
+        if key == "sizes":
+            out["sizes"] = {
+                size: {"summary": (z or {}).get("summary")}
+                for size, z in (val or {}).items()}
+        elif key == "monitors":
+            out["monitors"] = {"summary": (val or {}).get("summary")}
+        else:
+            out[key] = val
+    return out
+
+
+def _write_overview_units(ov_dir, run_name, accs):
+    """Persist the slim per-unit index beside the overview.html.
+
+    scripts/run_rank_recall.py merges the two children's indexes into one
+    parent overview. WARN-only: never affects this run's reports."""
+    try:
+        units = []
+        for acc in accs:
+            sc = _slim_overview_unit(dict(acc["data"]))
+            sc["unit"] = acc.get("unit") or ""
+            units.append({
+                "report_html": acc.get("report_html") or "",
+                "unit": sc["unit"],
+                "sc": sc,
+            })
+        os.makedirs(ov_dir, exist_ok=True)
+        with open(os.path.join(ov_dir, "overview_units.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"run": run_name, "units": units}, f,
+                      ensure_ascii=False)
+    except Exception as exc:
+        log_detail("[report] overview_units.json write failed: {}".format(exc))
+
+
 def _render_run_overview(ts_dir, mode=""):
     """Render the run-level overview.html from the scenarios accumulated so
     far (also used by the STOP path). WARN-only, never raises outward."""
@@ -3511,11 +3578,13 @@ def _render_run_overview(ts_dir, mode=""):
     scenarios = []
     # snapshot: a STOP can race a background post-processing unit that is
     # still appending to the accumulator
-    for acc in list(_REPORT_ACC):
+    _accs = list(_REPORT_ACC)
+    for acc in _accs:
         rel = os.path.relpath(acc["report_html"], ov_dir)
         sc = dict(acc["data"], report_rel=rel.replace(os.sep, "/"))
         sc["unit"] = acc.get("unit") or ""
         scenarios.append(sc)
+    _write_overview_units(ov_dir, os.path.basename(ts_dir), _accs)
     by_node = {}
     for sc in scenarios:
         for n in sc.get("nodes") or []:

@@ -485,19 +485,10 @@ const InstanceView = {
           <el-button size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      @click="gotoResults">跳转至结果详情</el-button>
-          <el-dropdown v-if="isCombined" trigger="click" @command="openRoleReport"
-                       :disabled="!latestRun || !latestRun.ts_dir">
-            <el-button size="small" plain :disabled="!latestRun || !latestRun.ts_dir"
-                       :title="latestRun && latestRun.ts_dir ? '' : '该运行还没有产物（未运行或已清理）'">
-              查看报表
-            </el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="rank">rank 报表（overview.html）</el-dropdown-item>
-                <el-dropdown-item command="recall">recall 报表（overview.html）</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+          <el-button v-if="isCombined" size="small" plain
+                     :disabled="!latestRun || !latestRun.ts_dir"
+                     :title="latestRun && latestRun.ts_dir ? '' : '该运行还没有产物（未运行或已清理）'"
+                     @click="openCombinedReport">查看报表</el-button>
           <el-button v-else size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      :title="latestRun && latestRun.ts_dir ? '' : '该运行还没有产物（未运行或已清理）'"
@@ -746,20 +737,23 @@ const InstanceView = {
       }
       _openRawReport(loc.root, pick);
     }
-    /* 双任务（rank + recall）：按角色打开 <role>/report/overview.html */
-    async function openRoleReport(role) {
+    /* 双任务（rank + recall）：直接打开父级总览 report/overview.html
+       （总览内每配置一卡并链接到两侧全部单元报表）；旧 run 没有父级
+       总览时回退到 rank 侧，保证仍能看报表。 */
+    async function openCombinedReport() {
       const r = latestRun.value;
       if (!r || !r.ts_dir) return;
       const loc = _reportLoc(r.ts_dir);
       const base = loc.base;
-      // ts_dir 可能已是 outputs/<parent>/rank（子目录）：角色目录在父目录下
+      // ts_dir 可能已是 outputs/<parent>/rank（子目录）：父目录是它的上级
       const parent = (base === "rank" || base === "recall")
         ? base.split("/").slice(0, -1).join("/") : base;
-      const pref = (parent ? parent + "/" : "") + role + "/";
+      const pref = parent ? parent + "/" : "";
       const files = await _treeOf(loc.root);
-      const pick = _pickReport(files, pref, true);
+      let pick = files.find(f => f === pref + "report/overview.html");
+      if (!pick) pick = _pickReport(files, pref + "rank/", true);
       if (!pick) {
-        ElementPlus.ElMessage.warning(role + " 还没有报表（未生成或已清理）");
+        ElementPlus.ElMessage.warning("该 run 还没有报表（未生成或已清理）");
         return;
       }
       _openRawReport(loc.root, pick);
@@ -790,6 +784,6 @@ const InstanceView = {
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, closeMissingTab, activate, closeTab,
              statusType, statusText, fmtTimeAbs, run, stop, remove, rename,
-             reconnectRun, gotoResults, openReport, openRoleReport };
+             reconnectRun, gotoResults, openReport, openCombinedReport };
   },
 };

@@ -286,18 +286,17 @@ def test_instance_reconnect_after_webui_restart():
     assert ".ilog-conn" in css
 
 
-def test_instance_report_dropdown_for_rank_recall():
-    """查看报表：单任务直开 overview.html；rank+recall 下拉选择角色报表。"""
+def test_instance_report_button_opens_overview():
+    """查看报表：单任务直开本 run 的 overview.html；rank+recall 直开父级
+    聚合总览（内含两侧全部单元报表链接），旧 run 回退 rank 侧。"""
     src = open(os.path.join(JS_DIR, "views", "instance-view.js"),
                encoding="utf-8").read()
     assert "function _reportLoc(" in src and "function _pickReport(" in src
-    assert "function openRoleReport(" in src
-    assert '<el-dropdown v-if="isCombined"' in src
-    assert 'command="rank"' in src and 'command="recall"' in src
-    assert "rank 报表（overview.html）" in src
-    assert "recall 报表（overview.html）" in src
+    assert "function openCombinedReport(" in src
+    assert '@click="openCombinedReport">查看报表' in src
     assert '@click="openReport">查看报表' in src   # 单任务仍走直开
     assert "report/overview.html" in src
+    assert "openRoleReport" not in src
 
 
 def test_report_picker_pure_logic():

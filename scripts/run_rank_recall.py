@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run rank and recall benchmark groups concurrently as one managed task."""
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -35,6 +36,7 @@ def partition_configs(config_dirs, config_files, configs_root=None):
         paths.append(path)
 
     groups = {"rank": [], "recall": []}
+    cfgs = {"rank": [], "recall": []}
     seen = set()
     for path in paths:
         full = os.path.abspath(path)
@@ -48,9 +50,36 @@ def partition_configs(config_dirs, config_files, configs_root=None):
                 "parallel rank+recall only accepts work_mode=rank|recall: "
                 "{} ({})".format(path, work_mode or "missing"))
         groups[work_mode].append(path)
+        cfgs[work_mode].append(cfg)
     for work_mode in ("rank", "recall"):
         if not groups[work_mode]:
             raise ValueError("no {} test config selected".format(work_mode))
+    # Deliberately strict: the combined mode exists to align ONE rank and ONE
+    # recall load against each other, so exactly one config per side and an
+    # identical measurement window (warmup + duration) are required — anything
+    # else would interleave mismatched epochs under one barrier.
+    for work_mode in ("rank", "recall"):
+        if len(groups[work_mode]) != 1:
+            raise ValueError(
+                "parallel rank+recall 仅支持一份 rank + 一份 recall 配置"
+                "（当前 rank={}, recall={}）".format(
+                    len(groups["rank"]), len(groups["recall"])))
+
+    def _times(cfg):
+        # effective values, mirroring how benchmark.py resolves them
+        w = cfg.get("warmup")
+        warm = float(w.get("duration", 0) or 0) if isinstance(w, dict) \
+            else float(w or 0)
+        dur = float(cfg.get("duration", 30))
+        return warm, dur
+
+    rank_t, recall_t = _times(cfgs["rank"][0]), _times(cfgs["recall"][0])
+    if rank_t != recall_t:
+        raise ValueError(
+            "parallel rank+recall 要求两份配置的 warmup/duration 完全一致："
+            "rank warmup={:g}s duration={:g}s, "
+            "recall warmup={:g}s duration={:g}s".format(
+                rank_t[0], rank_t[1], recall_t[0], recall_t[1]))
     return groups
 
 
@@ -136,6 +165,85 @@ def _child_env(work_mode):
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     return env
+
+
+def _load_child_units(child_dir):
+    """Slim per-unit index written by benchmark.py beside the child overview."""
+    path = os.path.join(child_dir, "report", "overview_units.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _render_parent_overview(parent_dir):
+    """One combined overview.html over both children.
+
+    Merges the children's overview_units.json, re-anchors every unit report
+    link to the parent report/ dir and renders the regular overview template:
+    one card per config (rank + recall), each with direct links to that
+    side's report.html files. WARN-only: never fails the run."""
+    rank = _load_child_units(os.path.join(parent_dir, "rank"))
+    recall = _load_child_units(os.path.join(parent_dir, "recall"))
+    if not rank and not recall:
+        print("[parallel] 未找到子报表索引（overview_units.json），"
+              "跳过总览生成", flush=True)
+        return None
+    for role, data in (("rank", rank), ("recall", recall)):
+        if not data:
+            print("[parallel] {} 侧没有报表产物（失败或 --no-report），"
+                  "总览仅包含另一侧".format(role), flush=True)
+    ov_dir = os.path.join(parent_dir, "report")
+    scenarios = []
+    for data in (rank, recall):
+        for unit in (data or {}).get("units") or []:
+            sc = dict(unit.get("sc") or {})
+            html_path = unit.get("report_html") or ""
+            sc["report_rel"] = (os.path.relpath(html_path, ov_dir)
+                                .replace(os.sep, "/")) if html_path else ""
+            sc["unit"] = unit.get("unit") or sc.get("unit") or ""
+            scenarios.append(sc)
+    if not scenarios:
+        return None
+    by_node = {}
+    for sc in scenarios:
+        for n in sc.get("nodes") or []:
+            e = by_node.setdefault(n.get("node"), {"node": n.get("node"),
+                                                   "pods": 0, "bytes": 0})
+            e["pods"] += n.get("pods") or 0
+            e["bytes"] += n.get("bytes") or 0
+    started = next((str((sc.get("meta") or {}).get("started"))
+                    for sc in scenarios
+                    if (sc.get("meta") or {}).get("started")),
+                   time.strftime("%Y-%m-%d %H:%M:%S"))
+    run_meta = {
+        "run": os.path.basename(parent_dir.rstrip(os.sep)) or parent_dir,
+        "mode": "rank+recall",
+        "started": started,
+        "nodes": sorted(by_node.values(),
+                        key=lambda x: -(x.get("bytes") or 0)),
+    }
+    # 现场索引：两侧的 namespace / 日志根天然不同（rank 与 recall 各一套
+    # namespace），并列展示而不是取其一。
+    for key in ("host_log_root", "remote_log_dir", "run_id", "k8s_namespace"):
+        vals = []
+        for sc in scenarios:
+            v = (sc.get("meta") or {}).get(key)
+            if v and str(v) not in vals:
+                vals.append(str(v))
+        if vals:
+            run_meta[key] = " / ".join(vals)
+    rp = bm._report_module()
+    ov = rp.render_overview(
+        run_meta, scenarios, ov_dir,
+        rel_base=os.path.relpath(ov_dir, bm.ROOT).replace(os.sep, "/"))
+    print("[parallel] overview -> {}".format(
+        os.path.relpath(ov, bm.ROOT)), flush=True)
+    return ov
 
 
 def parse_args(argv=None):
@@ -277,6 +385,11 @@ def main(argv=None):
     codes = {name: proc.returncode for name, proc in children.items()}
     print("[parallel] finished: rank rc={}, recall rc={}".format(
         codes.get("rank"), codes.get("recall")), flush=True)
+    if not args.dry_run:
+        try:
+            _render_parent_overview(os.path.join(bm.RESULTS_DIR, parent))
+        except Exception as exc:
+            print("[WARN] 总览生成失败: {}".format(exc), flush=True)
     if stop_requested.is_set():
         return 1 if (spawn_error or peer_failure) else 130
     return 0 if all(code == 0 for code in codes.values()) else 1
