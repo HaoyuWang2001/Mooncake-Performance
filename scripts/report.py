@@ -4066,7 +4066,7 @@ function renderVolume(){
   t.appendChild(tb);
   const wrapx=el('div','wrapx'); wrapx.appendChild(t); box.appendChild(wrapx);
 }
-/* 实例与日志现场（合并卡）：节点树（节点可展开）+ 客户端行（writer 在前）
+/* 日志现场（合并卡）：节点树（节点可展开，实例默认折叠）+ 客户端行（writer 在前）
    + 日志文件/大小 + 对慢点追踪的贡献（无 C++ trace 时整列隐藏）。 */
 let clientOpen={};
 function contribMap(z){
@@ -4124,7 +4124,7 @@ function renderClientSite(){
   const tb=el('tbody');
   names.forEach(function(n){
     const list=nodes[n];
-    const open=clientOpen[n]!==false;
+    const open=clientOpen[n]===true;   /* 默认折叠所有实例 */
     const tr=el('tr','node-row');
     tr.style.cursor='pointer';
     tr.title='点击展开/收起该节点的客户端';
@@ -4163,6 +4163,7 @@ function renderClientSite(){
   const wrapx=el('div','wrapx'); wrapx.appendChild(t);
   box.appendChild(wrapx);
 }
+let errOpen={};          /* 错误与异常：节点级收放（默认折叠实例） */
 function renderErrors(){
   const z=Z(); if(!z) return;
   const wrap=document.getElementById('errors');
@@ -4215,22 +4216,32 @@ function renderErrors(){
           Object.keys(c.errors||{}).forEach(function(k){
             agg[k]=(agg[k]||0)+Number(c.errors[k]||0);});
         });
+        const okey=role+'|'+n;
+        const open=errOpen[okey]===true;   /* 默认折叠：只显示节点汇总行 */
         const trn=el('tr','node-row');
-        trn.appendChild(el('td','node-name',n));
+        const tdn=el('td','node-name');
+        const tg=el('button','mini err-toggle',open?'▾':'▸');
+        tg.title=open?'收起该节点实例':'展开该节点实例';
+        tg.onclick=function(){errOpen[okey]=!open;renderErrors();};
+        tdn.appendChild(tg);
+        tdn.appendChild(el('span',null,' '+n));
+        trn.appendChild(tdn);
         trn.appendChild(el('td','','（'+ls.length+' 实例）'));
         trn.appendChild(el('td','n',String(tot)));
         trn.appendChild(el('td','n',String(fail)));
         trn.appendChild(el('td','mono',stCodes(agg)));
         tb.appendChild(trn);
-        ls.forEach(function(c){
-          const tr=el('tr','client-row');
-          tr.appendChild(el('td','', ''));
-          tr.appendChild(el('td','mono',c.name));
-          tr.appendChild(el('td','n',String(c.total)));
-          tr.appendChild(el('td','n',String(c.fail)));
-          tr.appendChild(el('td','mono',stCodes(c.errors)));
-          tb.appendChild(tr);
-        });
+        if(open){
+          ls.forEach(function(c){
+            const tr=el('tr','client-row');
+            tr.appendChild(el('td','', ''));
+            tr.appendChild(el('td','mono',c.name));
+            tr.appendChild(el('td','n',String(c.total)));
+            tr.appendChild(el('td','n',String(c.fail)));
+            tr.appendChild(el('td','mono',stCodes(c.errors)));
+            tb.appendChild(tr);
+          });
+        }
       });
       t.appendChild(tb);
       const wrapx=el('div','wrapx'); wrapx.appendChild(t); wrap.appendChild(wrapx);
@@ -6704,7 +6715,7 @@ memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total
 _SEC_ERRORS = """<div class="card"><h2>错误与异常</h2><div id="errors"></div>
 <h3 class="sec">状态分布</h3><div id="terrs"></div></div>
 """
-_SEC_CLIENTSITE = """<div class="card" id="clientsite"><h2>实例与日志现场</h2>
+_SEC_CLIENTSITE = """<div class="card" id="clientsite"><h2>日志现场</h2>
 <div class="note" id="datanote" style="display:none">全量数据 data.js 未加载（例如通过
 WebUI/HTTP 直接打开）：实例表按 p99 显示前 20 名。
 把 data.js 与 report.html 放在同一目录后重新打开即可查看全量。</div>
