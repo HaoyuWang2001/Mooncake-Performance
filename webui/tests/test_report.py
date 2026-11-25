@@ -433,7 +433,10 @@ def test_reduce_trace_block_and_sources(tmp_path):
     # glog source included in the on-site index with kind=glog
     glogs = [s for s in data["sources"] if s.get("kind") == "glog"]
     assert glogs and glogs[0]["source"] == "c.glog"
-    assert tr["top"] and tr["top"][0]["total_us"] == 401
+    # 慢点追踪：每组各自 Top-K（根级全局 top 已移除）
+    assert "top" not in tr
+    assert tr["groups"]["write"]["top"][0]["total_us"] == 401
+    assert tr["groups"]["read"]["top"][0]["total_us"] == 266
 
 
 def test_render_trace_section(tmp_path):
@@ -2684,6 +2687,78 @@ def test_slow_tracking_ranked_colors_and_legend_solo(tmp_path):
     rows = res.get("detail_rows") or []
     assert rows, res.get("detail_rows")
     assert all("root" not in c for c in rows), rows
+
+
+def _trace_group_lines(kind, n, start_total, tid0):
+    tpl = TRACE_READ if kind == "read" else TRACE_WRITE
+    tpl_total = 266 if kind == "read" else 401
+    out = []
+    for i in range(n):
+        out.append(tpl
+                   .replace("trace_id[18446744073]",
+                            "trace_id[%d]" % (tid0 + i))
+                   .replace("total_us[%d]" % tpl_total,
+                            "total_us[%d]" % (start_total + i)))
+    return out
+
+
+def _trace_group_stats(tmp_path, name, kind, n, start_total, tid0,
+                       node="n1"):
+    from tracestats import compute_trace_stats
+    p = tmp_path / name
+    p.write_text("\n".join(_trace_group_lines(kind, n, start_total, tid0))
+                 + "\n", encoding="utf-8")
+    return compute_trace_stats(str(p), node=node, size="8MB")
+
+
+def test_trace_top_is_per_group_topk(tmp_path):
+    """慢点追踪：先按写/读过滤、再各组 Top-K（图与表恰 K 条；全局 Top 会
+    让一组被另一组挤空，这里用写组时延远高于读组来锁回归）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    trs = [
+        _trace_group_stats(tmp_path, "r1.glog", "read", 100, 1000, 1000000),
+        _trace_group_stats(tmp_path, "w1.glog", "write", 100, 10000, 2000000),
+        _trace_group_stats(tmp_path, "r2.glog", "read", 100, 1100, 3000000),
+        _trace_group_stats(tmp_path, "w2.glog", "write", 100, 10100, 4000000),
+    ]
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=trs)
+    tr = data["sizes"]["8MB"]["trace"]
+    assert "top" not in tr                     # 根级全局榜已移除
+    rt = tr["groups"]["read"]["top"]
+    wt = tr["groups"]["write"]["top"]
+    assert len(rt) == rp.TRACE_TOP_N, len(rt)
+    assert len(wt) == rp.TRACE_TOP_N, len(wt)
+    assert all(e["op"] == "get_buffer" for e in rt)
+    assert all(e["op"] == "put" for e in wt)
+    # 各组保留自己的最高 K 条（降序、组内裁剪，不被对方挤占）
+    assert rt[0]["total_us"] == 1199 and rt[-1]["total_us"] == 1100
+    assert wt[0]["total_us"] == 10199 and wt[-1]["total_us"] == 10100
+
+
+def test_slow_tracking_table_and_chart_follow_group(tmp_path):
+    """切写/读总控：图与表取同一组 Top-K 集合（行数 1:1）。"""
+    a = _stats(tmp_path, "a.reader", "reader")
+    trs = [
+        _trace_group_stats(tmp_path, "r.glog", "read", 5, 1000, 1000000),
+        _trace_group_stats(tmp_path, "w.glog", "write", 3, 10000, 2000000),
+    ]
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=trs)
+    res = _js_check(tmp_path, data, "--slow-tracking", "--ttop-group",
+                    "write")
+    if res is None:
+        return
+    assert res["errors"] == []
+    # 默认组 = read：表格只含读 op，行数与图中柱数一致
+    assert res["ttop_rows"] == 5, res.get("ttop_ops")
+    assert all(op == "get_buffer" for op in res["ttop_ops"]), res["ttop_ops"]
+    tops = res.get("stack_totals") or []
+    assert len(tops) == 5, tops
+    # 切到写路径：表格只含写 op，行数与柱数一致
+    assert res["ttop_rows_after"] == 3, res.get("ttop_ops_after")
+    assert all(op == "put" for op in res["ttop_ops_after"]), \
+        res["ttop_ops_after"]
+    ser = res.get("stack_series_after") or []
+    assert ser and all(x["len"] == 3 for x in ser), ser
 
 
 def test_errors_split_by_role_and_client(tmp_path):

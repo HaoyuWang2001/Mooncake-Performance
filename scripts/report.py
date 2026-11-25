@@ -985,10 +985,11 @@ def _merge_bucket_rows(dst, rows):
 
 
 
-def _merge_trace_stat(groups, st, tops=None):
+def _merge_trace_stat(groups, st, tops_by_group=None):
     """Merge one trace stats file into `groups` (aggregate or per-object).
 
-    tops=None 时不收集慢请求明细（按对象合并时不需要，节省内存）。"""
+    tops_by_group=None 时不收集慢请求明细（按对象合并时不需要，节省内存）；
+    否则按写/读组分别收集，供 reduce 端「先按组过滤、再各组 Top-K」。"""
     m = st.get("meta") or {}
     for gname, g in (st.get("groups") or {}).items():
         gg = groups.setdefault(gname, {"ops": {}})
@@ -1026,13 +1027,13 @@ def _merge_trace_stat(groups, st, tops=None):
                         cur[2] = max(cur[2], float(r[3]))
             _ft = int(o.get("ftier") or 60)
             dst["ftier"] = min(dst.get("ftier") or _ft, _ft)
-            if tops is not None:
+            if tops_by_group is not None:
                 for _e in (o.get("top") or []):
                     _e = dict(_e)
                     _e["node"] = m.get("node") or ""
                     _e["pod"] = m.get("pod") or ""
                     _e["client"] = m.get("source") or ""
-                    tops.append(_e)
+                    tops_by_group.setdefault(gname, []).append(_e)
 
 
 def _finalize_trace_groups(groups, edges, hist_ok):
@@ -1191,7 +1192,7 @@ def reduce_trace_size(trace_list):
     groups = {}
     objects = {}
     clients = []
-    tops = []
+    tops_by_group = {}
     metad = {"files": 0, "lines": 0, "trace_lines": 0, "slice_lines": 0,
              "parse_errors": 0, "sample_rates": {}, "bins": "us-v1",
              "markers": False, "raw_bytes": 0, "product_bytes": 0,
@@ -1223,7 +1224,7 @@ def reduce_trace_size(trace_list):
         for g in (st.get("groups") or {}).values():
             for op, o in (g.get("ops") or {}).items():
                 cl["ops"][op] = cl["ops"].get(op, 0) + (o.get("count") or 0)
-        _merge_trace_stat(groups, st, tops)
+        _merge_trace_stat(groups, st, tops_by_group)
         # ---- 按对象（总计/节点/实例）保留阶段桶：SDK 全链路的对象树用 ----
         node = m.get("node") or ""
         pod = m.get("pod") or m.get("source") or ""
@@ -1253,10 +1254,13 @@ def reduce_trace_size(trace_list):
     for tobj in objects.values():
         _finalize_trace_groups(tobj["groups"], trace_edges, trace_hist_ok)
     # 慢请求时刻归一：start_time 是节点本地钟面时间 -> epoch（前端时间轴用）
-    for _e in tops:
-        _e["ts_epoch"] = _node_ts_epoch(_e.get("start_time"))
-    tops.sort(key=lambda e: -float(e.get("total_us") or 0))
-    return {"meta": metad, "groups": groups, "top": tops[:TRACE_TOP_N],
+    # 每组先过滤（该组自身的慢请求集合）再各自 Top-K —— 图与表恰有 K 条。
+    for _gname, _lst in tops_by_group.items():
+        for _e in _lst:
+            _e["ts_epoch"] = _node_ts_epoch(_e.get("start_time"))
+        _lst.sort(key=lambda e: -float(e.get("total_us") or 0))
+        groups.setdefault(_gname, {"ops": {}})["top"] = _lst[:TRACE_TOP_N]
+    return {"meta": metad, "groups": groups,
             "clients": clients, "objects": objects,
             "object_total": len(objects)}
 
@@ -4066,10 +4070,14 @@ function renderVolume(){
    + 日志文件/大小 + 对慢点追踪的贡献（无 C++ trace 时整列隐藏）。 */
 let clientOpen={};
 function contribMap(z){
+  /* 贡献 = 该客户端在各写/读组 Top-K 中的条数之和 */
   const m={};
-  ((z&&z.trace&&z.trace.top)||[]).forEach(function(r){
-    const k=String(r.client||'').replace(/\.log$/,'');
-    if(k) m[k]=(m[k]||0)+1;
+  const gs=(z&&z.trace&&z.trace.groups)||{};
+  Object.keys(gs).forEach(function(g){
+    ((gs[g]||{}).top||[]).forEach(function(r){
+      const k=String(r.client||'').replace(/\.log$/,'');
+      if(k) m[k]=(m[k]||0)+1;
+    });
   });
   return m;
 }
@@ -4082,8 +4090,8 @@ function renderClientSite(){
   const clients=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&
     FULL.sizes[curSize].clients)||z.clients||[];
   const cs=clients.filter(function(c){return clientInCombo(c.name);});
-  const hasTrace=!!(z.trace&&(z.trace.top||[]).length);
-  const contrib=hasTrace?contribMap(z):null;
+  const contrib=contribMap(z);
+  const hasTrace=Object.keys(contrib).length>0;
   function contribOf(c){
     if(!contrib) return 0;
     return (contrib[c.name]||0)+(c.pod?(contrib[c.pod]||0):0);
@@ -6148,6 +6156,12 @@ function stageBreakdownRow(r,opts){
 }
 let tStackChart=null, tStackLegendBound=false, tStackLegendLock=false;
 let tStackSolo=null;   /* 当前被 solo 的阶段名（null=全部显示） */
+function tTop(g){
+  /* 慢点追踪：每组各自的 Top-K（reduce 端先按组过滤再截断） */
+  const t=traceOf(); if(!t) return [];
+  const gg=(t.groups||{})[g];
+  return (gg&&gg.top)||[];
+}
 function renderTraceStack(){
   /* 慢点追踪：柱按端到端时延降序排列（x 标签=时延值，便于看出
      1000ms/500ms 等聚集簇）；柱高=端到端时延，自下而上=一级阶段；
@@ -6155,9 +6169,8 @@ function renderTraceStack(){
   const box=document.getElementById('tstackchart'); if(!box) return;
   const t=traceOf(); if(!t){box.style.display='none';return;}
   const g=tGroup;
-  const ops=((t.groups||{})[g]||{}).ops||{};
-  const rows=(t.top||[]).filter(function(r){
-    return Number(r.total_us)>0&&ops[r.op];
+  const rows=tTop(g).filter(function(r){
+    return Number(r.total_us)>0;
   }).sort(function(a,b){return Number(b.total_us)-Number(a.total_us);});
   if(!rows.length){box.style.display='none';return;}
   box.style.display='';
@@ -6239,7 +6252,9 @@ function renderTraceStack(){
 function renderTraceTop(cur){
   const tb=document.querySelector('#ttop tbody'); if(!tb) return;
   tb.innerHTML='';
-  const top=(traceOf()||{}).top||[];
+  const top=tTop(tGroup).filter(function(r){
+    return Number(r.total_us)>0;
+  });
   top.forEach(function(r){
     const tr=el('tr');
     tr.style.cursor='pointer';

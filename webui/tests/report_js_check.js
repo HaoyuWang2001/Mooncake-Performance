@@ -1123,6 +1123,34 @@ if (!errs.length) {
       hs.forEach(function (fn) { fn({name: clicked, selected: after2}); });
       const o3 = (charts.tstackchart || []).slice(-1)[0] || {};
       out.legend_restored = (o3.legend && o3.legend.selected) || null;
+      // 表格与图必须同集：捕获当前组的表格 op 列 / 行数
+      function ttopOps() {
+        const tb = getEl("ttop");
+        const tbody = (tb.children || []).find(function (c) {
+          return String(c.tagName || "").toLowerCase() === "tbody";}) ||
+          (tb.children || [])[1];
+        const body = tbody || getEl("#ttop tbody");
+        return ((body && body.children) || []).map(function (tr) {
+          const td = (tr.children || [])[3];
+          return td ? textOf(td).trim() : "";
+        });
+      }
+      out.ttop_ops = ttopOps();
+      out.ttop_rows = out.ttop_ops.length;
+      const wantG = arg("--ttop-group", null);
+      if (wantG) {
+        const label = wantG === "write" ? "写路径"
+          : (wantG === "read" ? "读路径" : "其它");
+        const gbtn = (getEl("tgroups").children || []).find(function (b) {
+          return textOf(b).trim() === label;});
+        if (gbtn && gbtn.onclick) gbtn.onclick();
+        out.ttop_ops_after = ttopOps();
+        out.ttop_rows_after = out.ttop_ops_after.length;
+        const seq2 = charts.tstackchart || [];
+        const oA = seq2.length ? seq2[seq2.length - 1] : null;
+        out.stack_series_after = ((oA && oA.series) || []).map(function (x) {
+          return {name: x.name, len: (x.data || []).length};});
+      }
       // 表格展开：点击第一行，检查紧凑块图（无 total 根行）
       const tb = getEl("ttop");
       const tbody = (tb.children || []).find(function (c) {
@@ -1323,7 +1351,15 @@ if (!errs.length) {
     out.tstack_cats = (topt && topt.xAxis && topt.xAxis.data)
       ? topt.xAxis.data.length : null;
     try {
-      const bk = sandbox.stageBreakdownRow(zz.trace.top[0]);
+      const _anyTop = (function () {
+        const gs = (zz.trace && zz.trace.groups) || {};
+        for (const k in gs) {
+          const lst = gs[k].top || [];
+          if (lst.length) return lst[0];
+        }
+        return null;
+      })();
+      const bk = _anyTop ? sandbox.stageBreakdownRow(_anyTop) : null;
       out.tbreak_text = bk ? textOf(bk) : "";
     } catch (e) { errs.push("tbreak: " + String(e && e.stack || e)); }
     try {
