@@ -5,8 +5,9 @@
 meta.instance 归属该实例，日志/停止/并发守卫沿用 runs 的机制。
 """
 import os
+import shutil
 
-from .. import conflicts, instances, runmgr
+from .. import conflicts, inst_snapshot, instances, runmgr
 from ..common import ApiError, read_json_body
 from ..paths import ROOT
 from .runs import _build_run_argv
@@ -44,6 +45,9 @@ def _summary(inst):
         "flags": flags,
         "selection": {"dirs": sel.get("dirs") or [],
                       "files": sel.get("files") or []},
+        "snapshot": ({"files": inst["snapshot"].get("files"),
+                      "created": inst["snapshot"].get("created")}
+                     if inst.get("snapshot") else None),
     }
 
 
@@ -65,7 +69,20 @@ def api_instance_create(handler, query):
     _build_run_argv(body)
     request = {"selector": body.get("selector") or {},
                "flags": body.get("flags") or {}}
-    inst = instances.create(request, body.get("name"))
+    name = body.get("name")
+    iid = instances.new_id()
+    # 创建瞬间冻结全部配置（含 k8s 模板）；之后改配置不影响该实例
+    try:
+        snap = inst_snapshot.build(iid, name, request)
+    except inst_snapshot.SnapshotError as exc:
+        raise ApiError(400, str(exc))
+    except OSError as exc:
+        raise ApiError(500, "创建配置快照失败: {}".format(exc))
+    try:
+        inst = instances.create(request, name, iid=iid, snapshot=snap)
+    except Exception:
+        shutil.rmtree(inst_snapshot.snapshot_dir(iid), ignore_errors=True)
+        raise
     return {"instance": _summary(inst)}
 
 
@@ -91,9 +108,23 @@ def api_instance_run(handler, query, iid):
     if _active_run(iid) is not None:
         raise ApiError(409, "实例 {} 正在运行，先停止再运行".format(
             inst.get("name") or iid))
-    request = inst.get("request") or {}
-    argv = _build_run_argv(request)
+    original = inst.get("request") or {}
+    snap = inst.get("snapshot") or {}
+    # 运行时只用创建瞬间冻结的配置（旧实例无快照 -> 沿用实时路径）
+    request = snap.get("request") or original
+    configs_root = snap.get("configs_root") or None
+    argv = _build_run_argv(request, configs_root=configs_root)
     identities = conflicts.run_identities(ROOT, request.get("flags") or {})
+    env_extra = None
+    if snap:
+        env_extra = {
+            "MC_CONFIGS_INHERIT_ROOT": (
+                configs_root if os.path.isabs(configs_root)
+                else os.path.join(ROOT, configs_root)),
+            "MC_INSTANCE_SNAPSHOT": (
+                snap["dir"] if os.path.isabs(snap["dir"])
+                else os.path.join(ROOT, snap["dir"])),
+        }
     warnings = []
     sch = runmgr.MGR.scheduler
     if sch is not None and sch.state in ("waiting", "waiting_slot"):
@@ -103,9 +134,12 @@ def api_instance_run(handler, query, iid):
                 os.path.basename(sch.plan_path), sch.next_trigger))
     try:
         run = runmgr.MGR.start_benchmark(
-            argv, meta={"request": request, "instance": iid,
-                        "instance_name": inst.get("name") or iid},
-            identities=identities)
+            argv, meta={"request": original, "instance": iid,
+                        "instance_name": inst.get("name") or iid,
+                        "snapshot": ({"dir": snap.get("dir"),
+                                      "files": snap.get("files")}
+                                     if snap else None)},
+            identities=identities, env_extra=env_extra)
     except runmgr.SlotBusy as exc:
         raise ApiError(409, exc.reason)
     return {"run": run.to_dict(), "warnings": warnings}

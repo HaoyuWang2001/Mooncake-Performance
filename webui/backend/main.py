@@ -174,11 +174,11 @@ def _generate_openapi():
     paths["/api/runs/{id}/reattach"] = _post(
         "Re-attach a still-running run (idempotent; repairs wrongly finalized status)")
     paths["/api/instances"] = _p("List instances (instance = reusable form snapshot)")
-    paths["/api/instances"].update(_post("Create instance (does NOT start it)"))
+    paths["/api/instances"].update(_post("Create instance (freezes a full config snapshot; does NOT start it)"))
     paths["/api/instances"]["post"]["responses"]["409"] = {"description": "Conflict"}
     paths["/api/instances/{iid}"] = _p("Instance detail + its runs")
     paths["/api/instances/{iid}"].update(_delete("Delete instance record (keeps runs/logs)"))
-    paths["/api/instances/{iid}/run"] = _post("Run this instance (guard-checked)")
+    paths["/api/instances/{iid}/run"] = _post("Run this instance from its frozen config snapshot (guard-checked)")
     paths["/api/instances/{iid}/run"]["post"]["responses"]["409"] = {
         "description": "Running or shared resource conflict"}
     paths["/api/instances/{iid}/stop"] = _post("Stop this instance's active run")

@@ -453,7 +453,8 @@ class RunManager(object):
                 "wait for it to finish or pick a different cluster/global"
                 "".format(label, rid, conflicts.describe(kind, value)))
 
-    def start_benchmark(self, argv, meta=None, identities=None):
+    def start_benchmark(self, argv, meta=None, identities=None,
+                        env_extra=None):
         with self.lock:
             busy = self.slot_busy_reason()
             if busy:
@@ -474,6 +475,8 @@ class RunManager(object):
                       meta, stop_path=stop_path, state_path=state_path,
                       identities=identities)
             env = _utf8_stdio_env(dict(os.environ))
+            if env_extra:
+                env.update({k: v for k, v in env_extra.items() if v})
             env["MC_BENCH_STATE_FILE"] = state_path
             try:
                 fh = open(log_path, "wb")

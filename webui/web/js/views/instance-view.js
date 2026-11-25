@@ -417,6 +417,10 @@ const InstanceView = {
           <el-tag size="small" :type="detail.instance.launch_mode === 'rank_recall' ? 'warning' : 'info'">
             {{ detail.instance.launch_mode === 'rank_recall' ? 'Rank+Recall' : '单任务' }}
           </el-tag>
+          <el-tooltip v-if="detail.instance.snapshot" placement="top"
+                      :content="'配置快照：创建于 ' + fmtTimeAbs(detail.instance.snapshot.created) + '；之后修改配置文件不影响该实例'">
+            <el-tag size="small" type="success" effect="plain">配置快照 {{ detail.instance.snapshot.files }}</el-tag>
+          </el-tooltip>
           <el-popover v-if="detail.instance.status === 'running' && detail.instance.stopping"
                       placement="top" :width="300" trigger="hover" :show-after="150"
                       content="正在优雅停止：先通知客户端清理并回收远端进程，宽限期内完成；超时后才会强制结束。">
@@ -785,7 +789,7 @@ const InstanceView = {
              resync, reconnecting, missing,
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, closeMissingTab, activate, closeTab,
-             statusType, statusText, run, stop, remove, rename,
+             statusType, statusText, fmtTimeAbs, run, stop, remove, rename,
              reconnectRun, gotoResults, openReport, openRoleReport };
   },
 };

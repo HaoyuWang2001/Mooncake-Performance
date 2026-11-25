@@ -211,18 +211,28 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 {"name": "rank-8mb（可空=自动命名）", "selector": {...}, "flags": {...}}
 ```
 校验与 POST /api/run 相同（配置存在性、launch_mode 规则），但不占用运行槽。
+**创建瞬间冻结配置快照**：本次运行会读取的全部文件被复制到
+`webui/data/instances/<iid>/`（部署配置、selector 展开后的场景配置、各级
+`_configs.json`、以及 k8s 的三个部署模板且快照版 cluster.json 内模板路径已改写）；
+之后修改实时配置**不影响**该实例的任何后续运行。
 → `{"instance":{"id":"i...","name":...,"status":"created","launch_mode":"single","mode":"k8s",
-   "flags":{...},"selection":{"dirs":[],"files":[]},"last_run":null}}`
+   "flags":{...},"selection":{"dirs":[],"files":[]},"last_run":null,
+   "snapshot":{"files":12,"created":1760000000.0}}}`
+（无 snapshot 的旧实例按实时配置运行）
 
 ### GET /api/instances
 `{"instances":[<instance summary>, ...]}`（新→旧）。`status` 派生自活跃 run 或最近持久化 run
-（`created|running|stopping|done|failed|stopped`），`last_run` 含 `id/status/rc/elapsed/ts_dir/cmd`。
+（`created|running|stopping|done|failed|stopped`），`last_run` 含 `id/status/rc/elapsed/ts_dir/cmd`；
+`snapshot` 为 `{"files":N,"created":ts}`（旧实例为 `null`）。
 
 ### GET /api/instances/{iid}
 `{"instance":<summary>,"runs":[<run meta>, ...]}`（该实例全部运行记录）。
 
 ### POST /api/instances/{iid}/run
-启动该实例的一次运行（表单快照 → benchmark argv）。守卫/冲突语义同 `POST /api/run`。
+启动该实例的一次运行：**使用创建时冻结的配置快照**（snapshot.request → benchmark argv，
+继承根指向快照 `files/configs`）。守卫/冲突语义同 `POST /api/run`。
+每次运行会把整份实例快照复制到产物目录 **`outputs/<ts>/snapshot/`** 供审计/复现
+（rank+recall 为 `outputs/<parent>/snapshot/`；dry-run 不产生）。
 → `{"run":{...},"warnings":[]}`；同实例已在运行或共享资源冲突 → 409。
 
 ### POST /api/instances/{iid}/stop

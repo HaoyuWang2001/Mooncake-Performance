@@ -61,6 +61,8 @@ import bench_etcd
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIGS_DIR = os.path.join(ROOT, "configs")
+# 实例快照运行：_configs.json 继承链的根改指向快照内的 configs/（默认实时目录）
+CONFIG_INHERIT_ROOT = os.environ.get("MC_CONFIGS_INHERIT_ROOT") or CONFIGS_DIR
 K8S_PRERUN = os.path.join(ROOT, "k8s-deployment", "scripts", "k8s-prerun.sh")
 
 # --- cooperative stop context (WebUI stop file / Ctrl+C) -------------------
@@ -9858,7 +9860,7 @@ def _deep_merge(base, overlay):
     return base
 
 
-def load_scenario_config(cfg_path):
+def load_scenario_config(cfg_path, configs_root=None):
     """Load a scenario config with layered _configs.json inheritance.
 
     Configs under configs/<category>/ inherit shared defaults from every
@@ -9878,9 +9880,10 @@ def load_scenario_config(cfg_path):
         raise RuntimeError(
             "{} is a shared-defaults fragment, not a runnable scenario".format(cfg_path))
     cfg_dir = os.path.normpath(os.path.dirname(os.path.abspath(cfg_path)))
+    root = configs_root or CONFIG_INHERIT_ROOT
     merged = {}
     for category in ("basic", "pipeline", "kvtest"):
-        category_dir = os.path.normpath(os.path.join(CONFIGS_DIR, category))
+        category_dir = os.path.normpath(os.path.join(root, category))
         if cfg_dir == category_dir or cfg_dir.startswith(category_dir + os.sep):
             # directory chain: category root -> ... -> the config's own dir
             chain = [category_dir]
@@ -9929,6 +9932,22 @@ def collect_config_files(directory):
             if f.endswith(".json") and not f.startswith("_"):
                 found.append(os.path.join(root, f))
     return found
+
+
+def _copy_audit_snapshot(result_dir):
+    """把实例配置快照复制到本次 run 的产物目录 snapshot/（审计/复现用）。"""
+    src = os.environ.get("MC_INSTANCE_SNAPSHOT")
+    if not src or not os.path.isdir(src):
+        return
+    dest = os.path.join(result_dir, "snapshot")
+    if os.path.isdir(dest):
+        return
+    try:
+        shutil.copytree(src, dest)
+        log("[snapshot] 配置快照已归档到 {}".format(
+            os.path.relpath(dest, ROOT)))
+    except Exception as exc:
+        log("[WARN] 配置快照归档失败: {}".format(exc))
 
 
 def parse_arguments(argv=None):
@@ -10492,6 +10511,8 @@ def main(args, cfg_paths):
     args._result_dir_path = ts_dir
     if not args.dry_run:
         os.makedirs(os.path.join(ts_dir, "logs"), exist_ok=True)
+        if not args.result_dir:
+            _copy_audit_snapshot(ts_dir)
         # full-detail log: every per-command/per-pod line goes here; the
         # console (WebUI) keeps the summary + verbose adds detail to it
         set_detail_log(os.path.join(ts_dir, "benchmark.log"))

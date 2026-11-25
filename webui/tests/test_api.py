@@ -217,6 +217,30 @@ def test_output_rename_delete():
     assert code == 400
 
 
+def test_instance_snapshot_and_cleanup():
+    """创建实例即冻结配置快照；删除实例连同快照目录一起清理。"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    code, d = _req("POST", "/api/instances", {
+        "name": "zz-snapshot-smoke",
+        "selector": {"files": ["configs/basic/get.json"]},
+        "flags": {"mode": "ssh", "cluster": "configs/cluster.json",
+                  "global": "configs/global.json",
+                  "profile": "configs/_ssh/profile.json"}})
+    assert code == 200
+    iid = d["instance"]["id"]
+    assert d["instance"]["snapshot"]["files"] >= 4
+    snap_dir = os.path.join(root, "webui/data/instances", iid)
+    assert os.path.isfile(os.path.join(snap_dir, "snapshot.json"))
+    assert os.path.isfile(os.path.join(
+        snap_dir, "files/configs/basic/_configs.json"))
+    code, _ = _req("DELETE", "/api/instances/" + iid)
+    assert code == 200
+    assert not os.path.isdir(snap_dir)
+    code, _ = _req("GET", "/api/instances/" + iid)
+    assert code == 404
+
+
 def test_schedule_plans():
     code, d = _req("GET", "/api/schedule/plans")
     assert code == 200

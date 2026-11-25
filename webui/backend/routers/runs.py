@@ -10,7 +10,7 @@ from ..paths import MAX_TEXT_CHUNK, OUTPUTS_DIR, ROOT, TS_RE
 ROUTES = []
 
 
-def _build_run_argv(body):
+def _build_run_argv(body, configs_root=None):
     sel = body.get("selector") or {}
     flags = body.get("flags") or {}
     if sel.get("type") or sel.get("path"):
@@ -52,8 +52,13 @@ def _build_run_argv(body):
         # actually contain one inherited rank config and one recall config.
         try:
             from scripts.run_rank_recall import partition_configs
+            _root = None
+            if configs_root:
+                _root = (configs_root if os.path.isabs(configs_root)
+                         else os.path.join(ROOT, configs_root))
             partition_configs([os.path.join(ROOT, d) for d in dirs],
-                              [os.path.join(ROOT, f) for f in files])
+                              [os.path.join(ROOT, f) for f in files],
+                              configs_root=_root)
         except Exception as exc:
             raise ApiError(400, "invalid rank_recall selection: {}".format(exc))
         profile = flags.get("profile") or (mode_dir + "/profile.json")

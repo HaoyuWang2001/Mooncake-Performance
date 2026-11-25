@@ -344,6 +344,19 @@ console.log(JSON.stringify(out));
     assert out["none"] == ""
 
 
+def test_instance_snapshot_labels():
+    """实例卡片/详情显示配置快照数量，说明之后改配置不影响。"""
+    perf = open(os.path.join(JS_DIR, "views", "perf-view.js"),
+                encoding="utf-8").read()
+    inst = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+                encoding="utf-8").read()
+    assert "快照 {{ it.snapshot.files }}" in perf
+    assert "之后修改配置文件不影响该实例" in perf
+    assert "detail.instance.snapshot" in inst
+    assert "配置快照 {{ detail.instance.snapshot.files }}" in inst
+    assert "fmtTimeAbs" in inst
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()

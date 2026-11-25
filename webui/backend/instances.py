@@ -8,6 +8,7 @@
 import json
 import os
 import re
+import shutil
 import threading
 import time
 
@@ -22,6 +23,11 @@ def _new_id():
     with _seq_lock:
         _seq[0] += 1
         return "i{}-{:03d}".format(time.strftime("%Y%m%d-%H%M%S"), _seq[0])
+
+
+def new_id():
+    """预先取一个实例 id（创建配置快照时需要先知道 id）。"""
+    return _new_id()
 
 
 def _path(iid):
@@ -68,14 +74,16 @@ def list_all():
     return out
 
 
-def create(request, name=None):
-    iid = _new_id()
+def create(request, name=None, iid=None, snapshot=None):
+    iid = iid or _new_id()
     inst = {
         "id": iid,
         "name": _normalize_name(name, iid),
         "created": time.time(),
         "request": request or {},
     }
+    if snapshot:
+        inst["snapshot"] = snapshot
     save(inst)
     return inst
 
@@ -108,6 +116,10 @@ def delete(iid):
     if not path or not os.path.isfile(path):
         return False
     os.remove(path)
+    # 配置快照目录随实例删除（快照只属于该实例）
+    snap_dir = os.path.join(INSTANCES_DIR, iid)
+    if os.path.isdir(snap_dir):
+        shutil.rmtree(snap_dir, ignore_errors=True)
     return True
 
 

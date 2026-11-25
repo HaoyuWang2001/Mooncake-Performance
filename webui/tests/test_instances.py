@@ -30,6 +30,13 @@ def _ctx(tmp_path, monkeypatch):
     runs.mkdir()
     monkeypatch.setattr(instances, "INSTANCES_DIR", str(inst_dir))
     monkeypatch.setattr(instances, "RUNS_DIR", str(runs))
+    # 这些用例用假配置路径（c/a.json）验证路由逻辑，快照构建用桩替代
+    monkeypatch.setattr(ir.inst_snapshot, "INSTANCES_DIR", str(inst_dir))
+    monkeypatch.setattr(ir.inst_snapshot, "build", lambda iid, name, request: {
+        "dir": "webui/data/instances/" + iid,
+        "configs_root": "webui/data/instances/" + iid + "/files/configs",
+        "manifest": "webui/data/instances/" + iid + "/snapshot.json",
+        "files": 0, "created": time.time(), "request": request})
     return inst_dir, runs
 
 
@@ -46,7 +53,8 @@ def _wait(run, want, tries=60):
 
 
 def _fake_run_argv(monkeypatch, sec=30):
-    monkeypatch.setattr(ir, "_build_run_argv", lambda body: _sleep_argv(sec))
+    monkeypatch.setattr(ir, "_build_run_argv",
+                        lambda body, configs_root=None: _sleep_argv(sec))
 
 
 def _req(flags=None):

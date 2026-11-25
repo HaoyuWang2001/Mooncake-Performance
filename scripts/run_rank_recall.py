@@ -22,7 +22,7 @@ def _csv(value):
     return [x.strip() for x in (value or "").split(",") if x.strip()]
 
 
-def partition_configs(config_dirs, config_files):
+def partition_configs(config_dirs, config_files, configs_root=None):
     """Expand selectors, resolve inheritance, then split by effective work_mode."""
     paths = []
     for directory in config_dirs:
@@ -41,7 +41,7 @@ def partition_configs(config_dirs, config_files):
         if full in seen:
             continue
         seen.add(full)
-        cfg = bm.load_scenario_config(path)
+        cfg = bm.load_scenario_config(path, configs_root=configs_root)
         work_mode = cfg.get("work_mode", cfg.get("mode", ""))
         if work_mode not in groups:
             raise ValueError(
@@ -194,6 +194,15 @@ def main(argv=None):
         os.makedirs(os.path.join(bm.RESULTS_DIR, parent))
         print("results root: {}".format(os.path.join(bm.RESULTS_DIR, parent)),
               flush=True)
+        snap_src = os.environ.get("MC_INSTANCE_SNAPSHOT")
+        if snap_src and os.path.isdir(snap_src):
+            snap_dst = os.path.join(bm.RESULTS_DIR, parent, "snapshot")
+            try:
+                shutil.copytree(snap_src, snap_dst, dirs_exist_ok=True)
+                print("[parallel] 配置快照已归档到 {}".format(
+                    os.path.relpath(snap_dst, bm.ROOT)), flush=True)
+            except Exception as exc:
+                print("[WARN] 配置快照归档失败: {}".format(exc), flush=True)
     print("[parallel] starting rank={} config(s), recall={} config(s)".format(
         len(groups["rank"]), len(groups["recall"])), flush=True)
 
