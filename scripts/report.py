@@ -1190,6 +1190,14 @@ def reduce_trace_size(trace_list):
     _finalize_trace_groups(groups, trace_edges, trace_hist_ok)
     for tobj in objects.values():
         _finalize_trace_groups(tobj["groups"], trace_edges, trace_hist_ok)
+    # 「错误与异常」卡按写/读路径各画一条状态分布：全量（跨所有实例）
+    # 合并每组的 status 计数，与「SDK 全链路」的对象选择器完全解耦。
+    for _g in groups.values():
+        _st = {}
+        for _o in (_g.get("ops") or {}).values():
+            for _k, _n in (_o.get("status") or {}).items():
+                _st[_k] = _st.get(_k, 0) + int(_n)
+        _g["status"] = _st
     # 慢请求时刻归一：start_time 是节点本地钟面时间 -> epoch（前端时间轴用）
     # 每组先过滤（该组自身的慢请求集合）再各自 Top-K —— 图与表恰有 K 条。
     for _gname, _lst in tops_by_group.items():
@@ -2173,16 +2181,18 @@ transition:width .3s ease-out}
 font-variant-numeric:tabular-nums}
 .tval{font-size:12.5px;font-weight:600;color:var(--mut);
 font-variant-numeric:tabular-nums}
-/* 状态分布（F5 横条） */
-.statusbars{display:flex;flex-direction:column;gap:6px;margin-top:6px}
-.sbrow{display:flex;align-items:center;gap:10px}
-.sbname{flex:0 0 168px;font-size:12.5px;overflow:hidden;
-text-overflow:ellipsis;white-space:nowrap}
-.sbtrack{flex:1;height:8px;border-radius:99px;background:var(--track);
-overflow:hidden}
-.sbfill{display:block;height:8px;border-radius:99px;min-width:2px}
-.sbval{flex:0 0 auto;font-size:12.5px;font-weight:700;
-font-variant-numeric:tabular-nums}
+/* 错误与异常：写/读路径各一条状态分布（横向分段条，取自 SDK 全链路
+   同路径组；与全链路对象选择器解耦） */
+.pstat{display:flex;align-items:center;gap:10px;margin-top:8px;
+font-size:12.5px}
+.pstat-label{flex:0 0 74px;color:var(--mut);white-space:nowrap}
+.pstat-track{flex:1;display:flex;height:10px;border-radius:99px;
+overflow:hidden;background:var(--track)}
+.pstat-seg{height:100%;min-width:1px}
+.pstat-legend{color:var(--mut);font-variant-numeric:tabular-nums;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46%}
+.pstat-total{font-weight:700;font-variant-numeric:tabular-nums;
+white-space:nowrap}
 /* RSS 增幅正负条（G10 diverging） */
 .grow{display:flex;flex-direction:column;gap:4px;margin:14px 0 2px}
 .grow-row{display:flex;align-items:center;gap:10px}
@@ -4496,6 +4506,7 @@ function renderErrors(){
       });
       t.appendChild(tb);
       const wrapx=el('div','wrapx'); wrapx.appendChild(t); wrap.appendChild(wrapx);
+      renderPathStatus(wrap, role);
     });
   }
   if(z.error_excerpt){
@@ -6535,26 +6546,40 @@ function renderTraceTop(cur){
     td.textContent='无数据'; tr.appendChild(td); tb.appendChild(tr);
   }
 }
-function renderTraceStatus(cur){
-  const box=document.getElementById('terrs'); if(!box) return;
-  box.innerHTML='';
-  const st=(cur&&cur.data&&cur.data.status)||{};
-  const es=Object.entries(st).sort(function(a,b){return b[1]-a[1];});
-  if(!es.length){box.appendChild(el('div','note','无数据'));return;}
-  const max=Math.max.apply(null,es.map(function(x){return x[1];}).concat([1]));
-  const wrap=el('div','statusbars');
-  es.forEach(function(x){
-    const row=el('div','sbrow');
-    row.appendChild(el('span','sbname mono',x[0]));
-    const track=el('span','sbtrack');
-    const fill=el('span','sbfill');
-    fill.style.width=Math.max(1.5,x[1]/max*100)+'%';
-    fill.style.background=(x[0]==='ok'||x[0]==='')?lfColor(1):C.hero;
-    track.appendChild(fill); row.appendChild(track);
-    row.appendChild(el('span','sbval',String(x[1])));
-    wrap.appendChild(row);
+function renderPathStatus(box, role){
+  /* 错误与异常卡：写/读路径各一条横向状态分布（分段条）。
+     数据 = SDK 全链路 trace.groups[write|read].status（全实例合并），
+     与该卡上方的「SDK 全链路」对象选择器完全解耦。 */
+  const z=Z(); const groups=(z&&z.trace&&z.trace.groups)||{};
+  let names=[];
+  if(role==='writer') names=['write'];
+  else if(role==='reader') names=['read'];
+  else names=Object.keys(groups);
+  names=names.filter(function(n){return groups[n];});
+  names.forEach(function(gname){
+    const st=(groups[gname]&&groups[gname].status)||{};
+    const es=Object.keys(st).map(function(k){return [k,Number(st[k])||0];})
+      .filter(function(x){return x[1]>0;})
+      .sort(function(a,b){return b[1]-a[1];});
+    if(!es.length) return;
+    const total=es.reduce(function(a,x){return a+x[1];},0);
+    const row=el('div','pstat');
+    row.appendChild(el('span','pstat-label',
+      names.length>1?(gname==='write'?'写路径':'读路径'):'状态分布'));
+    const track=el('span','pstat-track');
+    es.forEach(function(x){
+      const seg=el('span','pstat-seg');
+      seg.style.width=Math.max(0.6,x[1]/total*100)+'%';
+      seg.style.background=(x[0]==='ok')?lfColor(1):C.hero;
+      seg.title=x[0]+'×'+x[1]+'（'+(x[1]/total*100).toFixed(1)+'%）';
+      track.appendChild(seg);
+    });
+    row.appendChild(track);
+    row.appendChild(el('span','pstat-legend',es.map(function(x){
+      return x[0]+'×'+x[1];}).join(' / ')));
+    row.appendChild(el('span','pstat-total',String(total)));
+    box.appendChild(row);
   });
-  box.appendChild(wrap);
 }
 function renderBlockObjMenu(){
   /* 分级时延块图对象：树状弹层（总计 / 节点（下挂实例）/ 实例），单选即定并收起 */
@@ -6689,7 +6714,6 @@ function renderTrace(){
   safe('trace-tree',function(){renderTree(cur);renderTreeDetail(cur);});
   safe('trace-top',function(){renderTraceTop(cur);});
   safe('trace-stack',function(){renderTraceStack();});
-  safe('trace-status',function(){renderTraceStatus(cur);});
 }
 
 window.__MC_SEL=function(){return selObjs.slice();};
@@ -6948,8 +6972,7 @@ memwrite_* 与 slice 明细仅代表最后一个副本的传输（memwrite_total
 <pre class="term" style="display:none"></pre>
 """
 
-_SEC_ERRORS = """<div class="card"><h2>错误与异常</h2><div id="errors"></div>
-<h3 class="sec">状态分布</h3><div id="terrs"></div></div>
+_SEC_ERRORS = """<div class="card"><h2>错误与异常</h2><div id="errors"></div></div>
 """
 _SEC_CLIENTSITE = """<div class="card" id="clientsite"><h2>日志现场</h2>
 <div id="logsite"></div></div>

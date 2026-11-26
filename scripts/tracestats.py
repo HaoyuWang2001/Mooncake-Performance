@@ -45,6 +45,11 @@ if _HERE not in sys.path:
 import logstats as ls   # noqa: E402  (bin ladder + histogram percentile shared)
 
 PAIR_RE = re.compile(r"(\w+)\[([^\]]*)\]")
+# 成功状态归一：C++ 读路径历史上把成功写成 status[read_ok]（写路径为
+# status[ok]），严格 status=="ok" 会把全部读请求误判为失败。识别集合里的
+# 成功变体统一按 ok 归档（旧镜像/旧产物的兼容；生产端应写 ok）。
+SUCCESS_STATUSES = frozenset({"ok", "read_ok"})
+
 STRING_FIELDS = {"trace_id", "breakdown", "key", "status", "type",
                  "remote_endpoint", "local_endpoint", "src", "dst",
                  "engine"}
@@ -483,7 +488,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             lines_trace += 1
             eng = pairs.get("engine", "")
             status = pairs.get("status", "")
-            ok = status == "ok"
+            ok = status in SUCCESS_STATUSES
+            if ok:
+                status = "ok"          # canonical label (read_ok -> ok)
             group = _group_of(pairs)
             # phase bucket: only MEASURED rows feed the op aggregates; the
             # rest (setup / warmup prefill+reads / teardown) are counted and

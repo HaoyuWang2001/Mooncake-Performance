@@ -140,6 +140,16 @@ def test_parse_pairs_with_spaces_and_glog_prefix():
     assert ts.parse_line("plain log line without trace") is None
 
 
+def test_read_ok_status_counts_as_success(tmp_path):
+    """读路径成功状态历史写作 status[read_ok]：必须识别为成功并归一到 ok，
+    否则全部读请求会被误判为失败（错误与异常的状态分布按写/读各一条）。"""
+    line = READ_OK.replace("status[ok]", "status[read_ok]")
+    st = ts.compute_trace_stats(_write(tmp_path, "ro.glog", [line]))
+    op = st["groups"]["read"]["ops"]["get_buffer"]
+    assert op["ok"] == 1 and op["fail"] == 0
+    assert op["status"] == {"ok": 1}
+
+
 def test_read_tree_and_direction(tmp_path):
     st = ts.compute_trace_stats(_write(tmp_path, "a.glog", [READ_OK, READ_MISS]))
     m = st["meta"]

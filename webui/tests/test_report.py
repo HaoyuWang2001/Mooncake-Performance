@@ -2907,6 +2907,55 @@ def test_errors_split_by_role_and_client(tmp_path):
     assert "a.writer" in ex and "b.reader" in ex, ex
 
 
+def test_errors_status_distribution_per_path(tmp_path):
+    """错误与异常：写路径/读路径各一条横向状态分布；与「SDK 全链路」的
+    对象选择器解耦（不随全链路选择变化）。"""
+    import tracestats
+    a = _stats(tmp_path, "a.writer", "writer")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    lines = []
+    for i in range(3):
+        lines.append(
+            "I20261115 10:00:0{}.000000 1 te.cc:1] trace_id[1] breakdown[put] "
+            "key[k{}] status[ok] size[1] replicas[1] "
+            "start_time[2026-11-15 10:00:0{}.000000] prep_total_us[1] "
+            "total_us[100]".format(i, i, i))
+    for i, st in enumerate(("ok", "read_ok", "mem_fail")):
+        lines.append(
+            "I20261115 10:00:0{}.100000 1 te.cc:1] trace_id[1] get_breakdown "
+            "key[kr{}] status[{}] start_time[2026-11-15 10:00:0{}.100000] "
+            "query_us[1] select_us[1] total_us[10] read_a_us[1] "
+            "read_transfer_window_us[1] read_b_us[1] read_ab_valid[1] "
+            "read_transfer_count[1]".format(i, i, st, i))
+    p = tmp_path / "st.glog"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tr = tracestats.compute_trace_stats(str(p), node="n1", size="8MB")
+    data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"}, traces=[tr])
+    trb = data["sizes"]["8MB"]["trace"]
+    # per-path merged status: read_ok is normalized to ok by tracestats
+    assert trb["groups"]["write"]["status"] == {"ok": 3}
+    assert trb["groups"]["read"]["status"] == {"ok": 2, "mem_fail": 1}
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    et = res["errors_text"]
+    i_w = et.index("写路径（writer）")
+    i_r = et.index("读路径（reader）")
+    assert i_w < i_r
+    # each path carries exactly one status distribution bar
+    assert et.count("状态分布") == 2, et
+    i_wbar = et.index("ok×3")
+    i_rbar = et.index("mem_fail×1")
+    assert i_w < i_wbar < i_r < i_rbar, et
+    # the old trace-selector-driven section is gone
+    assert "renderTraceStatus" not in rp._APP_JS
+    assert "terrs" not in rp._APP_JS
+    html, _dj = rp.render_scenario(data, str(tmp_path / "e"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert '<h3 class="sec">状态分布</h3>' not in src
+    assert "renderPathStatus" in rp._APP_JS and "pstat-track" in src
+
+
 def test_section_order_and_footer_note(tmp_path):
     """章节顺序：SDK → 错误与异常 → 日志现场 →（监控）→ 页脚；
     页脚解释 map-reduce 与数据正确性并在最底部。"""
