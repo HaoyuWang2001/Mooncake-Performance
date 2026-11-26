@@ -1395,7 +1395,7 @@ def _engine_of(meta):
 
 
 def reduce_scenario(stats, meta, monitors=None, traces=None,
-                    monitor_sites=None):
+                    monitor_sites=None, site_sizes=None):
     """Full scenario report data: stats grouped by data-size (caller passes a
     flat list where possible; the size label is taken from meta["size"] when
     present, else 'all'). `monitors` (from reduce_monitors) is scenario-level
@@ -1430,9 +1430,18 @@ def reduce_scenario(stats, meta, monitors=None, traces=None,
                       if str((t.get("meta") or {}).get("size")
                              or meta.get("size") or "all") == size])
     sources, nodes = _sources(stats, trace_list)
+    du_ledger = _site_du_ledger(meta, sources, monitor_sites, site_sizes)
+    for size, blk in sizes.items():
+        if blk.get("volume") is not None and du_ledger:
+            blk["volume"]["site"] = {
+                "nodes": [{"node": n, "pods": v["pods"],
+                           "profiling": v["profiling"], "total": v["total"]}
+                          for n, v in sorted(du_ledger.items())],
+                "total": sum(v["total"] for v in du_ledger.values())}
     return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
             "monitors": monitors or {},
-            "logsite": build_logsite(meta, sources, monitor_sites)}
+            "logsite": build_logsite(meta, sources, monitor_sites,
+                                     site_sizes)}
 
 
 # ---------------------------------------------------------------------------
@@ -1478,7 +1487,60 @@ def reduce_monitor_sites(local_log_dir):
     return sites
 
 
-def build_logsite(meta, sources, monitor_sites=None):
+def _site_mount_twin(meta):
+    """旧产物兜底：pod 内路径 → 节点侧孪生路径（挂载逆变换）。"""
+    meta = meta or {}
+    root = str(meta.get("host_log_root") or "").rstrip("/")
+    run_id = str(meta.get("run_id") or "")
+    base = (root + "/" + run_id) if (root and run_id) else ""
+    remote_root = str(meta.get("remote_log_dir") or "").rstrip("/")
+
+    def twin(p):
+        p = str(p or "")
+        if (base and remote_root
+                and (p == remote_root or p.startswith(remote_root + "/"))):
+            return base + p[len(remote_root):]
+        return p
+    return twin, base
+
+
+def _site_du_ledger(meta, sources, monitor_sites, site_sizes):
+    """per-node du 台账：pods / profiling / total（无 du 数据时返回 {}）。
+
+    k8s：pod 目录逐项匹配；ssh 扁平目录（pod 行目录==根目录）用根 total，
+    profiling 作为其子集扣除，避免重复计数。"""
+    twin, base = _site_mount_twin(meta)
+    du_nodes = (site_sizes or {}).get("nodes") or {}
+    if not du_nodes:
+        return {}
+    pod_dirs = {}
+    for src in sources or []:
+        node = str(src.get("node") or "?")
+        pod = str(src.get("pod") or "")
+        rpath = twin(src.get("remote_path") or "")
+        d = (base + ("/" + pod if pod else "")) if base else (
+            os.path.dirname(rpath) if rpath else "")
+        if d:
+            pod_dirs.setdefault(node, set()).add(d.rstrip("/"))
+    mons = monitor_sites or {}
+    out = {}
+    for node, du in du_nodes.items():
+        dirs = du.get("dirs") or {}
+        scopes = sorted(pod_dirs.get(node) or [])
+        pod_bytes = sum(int(dirs.get(d, 0)) for d in scopes)
+        mdir = twin(((mons.get(node) or {}).get("remote_dir")) or "")
+        prof = int(dirs.get(mdir.rstrip("/"), 0)) if mdir else 0
+        root_path = str(du.get("root") or "").rstrip("/")
+        if root_path and scopes and all(d == root_path for d in scopes):
+            total = int(du.get("total") or 0)
+            pod_bytes = max(0, total - prof) if prof else total
+        else:
+            total = pod_bytes + prof
+        out[node] = {"pods": pod_bytes, "profiling": prof, "total": total}
+    return out
+
+
+def build_logsite(meta, sources, monitor_sites=None, site_sizes=None):
     """现场日志表行：每节点一个节点行（聚合）+ 若干 pod 行 + 恰好一个监控行。
 
     - 节点行：files/bytes = 该节点全部已知产物合计；dir = 节点日志根目录
@@ -1489,20 +1551,9 @@ def build_logsite(meta, sources, monitor_sites=None):
     - 结构性不变量：任何 source 的 remote_path 必须落在其 pod 行的目录下；
       落不进的强制以自身 dirname 成行（永不静默丢产物）。"""
     meta = meta or {}
-    root = str(meta.get("host_log_root") or "").rstrip("/")
-    run_id = str(meta.get("run_id") or "")
-    base = (root + "/" + run_id) if (root and run_id) else ""
-    # 挂载逆变换（仅旧产物兜底）：pod 内路径 /<pod_ws>/logs/<run_id>/… 的节点
-    # 孪生路径 = <host_log_root>/<run_id>/…。新产物在写盘时已是节点路径，此处
-    # no-op；旧 sidecar/本地 fallback 的 pod 内路径借此仍能给出 ssh 可进目录。
-    remote_root = str(meta.get("remote_log_dir") or "").rstrip("/")
-
-    def _twin(path):
-        p = str(path or "")
-        if (base and remote_root
-                and (p == remote_root or p.startswith(remote_root + "/"))):
-            return base + p[len(remote_root):]
-        return p
+    _twin, base = _site_mount_twin(meta)
+    du_nodes = (site_sizes or {}).get("nodes") or {}
+    du_ledger = _site_du_ledger(meta, sources, monitor_sites, site_sizes)
 
     pods = {}
     extras = {}
@@ -1553,19 +1604,28 @@ def build_logsite(meta, sources, monitor_sites=None):
         mon_dir = _twin(site.get("remote_dir") or "")
         if not node_dir and mon_dir:
             node_dir = os.path.dirname(os.path.dirname(mon_dir.rstrip("/")))
+        du = du_nodes.get(node) or {}
+        du_dirs = du.get("dirs") or {}
+        led = du_ledger.get(node)
+        node_bytes = (led["total"] if led else
+                      sum(r["bytes"] for r in items) + site_bytes)
         rows.append({"tier": "node", "node": node, "role": "", "pod": "",
                      "files": sum(len(r["files"]) for r in items) + site_files,
-                     "bytes": sum(r["bytes"] for r in items) + site_bytes,
-                     "dir": node_dir})
+                     "bytes": node_bytes, "dir": node_dir})
         for r in items:
+            dv = du_dirs.get(str(r["dir"]).rstrip("/"))
             rows.append({"tier": "pod", "node": node, "pod": r["pod"],
                          "role": "、".join(sorted(r["roles"])),
-                         "files": len(r["files"]), "bytes": r["bytes"],
+                         "files": len(r["files"]),
+                         "bytes": int(dv) if dv is not None else r["bytes"],
                          "dir": r["dir"]})
+        mv = du_dirs.get(mon_dir.rstrip("/")) if mon_dir else None
         rows.append({"tier": "monitor", "node": node,
                      "role": MONITOR_ROW_ROLE,
                      "pod": str(site.get("pod") or ""),
-                     "files": site_files, "bytes": site_bytes, "dir": mon_dir})
+                     "files": site_files,
+                     "bytes": int(mv) if mv is not None else site_bytes,
+                     "dir": mon_dir})
     return rows
 
 
@@ -4318,6 +4378,19 @@ function renderVolume(){
     '（原始日志留节点）',true);
   b('输出','data.js',out.data_js,'全量明细（深查用）');
   b('输出','report.html',out.report_html,'自包含单文件（内嵌当前档位）');
+  const sd=v.site||{}; const sdn=sd.nodes||[];
+  if(sdn.length){
+    sdn.forEach(function(x){
+      const formula=(x.profiling!=null&&x.pods!=null)
+        ?('pod 目录 '+fmtBytes(x.pods)+' + profiling '+fmtBytes(x.profiling)+
+          '（du -sb 实测）')
+        :'现场目录（du -sb 实测，含全部运行时文件）';
+      b('留存',String(x.node),x.total,formula);
+    });
+    b('留存','合计',sd.total,
+      'du -sb 实测（节点侧真实字节；含 .glog.d / summary / exitrc / '+
+      'remove 服务日志等全部现场文件）',true);
+  }
   const rawT=Number(raw.total_bytes)||0;
   const pulled=Number(red.pulled_bytes)||0;
   const repTotal=(Number(out.data_js)||0)+(Number(out.report_html)||0);

@@ -157,6 +157,7 @@ report.py（本组件：reduce + render，纯标准库）
   - **监控行**（每节点恰好一行，位于该节点 pod 行之后）：角色「监控」；开启监控时 pod 列填监控 pod 名、日志属性 = 大小、日志路径 = 节点侧 profiling 目录；**未开启时 pod/日志属性/日志路径均为 `-`**（行仍保留）；
   - **整表逐行 nowrap + 全表水平滑动**；节点行加粗；
   - **结构性不变量**：任何产物（stats/glog/监控 CSV 等）必须落在表中某行的日志路径之下；落不进规范目录的产物强制以自身目录成行（**永不静默丢产物**；属结构性 bug 时必须显式暴露）；
+  - **大小口径**：pod 行/监控行/节点行大小 = **节点侧 `du -sb` 实测**（配置收尾时采集，含目录内全部运行时文件；缺失时回退「已知产物合计」，见 R-SRC-2）；节点行「x 个子项」仍为已知产物去重计数；
   - 已删除：客户端实例树（总数/成功/失败/客户端列、对慢点追踪的贡献列、writer 在前排序）、节点汇总表、登录命令/查看列、其它产物索引、data.js 降级提示；性能指标（avg/p50/p99…）不在本卡展示。
 - **R-INST-3** `[已固化·DR-19·DR-29·DR-50]` 现场日志表**全部只读**（无点击交互、不叠加曲线、无折叠）；「节点与登录现场」小节及其节点汇总/登录命令/非客户端产物索引已删除，内容由 R-INST-1 单表承载。
 - **R-INST-4** `[已固化·DR-46]` **节点身份 = 节点 IP**：k8s 场景取 `pod.status.hostIP`（宿主节点 IP），ssh 场景取节点管理 IP；同一宿主上的多个 client pod 在**节点级合并**为一个节点（对象树/实例节点列/错误归属/来源表/监控标签一致）；pod 名保留在 `meta.pod` 与客户端名中（明细不丢）。取不到 IP 或 ssh 配置出现重复 IP 时回退原节点名；历史产物（IP 未记录）沿用 pod 名/节点名。
@@ -165,6 +166,7 @@ report.py（本组件：reduce + render，纯标准库）
 - **R-ERR-2** `[已固化·v1.0 修订·DR-29]` 异常窗口列表（≤100 条）：时刻 + 类型（错误突发/时延突增）+ 数值 + **归属（角色 · 节点 · 实例）**，与主图强调色竖线同源；reduce 按 (时刻,类型,节点) 去重并携带归属。
 - **R-SRC-1** `[已固化·v0.7 修订·DR-50]` 现场索引 = R-INST-1 的**现场日志单表**（节点行 + pod 行 + 监控行）：节点行给出节点日志根目录，pod 行给出逐 pod 的节点侧目录（`<host_log_root>/<run_id>/<pod>/`），监控行给出节点侧 profiling 目录；ssh `<节点IP>` 后 cd 对应路径即可看到该处全部日志。路径必须由产物生成阶段写入节点侧真实路径（见 R-SRC-2），报表只做展示；旧产物的 pod 内路径允许在 reduce 侧做一次挂载逆变换（`remote_log_dir` → `host_log_root/run_id`）。
 - **R-SRC-2** `[已固化]` **日志目录契约**：k8s 每 run 每节点一个唯一目录（hostPath `<host_log_root>/<run_id>` 挂载到 `<pod_workspace>/logs/<run_id>`），每 pod 一个专属子目录存放该实例全部产物（`.log/.log.ylt.log/.log.exitrc/.samples.csv(.gz)/.summary.json/<base>.trace.json(.gz)/kvtest_out/`、remove-keys 四件套、remove 服务日志、以及 `MC_LOG_DIR` 的 `<base>.glog.d/`——完整 glog 的 INFO 分段，glog 按 max_log_size 轮转、解析时多段合并；不再产生 `.log.glog` stderr 捕获）；索引路径在 collect/job/map 阶段生成，**禁止渲染侧改写**；`MC_LOG_DIR` 默认指向 `<per-pod>/<client>.glog.d/`（位于 hostPath 映射内，每进程/size 独立）。
+  - **现场大小快照（du 实测，DR-51）**：每个配置**成功收尾时**（profiling 落盘之后、pod 销毁之前）在节点侧执行 `du -sb <run 根> <run 根>/* <run 根>/profiling/*`（k8s 经该宿主任一存活 client pod `kubectl exec`，ssh 直接远端执行；pod 内路径换算为节点侧真实路径），结果写入 `logs/<配置>/report/site_sizes.json`（**位于 report/ 内**：成功清理不删除、`--rebuild-report` 可复用）；失败/STOP 路径不采集（报表回退已知产物合计）；du 不可用时 WARN 并回退，**不得影响压测结论**。
 
 ### J. 节点监控（MON）
 
@@ -186,9 +188,9 @@ report.py（本组件：reduce + render，纯标准库）
 ### K. 数据量与优化（VOL）
 
 - **R-VOL-1** `[已固化·DR-40]` 报表含**独立卡「数据量与优化」**，位于节点监控之后、页脚之前。
-- **R-VOL-2** `[已固化·DR-40]` 卡内按层级给出：输入（时长/实例数/采样率）→ 行数与**每秒新增行数**（公式：行数 ÷ 时长）→ **原始数据量分文件**（writer.log / reader.log / glog / ylt / 合计）→ **单实例 map 后**（stats.json / trace.json 均值，注明构成：时间桶 ≤8192/档、直方图箱、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ **reduce 回传统计总量** → 输出（data.js / report.html）→ **原始 vs 体系优化倍数**（原始÷回传、原始÷报表）。
+- **R-VOL-2** `[已固化·DR-40·DR-51]` 卡内按层级给出：输入（时长/实例数/采样率）→ 行数与**每秒新增行数**（公式：行数 ÷ 时长）→ **原始数据量分文件**（writer.log / reader.log / glog / ylt / 合计）→ **单实例 map 后**（stats.json / trace.json 均值，注明构成：时间桶 ≤8192/档、直方图箱、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ **reduce 回传统计总量** → 输出（data.js / report.html）→ **现场留存（du 实测，场景级）**（每节点一行 + 合计；k8s 标注 pod 目录 + profiling 拆分，ssh 为现场根目录；口径 `du -sb` apparent bytes，含 .glog.d/summary/exitrc/remove 服务日志等全部现场文件）→ **原始 vs 体系优化倍数**（原始÷回传、原始÷报表）。
 - **R-VOL-3** `[已固化·DR-40]` **glog 参与 map-reduce**（原始 glog 字节实测，产物 trace.json 实测）；**ylt（coro_rpc easylog）暂不处理**——只作为原始数据出现并标注「未采集/暂不处理」，**不得进入 map 回传或 reduce 统计**。
-- **R-VOL-4** `[已固化·DR-40]` 数据以实测为准：原始=stats/trace meta.bytes、map 产物=文件大小、输出=实际写盘大小（data.js 精确、report.html 两遍渲染实测）；旧产物无数据量块时显示降级说明。
+- **R-VOL-4** `[已固化·DR-40·DR-51]` 数据以实测为准：原始=stats/trace meta.bytes、map 产物=文件大小、输出=实际写盘大小（data.js 精确、report.html 两遍渲染实测）、**现场留存=节点侧 `du -sb` 实测**（配置收尾快照，见 R-SRC-2）；旧产物/无 du 数据时回退源头记录口径并显示降级说明。
 
 ## 3. 硬约束（C）
 
@@ -295,6 +297,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-48 | 2026-11-25 | ① 错误与异常：节点级新增收放按钮（▸/▾），实例行默认折叠（节点汇总行仍显示实例数/总数/失败/聚合状态码）；② 「实例与日志现场」更名为「日志现场」，节点行默认折叠（实例默认不展开），展开状态仍跨重渲染记忆 | 用户需求 |
 | DR-49 | 2026-11-25 | 黄区 k8s 监控三修：① kvtest 采样器注入编排器时钟基准 EPOCH_BASE（编排机与节点时钟差 5 分钟导致时间窗裁空、监控图整卡消失）；时间窗裁空回退全量+注记；python 引擎不改（stats 为节点钟域）；② profiling 产物目录改为节点 IP（原为 monitor pod 名），显示名冲突回退原名，monitor.config.json 保留；③ URMA slot 以 mdcli 报错的 available slot id 为准自动切换（配置仅提示）并记录 probe；④ 有产物无序列时渲染占位卡列出原因，不再静默隐藏 | 用户需求 |
 | DR-50 | 2026-11-26 | 日志现场改版（用户需求）：唯一一张「现场日志」表（节点行聚合 + pod 行 + 每节点一个监控行；列=节点/角色/pod/日志属性/日志路径；展平不折叠、全表水平滑动、节点列仅节点行填写）；删除客户端实例树（总数/成功/失败/贡献列）、节点汇总、登录命令、其它产物索引与 data.js 降级提示；监控行未开启时三列为 `-`；新增结构性不变量（任何产物必须落在表内路径下，落不进的自成一行）；prof_core 在 monitor.config.json 记录监控 pod 与节点侧 profiling 目录；python 引擎经节点侧 remote_path 同步（无需额外 meta） | 用户需求 |
+| DR-51 | 2026-11-26 | 现场日志大小改为节点侧 **du -sb 实测**（用户需求：不再依赖 map/pull 源头记录的已知产物字节，避免遗漏 .glog.d/summary/exitrc/remove 服务日志等运行时文件）：成功收尾时（profiling 落盘后、pod 销毁前）每宿主一次 du 快照（k8s=kubectl exec 进存活 client pod / ssh=远端直跑），pod 内路径换算为节点侧真实路径，写入 `logs/<cfg>/report/site_sizes.json`（report/ 内：成功清理保留、rebuild 可复用）；失败/STOP 不采集并回退旧口径；现场日志表 pod/监控/节点行与 V-7「数据量与优化」新增「留存（du 实测，场景级）」同源消费 | 用户需求 |
 
 ---
 

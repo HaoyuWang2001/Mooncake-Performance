@@ -992,6 +992,11 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   总会发送两者（默认关闭），内存紧张的环境可关掉它们避免监控 DaemonSet
   与压测争内存。
   保留报表成功后的全部中间产物。`--dry-run` 仍全部跳过。
+- **现场日志实测大小**：每个配置成功收尾时（profiling 落盘后、pod 销毁前）在节点侧执行
+  `du -sb`（k8s 经存活 client pod `kubectl exec`、ssh 直跑），快照写入
+  `logs/<配置>/report/site_sizes.json`（成功清理保留、重建可复用）；「日志现场」表的
+  pod/监控/节点行与「数据量与优化」的「留存（du 实测）」同源消费，含 .glog.d/summary/
+  exitrc/remove 服务日志等全部运行时文件；失败/STOP 或 du 不可用时回退已知产物合计。
 - **k8s 节点级监控（容器内采样、宿主工具借用）**：每宿主一个 monitor
   DaemonSet（hostPID + nsenter/chroot 借用宿主的 mdcli），产物落在
   `logs/<配置>/profiling/<节点 IP>/`（目录名即报表节点显示名；历史 run 的 pod 名

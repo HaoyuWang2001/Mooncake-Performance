@@ -3530,6 +3530,14 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
     cfg_name = os.path.splitext(os.path.basename(
         cfg.get("__cfg_path__") or "scenario"))[0]
     echarts = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
+    # 节点侧现场日志实测大小（配置收尾 du 快照；缺失则报表回退旧口径）
+    site_sizes = None
+    try:
+        with open(os.path.join(local_log_dir, "report", "site_sizes.json"),
+                  "r", encoding="utf-8") as f:
+            site_sizes = json.load(f) or None
+    except (OSError, ValueError):
+        site_sizes = None
     units = _unit_groups(stats, mode)
     traces_by_unit = {}
     for tp in traces_all:
@@ -3580,7 +3588,8 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
             loaded, meta,
             monitors=rp.reduce_monitors(local_log_dir, t0=t0, t1=t1),
             traces=rp.load(traces_by_unit.get(key, [])),
-            monitor_sites=rp.reduce_monitor_sites(local_log_dir))
+            monitor_sites=rp.reduce_monitor_sites(local_log_dir),
+            site_sizes=site_sizes)
         out_dir = os.path.join(local_log_dir, "report", u["name"])
         html, _datajs = rp.render_scenario(
             data, out_dir, echarts,
@@ -5156,6 +5165,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if profile_sess is not None:
             _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
                             dry=dry)
+        # 现场日志实测大小（pod/profile 产物已全部落盘、pod 仍存活）
+        _site_du_snapshot(cluster, ts, cfg_name, involved_nodes,
+                          local_result_dir, remote_log_dir, dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -5819,6 +5831,110 @@ def _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
         _delete_monitor_daemonset(cluster, dry_run=dry)
     except Exception as exc:
         log("[WARN] [profile] monitor DaemonSet teardown failed: {}".format(exc))
+
+
+_SITE_DU_TIMEOUT_S = 120
+
+
+def _site_du_snapshot(cluster, ts, cfg_name, involved_nodes, local_result_dir,
+                      remote_log_dir, dry=False):
+    """配置收尾时在节点侧实测现场日志目录大小（du -sb，apparent bytes）。
+
+    时机：成功路径、profiling 落盘之后、pod 销毁之前（失败/STOP 不调用）。
+    k8s 经 kubectl exec 进该宿主任一存活 client pod（pod 内路径 = 挂载视图），
+    ssh 直接远端执行；输出路径统一换算为节点侧真实路径。
+    结果写入 logs/<cfg>/report/site_sizes.json（report/ 内：成功清理保留、
+    --rebuild-report 可复用）。WARN-only：du 不可用时静默回退旧口径。"""
+    if dry:
+        return None
+    is_k8s = cluster.get("_controller") is not None
+    k8s = {}
+    host_root = ""
+    if is_k8s:
+        try:
+            k8s = k8s_settings(cluster)
+            host_root = (k8s.get("host_log_root") or "").rstrip("/")
+            pod_ws = (k8s.get("pod_workspace") or "").rstrip("/")
+        except Exception:
+            return None
+        if not host_root or not pod_ws:
+            return None
+        root_view = pod_ws + "/logs/" + ts
+    else:
+        root_view = str(remote_log_dir or "").rstrip("/")
+        if not root_view:
+            return None
+    root_site = (_pod_path_to_site(cluster, root_view) if is_k8s
+                 else root_view).rstrip("/")
+    cmd = "du -sb {root} {root}/* {root}/profiling/* 2>/dev/null".format(
+        root=root_view)
+    # 每宿主一次：k8s 挑一个存活 client pod；ssh 直接 ssh 节点
+    targets = {}
+    for node_name in sorted(involved_nodes or []):
+        try:
+            n = get_node(cluster, node_name)
+        except Exception:
+            continue
+        try:
+            disp = _node_display(cluster, n, node_name) or node_name
+        except Exception:
+            disp = node_name
+        if is_k8s:
+            host = n.get("host_ip") or ""
+            pod = n.get("_pod") or ""
+            if not host or not pod or host in targets:
+                continue
+            targets[host] = (disp, n, pod)
+        else:
+            targets[disp] = (disp, n, "")
+    nodes = {}
+    for _key, (disp, n, pod) in sorted(targets.items()):
+        try:
+            if is_k8s:
+                ns = k8s.get("namespace") or ""
+                out, rc = controller_run(
+                    cluster["_controller"],
+                    ["-n", ns, "exec", pod, "--", "sh", "-c", cmd],
+                    check=False, timeout=_SITE_DU_TIMEOUT_S)
+                if rc != 0:
+                    raise RuntimeError("kubectl exec rc={}".format(rc))
+            else:
+                out = ssh_check_output(n["ip"], n, cmd, quiet=True)
+        except Exception as exc:
+            log("[WARN] [site] du failed on {}: {}".format(disp, exc))
+            continue
+        dirs = {}
+        total = 0
+        for line in str(out or "").splitlines():
+            raw = line.split("\t", 1)
+            if len(raw) != 2 or not raw[0].strip().isdigit():
+                continue
+            size = int(raw[0].strip())
+            path = raw[1].strip().rstrip("/")
+            if not path:
+                continue
+            site_path = _pod_path_to_site(cluster, path) if is_k8s else path
+            dirs[site_path] = size
+            if site_path == root_site:
+                total = size
+        if not dirs:
+            log("[WARN] [site] du produced no data on {} (du missing?)"
+                .format(disp))
+            continue
+        nodes[disp] = {"total": total, "root": root_site, "dirs": dirs}
+    if not nodes:
+        return None
+    out_dir = os.path.join(local_result_dir, "logs", cfg_name, "report")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "site_sizes.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"nodes": nodes}, f, ensure_ascii=False,
+                      separators=(",", ":"))
+    except OSError as exc:
+        log("[WARN] [site] write site_sizes.json failed: {}".format(exc))
+        return None
+    return {"nodes": nodes}
 
 
 def _pipeline_reader_launch_cmd(launch_prefix, remote_runner, merged_log,
@@ -6679,6 +6795,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         if profile_sess is not None:
             _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
                             dry=dry)
+        # 现场日志实测大小（pod/profile 产物已全部落盘、pod 仍存活）
+        _site_du_snapshot(cluster, ts, cfg_name, involved_nodes,
+                          local_result_dir, remote_log_dir, dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -8855,6 +8974,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
+        # 现场日志实测大小（remove 服务日志/profile 产物已落盘、pod 仍存活）
+        _site_du_snapshot(cluster, ts, cfg_name, involved_nodes,
+                          local_result_dir, remote_log_dir, dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod; cleanup_pods runs in main()
         # after sweep-end. Hand the sweep-end pass this config's coordinates.
@@ -10770,11 +10892,19 @@ def rebuild_reports(ts):
                 "unit_threads": u["t"],
                 "params": params,
             }
+            site_sizes = None
+            try:
+                with open(os.path.join(d, "report", "site_sizes.json"),
+                          "r", encoding="utf-8") as f:
+                    site_sizes = json.load(f) or None
+            except (OSError, ValueError):
+                site_sizes = None
             data = rp.reduce_scenario(
                 loaded, meta,
                 monitors=rp.reduce_monitors(d, t0=t0, t1=t1),
                 traces=rp.load(traces_by_unit.get(key, [])),
-                monitor_sites=rp.reduce_monitor_sites(d))
+                monitor_sites=rp.reduce_monitor_sites(d),
+                site_sizes=site_sizes)
             out_d = os.path.join(d, "report", u["name"])
             # 回写修正后的 meta.json：后续重建/打开读到一致的参数
             try:
