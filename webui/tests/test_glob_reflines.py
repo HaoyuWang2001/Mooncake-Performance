@@ -73,7 +73,8 @@ def test_skill_and_requirements_document_exception():
     assert "全局统计横线仅存在于端到端时延图" in skill
     req = open(os.path.join(ROOT, "docs", "spec", "report",
                             "REQUIREMENTS.md"), encoding="utf-8").read()
-    assert "R-LAT-9" in req and "全局统计横线" in req
+    assert "R-LAT-20" in req and "全局统计横线" in req
+    assert "DR-52" in req
 
 
 def test_global_line_values_equal_role_summary(tmp_path):
