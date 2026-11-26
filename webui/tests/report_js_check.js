@@ -435,6 +435,7 @@ if (!errs.length) {
   }
   out.perf_kids = kids("perfcards");
   out.unit_kids = kids("unitmeta");
+  out.tmeta_text = textOf(getEl("tmeta"));
   out.perf_shown = getEl("perfcards").style.display !== "none";
   out.rolecards_shown = getEl("rolecards").style.display !== "none";
   out.rolecards_text = textOf(getEl("rolecards"));

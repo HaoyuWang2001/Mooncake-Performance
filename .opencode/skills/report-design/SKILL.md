@@ -194,7 +194,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 236 条 · ✓213 · ◐22 · ✗0 · n/a1
+> **覆盖率（自动校验）**：共 237 条 · ✓214 · ◐22 · ✗0 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -354,6 +354,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C11.V6 顶部总控只有 读写/op；**对象树与阶段树位于分级时延曲线控台**（不在顶部独立条） —— R-TRACE-12 〔test_trace_toolbar_stage_rows〕
 - C11.I2 切换读写组时重置 op 选择与阶段/对象选择（对象按组作用域过滤） —— R-TRACE-6 〔◐〕
 - C11.B1 写/读分组曾只作用于部分子图（慢点追踪未跟随） —— DR-29 〔test_slow_tracking_ranked_colors_and_legend_solo〕
+- C11.V8 SDK 元信息行展示 **engine 分布**（`engine classic×N / tent×M`；reduce 必须合并 per-op `engine` 计数，否则合并阶段丢失） —— R-TRACE-14 〔test_trace_meta_shows_engine_distribution, test_trace_reduce_merges_engine_distribution〕
 - C11.V7 **统一 `breakdown[op]` 行匹配与字段归一**（docs/yh/log-reference.md §14）：get_buffer 走通用分支（旧 `get_breakdown` 仅兼容）；`query_total_us→query_us`、`buf_alloc_us→alloc_us`；接口集合 读=get_buffer/get_into/batch_get/batch_get_into、写=put/put_from/upsert/upsert_from/batch_put/batch_put_into；remove/batchRemove 薄行归「其它」；TENT+TCP 四相位诚实零值按 engine 标注（不误判 classic） —— R-TRACE-14 〔test_unified_get_buffer_field_alias_and_tree, test_batch_read_interfaces_prep_and_query_drill, test_batch_put_write_group_and_remove_other, test_tent_tcp_honest_zero_phases〕
 
 ### C12 SDK 全链路 · 对象树

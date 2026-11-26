@@ -467,6 +467,31 @@ def test_reduce_trace_block_and_sources(tmp_path):
     assert tr["groups"]["read"]["top"][0]["total_us"] == 269
 
 
+def test_trace_meta_shows_engine_distribution(tmp_path):
+    """SDK 元信息行展示 engine 分布（classic/tent），退化/双引擎一眼可见。"""
+    import tracestats as tstats
+    glog = tmp_path / "eng2.glog"
+    glog.write_text(
+        "I20261127 10:00:00.000000 1 real_client.cpp:1] trace_id[1] "
+        "breakdown[put] key[k] status[ok] size[8192] replicas[1] "
+        "start_time[2026-11-27 10:00:00.000000] prep_total_us[10] "
+        "engine[classic] memwrite_total_us[100] total_us[110]\n"
+        "I20261127 10:00:01.000000 1 real_client.cpp:1] trace_id[2] "
+        "breakdown[put] key[k] status[ok] size[8192] replicas[1] "
+        "start_time[2026-11-27 10:00:01.000000] prep_total_us[10] "
+        "engine[tent] admit_us[1] queue_prep_us[2] wire_span_us[3] "
+        "propagate_us[4] total_us[20]\n", encoding="utf-8")
+    tr = tstats.compute_trace_stats(str(glog), node="n1", size="8MB")
+    st = _stats(tmp_path, "a.writer", "writer", node="n1")
+    data = rp.reduce_scenario(rp.load([st]), {"config": "cfg"}, traces=[tr])
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    tm = res.get("tmeta_text") or ""
+    assert "engine" in tm and "classic×1" in tm and "tent×1" in tm, tm
+
+
 def test_trace_stage_tree_covers_unified_breakdown_fields():
     """统一 breakdown[op]：读树补 prep_us（batch 接口 L1），读写 query 均带
     query_route/rpc/retry 下钻（log-reference §14.9）。"""
@@ -476,6 +501,29 @@ def test_trace_stage_tree_covers_unified_breakdown_fields():
         assert '["{}",2,"query_us"]'.format(key) in js, key
     # 两个引擎的写树都在（classic memwrite_* / tent 四相位）
     assert "memwrite_total_us" in js and '"admit_us"' in js
+
+
+def test_trace_reduce_merges_engine_distribution(tmp_path):
+    """reduce 合并 per-op engine 分布（classic/tent 计数不能丢）。"""
+    import tracestats as tstats
+    glog = tmp_path / "eng.glog"
+    glog.write_text(
+        # classic 写 + TENT 写（同一 op：upsert）
+        "I20261127 10:00:00.000000 1 real_client.cpp:1] trace_id[1] "
+        "breakdown[upsert] key[k] status[ok] size[8192] replicas[1] "
+        "start_time[2026-11-27 10:00:00.000000] prep_total_us[10] "
+        "engine[classic] memwrite_total_us[100] total_us[110]\n"
+        "I20261127 10:00:01.000000 1 real_client.cpp:1] trace_id[2] "
+        "breakdown[upsert] key[k] status[ok] size[8192] replicas[1] "
+        "start_time[2026-11-27 10:00:01.000000] prep_total_us[10] "
+        "engine[tent] admit_us[1] queue_prep_us[2] wire_span_us[3] "
+        "propagate_us[4] total_us[20]\n", encoding="utf-8")
+    tr = tstats.compute_trace_stats(str(glog), node="n1", size="8MB")
+    st = _stats(tmp_path, "a.writer", "writer", node="n1")
+    data = rp.reduce_scenario(rp.load([st]), {"config": "cfg"}, traces=[tr])
+    blk = list(data["sizes"].values())[0]["trace"]
+    op = blk["groups"]["write"]["ops"]["upsert"]
+    assert op["engine"] == {"classic": 1, "tent": 1}, op.get("engine")
 
 
 def test_render_trace_section(tmp_path):

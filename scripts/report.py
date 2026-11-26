@@ -936,9 +936,11 @@ def _merge_trace_stat(groups, st, tops_by_group=None):
                 "fields": {}, "_buckets": {"seconds": {}, "minutes": {}},
                 "_fmin": {}, "ftier": 0,
                 "size_values": {}, "replicas": {}, "slice_count": {},
-                "residual": None, "top": []})
+                "engine": {}, "residual": None, "top": []})
             dst["count"] += o.get("count") or 0
             dst["ok"] += o.get("ok") or 0
+            for _eng, _n in (o.get("engine") or {}).items():
+                dst["engine"][_eng] = dst["engine"].get(_eng, 0) + int(_n)
             dst["fail"] += o.get("fail") or 0
             for k, n in (o.get("status") or {}).items():
                 dst["status"][k] = dst["status"].get(k, 0) + int(n)
@@ -6686,10 +6688,18 @@ function renderTrace(){
   }else{
     phaseTxt=' · 无阶段标记（旧客户端），样本未分阶段';
   }
+  const _engs={};
+  Object.keys(t.groups||{}).forEach(function(g){
+    Object.keys((t.groups[g]||{}).ops||{}).forEach(function(op){
+      const e=t.groups[g].ops[op].engine||{};
+      Object.keys(e).forEach(function(k){_engs[k]=(_engs[k]||0)+Number(e[k]||0);});});});
+  const _engTxt=Object.keys(_engs).length
+    ?(' · engine '+Object.keys(_engs).sort().map(function(k){
+        return k+'×'+_engs[k];}).join(' / ')):'';
   document.getElementById('tmeta').textContent=
     'trace 文件 '+m.files+' · 解析行 '+m.trace_lines+
     ' · slice 行（仅计数）'+m.slice_lines+' · 解析失败 '+m.parse_errors+
-    (rates.length?(' · 采样率 '+rates.join('/')):'')+phaseTxt;
+    (rates.length?(' · 采样率 '+rates.join('/')):'')+phaseTxt+_engTxt;
   const gbox=document.getElementById('tgroups'); gbox.innerHTML='';
   tGroupsList().forEach(function(g){
     const b=el('button',g===tGroup?'on':'',
