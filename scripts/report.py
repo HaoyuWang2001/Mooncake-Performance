@@ -4395,9 +4395,9 @@ function renderSources(){
       locs.forEach(function(x){
         const tr=el('tr');
         const dir=dir0+(x.pod?('/'+x.pod):'')+'/';
-        const view=x.pod&&ns
-          ? ('ssh '+x.node+'  ⏎  kubectl exec -it '+x.pod+' -n '+ns+' -- bash')
-          : ('ssh '+x.node);
+        /* 现场目录就是节点上的绝对路径：ssh 节点后 cd 进去即全部日志。
+           pod 内视角（kubectl exec）只在需要时使用，降为次要提示。 */
+        const view='ssh '+x.node+'  ⏎  cd '+dir;
         tr.appendChild(el('td','mono',String(x.node)));
         tr.appendChild(el('td','mono',String(x.pod||'-')));
         tr.appendChild(el('td','mono',dir));
@@ -4406,14 +4406,19 @@ function renderSources(){
       t.appendChild(tb);
       const wrapx=el('div','wrapx'); wrapx.appendChild(t);
       box.appendChild(el('div','note',
-        '现场日志（原始 log/glog/ylt 不拉回，CLEAN-UP 不删除）：'));
+        '现场日志（原始日志不拉回，CLEAN-UP 不删除）：'));
       box.appendChild(wrapx);
       box.appendChild(el('div','note',
-        '每个 pod 一个独立目录；同目录含 .log/.log.glog/.ylt.log/.exitrc。'));
+        '每个 pod 一个独立目录；同目录含 .log / .log.glog / .log.ylt.log / '+
+        '.log.exitrc / .samples.csv(.gz) / .summary.json / '+
+        '.log.glog.trace.json(.gz) / kvtest_out/ / remove 服务日志。'+
+        'ssh <节点IP> 后 cd 该目录即可看到全部日志；'+
+        '仅在需要 pod 内视角时再 kubectl exec -it <pod> -n <ns> -- bash。'));
     } else {
       box.appendChild(el('div','note',
-        '宿主机日志：<host_log_root>/<run_id>/<pod>/（CLEAN-UP 不删除）。'+
-        '登录节点 ssh <node>；进入 pod：kubectl exec -it <pod> -n <ns> -- bash'));
+        '宿主机日志目录：<host_log_root>/<run_id>/<pod>/（CLEAN-UP 不删除）。'+
+        'ssh 节点后 cd 该目录即可看到全部日志；'+
+        '需要 pod 内视角时再 kubectl exec -it <pod> -n <ns> -- bash'));
     }
   }
   /* 客户端日志文件已在实例树中给出；这里只保留非客户端产物（trace 等） */

@@ -359,6 +359,32 @@ def _pod_base(base_noext, node):
     return "{}/{}/{}".format(head, node["_pod"], tail)
 
 
+def _pod_path_to_site(cluster, path):
+    """Map a pod-internal log path to its node-side hostPath twin.
+
+    Benchmark pods mount <host_log_root>/<run_id> at
+    <pod_workspace>/logs/<run_id> (benchmark-pod.yaml.tpl), so every path
+    under that mount has an exact node-side counterpart — the path the report
+    must hand out for "ssh the node and cd there". ssh-mode paths and
+    anything outside the mount are returned unchanged (there the node path IS
+    the path)."""
+    p = str(path or "")
+    if not p.startswith("/"):
+        return path
+    try:
+        k8s = k8s_settings(cluster)
+    except Exception:
+        return path
+    pod_ws = (k8s.get("pod_workspace") or "").rstrip("/")
+    root = (k8s.get("host_log_root") or "").rstrip("/")
+    if not pod_ws or not root:
+        return path
+    mount = pod_ws + "/logs/"
+    if not p.startswith(mount):
+        return path
+    return root + "/" + p[len(mount):]
+
+
 def remote_log_path_pod(remote_log_dir, scenario, name, node):
     """<dir>/<scenario>.<name>.log with the k8s pod subdirectory inserted.
 
@@ -394,6 +420,41 @@ def _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s):
         except Exception:
             pass
     return ctx
+
+
+def _kvtest_site_dirs(cluster, remote_log_dir, cfg):
+    """iid -> node-side per-pod log directory (the "ssh + cd" target).
+
+    Only k8s runs have a hostPath twin; ssh-mode/old layouts yield {} so the
+    report keeps its previous behaviour."""
+    pods = (cfg or {}).get("_kvtest_iid_pods") or {}
+    out = {}
+    for iid, pod in pods.items():
+        if not pod or not remote_log_dir:
+            continue
+        src = posixpath.join(remote_log_dir, pod)
+        site = _pod_path_to_site(cluster, src)
+        if site and site != src:
+            out[str(iid)] = site
+    return out
+
+
+def _kvtest_remote_names(groups):
+    """Locally pulled logical name -> actual node-side name.
+
+    kvtest gzips samples/trace in place on the pod, so the node keeps
+    <x>.samples.csv.gz while the pulled copy is gunzipped back to
+    <x>.samples.csv. The report must point at the file that actually exists
+    on the node."""
+    out = {}
+    for _n, files, _label in groups or []:
+        for f in files or []:
+            name = os.path.basename(f)
+            if name.endswith(".gz"):
+                out[name[:-len(".gz")]] = name
+            else:
+                out.setdefault(name, name)
+    return out
 
 
 def data_size_list(cfg):
@@ -1106,8 +1167,12 @@ def _remove_service_ensure(cluster, globals_cfg, ts, cfg_name, dry=False):
     st["node"] = entry
     scripts_dir = posixpath.join(k8s.get("pod_workspace")
                                  or "/tmp/Mooncake-Performance", "scripts")
+    # must live INSIDE the hostPath mount (<pod_ws>/logs/<ts>) and under the
+    # service pod's own directory — <pod_ws>/logs alone is the container
+    # filesystem and is lost with the pod (the report indexes this file).
     log_dir = posixpath.join(k8s.get("pod_workspace")
-                             or "/tmp/Mooncake-Performance", "logs")
+                             or "/tmp/Mooncake-Performance",
+                             "logs", ts, pod)
     launch = (
         "set -a; . {env}; if [ -f {envm} ]; then . {envm}; fi; "
         "export LD_LIBRARY_PATH=/home/Mooncake/outputs/lib:${{LD_LIBRARY_PATH:-}}; "
@@ -2896,7 +2961,7 @@ def _hifreq_sample_rate():
 
 def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
                        dry=False, node_name=None, role=None, size=None,
-                       sample_rate=None):
+                       sample_rate=None, remote_path=None):
     """map 阶段（C++ trace）：在节点/pod 内对每个 .glog 执行 tracestats，
     就地生成 <glog>.trace.json（只回传统计，glog 原始文件留远端）。"""
     py = resolve_venv(cluster, globals_cfg) or "python3"
@@ -2920,6 +2985,9 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
             cmd += " --size {}".format(shlex.quote(str(size)))
         if sample_rate is not None:
             cmd += " --sample-rate {}".format(sample_rate)
+        # 报表索引里的路径 = 节点侧真实文件（ssh 后可读），不是 pod 内路径
+        cmd += " --remote-path {}".format(shlex.quote(
+            remote_path or _pod_path_to_site(cluster, trace_file)))
         ok = True
         t0 = time.time()
         if dry:
@@ -2974,7 +3042,9 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
             cmd += " --role {}".format(shlex.quote(str(file_role)))
         if size:
             cmd += " --size {}".format(shlex.quote(str(size)))
-        cmd += " --remote-path {}".format(shlex.quote(log_path))
+        # 报表索引里的路径 = 节点侧真实文件（ssh 后可读），不是 pod 内路径
+        cmd += " --remote-path {}".format(shlex.quote(
+            _pod_path_to_site(cluster, log_path)))
         ok = True
         t0 = time.time()
         if dry:
@@ -6955,7 +7025,8 @@ def _controller_cp_groups(cluster, groups, cdir, workers=None):
 def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
                                 cfg_name, ds, instance_pids, groups,
                                 local_log_dir, extra_bytes,
-                                qps_target=0, nodes=0):
+                                qps_target=0, nodes=0,
+                                remote_log_dir=None, is_k8s=True):
     """Controller-side kvtest data plane: cp artifacts pod->controller,
     run the staged map+reduce driver there, pull back only the compact
     reduced/meta/summary products. Raises on any failure so the caller can
@@ -7001,13 +7072,18 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
             if cand in names:
                 trace = cand
                 break
+        pod = iid_pods.get(str(entry["iid"]), "")
+        site_dir = (_pod_path_to_site(
+            cluster, posixpath.join(remote_log_dir, pod))
+            if (remote_log_dir and pod) else "")
         instances.append({
             "samples": samples,
             "summary": base + ".summary.json",
             "trace": trace,
+            "site_dir": site_dir,
             "node": iid_nodes.get(str(entry["iid"]),
                                   "i{}".format(entry["iid"])),
-            "pod": iid_pods.get(str(entry["iid"]), ""),
+            "pod": pod,
             "ds": ds,
             "start_epoch": start_epochs.get(str(ds)),
             "extra_bytes": int(extra_bytes.get(base) or 0),
@@ -7018,7 +7094,9 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
            "out_dir": posixpath.join(cdir, "reduced"),
            "meta_base": _kvtest_report_meta_base(
                cfg, args, cfg_name, ds,
-               qps_target=qps_target, nodes=nodes),
+               qps_target=qps_target, nodes=nodes,
+               context=_kvtest_report_context(
+                   cluster, ts, remote_log_dir or "", is_k8s)),
            "instances": instances}
     job_local = os.path.join(local_log_dir, "controller_job.json")
     with open(job_local, "w", encoding="utf-8") as f:
@@ -7055,9 +7133,15 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
 
 
 def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
-                              qps_target=0, nodes=0):
+                              qps_target=0, nodes=0, context=None):
     """The reduce meta the controller driver needs (everything except
-    'started', which only the data itself knows)."""
+    'started', which only the data itself knows).
+
+    ``context`` carries the 现场索引 (run_id / host_log_root /
+    remote_log_dir / k8s_namespace) so the report produced from the
+    controller's reduced.json can point at the on-node log directories —
+    the same four fields the orchestrator-local path merges from the
+    sidecar."""
     meta = {
         "config": cfg_name, "mode": "pipeline", "scenario": "pipeline",
         "engine": "kvtest", "launch_mode": "single",
@@ -7067,6 +7151,9 @@ def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
         "profile_cfg": os.path.basename(getattr(args, "profile", "") or ""),
         "early_stop": False, "unit": ds, "unit_size": ds,
     }
+    for _k, _v in (context or {}).items():
+        if _v:
+            meta[_k] = _v
     try:
         meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
     except Exception as exc:
@@ -7146,7 +7233,8 @@ def _gunzip_local_dir(local_dir):
 
 
 def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
-                             globals_cfg, best_effort=True):
+                             globals_cfg, best_effort=True,
+                             gzip_after=False):
     """pod 内 tracestats：glog -> <glog>.trace.json（只回传统计，glog 不传输）。
 
     与 pipeline 的 map 阶段完全一致：--node 由 run_tracestats_map 内部经
@@ -7161,7 +7249,17 @@ def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
         return run_tracestats_map(
             cluster, n, [glog], remote_scripts, globals_cfg,
             node_name=entry["node"], role=role, size=entry.get("_ds"),
-            sample_rate=_hifreq_sample_rate())
+            sample_rate=_hifreq_sample_rate(),
+            # The success path RENAMES trace.json -> trace.json.gz after this
+            # map, so a file path recorded now would be stale; point at the
+            # (always-existing) node-side per-pod directory instead. The STOP
+            # path pulls uncompressed and keeps the exact file path.
+            remote_path=(
+                _pod_path_to_site(cluster, posixpath.dirname(glog))
+                if gzip_after and
+                _pod_path_to_site(cluster, posixpath.dirname(glog))
+                != posixpath.dirname(glog)
+                else _pod_path_to_site(cluster, glog + ".trace.json")))
     except Exception as exc:
         if not best_effort:
             raise
@@ -7547,13 +7645,19 @@ def _kvtest_map_stats(local_log_dir, cfg):
         node = iid_nodes.get(str(iid), "i{}".format(iid))
         pod = iid_pods.get(str(iid), "")
         base = os.path.basename(path)[:-len(".samples.csv")]
-        # 远程路径指向节点现场（不是本地拉回路径）：k8s 为 <pod_dir>/<base>...
-        if remote_log_root:
-            remote_path = ("{}/{}/{}".format(remote_log_root, pod,
-                                             os.path.basename(path))
+        # 远程路径指向节点现场（ssh 后 cd 可用的真实文件）：优先 sidecar 的
+        # 节点 per-pod 目录（site_dirs），文件名按 gzip 后的实际名
+        # （remote_names），旧 sidecar 回退 pod 内路径。
+        _name = os.path.basename(path)
+        site_dir = (side.get("site_dirs") or {}).get(str(iid)) or ""
+        if site_dir:
+            remote_path = "{}/{}".format(
+                site_dir,
+                (side.get("remote_names") or {}).get(_name) or _name)
+        elif remote_log_root:
+            remote_path = ("{}/{}/{}".format(remote_log_root, pod, _name)
                            if pod else
-                           "{}/{}".format(remote_log_root,
-                                          os.path.basename(path)))
+                           "{}/{}".format(remote_log_root, _name))
         else:
             remote_path = path
         summary_path = path[:-len(".samples.csv")] + ".summary.json"
@@ -8523,7 +8627,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                       entry["_out_dir"]))
                     _trace_files = _kvtest_remote_trace_map(
                         cluster, entry, remote_log_dir, remote_scripts,
-                        globals_cfg)
+                        globals_cfg, gzip_after=True)
                     _extra_bytes[base] = _kvtest_small_log_bytes(
                         cluster, entry, remote_log_dir)
                     # 压缩大件再传输（~8-12x）；失败时透明回退原文件名
@@ -8565,7 +8669,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         cluster, globals_cfg, cfg, args, ts, cfg_name, ds,
                         instance_pids, _groups, local_log_dir,
                         _extra_bytes, qps_target=plan.get("total_qps") or 0,
-                        nodes=int(cfg.get("_kvtest_nodes") or 0))
+                        nodes=int(cfg.get("_kvtest_nodes") or 0),
+                        remote_log_dir=remote_log_dir, is_k8s=is_k8s)
                     _ctrl_done = True
                     log("[kvtest] controller data-plane done in {:.1f}s "
                         "(pod->controller single hop; orchestrator keeps no "
@@ -8606,10 +8711,12 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # keep node mapping + this size's /start epoch local for the
                 # report map and for --rebuild-report after a later failure
                 cfg["_kvtest_extra_bytes"] = _extra_bytes
-                _kvtest_write_report_meta(
-                    local_log_dir, cfg,
-                    _kvtest_report_context(cluster, ts, remote_log_dir,
-                                           is_k8s))
+                _ctx = _kvtest_report_context(cluster, ts, remote_log_dir,
+                                              is_k8s)
+                _ctx["site_dirs"] = _kvtest_site_dirs(
+                    cluster, remote_log_dir, cfg)
+                _ctx["remote_names"] = _kvtest_remote_names(_groups)
+                _kvtest_write_report_meta(local_log_dir, cfg, _ctx)
             if not _ctrl_done:
                 log("[kvtest] pulled: {} files / {} instances ({:.1f} min, "
                     "{}; samples={:.1f}MB trace={:.1f}MB summary={:.1f}MB "

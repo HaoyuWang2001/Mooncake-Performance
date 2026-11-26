@@ -461,7 +461,7 @@ def test_kvtest_report_field_index_uses_real_host_dir(tmp_path):
     assert "host_log_root" in datajs and "/var/lib/mooncake-bench" in datajs
     assert "20261121-1244" in datajs
     html = (out / "report.html").read_text(encoding="utf-8")
-    assert "现场日志（原始 log/glog/ylt 不拉回" in html
+    assert "现场日志（原始日志不拉回" in html
     assert "kubectl exec -it" in html
     assert "每个 pod 一个独立目录" in html
     # overview 的节点日志量说明由 Python 渲染真值

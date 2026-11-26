@@ -406,7 +406,7 @@ def _value_hist(value_counts, cap=24):
 
 
 def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
-                        sample_rate=None, top_n=TOP_N):
+                        sample_rate=None, top_n=TOP_N, remote_path=None):
     top_n = max(1, int(top_n or 0))
     ops = {}                       # (group, op) -> aggregate dict
     lines_total = lines_trace = lines_slice = parse_errors = 0
@@ -659,6 +659,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     meta = {
         "source": os.path.basename(path),
         "bytes": os.path.getsize(path),
+        # node-side twin of the glog (the path a report reader can ssh+cat);
+        # the orchestrator passes it explicitly, older callers stay empty
+        "remote_path": remote_path or "",
         "node": node, "pod": pod, "role": role, "size": size,
         "sample_rate": sample_rate,
         "lines": lines_total,
@@ -690,13 +693,16 @@ def main(argv=None):
     ap.add_argument("--role", default=None)
     ap.add_argument("--size", default=None)
     ap.add_argument("--sample-rate", type=float, default=None)
+    ap.add_argument("--remote-path", default=None,
+                    help="node-side path of the source glog (report index)")
     ap.add_argument("--top-n", type=int, default=TOP_N)
     args = ap.parse_args(argv)
     out = args.out or (args.log + ".trace.json")
     stats = compute_trace_stats(args.log, node=args.node, pod=args.pod,
                                 role=args.role, size=args.size,
                                 sample_rate=args.sample_rate,
-                                top_n=args.top_n)
+                                top_n=args.top_n,
+                                remote_path=args.remote_path)
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, separators=(",", ":"))

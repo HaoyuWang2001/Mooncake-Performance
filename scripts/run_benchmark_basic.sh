@@ -53,14 +53,21 @@ if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
   source "$SCRIPT_DIR/env.mooncake.sh" || exit 1
 fi
 
+# All logs for this instance belong in the hostPath-mounted per-pod directory
+# (<host_log_root>/<run_id>/<pod>/ on the node). Export it as MC_LOG_DIR so
+# SDK/glog output that honors it lands beside .log/.glog/.ylt.log instead of
+# somewhere unmapped; env.mooncake.sh may still override (sourced above).
+export MC_LOG_DIR="${MC_LOG_DIR:-$(dirname "$LOG_FILE")}"
+
 # Print the inherited transport/env snapshot before each client starts.
 print_client_env() {
-  printf '[client-env] %s POD_IP=%s NODE_NAME=%s LD_LIBRARY_PATH=%s SETUP_FABRIC_IP=%s MC_FABRIC_IP=%s MC_TCP_BIND_ADDRESS=%s SETUP_UB_DEVICE=%s MC_URMA_TRANS_MODE=%s SETUP_PROTOCOL=%s\n' \
+  printf '[client-env] %s POD_IP=%s NODE_NAME=%s LD_LIBRARY_PATH=%s SETUP_FABRIC_IP=%s MC_FABRIC_IP=%s MC_TCP_BIND_ADDRESS=%s SETUP_UB_DEVICE=%s MC_URMA_TRANS_MODE=%s SETUP_PROTOCOL=%s MC_LOG_DIR=%s\n' \
     "$1" \
     "${POD_IP:-<unset>}" "${NODE_NAME:-<unset>}" "${LD_LIBRARY_PATH:-<unset>}" \
     "${SETUP_FABRIC_IP:-<unset>}" "${MC_FABRIC_IP:-<unset>}" \
     "${MC_TCP_BIND_ADDRESS:-<unset>}" "${SETUP_UB_DEVICE:-<unset>}" \
-    "${MC_URMA_TRANS_MODE:-<unset>}" "${SETUP_PROTOCOL:-<unset>}"
+    "${MC_URMA_TRANS_MODE:-<unset>}" "${SETUP_PROTOCOL:-<unset>}" \
+    "${MC_LOG_DIR:-<unset>}"
 }
 # Collect passthrough args; extract script-level flags (--num-clients and
 # --client-binds/--numa-node are consumed here and NOT forwarded directly).

@@ -67,6 +67,44 @@ def test_controller_job_end_to_end(tmp_path):
     assert "reader" not in data["sizes"]["8MB"]["role_summaries"]
 
 
+def test_controller_job_uses_node_site_remote_path(tmp_path):
+    """报表索引必须是节点侧真实路径：job 用 site_dir，不泄漏 controller 暂存目录。"""
+    d = str(tmp_path / "data")
+    os.makedirs(d)
+    samples = _write_samples(d, 1, [1.0, 2.0])
+    base = samples[:-len(".samples.csv")]
+    with open(base + ".summary.json", "w", encoding="utf-8") as f:
+        json.dump({"instance_id": 1, "elapsed_seconds": 10.0,
+                   "verify_failures": 0,
+                   "operations": {"upsert_from": {
+                       "total": 2, "success": 2, "failure": 0,
+                       "bytes": 2}}}, f)
+    site = "/var/lib/mooncake-bench/20261126-1141/pod-a"
+    inst = [{"samples": os.path.basename(samples),
+             "summary": os.path.basename(base + ".summary.json"),
+             "trace": None, "site_dir": site,
+             "node": "10.0.0.1", "pod": "pod-a", "ds": "8MB",
+             "start_epoch": 1000.0, "extra_bytes": 0,
+             "writer_ops": ["upsert_from"], "reader_ops": ["get_buffer"]}]
+    job = {"dir": d, "out_dir": os.path.join(d, "reduced"),
+           "meta_base": {"config": "cfg"}, "instances": inst}
+    job_path = os.path.join(str(tmp_path), "job.json")
+    with open(job_path, "w", encoding="utf-8") as f:
+        json.dump(job, f)
+    out = subprocess.run(
+        [sys.executable,
+         os.path.join(ROOT, "scripts", "kvtest_controller_job.py"),
+         "--job", job_path], capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    data = json.load(open(os.path.join(d, "reduced",
+                                       "8MB.reduced.json")))
+    src = [s for s in data["sources"] if s.get("role") == "writer"]
+    assert src
+    assert src[0]["remote_path"] == site + "/" + os.path.basename(samples)
+    assert src[0]["source"] == os.path.basename(base) + ".writer.samples.csv"
+    assert "k8s-ws" not in json.dumps(data)
+
+
 def test_controller_job_missing_samples_fails(tmp_path):
     d = str(tmp_path / "data")
     os.makedirs(d)

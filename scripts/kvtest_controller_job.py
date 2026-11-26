@@ -9,6 +9,7 @@ Runs ON the k8s controller, next to the per-run data directory the pods'
      "instances": [{"samples": "<base>.samples.csv[.gz]",
                     "summary": "<base>.summary.json",
                     "trace": "<base>.log.glog.trace.json[.gz]",
+                    "site_dir": "<node-side per-pod log dir, optional>",
                     "node": "...", "pod": "...", "ds": "8MB",
                     "start_epoch": 1234.5, "extra_bytes": 0,
                     "writer_ops": [...], "reader_ops": [...]}]}
@@ -73,15 +74,27 @@ def _map_one(d, inst):
                       ("reader", inst.get("reader_ops") or [])):
         ops = frozenset(ops)
         payload = ls.kvtest_summary_payload(summary, ops)
+        # Remote path must be the real NODE-side file (the orchestrator sends
+        # site_dir = <host_log_root>/<run_id>/<pod>), never the controller's
+        # staging copy (deleted right after the job). source_name stays a
+        # basename exactly like the orchestrator-local map so the report's
+        # source column/keys match in both data planes.
+        site_dir = (inst.get("site_dir") or "").rstrip("/")
+        remote_path = (site_dir + "/" + os.path.basename(samples)
+                       if site_dir else samples)
+        stem = os.path.basename(samples)
+        for _suf in (".samples.csv.gz", ".samples.csv"):
+            if stem.endswith(_suf):
+                stem = stem[:-len(_suf)]
+                break
         stats = ls.compute_stats(
             samples, top_n=100, context=20,
             node=inst.get("node") or "", pod=inst.get("pod") or "",
-            role=role, remote_path=samples, size=inst.get("ds"),
+            role=role, remote_path=remote_path, size=inst.get("ds"),
             rows_factory=lambda p, _ops=ops, _start=start:
                 ls.iter_kvtest_rows(p, _start, _ops),
             summaries=[("summary", payload)] if payload is not None else [],
-            source_name="{}.{}.samples.csv".format(
-                samples[:-len(".samples.csv")], role),
+            source_name="{}.{}.samples.csv".format(stem, role),
             extra_meta={"format": "kvtest_samples", "scenario": "kvtest"})
         if not stats["meta"]["rows"]:
             continue

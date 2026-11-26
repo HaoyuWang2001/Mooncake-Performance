@@ -36,6 +36,12 @@ if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
   source "$SCRIPT_DIR/env.mooncake.sh" || exit 1
 fi
 
+# All logs for this instance belong in the hostPath-mounted per-pod directory
+# (<host_log_root>/<run_id>/<pod>/ on the node). Export it as MC_LOG_DIR so
+# SDK/glog output that honors it lands beside .log/.glog/.ylt.log instead of
+# somewhere unmapped; env.mooncake.sh may still override (sourced above).
+export MC_LOG_DIR="${MC_LOG_DIR:-$(dirname "$LOG_FILE")}"
+
 if [ ! -x "$(command -v "$BINARY" 2>/dev/null)" ] && [ ! -x "$BINARY" ]; then
   echo "[FATAL] mooncake_kvtest binary not found or not executable: $BINARY" >&2
   exit 1
