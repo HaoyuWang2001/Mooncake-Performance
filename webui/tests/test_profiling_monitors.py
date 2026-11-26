@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
@@ -233,6 +234,109 @@ def test_urma_counter_wrap_and_reset_no_spike(tmp_path):
     u = mon["urma"][0]
     assert u["rx_max"] <= 12.0, u["rx_max"]     # 无 310 GiB/s 假尖峰
     assert 8.0 <= max(u["rx"]) <= 12.0
+
+
+def test_reduce_monitors_window_misaligned_falls_back(tmp_path):
+    """时间窗与采样无交叠（节点/编排器时钟偏差）时回退全量并注记，
+    绝不因为裁空而丢掉整卡监控。"""
+    log_dir = _write_monitors(tmp_path)
+    mon = rp.reduce_monitors(str(log_dir), t0=5000, t1=5010)
+    h = mon["mem_host"][0]
+    assert h["series"]["n0_used_mb"] == [100.0, 150.0]
+    assert mon["mem_proc"] and mon["urma"]
+    blob = " ".join(mon.get("notes") or [])
+    assert "时钟偏差" in blob and "回退全量" in blob
+
+
+def test_reduce_monitors_notes_when_artifacts_but_no_series(tmp_path):
+    """有监控产物（config/err.log/空 CSV）但无可用序列：返回原因，不返回 {}。"""
+    root = tmp_path / "logs" / "cfg" / "profiling" / "10.0.0.9"
+    root.mkdir(parents=True)
+    (root / "monitor.config.json").write_text(
+        json.dumps({"urma": {"bytes_per_flit": 20}}), encoding="utf-8")
+    (root / "urma.err.log").write_text(
+        "2026-11-25 16:28:13 slot=2 ubpu=0 fetch failed: "
+        "Error:The available slot id is <1>.\n", encoding="utf-8")
+    (root / "mem.host.csv").write_text("ts,n0_used_mb\n", encoding="utf-8")
+    mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"))
+    assert "mem_host" not in mon and mon.get("notes")
+    blob = " ".join(mon["notes"])
+    assert "URMA 采集失败" in blob and "available slot id" in blob
+    assert "mem.host.csv 无有效数据行" in blob
+
+
+def test_render_monitor_placeholder_card_with_reasons(tmp_path):
+    """无可用序列但有原因：渲染占位卡（标题+原因），图表/说明隐藏。"""
+    root = tmp_path / "logs" / "cfg" / "profiling" / "10.0.0.9"
+    root.mkdir(parents=True)
+    (root / "monitor.config.json").write_text("{}", encoding="utf-8")
+    (root / "urma.err.log").write_text(
+        "Error:The available slot id is <1>.\n", encoding="utf-8")
+    mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"))
+    data = rp.reduce_scenario([_min_stats()],
+                              {"config": "cfg", "mode": "pipeline"},
+                              monitors=mon)
+    html, _dj = rp.render_scenario(data, str(tmp_path / "report"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert 'id="monitorcard"' in src and "节点监控" in src
+    assert "URMA 采集失败" in src
+    assert "renderMonitors" in src
+
+
+def test_compact_monitors_keeps_notes(tmp_path):
+    mon = {"notes": ["x：URMA 采集失败 — slot"], "mem_host": [],
+           "mem_proc": [], "urma": [], "summary": {}}
+    comp = rp.compact_monitors(mon)
+    assert comp["notes"] == mon["notes"]
+
+
+def test_mem_monitor_epoch_base_domain(tmp_path):
+    """EPOCH_BASE 注入后 ts 属编排器时钟域；未注入保持节点绝对时间。"""
+    script = os.path.join(ROOT, "profiling", "scripts", "mem_monitor.sh")
+
+    def _run(env_extra):
+        out = tmp_path / ("e%d" % len(list(tmp_path.iterdir())))
+        out.mkdir()
+        env = dict(os.environ, OUT_DIR=str(out), INTERVAL_S="1",
+                   PROC_PATTERN="zz_no_such_proc", **env_extra)
+        subprocess.run(["timeout", "3", "bash", script], env=env, check=False)
+        rows = [l for l in (out / "mem.host.csv").read_text(
+            encoding="utf-8").splitlines()[1:] if l.strip()]
+        assert rows, "sampler produced no host rows"
+        return float(rows[0].split(",")[0])
+
+    base = 1700000000
+    ts = _run({"EPOCH_BASE": str(base)})
+    assert abs(ts - base) <= 10, ts          # 编排器域，不是节点绝对时间
+    ts2 = _run({})
+    assert abs(ts2 - time.time()) <= 120, ts2  # 无注入 = 节点绝对时间
+
+
+def test_urma_monitor_probes_slot_and_epoch_base(tmp_path):
+    """mdcli 报可用 slot 时自动切换（配置值仅提示），且 ts_ns 属编排器域。"""
+    script = os.path.join(ROOT, "profiling", "scripts", "urma_monitor.sh")
+    stub = tmp_path / "fake_mdcli.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "input=$(cat)\n"
+        "case \"$input\" in\n"
+        "  *'slot=\"2\"'*) echo 'Error:The available slot id is <1>.' ;;\n"
+        "  *'slot=\"1\"'*) echo '1 2 3 500 700 900 7' ;;\n"
+        "  *) echo 'Error:unknown slot' ;;\n"
+        "esac\n", encoding="utf-8")
+    stub.chmod(0o755)
+    base = 1700000000
+    env = dict(os.environ, OUT_DIR=str(tmp_path), INTERVAL_S="1",
+               SLOT="2", UBPUS="0", MDCLI_BIN=str(stub),
+               EPOCH_BASE=str(base))
+    subprocess.run(["timeout", "4", "bash", script], env=env, check=False)
+    rows = [l for l in (tmp_path / "urma.flits.csv").read_text(
+        encoding="utf-8").splitlines()[1:] if l.strip()]
+    assert rows, "slot probe did not switch to the available slot"
+    ts_ns = int(rows[0].split(",")[0])
+    assert abs(ts_ns / 1e9 - base) <= 10, ts_ns
+    err = (tmp_path / "urma.err.log").read_text(encoding="utf-8")
+    assert "slot probe" in err and "using 1" in err
 
 
 def test_reduce_monitors_window_slice(tmp_path):

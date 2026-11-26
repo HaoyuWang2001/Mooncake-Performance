@@ -187,7 +187,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 230 条 · ✓204 · ◐24 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 234 条 · ✓208 · ◐24 · ✗1 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -435,10 +435,14 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C18.V1 三图：宿主内存（mem.host）/ 进程 RSS（mem.proc）/ URMA 端口流量（urma.flits）；标题后缀 —— R-MON-1 〔test_render_new_charts_structure, test_render_scenario_has_monitor_card〕
 - C18.V2 部分缺失分支：URMA 无数据不留空占位、标题与图注同步 —— R-MON-4 〔test_b06_monitor_card_partial_missing〕
 - C18.V3 进程 RSS 增幅排序、疑似泄露标记 —— R-MON-2/3 〔test_monitor_proc_growth_sorted〕
-- C18.V4 无监控数据整卡隐藏 —— R-MON-1 〔test_render_scenario_without_monitors_hides_card〕
+- C18.V4 无监控数据整卡隐藏（仅限完全没有 profiling 产物） —— R-MON-1 〔test_render_scenario_without_monitors_hides_card〕
+- C18.V5 产物目录 = 节点 IP（k8s 宿主 IP / ssh 管理 IP；显示名冲突回退原名） —— R-MON-1 〔test_stop_and_collect_uses_node_ip_dirs, test_stop_and_collect_display_collision_falls_back〕
+- C18.V6 有产物无可用序列 → 占位卡列出原因（URMA 失败原文 / CSV 无数据行 / 时间窗无交叠），不静默消失 —— R-MON-1/4 〔test_reduce_monitors_notes_when_artifacts_but_no_series, test_render_monitor_placeholder_card_with_reasons〕
 - C18.D1 监控时间窗与主图对齐（reduce 按 t0/t1 切片） —— R-MON-1 〔test_reduce_monitors_window_slice〕
 - C18.D2 URMA 计数器回绕/重置不产生尖峰 —— R-MON-3 〔test_urma_counter_wrap_and_reset_no_spike〕
-- C18.D3 产物下采样有界（compact_monitors） —— R-MON-1 〔test_compact_monitors_downsamples〕
+- C18.D3 产物下采样有界（compact_monitors；notes 透传） —— R-MON-1 〔test_compact_monitors_downsamples, test_compact_monitors_keeps_notes〕
+- C18.D4 kvtest 采样注入编排器时钟基准 EPOCH_BASE（时间戳=基准+节点流逝）；窗口裁空回退全量+注记；python 保持节点绝对时间 —— R-MON-5 〔test_mem_monitor_epoch_base_domain, test_start_profiling_injects_epoch_base, test_reduce_monitors_window_misaligned_falls_back〕
+- C18.D5 URMA slot 以 mdcli 报错的 available slot id 为准（配置仅提示），自动切换并记录 probe —— R-MON-5 〔test_urma_monitor_probes_slot_and_epoch_base〕
 - C18.I1 图表 tooltip 同构（悬浮指针 / 点击开框） —— R-SHELL-14 〔◐ 通用 tooltip 测试仅覆盖主图族〕
 - C18.B1 监控卡在页脚之后（曾被追加到 body 末尾） —— R-SHELL-15 〔test_section_order_and_footer_note〕
 

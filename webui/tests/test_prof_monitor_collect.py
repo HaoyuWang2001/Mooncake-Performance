@@ -64,3 +64,77 @@ def test_monitor_collect_waits_for_stable_before_pull(monkeypatch, tmp_path):
     for f in files:
         assert ("pull", f) in pos, "no pull for {}".format(f)
         assert pos[("pidgone", "pid")] < pos[("pull", f)]
+
+
+def _patch_collect(monkeypatch, nodes, display=None):
+    """Fake the collect primitives; returns the set of local dir names pulled."""
+    import benchmark as bm
+    pulled = set()
+
+    def fake_pull(ip, node, remote, local_dir, dry_run=False):
+        pulled.add(os.path.basename(local_dir))
+
+    monkeypatch.setattr(prof_core, "_run", lambda *a, **k: "")
+    monkeypatch.setattr(prof_core, "_wait_pid_gone", lambda *a, **k: None)
+    monkeypatch.setattr(prof_core, "_wait_artifact_stable",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(prof_core, "scp_pull", fake_pull)
+    monkeypatch.setattr(prof_core, "get_node", lambda c, name: nodes[name])
+    monkeypatch.setattr(bm, "state_remove", lambda *a, **k: None)
+    if display is not None:
+        monkeypatch.setattr(bm, "_node_display",
+                            lambda cluster, n, name: display)
+    return pulled
+
+
+def test_stop_and_collect_uses_node_ip_dirs(tmp_path, monkeypatch):
+    """Profiling 产物目录 = 节点显示名（k8s 宿主 IP / ssh 管理 IP）。"""
+    nodes = {"n1": {"ip": "10.0.0.1"}, "n2": {"ip": "10.0.0.2"}}
+    pulled = _patch_collect(monkeypatch, nodes)
+    session = {"tools": {"n1": {"mem": "11"}, "n2": {"mem": "22"}},
+               "matrix_tools": {"mem": {}}, "remote_out_dir": "/remote/out"}
+    prof_core.stop_and_collect({"nodes": nodes}, session, str(tmp_path))
+    assert pulled == {"10.0.0.1", "10.0.0.2"}
+
+
+def test_stop_and_collect_display_collision_falls_back(tmp_path, monkeypatch):
+    """显示名冲突（异常配置）时回退原名，绝不互相覆盖。"""
+    nodes = {"n1": {"ip": "10.0.0.9"}, "n2": {"ip": "10.0.0.9"}}
+    pulled = _patch_collect(monkeypatch, nodes, display="dup-host")
+    session = {"tools": {"n1": {"mem": "11"}, "n2": {"mem": "22"}},
+               "matrix_tools": {"mem": {}}, "remote_out_dir": "/remote/out"}
+    prof_core.stop_and_collect({"nodes": nodes}, session, str(tmp_path))
+    assert len(pulled) == 2, pulled
+    assert "dup-host" in pulled
+
+
+def test_start_profiling_injects_epoch_base(monkeypatch, tmp_path):
+    """kvtest 传入 epoch_base 时启动命令带 EPOCH_BASE；python 不传则不带。"""
+    import benchmark as bm
+    cmds = []
+
+    def fake_run(ip, node, cmd, quiet=True):
+        cmds.append(cmd)
+        return "OK" if ("command -v" in cmd or "test -x" in cmd) else "123"
+
+    monkeypatch.setattr(prof_core, "_run", fake_run)
+    monkeypatch.setattr(prof_core, "scp_push", lambda *a, **k: None)
+    monkeypatch.setattr(bm, "state_append", lambda *a, **k: None)
+    nodes = {"n1": {"ip": "10.0.0.1"}}
+    monkeypatch.setattr(prof_core, "get_node", lambda c, n: nodes[n])
+    matrix = {"nodes": "auto", "trigger": "whole_run",
+              "tools": {"mem": {"enabled": True, "interval_s": 1,
+                                "bin": "bash", "sudo": False,
+                                "proc_pattern": "p"},
+                        "urma": {"enabled": False}}}
+    prof_core.start_profiling({"nodes": nodes}, matrix, ["n1"], "cfg",
+                              "/remote/out", epoch_base=1700000000)
+    launched = [c for c in cmds
+                if "nohup" in c and "mem_monitor.sh" in c]
+    assert launched and "EPOCH_BASE=1700000000" in launched[0], launched
+    cmds.clear()
+    prof_core.start_profiling({"nodes": nodes}, matrix, ["n1"], "cfg",
+                              "/remote/out")
+    launched = [c for c in cmds
+                if "nohup" in c and "mem_monitor.sh" in c]
+    assert launched and "EPOCH_BASE" not in launched[0], launched

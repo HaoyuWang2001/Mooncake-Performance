@@ -14,12 +14,20 @@
 # processes (the benchmark clients run as the ssh user).
 #
 # env: OUT_DIR (required), INTERVAL_S (default 1),
-#      PROC_PATTERN (default mooncake_benchmark_client)
+#      PROC_PATTERN (default mooncake_benchmark_client),
+#      EPOCH_BASE (optional; orchestrator clock at sampler start — when set,
+#                  ts = EPOCH_BASE + elapsed, i.e. orchestrator time domain,
+#                  so node/orchestrator clock skew cannot push the samples
+#                  outside the report window; unset = node absolute time)
 set -u
 
 OUT_DIR="${OUT_DIR:?OUT_DIR required}"
 INTERVAL_S="${INTERVAL_S:-1}"
 PROC_PATTERN="${PROC_PATTERN:-mooncake_benchmark_client}"
+
+EPOCH_BASE="${EPOCH_BASE:-}"
+case "$EPOCH_BASE" in ''|*[!0-9]*) EPOCH_BASE="" ;; esac
+START_TS=$(date +%s)
 
 HOST_CSV="$OUT_DIR/mem.host.csv"
 PROC_CSV="$OUT_DIR/mem.proc.csv"
@@ -32,7 +40,11 @@ host_header_written=0
 [ -s "$PROC_CSV" ] || echo "ts,pid,comm,rss_kb,pss_kb,private_dirty_kb,private_clean_kb,swap_kb" >> "$PROC_CSV"
 
 while true; do
-  ts=$(date +%s)
+  if [ -n "$EPOCH_BASE" ]; then
+    ts=$((EPOCH_BASE + $(date +%s) - START_TS))
+  else
+    ts=$(date +%s)
+  fi
 
   # ---- whole-node memory: per-NUMA MemUsed + MemAvailable ----
   # 优先 numastat -m；缺失（如精简镜像）时回退内核接口 /sys 节点 meminfo，

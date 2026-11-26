@@ -1442,56 +1442,79 @@ def _to_int(x):
         return None
 
 
-def _parse_mem_host(path, node, t0=None, t1=None):
+def _parse_mem_host(path, node, t0=None, t1=None, flags=None):
     rows = _read_csv_rows(path)
     if len(rows) < 2 or len(rows[0]) < 2:
         return None
     cols = [c.strip() for c in rows[0][1:]]
-    t, series = [], {c: [] for c in cols}
-    for r in rows[1:]:
-        ts = _to_float(r[0]) if r else None
-        if ts is None:
-            continue
-        if t0 is not None and ts < t0:
-            continue
-        if t1 is not None and ts > t1:
-            continue
-        t.append(int(ts))
-        for i, c in enumerate(cols):
-            series[c].append(_to_float(r[i + 1]) if i + 1 < len(r) else None)
+
+    def _collect(lo, hi):
+        t, series = [], {c: [] for c in cols}
+        for r in rows[1:]:
+            ts = _to_float(r[0]) if r else None
+            if ts is None:
+                continue
+            if lo is not None and ts < lo:
+                continue
+            if hi is not None and ts > hi:
+                continue
+            t.append(int(ts))
+            for i, c in enumerate(cols):
+                series[c].append(_to_float(r[i + 1]) if i + 1 < len(r) else None)
+        return t, series
+
+    t, series = _collect(t0, t1)
+    if not t and (t0 is not None or t1 is not None):
+        # 窗口内无任何采样、但文件有行：节点/编排器时钟偏差等——回退全量，
+        # 绝不能因为时间窗对不齐就把监控图整张丢掉。
+        t, series = _collect(None, None)
+        if t and flags is not None:
+            flags["window_misaligned"] = True
     if not t:
         return None
     return {"node": node, "t": t, "columns": cols, "series": series}
 
 
-def _parse_mem_proc(path, node, leak_pct, leak_mb, t0=None, t1=None):
+def _parse_mem_proc(path, node, leak_pct, leak_mb, t0=None, t1=None,
+                    flags=None):
     rows = _read_csv_rows(path)
     if len(rows) < 2:
         return []
     idx = {name.strip(): i for i, name in enumerate(rows[0])}
     if any(n not in idx for n in ("ts", "pid", "rss_kb")):
         return []
-    groups = {}
-    for r in rows[1:]:
-        def cell(name):
-            i = idx[name]
-            return r[i] if i < len(r) else None
-        ts, pid = _to_int(cell("ts")), _to_int(cell("pid"))
-        rss = _to_float(cell("rss_kb"))
-        if ts is None or pid is None:
-            continue
-        if (t0 is not None and ts < t0) or (t1 is not None and ts > t1):
-            continue
-        key = (node, pid)
-        g = groups.get(key)
-        if g is None:
-            g = groups[key] = {"node": node, "pid": pid,
-                               "comm": (cell("comm") or "").strip(),
-                               "t": [], "rss_mb": [], "pss_mb": []}
-        g["t"].append(ts)
-        g["rss_mb"].append(round(rss / 1024.0, 2) if rss is not None else None)
-        pss = _to_float(cell("pss_kb"))
-        g["pss_mb"].append(round(pss / 1024.0, 2) if pss is not None else None)
+
+    def _collect(lo, hi):
+        groups = {}
+        for r in rows[1:]:
+            def cell(name):
+                i = idx[name]
+                return r[i] if i < len(r) else None
+            ts, pid = _to_int(cell("ts")), _to_int(cell("pid"))
+            rss = _to_float(cell("rss_kb"))
+            if ts is None or pid is None:
+                continue
+            if (lo is not None and ts < lo) or (hi is not None and ts > hi):
+                continue
+            key = (node, pid)
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {"node": node, "pid": pid,
+                                   "comm": (cell("comm") or "").strip(),
+                                   "t": [], "rss_mb": [], "pss_mb": []}
+            g["t"].append(ts)
+            g["rss_mb"].append(round(rss / 1024.0, 2)
+                              if rss is not None else None)
+            pss = _to_float(cell("pss_kb"))
+            g["pss_mb"].append(round(pss / 1024.0, 2)
+                               if pss is not None else None)
+        return groups
+
+    groups = _collect(t0, t1)
+    if not groups and (t0 is not None or t1 is not None):
+        groups = _collect(None, None)
+        if groups and flags is not None:
+            flags["window_misaligned"] = True
     out = []
     for g in groups.values():
         vals = [v for v in g["rss_mb"] if v is not None]
@@ -1504,32 +1527,47 @@ def _parse_mem_proc(path, node, leak_pct, leak_mb, t0=None, t1=None):
                   "rss_peak_mb": round(max(vals), 2),
                   "rss_growth_mb": round(growth, 2),
                   "rss_growth_pct": round(growth_pct, 1),
-                  "leak_suspect": bool(growth_pct >= leak_pct and growth >= leak_mb)})
+                  "leak_suspect": bool(growth_pct >= leak_pct
+                                       and growth >= leak_mb)})
         out.append(g)
     out.sort(key=lambda x: (x["node"], -x.get("rss_growth_mb", 0)))
     return out
 
 
-def _parse_urma(path, node, flit_bytes, t0=None, t1=None):
+def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None):
     rows = _read_csv_rows(path)
     if len(rows) < 2:
         return []
     idx = {name.strip(): i for i, name in enumerate(rows[0])}
-    if any(n not in idx for n in ("ts_ns", "ubpu", "port", "rx_flits", "tx_flits")):
+    if any(n not in idx for n in ("ts_ns", "ubpu", "port", "rx_flits",
+                                  "tx_flits")):
         return []
-    groups = {}
-    for r in rows[1:]:
-        def cell(name):
-            i = idx[name]
-            return r[i] if i < len(r) else None
-        ts, ubpu, port = _to_int(cell("ts_ns")), _to_int(cell("ubpu")), _to_int(cell("port"))
-        rx, tx = _to_int(cell("rx_flits")), _to_int(cell("tx_flits"))
-        if None in (ts, ubpu, port, rx, tx):
-            continue
-        sec = ts / 1e9
-        if (t0 is not None and sec < t0) or (t1 is not None and sec > t1):
-            continue
-        groups.setdefault((ubpu, port), []).append((ts, rx, tx))
+
+    def _collect(lo, hi):
+        groups = {}
+        for r in rows[1:]:
+            def cell(name):
+                i = idx[name]
+                return r[i] if i < len(r) else None
+            ts, ubpu, port = (_to_int(cell("ts_ns")), _to_int(cell("ubpu")),
+                              _to_int(cell("port")))
+            rx, tx = _to_int(cell("rx_flits")), _to_int(cell("tx_flits"))
+            if None in (ts, ubpu, port, rx, tx):
+                continue
+            sec = ts / 1e9
+            if (lo is not None and sec < lo) or (hi is not None and sec > hi):
+                continue
+            groups.setdefault((ubpu, port), []).append((ts, rx, tx))
+        return groups
+
+    groups = _collect(t0, t1)
+    if not groups and (t0 is not None or t1 is not None):
+        groups = _collect(None, None)
+        if groups and flags is not None:
+            flags["window_misaligned"] = True
+    if flags is not None:
+        # 窗口内样本数：>0 但 <2 属「样本不足」（不打扰），0 才是采集失败
+        flags["urma_samples"] = sum(len(v) for v in groups.values())
     gib = float(1024 ** 3)
     out = []
     for (ubpu, port), samples in groups.items():
@@ -1552,8 +1590,10 @@ def _parse_urma(path, node, flit_bytes, t0=None, t1=None):
             continue
         out.append({"node": node, "ubpu": ubpu, "port": port, "t": t,
                     "rx": rxr, "tx": txr,
-                    "rx_avg": round(sum(rxr) / len(rxr), 3), "rx_max": max(rxr),
-                    "tx_avg": round(sum(txr) / len(txr), 3), "tx_max": max(txr)})
+                    "rx_avg": round(sum(rxr) / len(rxr), 3),
+                    "rx_max": max(rxr),
+                    "tx_avg": round(sum(txr) / len(txr), 3),
+                    "tx_max": max(txr)})
     out.sort(key=lambda x: (x["node"], x["ubpu"], x["port"]))
     return out
 
@@ -1565,14 +1605,31 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
     size×combo）只带自己的时间窗，避免同一场景的监控曲线在每份报表里
     重复且混入其它单元的数据。summary 在裁剪后的数据上重算。
 
-    Returns {config, mem_host, mem_proc, urma, summary} or {} when no monitor
-    artifact exists (old runs / monitoring disabled). Never raises."""
+    Returns {config, mem_host, mem_proc, urma, summary, notes}；当存在监控
+    产物却没有任何可用序列时返回 {notes: [...]}（报表渲染占位卡列出原因，
+    不再整卡静默消失）；完全没有 profiling 产物（监控未开/旧 run）时返回 {}。
+    Never raises."""
     mem_host, mem_proc, urma, cfg = [], [], [], {}
+    notes = []
+    flags = {}
     seen_host = set()     # 同主机多 pod 的宿主内存只保留一份
+
+    def _first_line(path, limit=160):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        return line[:limit]
+        except OSError:
+            pass
+        return ""
+
     try:
         for root, _dirs, files in os.walk(local_log_dir):
             fset = set(files)
-            if not (fset & {MEM_HOST, MEM_PROC, URMA_FLITS}):
+            if not (fset & {MEM_HOST, MEM_PROC, URMA_FLITS, MONITOR_CONFIG,
+                            "mem.err.log", "urma.err.log"}):
                 continue
             node = os.path.basename(root)
             rcfg = {}
@@ -1585,8 +1642,8 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
                     rcfg = {}
                 if not cfg:
                     cfg = rcfg
-            # 节点显示名：monitor.config 的 node_ip（k8s=宿主 IP / ssh=管理 IP），
-            # 缺省回退目录名（节点原名/pod 名）
+            # 节点显示名：产物目录名已是节点 IP（新 run），旧产物靠
+            # monitor.config.json 的 node_ip 覆盖（k8s=宿主 IP / ssh=管理 IP）
             disp = str(rcfg.get("node_ip") or node)
             mem_cfg = rcfg.get("mem") or cfg.get("mem") or {}
             leak_pct = float(mem_cfg.get("leak_growth_pct") or _MON_LEAK_PCT)
@@ -1596,21 +1653,50 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
             if MEM_HOST in fset and disp not in seen_host:
                 seen_host.add(disp)
                 h = _parse_mem_host(os.path.join(root, MEM_HOST), disp,
-                                    t0=t0, t1=t1)
+                                    t0=t0, t1=t1, flags=flags)
                 if h:
                     mem_host.append(h)
+                else:
+                    notes.append("{}：mem.host.csv 无有效数据行".format(disp))
             if MEM_PROC in fset:
-                mem_proc.extend(_parse_mem_proc(
+                got = _parse_mem_proc(
                     os.path.join(root, MEM_PROC), disp, leak_pct, leak_mb,
-                    t0=t0, t1=t1))
+                    t0=t0, t1=t1, flags=flags)
+                if got:
+                    mem_proc.extend(got)
+                else:
+                    notes.append("{}：mem.proc.csv 无有效数据行".format(disp))
+            urma_ok = False
+            urma_samples = 0
             if URMA_FLITS in fset:
-                urma.extend(_parse_urma(
+                flags.pop("urma_samples", None)
+                got = _parse_urma(
                     os.path.join(root, URMA_FLITS), disp, flit_bytes,
-                    t0=t0, t1=t1))
+                    t0=t0, t1=t1, flags=flags)
+                urma_samples = int(flags.pop("urma_samples", 0) or 0)
+                if got:
+                    urma.extend(got)
+                    urma_ok = True
+            if (not urma_ok and not urma_samples
+                    and ("urma.err.log" in fset or URMA_FLITS in fset)):
+                reason = (_first_line(os.path.join(root, "urma.err.log"))
+                          if "urma.err.log" in fset else "")
+                notes.append(
+                    "{}：URMA 采集失败 — {}".format(disp, reason)
+                    if reason else "{}：URMA 无有效样本".format(disp))
+            if (MEM_HOST not in fset and "mem.err.log" in fset
+                    and not any(h["node"] == disp for h in mem_host)):
+                reason = _first_line(os.path.join(root, "mem.err.log"))
+                notes.append("{}：内存采集失败 — {}".format(disp, reason)
+                             if reason else
+                             "{}：内存采集无产物".format(disp))
     except Exception:
         pass
+    if flags.get("window_misaligned"):
+        notes.append("监控时间窗与测量窗无交叠（疑似节点/编排器时钟偏差），"
+                     "已回退全量采样")
     if not (mem_host or mem_proc or urma):
-        return {}
+        return {"notes": notes} if notes else {}
     summary = {"peak_mem_mb": {}, "worst_proc": None, "peak_urma": None}
     for h in mem_host:
         used = [c for c in h["columns"] if "used_mb" in c]
@@ -1641,8 +1727,11 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
             "label": "{} ubpu={} port={}".format(best["node"], best["ubpu"],
                                                  best["port"]),
             "value": round(max(best.get("rx_max") or 0, best.get("tx_max") or 0), 3)}
-    return {"config": cfg, "mem_host": mem_host, "mem_proc": mem_proc,
-            "urma": urma, "summary": summary}
+    out = {"config": cfg, "mem_host": mem_host, "mem_proc": mem_proc,
+           "urma": urma, "summary": summary}
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 def _downsample(t, arrays, max_points=MON_EMBED_MAX_POINTS):
@@ -1669,6 +1758,7 @@ def compact_monitors(mons):
     if not mons:
         return {}
     out = {"summary": mons.get("summary") or {},
+           "notes": mons.get("notes") or [],
            "mem_host": [], "mem_proc": [], "urma": []}
     for h in mons.get("mem_host") or []:
         cols = h.get("columns") or []
@@ -4661,11 +4751,26 @@ function _monChart(id, series, yname){
 function renderMonitors(){
   const M=D.monitors||{}; const card=document.getElementById('monitorcard');
   if(!card) return;
+  const notes=M.notes||[];
   const has=(M.mem_host&&M.mem_host.length)||(M.mem_proc&&M.mem_proc.length)||
     (M.urma&&M.urma.length);
-  if(!has){card.style.display='none';return;}
+  /* 没有可用序列但有产物/失败原因：渲染占位卡列出原因，不静默消失 */
+  if(!has&&!notes.length){card.style.display='none';return;}
   card.style.display='';
   const g=document.getElementById('moncards'); g.innerHTML='';
+  if(notes.length){
+    const nb=el('div','note');
+    notes.forEach(function(s){nb.appendChild(el('div',null,'• '+s));});
+    g.appendChild(nb);
+  }
+  if(!has){
+    const suf=document.getElementById('monTitleSuffix');
+    if(suf) suf.textContent='';
+    ['growthTitle','growth','memchart','procchart','urmachart','monNote']
+      .forEach(function(id){
+        const b=document.getElementById(id); if(b) b.style.display='none';});
+    return;
+  }
   const sm=M.summary||{};
   /* R-MON-4 部分缺失：只有 mem 无 urma（或反之）时，标题/图注同步去掉
      对应分句、空图占位隐藏——不留下对不存在内容的说明与空洞。 */
@@ -6743,7 +6848,7 @@ max 取各节点最大）；分位数在 map 侧按直方图归并后计算；�
 _MONITOR_CARD = """
 <div class="card" id="monitorcard"><h2>节点监控<span id="monTitleSuffix">（内存 / URMA 端口）</span></h2>
 <div id="moncards" class="grid"></div>
-<h3 class="sec">进程 RSS 增幅</h3>
+<h3 class="sec" id="growthTitle">进程 RSS 增幅</h3>
 <div id="growth" class="grow" style="display:none"></div>
 <div id="memchart" class="chart" role="img" aria-label="节点宿主内存图"></div>
 <div id="procchart" class="chart" role="img" aria-label="进程 RSS 内存图"></div>
@@ -6836,7 +6941,7 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     body = body.replace("<!-- monitor -->",
                         _MONITOR_CARD
                         if (mon.get("mem_host") or mon.get("mem_proc")
-                            or mon.get("urma")) else "")
+                            or mon.get("urma") or mon.get("notes")) else "")
     # R-SHELL-11：title/h1 携带场景名与单元身份（meta.unit，如「c4×t8 · 128KB」）；
     # 报告生成时间已由副标题承载，不再占据页面最高层级（多标签页对照时
     # 同名不可区分的问题由此修复——pipeline 单元目录仅 size 一级时尤甚）。
