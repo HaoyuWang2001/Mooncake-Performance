@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 
 import benchmark as bm
 from webui.backend import inst_snapshot, instances
+from webui.backend.common import ApiError
 from webui.backend.paths import ROOT
 from webui.backend.routers import instances as ir
 
@@ -95,6 +96,13 @@ def test_k8s_templates_frozen_and_cluster_rewritten(tmp_path):
     manifest = json.load(open(os.path.join(root, "snapshot.json"),
                               encoding="utf-8"))
     assert len(manifest["templates"]) == 3
+    instances.create(req, "snap-k8s", iid=iid, snapshot=snap)
+    # 清单接口：模板组 / 部署配置组可识别
+    listing = ir.api_instance_snapshot(None, {}, iid)
+    by_path = {f["path"]: f for f in listing["files"]}
+    tpl = [f for f in listing["files"] if f["group"] == "k8s 模板"]
+    assert len(tpl) == 3
+    assert by_path["configs/_k8s/cluster.json"]["group"] == "部署配置"
 
 
 def test_run_uses_only_snapshot_and_is_immune_to_live_edits(tmp_path, monkeypatch):
@@ -224,6 +232,65 @@ def test_partition_configs_with_snapshot_root(tmp_path):
     groups = partition_configs([str(root / "pipeline")], [],
                                configs_root=str(root))
     assert len(groups["rank"]) == 1 and len(groups["recall"]) == 1
+
+
+def test_snapshot_list_and_file_endpoints(tmp_path):
+    """快照清单（分组 + 与实时配置对比）与单文件读取。"""
+    live_rel = "configs/basic/zz-snap-view.json"
+    live = os.path.join(ROOT, live_rel)
+    shutil.copy(os.path.join(ROOT, "configs/basic/get.json"), live)
+    try:
+        req = {"selector": {"files": [live_rel]}, "flags": dict(REQ["flags"])}
+        iid = instances.new_id()
+        snap = inst_snapshot.build(iid, "snap-view", req)
+        instances.create(req, "snap-view", iid=iid, snapshot=snap)
+
+        listing = ir.api_instance_snapshot(None, {}, iid)
+        by_path = {f["path"]: f for f in listing["files"]}
+        assert by_path[live_rel]["group"] == "场景配置"
+        assert by_path[live_rel]["live"] == "same"
+        assert by_path["configs/basic/_configs.json"]["group"] == "继承碎片"
+        assert by_path["configs/cluster.json"]["group"] == "部署配置"
+        assert by_path["snapshot.json"]["group"] == "元数据"
+        assert by_path["instance.json"]["group"] == "元数据"
+
+        # 修改实时配置 -> changed；删除 -> missing（快照内容不受影响）
+        with open(live, "w", encoding="utf-8") as f:
+            f.write("{}")
+        assert ({f["path"]: f for f in ir.api_instance_snapshot(None, {}, iid)["files"]}
+                [live_rel]["live"] == "changed")
+        os.remove(live)
+        assert ({f["path"]: f for f in ir.api_instance_snapshot(None, {}, iid)["files"]}
+                [live_rel]["live"] == "missing")
+
+        # 单文件读取：场景配置（冻结原文）+ 元数据
+        r = ir.api_instance_snapshot_file(None, {"path": [live_rel]}, iid)
+        assert '"operation"' in r["content"] and r["bytes"] > 0
+        r2 = ir.api_instance_snapshot_file(None, {"path": ["snapshot.json"]}, iid)
+        assert '"files"' in r2["content"]
+
+        # 穿越 / 缺失
+        with pytest.raises(ApiError) as exc:
+            ir.api_instance_snapshot_file(
+                None, {"path": ["../../../../etc/passwd"]}, iid)
+        assert exc.value.code in (403, 404)
+        with pytest.raises(ApiError) as exc:
+            ir.api_instance_snapshot_file(None, {"path": ["configs/nope.json"]}, iid)
+        assert exc.value.code == 404
+    finally:
+        if os.path.isfile(live):
+            os.remove(live)
+
+
+def test_snapshot_endpoints_reject_legacy_instance(tmp_path):
+    inst = instances.create(REQ, "legacy-snap")
+    with pytest.raises(ApiError) as exc:
+        ir.api_instance_snapshot(None, {}, inst["id"])
+    assert exc.value.code == 404
+    with pytest.raises(ApiError) as exc:
+        ir.api_instance_snapshot_file(None, {"path": ["configs/cluster.json"]},
+                                      inst["id"])
+    assert exc.value.code == 404
 
 
 def test_audit_snapshot_copy(tmp_path, monkeypatch):

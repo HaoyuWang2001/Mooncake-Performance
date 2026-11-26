@@ -335,8 +335,12 @@ const PerfView = {
               {{ it.launch_mode === 'rank_recall' ? 'Rank+Recall' : '单任务' }}
             </el-tag>
             <el-tooltip v-if="it.snapshot" placement="top"
-                        :content="'配置快照：创建于 ' + fmtTimeAbs(it.snapshot.created) + '；之后修改配置文件不影响该实例'">
-              <el-tag size="small" type="success" effect="plain">快照 {{ it.snapshot.files }}</el-tag>
+                        :content="'配置快照：创建于 ' + fmtTimeAbs(it.snapshot.created) + '；之后修改配置文件不影响该实例（点击查看）'">
+              <el-tag size="small" type="success" effect="plain" class="snap-tag"
+                      role="button" tabindex="0"
+                      @click="openSnapshot(it)"
+                      @keydown.enter.prevent="openSnapshot(it)"
+                      @keydown.space.prevent="openSnapshot(it)">快照 {{ it.snapshot.files }}</el-tag>
             </el-tooltip>
             <el-popover v-if="it.status === 'running' && it.stopping" placement="top"
                         :width="300" trigger="hover" :show-after="150"
@@ -898,6 +902,12 @@ const PerfView = {
       store.view = "instances";
     }
 
+    function openSnapshot(it) {
+      if (!it || !it.snapshot) return;
+      store.snapshotTarget = it.id;
+      store.view = "instances";
+    }
+
     function openResults(tsDir) {
       if (!tsDir) return;
       const rel = String(tsDir).replace(/^outputs[\\/]/, "");
@@ -974,7 +984,7 @@ const PerfView = {
              statusType, statusText, fmtTimeRel, fmtTimeAbs,
              instanceRunHint, scrollToForm,
              instances, instLoading, busy, loadInstances, createInstance, runInstance,
-             stopInstance, deleteInstance, openInstance, openResults,
+             stopInstance, deleteInstance, openInstance, openSnapshot, openResults,
              runs, drawerOpen, onHistoryClick, cleanup };
   },
 };

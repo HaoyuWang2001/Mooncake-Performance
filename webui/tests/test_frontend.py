@@ -356,6 +356,28 @@ def test_instance_snapshot_labels():
     assert "fmtTimeAbs" in inst
 
 
+def test_instance_snapshot_viewer_ui():
+    """实例详情「查看快照」：清单分组 + 实时对比标签 + 内容查看；卡片标签可直达。"""
+    inst = open(os.path.join(JS_DIR, "views", "instance-view.js"),
+                encoding="utf-8").read()
+    assert "查看快照" in inst
+    assert "/snapshot" in inst and "/snapshot/file" in inst
+    assert "snapGroups" in inst and "openSnapshotById" in inst
+    assert "selectSnapFile" in inst and "copySnapshot" in inst
+    assert "已变化" in inst and "实时已删除" in inst
+    assert "自动换行" in inst
+    perf = open(os.path.join(JS_DIR, "views", "perf-view.js"),
+                encoding="utf-8").read()
+    assert "openSnapshot(it)" in perf and "store.snapshotTarget" in perf
+    app = open(os.path.join(JS_DIR, "app.js"), encoding="utf-8").read()
+    assert "snapshotTarget" in app
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    for cls in (".snap-list", ".snap-item.active", ".snap-pre", ".snap-path",
+                ".snap-sel"):
+        assert cls in css, "missing style {}".format(cls)
+
+
 def test_shared_status_module():
     """状态中文化、相对时间与危险确认统一在 status.js。"""
     src = open(os.path.join(JS_DIR, "status.js"), encoding="utf-8").read()

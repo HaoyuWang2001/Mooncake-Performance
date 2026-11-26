@@ -177,6 +177,12 @@ def _generate_openapi():
     paths["/api/instances"].update(_post("Create instance (freezes a full config snapshot; does NOT start it)"))
     paths["/api/instances"]["post"]["responses"]["409"] = {"description": "Conflict"}
     paths["/api/instances/{iid}"] = _p("Instance detail + its runs")
+    paths["/api/instances/{iid}/snapshot"] = _p(
+        "Frozen config snapshot index (deployment/scenario/_configs/templates + live drift)")
+    paths["/api/instances/{iid}/snapshot/file"] = _p(
+        "Read one file from the instance's frozen config snapshot")
+    paths["/api/instances/{iid}/snapshot/file"]["get"]["parameters"] = [
+        _q("path", required=True)]
     paths["/api/instances/{iid}"].update(_delete("Delete instance record (keeps runs/logs)"))
     paths["/api/instances/{iid}/run"] = _post("Run this instance from its frozen config snapshot (guard-checked)")
     paths["/api/instances/{iid}/run"]["post"]["responses"]["409"] = {

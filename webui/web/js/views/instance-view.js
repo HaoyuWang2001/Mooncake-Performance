@@ -485,6 +485,15 @@ const InstanceView = {
           <el-button size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      @click="gotoResults">跳转至结果详情</el-button>
+          <el-tooltip placement="top"
+                      :content="detail.instance.snapshot
+                        ? '查看创建时冻结的配置快照（部署配置 / 场景配置 / 继承碎片 / k8s 模板）'
+                        : '该实例没有配置快照（快照功能上线前创建的旧实例）'">
+            <span>
+              <el-button size="small" plain :disabled="!detail.instance.snapshot"
+                         @click="openSnapshotById(detail.instance.id)">查看快照</el-button>
+            </span>
+          </el-tooltip>
           <el-button v-if="isCombined" size="small" plain
                      :disabled="!latestRun || !latestRun.ts_dir"
                      :title="latestRun && latestRun.ts_dir ? '' : '该运行还没有产物（未运行或已清理）'"
@@ -522,6 +531,63 @@ const InstanceView = {
         <el-button size="small" @click="goPerf">回性能测试页查看实例列表</el-button>
       </el-empty>
     </el-card>
+
+    <!-- 配置快照查看（创建瞬间冻结；左清单 + 右原文） -->
+    <el-dialog v-model="snapOpen" width="96%" top="24px" class="cfg-dlg snap-dlg"
+               :close-on-click-modal="false">
+      <template #header>
+        <div class="cfg-dlg-head">
+          <b>配置快照</b>
+          <span v-if="snapInstance" class="cfg-dlg-path">{{ snapInstance.name }}</span>
+          <el-tag v-if="snapInstance && snapInstance.snapshot" size="small"
+                  type="success" effect="plain">{{ snapInstance.snapshot.files }} 个文件</el-tag>
+          <span v-if="snapInstance && snapInstance.snapshot" class="mc-muted">
+            创建于 {{ fmtTimeAbs(snapInstance.snapshot.created) }}
+          </span>
+        </div>
+      </template>
+      <div class="cfg-dlg-body has-chain">
+        <div class="cfg-chain snap-list" v-loading="snapLoading">
+          <div class="cfg-chain-title">
+            快照文件（创建瞬间冻结；「已变化 / 实时已删除」= 与当前磁盘配置对比）
+          </div>
+          <div v-for="g in snapGroups" :key="g.label" class="snap-group">
+            <div class="snap-group-title">{{ g.label }}（{{ g.files.length }}）</div>
+            <div v-for="f in g.files" :key="f.path" class="snap-item"
+                 :class="{ active: f.path === snapSel }" role="button" tabindex="0"
+                 @click="selectSnapFile(f.path)"
+                 @keydown.enter.prevent="selectSnapFile(f.path)"
+                 @keydown.space.prevent="selectSnapFile(f.path)">
+              <span class="snap-path mc-mono" :title="f.path">{{ f.path }}</span>
+              <span class="mc-num mc-muted">{{ fmtBytes(f.bytes) }}</span>
+              <el-tag v-if="f.live === 'changed'" size="small" type="warning"
+                      effect="plain" title="创建后该实时配置被修改">已变化</el-tag>
+              <el-tag v-else-if="f.live === 'missing'" size="small" type="danger"
+                      effect="plain" title="该文件已从实时配置中删除">实时已删除</el-tag>
+            </div>
+          </div>
+          <el-empty v-if="!snapLoading && !snapFiles.length"
+                    description="没有可查看的快照文件" :image-size="60" />
+        </div>
+        <div class="cfg-editor-pane">
+          <div class="snap-view-head">
+            <span class="mc-mono snap-sel" :title="snapSel">{{ snapSel || '-' }}</span>
+            <span class="spacer"></span>
+            <span class="log-wrap-toggle">
+              <el-switch v-model="snapWrap" size="small" />
+              <span class="log-wrap-label" @click="snapWrap = !snapWrap">自动换行</span>
+            </span>
+            <el-button size="small" :disabled="!snapContent" @click="copySnapshot">复制</el-button>
+          </div>
+          <pre v-if="snapContent" class="snap-pre"
+               :class="{ 'snap-nowrap': !snapWrap }">{{ snapContent }}</pre>
+          <el-empty v-else-if="!snapLoading && !snapMsg"
+                    description="选择左侧文件查看内容" :image-size="60" />
+          <el-alert v-if="snapMsg" :title="snapMsg" type="error"
+                    :closable="false" show-icon class="mt-2"></el-alert>
+        </div>
+      </div>
+    </el-dialog>
   </div>`,
   setup() {
     const loading = Vue.ref(false);
@@ -533,6 +599,16 @@ const InstanceView = {
     const resync = Vue.ref(0);         // 「重连运行」/自动重连：日志续接信号
     const reconnecting = Vue.ref(false);
     const missing = Vue.ref(false);   // 实例已被删除（API 操作后仍开着页签）
+    // ---- 配置快照查看器 ----
+    const snapOpen = Vue.ref(false);
+    const snapLoading = Vue.ref(false);
+    const snapFiles = Vue.ref([]);
+    const snapSel = Vue.ref("");
+    const snapContent = Vue.ref("");
+    const snapMsg = Vue.ref("");
+    const snapWrap = Vue.ref(true);
+    const snapIid = Vue.ref("");
+    const snapInstance = Vue.ref(null);
     let timer = null;
 
     const tabs = Vue.computed(() => store.instancesOpen || []);
@@ -708,6 +784,79 @@ const InstanceView = {
         await load();
       } catch (e) { ElementPlus.ElMessage.error("改名失败: " + e.message); }
     }
+    const SNAP_GROUP_ORDER = ["部署配置", "场景配置", "继承碎片", "k8s 模板", "元数据"];
+    const snapGroups = Vue.computed(() => {
+      const map = {};
+      for (const f of snapFiles.value) {
+        (map[f.group] = map[f.group] || []).push(f);
+      }
+      return SNAP_GROUP_ORDER.filter(g => map[g])
+        .map(g => ({ label: g, files: map[g] }));
+    });
+    function fmtBytes(n) {
+      n = Number(n) || 0;
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+      if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+      return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+    }
+    async function _loadSnapshot(iid) {
+      snapLoading.value = true;
+      snapMsg.value = "";
+      snapFiles.value = [];
+      snapSel.value = "";
+      snapContent.value = "";
+      try {
+        const r = await api("GET", "/api/instances/" + encodeURIComponent(iid) +
+                            "/snapshot");
+        snapFiles.value = r.files || [];
+        const first = snapFiles.value[0];
+        if (first) await selectSnapFile(first.path);
+      } catch (e) {
+        snapMsg.value = e.message;
+      } finally {
+        snapLoading.value = false;
+      }
+    }
+    async function selectSnapFile(path) {
+      snapSel.value = path;
+      snapContent.value = "";
+      snapMsg.value = "";
+      try {
+        const r = await api("GET", "/api/instances/" + encodeURIComponent(snapIid.value) +
+                            "/snapshot/file?path=" + encodeURIComponent(path));
+        let text = r.content || "";
+        if (/\.json$/.test(path)) {
+          try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* keep raw */ }
+        }
+        snapContent.value = text;
+      } catch (e) {
+        snapMsg.value = e.message;
+      }
+    }
+    function openSnapshotById(iid) {
+      if (!iid) return;
+      const it = (store.instances || []).find(x => x.id === iid) ||
+                 (detail.value && detail.value.instance.id === iid
+                  ? detail.value.instance : null);
+      if (!it || !it.snapshot) {
+        ElementPlus.ElMessage.warning("该实例没有配置快照（旧实例）");
+        return;
+      }
+      snapIid.value = iid;
+      snapInstance.value = it;
+      snapOpen.value = true;
+      _loadSnapshot(iid);
+    }
+    async function copySnapshot() {
+      try {
+        await navigator.clipboard.writeText(snapContent.value);
+        ElementPlus.ElMessage.success("已复制");
+      } catch (e) {
+        ElementPlus.ElMessage.error("复制失败: " + e.message);
+      }
+    }
+
     function gotoResults() {
       const r = latestRun.value;
       if (!r || !r.ts_dir) return;
@@ -776,6 +925,19 @@ const InstanceView = {
       autoReattach(active.value);
       load();
       timer = setInterval(load, 2000);
+      if (store.snapshotTarget) {
+        const iid = store.snapshotTarget;
+        store.snapshotTarget = null;
+        const open = store.instancesOpen || [];
+        if (!open.includes(iid)) {
+          store.instancesOpen = open.concat([iid]);
+          persist();
+        }
+        store.instancesTarget = iid;
+        detail.value = null;
+        load();
+        openSnapshotById(iid);
+      }
     });
     Vue.onDeactivated(() => { clearInterval(timer); });
 
@@ -784,6 +946,9 @@ const InstanceView = {
              latestRun, isCombined, schedulerBusy, runHint, pairCluster,
              pairGlobal, nameOf, tabDot, goPerf, closeMissingTab, activate, closeTab,
              statusType, statusText, fmtTimeAbs, run, stop, remove, rename,
-             reconnectRun, gotoResults, openReport, openCombinedReport };
+             reconnectRun, gotoResults, openReport, openCombinedReport,
+             snapOpen, snapLoading, snapFiles, snapSel, snapContent, snapMsg,
+             snapWrap, snapInstance, snapGroups, selectSnapFile,
+             openSnapshotById, copySnapshot, fmtBytes };
   },
 };

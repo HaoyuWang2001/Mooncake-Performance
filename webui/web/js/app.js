@@ -57,6 +57,7 @@ const store = reactive({
   instances: [],                // /api/instances 全局轮询结果（统一 API 操作显示）
   runs: [],                     // /api/runs 全局轮询结果（历史运行）
   resultsTarget: null,          // 跳转 results 时聚焦的 outputs/<ts>
+  snapshotTarget: null,         // 性能测试卡片 -> 实例详情自动打开配置快照
   instancesOpen: _loadInstanceTabs(),   // 实例详情页已打开的实例（浏览器式页签）
   instancesTarget: null,        // 当前激活的实例详情
   cfgTree: null,                // /api/configs 缓存（config 视图刷新）

@@ -435,6 +435,52 @@ html, body, #app {
                padding-right: 0; }
 }
 
+/* ---- 实例配置快照查看器（复用配置弹窗骨架：左清单 + 右原文） ---- */
+.snap-list { width: 40%; min-width: 300px; }
+.snap-group { margin-bottom: var(--mc-space-2); }
+.snap-group-title {
+  font-size: 12px; font-weight: 600; color: var(--el-text-color-regular);
+  margin: var(--mc-space-2) 0 var(--mc-space-1);
+}
+.snap-item {
+  display: flex; align-items: center; gap: var(--mc-space-2);
+  padding: var(--mc-space-1) var(--mc-space-2);
+  border-radius: var(--mc-radius); border: 1px solid transparent;
+  cursor: pointer;
+}
+.snap-item:hover { background: var(--el-fill-color-light); }
+.snap-item:focus-visible {
+  outline: 2px solid var(--el-color-primary); outline-offset: 1px;
+}
+.snap-item.active {
+  border-color: var(--el-color-primary-light-5);
+  background: var(--el-color-primary-light-9);
+}
+.snap-path {
+  flex: 1; min-width: 0; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.snap-view-head {
+  display: flex; align-items: center; gap: var(--mc-space-2);
+  margin-bottom: var(--mc-space-2);
+}
+.snap-view-head .spacer { flex: 1; }
+.snap-sel {
+  min-width: 0; font-size: 12px; color: var(--el-text-color-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.snap-pre {
+  flex: 1; min-height: 0; max-height: none; margin: 0;
+  padding: var(--mc-space-2); border-radius: var(--mc-radius);
+  background: var(--el-fill-color-darker);
+  font: 12px/1.5 var(--mc-font-mono);
+  white-space: pre-wrap; word-break: break-all; overflow: auto;
+}
+.snap-pre.snap-nowrap { white-space: pre; word-break: normal; }
+@media (max-width: 1100px) {
+  .snap-list { width: auto; height: 30vh; flex: none; }
+}
+
 /* ---- 运行结果 ---- */
 .run-item {
   position: relative; display: flex; align-items: flex-start; gap: 8px;

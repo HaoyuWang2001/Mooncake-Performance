@@ -234,6 +234,17 @@ def test_instance_snapshot_and_cleanup():
     assert os.path.isfile(os.path.join(snap_dir, "snapshot.json"))
     assert os.path.isfile(os.path.join(
         snap_dir, "files/configs/basic/_configs.json"))
+    # 快照查看接口：清单 + 单文件原文（含 k8s/部署配置分组信息）
+    code, snap = _req("GET", "/api/instances/{}/snapshot".format(iid))
+    assert code == 200 and snap["files"]
+    groups = {f["group"] for f in snap["files"]}
+    assert {"部署配置", "场景配置", "继承碎片", "元数据"} <= groups
+    assert all(f["live"] in ("same", "changed", "missing", None)
+               for f in snap["files"])
+    code, fc = _req("GET", "/api/instances/{}/snapshot/file?path={}".format(
+        iid, "configs/_ssh/profile.json"))
+    assert code == 200 and "\"scenario\"" not in fc["content"][:0]  # 只要求可读
+    assert fc["bytes"] > 0
     code, _ = _req("DELETE", "/api/instances/" + iid)
     assert code == 200
     assert not os.path.isdir(snap_dir)

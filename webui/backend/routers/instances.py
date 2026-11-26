@@ -4,6 +4,8 @@
 创建实例只做表单快照（selector + flags），不占用运行槽；运行产生的 run 因
 meta.instance 归属该实例，日志/停止/并发守卫沿用 runs 的机制。
 """
+import hashlib
+import json
 import os
 import shutil
 
@@ -84,6 +86,137 @@ def api_instance_create(handler, query):
         shutil.rmtree(inst_snapshot.snapshot_dir(iid), ignore_errors=True)
         raise
     return {"instance": _summary(inst)}
+
+
+SNAPSHOT_GROUP_ORDER = ["部署配置", "场景配置", "继承碎片", "k8s 模板",
+                        "元数据"]
+
+
+def _snapshot_root(inst):
+    snap = inst.get("snapshot") or {}
+    if not snap or not snap.get("dir"):
+        raise ApiError(404, "该实例没有配置快照（旧实例）")
+    root = snap["dir"]
+    return snap, (root if os.path.isabs(root) else os.path.join(ROOT, root))
+
+
+def _sha256_path(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _snapshot_group_sets(manifest):
+    """从清单推导分组键：部署配置=flags 指向的配置；模板=manifest.templates。"""
+    flags = ((manifest.get("source_request") or {}).get("flags") or {})
+    dep = set()
+    for key in ("cluster", "global", "profile", "rank_cluster",
+                "rank_global", "recall_cluster", "recall_global"):
+        raw = flags.get(key)
+        if not raw:
+            continue
+        full = raw if os.path.isabs(raw) else os.path.join(ROOT, raw)
+        dep.add(os.path.relpath(full, ROOT).replace(os.sep, "/"))
+    tpl = set()
+    for item in manifest.get("templates") or []:
+        for key in ("source", "snapshot"):
+            raw = item.get(key)
+            if not raw:
+                continue
+            full = raw if os.path.isabs(raw) else os.path.join(ROOT, raw)
+            tpl.add(os.path.relpath(full, ROOT).replace(os.sep, "/"))
+    return dep, tpl
+
+
+def _snapshot_group(path, dep, tpl):
+    if path in ("snapshot.json", "instance.json"):
+        return "元数据"
+    if os.path.basename(path) == "_configs.json":
+        return "继承碎片"
+    if path in dep:
+        return "部署配置"
+    if path in tpl or path.endswith(".tpl"):
+        return "k8s 模板"
+    return "场景配置"
+
+
+def _snapshot_live_status(path, sha):
+    """快照文件 vs 当前磁盘（同路径）的状态：same/changed/missing。"""
+    if not sha:
+        return None
+    live = os.path.join(ROOT, path)
+    if not os.path.isfile(live):
+        return "missing"
+    try:
+        return "same" if _sha256_path(live) == sha else "changed"
+    except OSError:
+        return "missing"
+
+
+def api_instance_snapshot(handler, query, iid):
+    """GET /api/instances/{iid}/snapshot：配置快照清单（含与实时配置对比）。"""
+    inst = _load(iid)
+    snap, root = _snapshot_root(inst)
+    mpath = os.path.join(root, "snapshot.json")
+    try:
+        with open(mpath, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        raise ApiError(404, "快照清单缺失或损坏：{}".format(mpath))
+    dep, tpl = _snapshot_group_sets(manifest)
+    files = []
+    for item in manifest.get("files") or []:
+        path = item.get("path") or ""
+        if not path:
+            continue
+        sha = item.get("sha256") or ""
+        files.append({
+            "path": path,
+            "group": _snapshot_group(path, dep, tpl),
+            "bytes": int(item.get("bytes") or 0),
+            "sha256": sha,
+            "live": _snapshot_live_status(path, sha),
+        })
+    # 元数据（清单 / 创建时实例记录）也可查看
+    for name in ("snapshot.json", "instance.json"):
+        fp = os.path.join(root, name)
+        if os.path.isfile(fp):
+            files.append({"path": name, "group": "元数据",
+                          "bytes": os.path.getsize(fp), "sha256": "",
+                          "live": None})
+    files.sort(key=lambda x: (
+        SNAPSHOT_GROUP_ORDER.index(x["group"])
+        if x["group"] in SNAPSHOT_GROUP_ORDER else 99, x["path"]))
+    return {"iid": iid, "name": inst.get("name") or iid,
+            "created": snap.get("created"), "files": files}
+
+
+def api_instance_snapshot_file(handler, query, iid):
+    """GET /api/instances/{iid}/snapshot/file?path=...：读快照文件原文。"""
+    inst = _load(iid)
+    _snap, root = _snapshot_root(inst)
+    rel = (query.get("path", [""])[0] or "").strip()
+    if not rel:
+        raise ApiError(400, "missing query parameter: path")
+    root_real = os.path.realpath(root)
+    full = None
+    for cand in (os.path.join(root, "files", rel), os.path.join(root, rel)):
+        rp = os.path.realpath(cand)
+        if not (rp == root_real or rp.startswith(root_real + os.sep)):
+            raise ApiError(403, "path outside snapshot: {}".format(rel))
+        if os.path.isfile(rp):
+            full = rp
+            break
+    if full is None:
+        raise ApiError(404, "snapshot file not found: {}".format(rel))
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as exc:
+        raise ApiError(500, "read snapshot file failed: {}".format(exc))
+    return {"path": rel, "content": content, "bytes": os.path.getsize(full)}
 
 
 def api_instance_get(handler, query, iid):
@@ -212,6 +345,9 @@ ROUTES += [
     ("GET", r"^/api/instances$", api_instances),
     ("POST", r"^/api/instances$", api_instance_create),
     ("GET", r"^/api/instances/(?P<iid>[^/]+)$", api_instance_get),
+    ("GET", r"^/api/instances/(?P<iid>[^/]+)/snapshot$", api_instance_snapshot),
+    ("GET", r"^/api/instances/(?P<iid>[^/]+)/snapshot/file$",
+     api_instance_snapshot_file),
     ("DELETE", r"^/api/instances/(?P<iid>[^/]+)$", api_instance_delete),
     ("POST", r"^/api/instances/(?P<iid>[^/]+)/run$", api_instance_run),
     ("POST", r"^/api/instances/(?P<iid>[^/]+)/stop$", api_instance_stop),

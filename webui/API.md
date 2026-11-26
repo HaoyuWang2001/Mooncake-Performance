@@ -228,6 +228,28 @@ client/stage/profiling 进程，reader 先 HTTP /shutdown）。默认 grace 60s
 ### GET /api/instances/{iid}
 `{"instance":<summary>,"runs":[<run meta>, ...]}`（该实例全部运行记录）。
 
+### GET /api/instances/{iid}/snapshot
+实例创建时冻结的配置快照清单：
+```json
+{"iid":"i...","name":"...","created":1760000000.0,
+ "files":[{"path":"configs/_k8s/cluster.json","group":"部署配置",
+           "bytes":1234,"sha256":"...","live":"same"},
+          {"path":"configs/_k8s/templates/benchmark-pod.yaml.tpl",
+           "group":"k8s 模板","bytes":456,"sha256":"...","live":"changed"},
+          {"path":"configs/basic/_configs.json","group":"继承碎片",...},
+          {"path":"configs/basic/put.json","group":"场景配置",...},
+          {"path":"snapshot.json","group":"元数据",...}]}
+```
+- `group`：部署配置 / 场景配置 / 继承碎片 / k8s 模板 / 元数据
+- `live`：`same`（与当前磁盘一致）/ `changed`（创建后被修改）/
+  `missing`（实时文件已删除）/ `null`（元数据）
+- 旧实例（无快照）→ 404
+
+### GET /api/instances/{iid}/snapshot/file?path=configs/_k8s/cluster.json
+读取快照内单个文件原文（`path` 为快照清单中的相对路径；也支持
+`snapshot.json` / `instance.json`）→ `{"path":"...","content":"...","bytes":N}`。
+路径必须落在该实例快照内（防穿越，403）；不存在 → 404。
+
 ### POST /api/instances/{iid}/run
 启动该实例的一次运行：**使用创建时冻结的配置快照**（snapshot.request → benchmark argv，
 继承根指向快照 `files/configs`）。守卫/冲突语义同 `POST /api/run`。
