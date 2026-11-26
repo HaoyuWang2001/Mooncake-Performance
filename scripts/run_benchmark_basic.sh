@@ -54,10 +54,14 @@ if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
 fi
 
 # All logs for this instance belong in the hostPath-mounted per-pod directory
-# (<host_log_root>/<run_id>/<pod>/ on the node). Export it as MC_LOG_DIR so
-# SDK/glog output that honors it lands beside .log/.glog/.ylt.log instead of
-# somewhere unmapped; env.mooncake.sh may still override (sourced above).
-export MC_LOG_DIR="${MC_LOG_DIR:-$(dirname "$LOG_FILE")}"
+# (<host_log_root>/<run_id>/<pod>/ on the node). MC_LOG_DIR points at a
+# per-process subdirectory: the SDK initializes glog from it (glog_compat), so
+# the FULL glog (INFO/WARN/ERROR, rotated segments included) lands there — the
+# report parses <MC_LOG_DIR>/*.INFO.* directly and does not rely on stderr.
+# One subdirectory per process/size keeps rotated files and multi-size pod
+# reuse from mixing. env.mooncake.sh may still override (sourced above).
+export MC_LOG_DIR="${MC_LOG_DIR:-$(dirname "$LOG_FILE")/$(basename "$LOG_FILE" .log).glog.d}"
+mkdir -p "$MC_LOG_DIR"
 
 # Print the inherited transport/env snapshot before each client starts.
 print_client_env() {
@@ -189,8 +193,9 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
     bind_launch "$i"
     print_client_env "client-id=$i mode=$MODE"
     # three-stream separation: Python RESULT/SUMMARY -> MC_WRITER_LOG file;
-    # fd1+fd2 (C++ SDK glog + Python fatal) -> the per-client glog file
-    # (merged into LOG_FILE.glog below)
+    # fd1+fd2 (Python fatal + non-glog) -> the per-client glog file. The SDK
+    # glog itself goes to MC_LOG_DIR (per-client dir, parsed by the report).
+    MC_LOG_DIR="$LOG_DIR/client.$i.glog.d" \
     MC_WRITER_LOG="$LOG_DIR/client.$i.log" \
     MC_YLT_LOG_PATH="$LOG_DIR/client.$i.ylt.log" \
     ${LAUNCH_CMD[@]+"${LAUNCH_CMD[@]}"} "$PYTHON" "$CLIENT" \
@@ -220,6 +225,14 @@ if [ "$MODE" = "benchmark" ] && [ "$NUM_CLIENTS" -gt 1 ]; then
   for f in "$LOG_DIR"/client.*.glog; do
     [ -f "$f" ] || continue
     echo "===== $(basename "$f") =====" >> "$LOG_FILE.glog"
+    cat "$f" >> "$LOG_FILE.glog"
+  done
+  # the SDK glog itself lives in each client's MC_LOG_DIR (<client>.glog.d/
+  # *.INFO.*, rotated segments included); merge it before $LOG_DIR is removed
+  # so the single-glog trace product keeps working in multi-client basic mode
+  for f in "$LOG_DIR"/client.*.glog.d/*.INFO.*; do
+    [ -f "$f" ] || continue
+    echo "===== $(basename "$(dirname "$f")")/$(basename "$f") =====" >> "$LOG_FILE.glog"
     cat "$f" >> "$LOG_FILE.glog"
   done
   rm -rf "$LOG_DIR"

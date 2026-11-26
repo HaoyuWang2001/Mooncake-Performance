@@ -505,3 +505,50 @@ def test_get_into_offload_tree(tmp_path):
             f["release_buffer_us"]["max"] +
             f["read_overhead_us"]["max"]) == f["read_us"]["max"]
     assert op["residual"]["n"] == 1 and op["residual"]["max"] == 0
+
+
+def test_rotated_segments_merge_into_one_product(tmp_path):
+    """glog 按 max_log_size 轮转：多段 INFO 文件必须合并成一份统计。
+
+    MC_LOG_DIR 模式下 glog 全量写文件（名含时间戳+pid），长跑/高流量会切
+    段。合并口径：计数/字段/直方图相加，ts 取 min/max，top 取并集重截，
+    meta.source=分段目录名、bytes=各段之和。"""
+    (tmp_path / "s1").mkdir()
+    (tmp_path / "s2").mkdir()
+    seg1 = _write(tmp_path / "s1", "prog.host.root.log.INFO.20261126-130000.45",
+                  [READ_OK, WRITE_OK])
+    seg2 = _write(tmp_path / "s2", "prog.host.root.log.INFO.20261126-140000.45",
+                  [READ_OK, READ_OK])
+    one = ts.compute_trace_stats(seg1)
+    st = ts.compute_trace_stats([seg1, seg2])
+    m = st["meta"]
+    assert m["trace_lines"] == one["meta"]["trace_lines"] + 2
+    assert m["lines"] == one["meta"]["lines"] + 2
+    assert m["bytes"] == (os.path.getsize(seg1) + os.path.getsize(seg2))
+    # 单文件时 source=文件名；多段时 source=分段目录名（clients 里一行）
+    assert m["source"] == os.path.basename(os.path.dirname(seg1))
+    read = st["groups"]["read"]["ops"]["get_buffer"]
+    assert read["count"] == 3
+    # ts 覆盖两段（min/max）
+    assert m["ts_from"] is not None and m["ts_to"] >= m["ts_from"]
+    # top 并集后仍按 total_us 降序、不超过 top_n
+    assert len(read["top"]) <= ts.TOP_N
+    totals = [e["total_us"] for e in read["top"]]
+    assert totals == sorted(totals, reverse=True)
+
+
+def test_cli_accepts_rotated_logs(tmp_path):
+    import subprocess
+    (tmp_path / "r1").mkdir()
+    (tmp_path / "r2").mkdir()
+    p1 = _write(tmp_path / "r1", "a.INFO.20261126-130000.45", [READ_OK])
+    p2 = _write(tmp_path / "r2", "a.INFO.20261126-140000.45", [WRITE_OK])
+    out = str(tmp_path / "rot.json")
+    r = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "scripts", "tracestats.py"),
+         "--log", p1, "--log", p2, "--out", out],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    d = json.load(open(out, encoding="utf-8"))
+    assert set(d["groups"]) == {"read", "write"}
+    assert "segments" in r.stdout

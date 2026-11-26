@@ -48,18 +48,33 @@ def test_remote_trace_map_uses_ip_display_and_pod(monkeypatch):
     cluster = {"nodes": {"pod-a": node}}
     monkeypatch.setattr(bm, "get_node", lambda c, name: node)
     captured = {}
+    segs = ["/logs/ts/pod-a/" + BASE + ".glog.d/mooncake_kvtest.h.u.log.INFO."
+            "20261126-134505.45"]
+    site = "/var/lib/mooncake-bench/ts/pod-a/" + BASE + ".glog.d"
+
+    def fake_inputs(cluster_, node_, glog_dir, legacy, dry=False):
+        captured["glog_dir"] = glog_dir
+        captured["legacy"] = legacy
+        return list(segs), site
 
     def fake_map(cluster_, node_, glogs, remote_scripts, globals_cfg, **kw):
         captured.update({"glogs": glogs, "node_name": kw.get("node_name"),
-                         "role": kw.get("role"), "size": kw.get("size")})
-        return [glogs[0] + ".trace.json"]
+                         "role": kw.get("role"), "size": kw.get("size"),
+                         "out_path": kw.get("out_path"),
+                         "remote_path": kw.get("remote_path")})
+        return [kw["out_path"]]
 
+    monkeypatch.setattr(bm, "_resolve_glog_inputs", fake_inputs)
     monkeypatch.setattr(bm, "run_tracestats_map", fake_map)
     entry = {"node": "pod-a", "_base": BASE, "_ds": "8MB", "_role": "dual"}
     out = bm._kvtest_remote_trace_map(
         cluster, entry, "/logs/ts", "/scripts", {}, best_effort=False)
-    assert out == ["/logs/ts/pod-a/" + BASE + ".log.glog.trace.json"]
-    assert captured["glogs"] == ["/logs/ts/pod-a/" + BASE + ".log.glog"]
+    assert out == ["/logs/ts/pod-a/" + BASE + ".trace.json"]
+    assert captured["glog_dir"] == "/logs/ts/pod-a/" + BASE + ".glog.d"
+    assert captured["legacy"] == "/logs/ts/pod-a/" + BASE + ".log.glog"
+    assert captured["glogs"] == segs
+    assert captured["out_path"] == "/logs/ts/pod-a/" + BASE + ".trace.json"
+    assert captured["remote_path"] == site
     # dual 实例不传 role（一个 glog 同时含 writer+reader）
     assert captured["role"] is None
     assert captured["size"] == "8MB"

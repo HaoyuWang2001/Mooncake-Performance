@@ -116,6 +116,9 @@ def test_small_run_threshold_counts_glog(monkeypatch, tmp_path):
     monkeypatch.setattr(bm, "run_logstats_map", lambda *a, **k: [str(stats_p)])
     monkeypatch.setattr(bm, "run_tracestats_map",
                         lambda *a, **k: [str(trace_p)])
+    monkeypatch.setattr(bm, "_resolve_glog_inputs",
+                        lambda cluster, node, gdir, legacy, dry=False:
+                        (["/r/a.glog"], "/r/a.glog"))
     monkeypatch.setattr(bm, "_pipeline_pull_parallel",
                         lambda cluster, groups, d, dry, workers=None:
                         calls.append(list(groups[0][1])) or 0)

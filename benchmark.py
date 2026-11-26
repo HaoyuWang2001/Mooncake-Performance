@@ -397,8 +397,9 @@ def remote_log_path_pod(remote_log_dir, scenario, name, node):
 
 def _kvtest_pod_dir(remote_log_dir, node):
     """kvtest 远端日志根目录：k8s 每 pod 独立子目录（与 pipeline 现场结构一致），
-    ssh 模式保持平铺（无 pod 概念）。该目录同时容纳 .log/.log.glog/.ylt.log/
-    .exitrc/.summary.json/.samples.csv/.log.glog.trace.json，ssh 现场可整体查看。"""
+    ssh 模式保持平铺（无 pod 概念）。该目录同时容纳 .log/.log.ylt.log/
+    .exitrc/.summary.json/.samples.csv/.trace.json 与 MC_LOG_DIR 的
+    <base>.glog.d/（glog INFO 分段），ssh 现场可整体查看。"""
     if node is not None and node.get("_pod"):
         return "{}/{}".format(remote_log_dir.rstrip("/"), node["_pod"])
     return remote_log_dir
@@ -2959,63 +2960,127 @@ def _hifreq_sample_rate():
     return 0.1
 
 
+def _tracestats_cmd(py, remote_scripts, inputs, node, cluster, node_name,
+                    role, size, sample_rate, remote_path):
+    cmd = "{} {} {}".format(
+        shlex.quote(py),
+        shlex.quote(remote_scripts + "/tracestats.py"),
+        " ".join("--log {}".format(shlex.quote(p)) for p in inputs))
+    if node_name:
+        cmd += " --node {}".format(shlex.quote(
+            str(_node_display(cluster, node, node_name))))
+    if node.get("_pod"):
+        cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
+    if role:
+        cmd += " --role {}".format(shlex.quote(str(role)))
+    if size:
+        cmd += " --size {}".format(shlex.quote(str(size)))
+    if sample_rate is not None:
+        cmd += " --sample-rate {}".format(sample_rate)
+    # 报表索引里的路径 = 节点侧真实位置（ssh 后可读），不是 pod 内路径
+    if remote_path:
+        cmd += " --remote-path {}".format(shlex.quote(remote_path))
+    return cmd
+
+
+def _run_map_cmd(cluster, node, cmd, dry):
+    """Run one map command inside the pod / on the node. True on success."""
+    if dry:
+        log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
+        return True
+    if node.get("_pod"):
+        ns = node.get("_ns") or k8s_settings(cluster)["namespace"]
+        o, rc = controller_run(
+            cluster["_controller"],
+            ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
+            check=False, timeout=_map_timeout() or None)
+        if rc != 0:
+            log("[WARN] [map] tracestats failed on pod {}: {}".format(
+                node["_pod"], (o or "").strip()[:200]))
+            return False
+        return True
+    try:
+        ssh_check_output(node["ip"], node, cmd, dry_run=dry,
+                         quiet=True, timeout=_map_timeout() or None)
+        return True
+    except Exception as exc:
+        log("[WARN] [map] tracestats failed on {}: {}".format(
+            node.get("ip"), exc))
+        return False
+
+
 def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
                        dry=False, node_name=None, role=None, size=None,
-                       sample_rate=None, remote_path=None):
-    """map 阶段（C++ trace）：在节点/pod 内对每个 .glog 执行 tracestats，
-    就地生成 <glog>.trace.json（只回传统计，glog 原始文件留远端）。"""
+                       sample_rate=None, remote_path=None, out_path=None):
+    """map 阶段（C++ trace）：在节点/pod 内执行 tracestats，只回传统计产物。
+
+    out_path given -> ALL inputs (glog rotated segments) merge into ONE
+    product there (kvtest/pipeline discovery path); otherwise legacy per-file
+    products <glog>.trace.json."""
     py = resolve_venv(cluster, globals_cfg) or "python3"
+    if out_path is not None:
+        if not glog_paths:
+            return []
+        cmd = _tracestats_cmd(py, remote_scripts, glog_paths, node, cluster,
+                              node_name, role, size, sample_rate,
+                              remote_path or _pod_path_to_site(
+                                  cluster, out_path))
+        cmd += " --out {}".format(shlex.quote(out_path))
+        t0 = time.time()
+        ok = _run_map_cmd(cluster, node, cmd, dry)
+        if not dry:
+            log_detail("[map] tracestats {} ({} segment(s)) {:.1f}s".format(
+                os.path.basename(out_path), len(glog_paths),
+                time.time() - t0))
+        return [out_path] if ok else []
     out = []
     # NOTE: the loop variable must NOT be named `log` (it would shadow the
     # module-level log() used by the failure branches below).
     for log_path in glog_paths:
         trace_file = log_path + ".trace.json"
-        cmd = "{} {} --log {}".format(
-            shlex.quote(py),
-            shlex.quote(remote_scripts + "/tracestats.py"),
-            shlex.quote(log_path))
-        if node_name:
-            cmd += " --node {}".format(shlex.quote(
-                str(_node_display(cluster, node, node_name))))
-        if node.get("_pod"):
-            cmd += " --pod {}".format(shlex.quote(str(node["_pod"])))
-        if role:
-            cmd += " --role {}".format(shlex.quote(str(role)))
-        if size:
-            cmd += " --size {}".format(shlex.quote(str(size)))
-        if sample_rate is not None:
-            cmd += " --sample-rate {}".format(sample_rate)
-        # 报表索引里的路径 = 节点侧真实文件（ssh 后可读），不是 pod 内路径
-        cmd += " --remote-path {}".format(shlex.quote(
-            remote_path or _pod_path_to_site(cluster, trace_file)))
-        ok = True
+        cmd = _tracestats_cmd(py, remote_scripts, [log_path], node, cluster,
+                              node_name, role, size, sample_rate,
+                              remote_path or _pod_path_to_site(
+                                  cluster, trace_file))
         t0 = time.time()
-        if dry:
-            log_detail("[map] (dry-run) {} {}".format(node.get("ip"), cmd))
-        elif node.get("_pod"):
-            ns = node.get("_ns") or k8s_settings(cluster)["namespace"]
-            o, rc = controller_run(
-                cluster["_controller"],
-                ["-n", ns, "exec", node["_pod"], "--", "bash", "-c", cmd],
-                check=False, timeout=_map_timeout() or None)
-            if rc != 0:
-                ok = False
-                log("[WARN] [map] tracestats failed on pod {}: {}".format(
-                    node["_pod"], (o or "").strip()[:200]))
-        else:
-            try:
-                ssh_check_output(node["ip"], node, cmd, dry_run=dry,
-                                 quiet=True, timeout=_map_timeout() or None)
-            except Exception as exc:
-                ok = False
-                log("[WARN] [map] tracestats failed on {}: {}".format(
-                    node.get("ip"), exc))
+        ok = _run_map_cmd(cluster, node, cmd, dry)
         if not dry:
             log_detail("[map] tracestats {} {:.1f}s".format(
                 os.path.basename(log_path), time.time() - t0))
         if ok:
             out.append(trace_file)     # never request a file that wasn't made
     return out
+
+
+def _resolve_glog_inputs(cluster, node_entry, glog_dir, legacy_file,
+                         dry=False):
+    """Resolve one process's glog inputs for the trace map.
+
+    MC_LOG_DIR splits glog into <prog>.<host>.<user>.log.INFO.<date>-<time>.
+    <pid> files inside a per-process directory (glog_compat initializes glog
+    from MC_LOG_DIR) and glog ROTATES at max_log_size — the full stream is
+    therefore the set of regular *.INFO.* files there (symlinks excluded).
+    Old images / no MC_LOG_DIR keep the legacy stderr capture file.
+
+    Returns (files, site_path). site_path is the NODE-side location the report
+    index shows (the segment DIRECTORY when MC_LOG_DIR is in use, the file
+    otherwise); ([], "") means this process produced no glog."""
+    if dry:
+        return [legacy_file], _pod_path_to_site(cluster, legacy_file)
+    cmd = ("F=$(find {d} -maxdepth 1 -type f -name '*.INFO.*' 2>/dev/null "
+           "| sort); if [ -z \"$F\" ] && [ -f {f} ]; then F={f}; fi; "
+           "printf '%s\\n' \"$F\"").format(
+               d=shlex.quote(glog_dir), f=shlex.quote(legacy_file))
+    try:
+        out = ssh_check_output(node_entry["ip"], node_entry, cmd, quiet=True)
+    except Exception:
+        out = ""
+    files = [ln.strip() for ln in str(out or "").splitlines() if ln.strip()]
+    if not files:
+        return [], ""
+    if files[0] == legacy_file:
+        return files, _pod_path_to_site(cluster, legacy_file)
+    return files, _pod_path_to_site(cluster, glog_dir)
 
 
 def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
@@ -3091,7 +3156,6 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
         paths = [f for f, _r in entries]
         roles = {f: r for f, r in entries if r}
         result_logs = [f for f in paths if not f.endswith(".glog")]
-        glog_logs = [f for f in paths if f.endswith(".glog")]
         role = None
         if not roles and result_logs:
             base = os.path.basename(result_logs[0])
@@ -3102,10 +3166,26 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
         stats = run_logstats_map(cluster, node, result_logs, remote_scripts,
                                  globals_cfg, dry=dry, node_name=name,
                                  role=role, size=size, roles=roles)
-        traces = run_tracestats_map(
-            cluster, node, glog_logs, remote_scripts, globals_cfg, dry=dry,
-            node_name=name, role=role, size=size, sample_rate=sample_rate)
-        pull_files = stats + traces + (paths if pull_raw else [])
+        # glog 来源：每个客户端的 MC_LOG_DIR 目录 <base>.glog.d/*.INFO.*
+        # （旧镜像回退 <base>.glog 的 stderr 捕获）；轮转多段合并成一个产物。
+        traces = []
+        glog_inputs = []
+        for _lp in result_logs:
+            if not _lp.endswith(".log"):
+                continue
+            _base = _lp[:-len(".log")]
+            _files, _site = _resolve_glog_inputs(
+                cluster, node, _base + ".glog.d", _base + ".glog", dry=dry)
+            if not _files:
+                continue
+            traces += run_tracestats_map(
+                cluster, node, _files, remote_scripts, globals_cfg, dry=dry,
+                node_name=name, role=roles.get(_lp) or role, size=size,
+                sample_rate=sample_rate, remote_path=_site,
+                out_path=_base + ".trace.json")
+            if pull_raw:
+                glog_inputs.extend(_files)
+        pull_files = stats + traces + (paths if pull_raw else []) + glog_inputs
         _pipeline_pull_parallel(
             cluster, [(node, pull_files, label)], local_log_dir, dry)
         if not dry and pull_raw:
@@ -5043,15 +5123,21 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             _stats_files = run_logstats_map(
                 cluster, node, [remote_log], remote_scripts, globals_cfg,
                 dry=dry, node_name=primary_node_name, size=ds)
+            _gl_base = remote_log[:-len(".log")] if remote_log.endswith(
+                ".log") else remote_log
+            _gl_files, _gl_site = _resolve_glog_inputs(
+                cluster, node, _gl_base + ".glog.d", remote_log + ".glog",
+                dry=dry)
             _trace_files = run_tracestats_map(
-                cluster, node, [remote_log + ".glog"], remote_scripts,
-                globals_cfg, dry=dry, node_name=primary_node_name, size=ds,
-                sample_rate=_hifreq_sample_rate())
+                cluster, node, _gl_files, remote_scripts, globals_cfg,
+                dry=dry, node_name=primary_node_name, size=ds,
+                sample_rate=_hifreq_sample_rate(), remote_path=_gl_site,
+                out_path=_gl_base + ".trace.json") if _gl_files else []
             _pull_files = list(_stats_files) + list(_trace_files)
             if getattr(args, "pull_raw_logs", False) \
                     or getattr(args, "png", False):
                 _pull_files += [remote_log, remote_log + ".glog"] + (
-                    [remote_log + ".pids"] if c > 1 else [])
+                    [remote_log + ".pids"] if c > 1 else []) + list(_gl_files)
             pull_stage_logs(host, node, _pull_files, local_log_dir, dry)
             # small runs: pull the raw log too (cheap; full per-point
             # inspection + local stats recompute); large runs stay stats-only
@@ -6766,10 +6852,14 @@ def _kvtest_key_pool(cfg, globals_cfg, plan, writer_count, ds_bytes, ds_label):
 
 def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
                                  entry, role, ds_label, key_pool,
-                                 all_instances):
+                                 all_instances, key_namespace=None):
     """Per-instance mooncake_kvtest JSON config. __FABRIC_IP__ and
     __UB_DEVICE__ are late-bound by run_kvtest.sh (per-pod values that only
-    exist at runtime, after env.sh's urma_admin / POD_IP resolution)."""
+    exist at runtime, after env.sh's urma_admin / POD_IP resolution).
+
+    key_namespace: parallel-mode role segment ("rank"/"recall"). Both children
+    of a rank+recall run share ONE store and restart instance ids at 0, so
+    without a segment their key spaces would collide outright."""
     kv = cfg.get("kvtest", {}) or {}
     # num_threads is also the baseline subtracted from num_total_threads to
     # derive the notification-worker count.  Keep the same baseline in pure
@@ -6809,6 +6899,14 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "notify_count": plan["notify_count"],
         "batch_keys_count": max(1, int(cfg.get("batch_size", 1) or 1)),
         "key_pool_size": key_pool,
+        # Key space is orchestrator-owned (the binary reads these fields):
+        # warmup MUST use its own prefix or its leases block the first
+        # measurement upserts (OBJECT_HAS_LEASE — 16.8% write failures when a
+        # build tree wrote warmup with the measurement prefix).
+        "key_prefix": "mooncake_kvtest_" + (
+            "{}_".format(key_namespace) if key_namespace else ""),
+        "warmup_key_prefix": "mooncake_kvtest_warmup_" + (
+            "{}_".format(key_namespace) if key_namespace else ""),
         "notify_queue_max": int(kv.get("notify_queue_max", 8192) or 8192),
         "enable_jitter": bool(kv.get("enable_jitter", True)),
         "start_paused": True,
@@ -7067,7 +7165,8 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
                 "kvtest i{}: no samples artifact for the controller job"
                 "".format(entry["iid"]))
         trace = None
-        for cand in (base + ".log.glog.trace.json",
+        for cand in (base + ".trace.json", base + ".trace.json.gz",
+                     base + ".log.glog.trace.json",
                      base + ".log.glog.trace.json.gz"):
             if cand in names:
                 trace = cand
@@ -7233,33 +7332,30 @@ def _gunzip_local_dir(local_dir):
 
 
 def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
-                             globals_cfg, best_effort=True,
-                             gzip_after=False):
-    """pod 内 tracestats：glog -> <glog>.trace.json（只回传统计，glog 不传输）。
+                             globals_cfg, best_effort=True):
+    """pod 内 tracestats：glog -> <base>.trace.json（只回传统计，glog 不传输）。
 
-    与 pipeline 的 map 阶段完全一致：--node 由 run_tracestats_map 内部经
-    _node_display 解析（k8s=宿主节点 IP），--pod 自动带 pod 名，因此报表
-    的节点归属是 IP 而不是 pod 名。返回可回传的 trace 路径列表（失败为空）。"""
+    Glog 来源 = MC_LOG_DIR 的 <base>.glog.d/ 下全部 *.INFO.*（glog 按
+    max_log_size 轮转，多段合并成一个产物）；旧镜像回退 stderr 捕获文件
+    <base>.log.glog。--node 由 run_tracestats_map 内部经 _node_display 解析
+    （k8s=宿主节点 IP），报表的节点归属是 IP 而不是 pod 名。返回可回传的
+    trace 路径列表（失败为空）。"""
     n = get_node(cluster, entry["node"])
-    glog = _kvtest_pod_base(remote_log_dir, entry["_base"], n) + ".log.glog"
+    pbase = _kvtest_pod_base(remote_log_dir, entry["_base"], n)
     role = entry.get("_role")
     if role in ("dual", "", None):
         role = None
     try:
+        files, site = _resolve_glog_inputs(
+            cluster, n, pbase + ".glog.d", pbase + ".log.glog")
+        if not files:
+            return []
         return run_tracestats_map(
-            cluster, n, [glog], remote_scripts, globals_cfg,
+            cluster, n, files, remote_scripts, globals_cfg,
             node_name=entry["node"], role=role, size=entry.get("_ds"),
             sample_rate=_hifreq_sample_rate(),
-            # The success path RENAMES trace.json -> trace.json.gz after this
-            # map, so a file path recorded now would be stale; point at the
-            # (always-existing) node-side per-pod directory instead. The STOP
-            # path pulls uncompressed and keeps the exact file path.
-            remote_path=(
-                _pod_path_to_site(cluster, posixpath.dirname(glog))
-                if gzip_after and
-                _pod_path_to_site(cluster, posixpath.dirname(glog))
-                != posixpath.dirname(glog)
-                else _pod_path_to_site(cluster, glog + ".trace.json")))
+            remote_path=site,
+            out_path=pbase + ".trace.json")
     except Exception as exc:
         if not best_effort:
             raise
@@ -7284,13 +7380,18 @@ def _kvtest_small_log_bytes(cluster, entry, remote_log_dir):
 
 
 def _kvtest_trace_bytes(local_log_dir, base):
-    """本地 trace 产物里的 glog 真实字节数（trace meta.bytes）。"""
-    path = os.path.join(local_log_dir, base + ".log.glog.trace.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return int((json.load(f).get("meta") or {}).get("bytes") or 0)
-    except (OSError, ValueError):
-        return 0
+    """本地 trace 产物里的 glog 真实字节数（trace meta.bytes）。
+
+    New products are <base>.trace.json (glog lives in MC_LOG_DIR segments);
+    pre-rename runs carry <base>.log.glog.trace.json — both are accepted."""
+    for name in (base + ".trace.json", base + ".log.glog.trace.json"):
+        try:
+            with open(os.path.join(local_log_dir, name), "r",
+                      encoding="utf-8") as f:
+                return int((json.load(f).get("meta") or {}).get("bytes") or 0)
+        except (OSError, ValueError):
+            continue
+    return 0
 
 
 KEEP_INTERMEDIATE_DIRS = ("report", "profiling")
@@ -7584,7 +7685,7 @@ def _kvtest_instance_log_bytes(local_log_dir, base):
     the actual client logs. Prefer the real log files when they were pulled.
     """
     total = 0
-    for suffix in (".log", ".log.glog", ".nohup", ".log.exitrc"):
+    for suffix in (".log", ".log.ylt.log", ".nohup", ".log.exitrc"):
         try:
             total += os.path.getsize(os.path.join(local_log_dir, base + suffix))
         except OSError:
@@ -8201,7 +8302,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             entry["_base"] = base
             entry["_ds"] = ds
             # 每 pod 独立目录（k8s）：<remote_log_dir>/<pod>/<base>.*；
-            # ssh 模式保持平铺。现场四件套同目录：.log/.log.glog/.ylt.log/.exitrc
+            # ssh 模式保持平铺。现场同目录：.log/.log.ylt.log/.exitrc +
+            # MC_LOG_DIR 的 <base>.glog.d/（glog INFO 分段）
             entry["_pod_dir"] = _kvtest_pod_dir(remote_log_dir, n)
             log_base = _kvtest_pod_base(remote_log_dir, base, n)
             # kvtest_out 也收进 pod 目录：<pod_dir>/kvtest_out/<base>（一个
@@ -8252,7 +8354,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             entry["_numa_node"] = explicit_numa_node
             inst_cfg = build_kvtest_instance_config(
                 cfg, globals_cfg, cluster_session, plan, entry, role, ds,
-                key_pool, all_instances)
+                key_pool, all_instances,
+                key_namespace=getattr(args, "parallel_ready_role", None))
             payload = base64.b64encode(
                 json.dumps(inst_cfg).encode("utf-8")).decode("ascii")
             if dry:
@@ -8600,8 +8703,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             stage = "collect artifacts ({})".format(ds)
             log_phase("收集", level=2)
             _t_pull = time.time()
-            # 对齐 pipeline 的 stats-only 策略：原始 .log（空）与 .log.glog
-            # （可达数百 MB/实例）一律不传输，留在各节点 hostPath 现场；
+            # 对齐 pipeline 的 stats-only 策略：原始 .log 与 MC_LOG_DIR 的
+            # glog 分段（可达数百 MB～GB/实例）一律不传输，留在节点现场；
             # glog 的 trace 统计在 pod 内算好后只回传小 trace.json。
             _extra_bytes = {}
 
@@ -8627,7 +8730,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                       entry["_out_dir"]))
                     _trace_files = _kvtest_remote_trace_map(
                         cluster, entry, remote_log_dir, remote_scripts,
-                        globals_cfg, gzip_after=True)
+                        globals_cfg)
                     _extra_bytes[base] = _kvtest_small_log_bytes(
                         cluster, entry, remote_log_dir)
                     # 压缩大件再传输（~8-12x）；失败时透明回退原文件名

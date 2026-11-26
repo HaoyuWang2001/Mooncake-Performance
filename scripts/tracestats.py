@@ -407,6 +407,18 @@ def _value_hist(value_counts, cap=24):
 
 def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                         sample_rate=None, top_n=TOP_N, remote_path=None):
+    """One compact trace product from one or more glog segments.
+
+    ``path`` may be a single file or a list. MC_LOG_DIR splits glog into
+    <prog>.<host>.<user>.log.INFO.<date>-<time>.<pid> and glog rotates at
+    max_log_size, so a long run produces several segments (each possibly
+    GBs). All segments are scanned into the SAME aggregates: one product,
+    exact stats, no per-file product sprawl."""
+    paths = ([path] if isinstance(path, (str, os.PathLike))
+             else [p for p in (path or [])])
+    paths = [str(p) for p in paths if p]
+    if not paths:
+        raise ValueError("compute_trace_stats: no glog input")
     top_n = max(1, int(top_n or 0))
     ops = {}                       # (group, op) -> aggregate dict
     lines_total = lines_trace = lines_slice = parse_errors = 0
@@ -428,14 +440,32 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             }
         return st
 
-    # phase markers first (one pass): classification windows for the C++
-    # trace rows. Legacy clients (no markers) -> every row is measured.
-    marks = parse_phase_markers(path)
-    ep_shift = _resolve_ep_shift(path, marks) if marks else 0.0
+    # phase markers first (one pass per segment): marker timestamps are
+    # absolute epochs, so the union across rotated segments is exact. The
+    # epoch-shift calibration needs one segment that carries markers.
+    marks = {}
+    _mark_src = None
+    for _p in paths:
+        _pm = parse_phase_markers(_p)
+        if _pm and _mark_src is None:
+            _mark_src = _p
+        for _k, _t in _pm.items():
+            if _k not in marks:
+                marks[_k] = _t
+    ep_shift = (_resolve_ep_shift(_mark_src, marks)
+                if _mark_src is not None else 0.0)
     phase_counts = {"setup": 0, "warmup": 0, "measured": 0, "teardown": 0}
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+    def _lines_multi():
+        for _p in paths:
+            try:
+                with open(_p, "r", encoding="utf-8", errors="replace") as f:
+                    for _ln in f:
+                        yield _ln
+            except OSError:
+                continue
+
+    for line in _lines_multi():
             lines_total += 1
             if ("breakdown[" in line or " get_breakdown " in line) \
                     and _truncated(line):
@@ -613,8 +643,8 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     # disk, sampled lines); only when trace lines exist
     if lines_trace:
         res = {}
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+        if True:
+            for line in _lines_multi():
                 pairs = parse_line(line)
                 if pairs is None:
                     continue
@@ -656,9 +686,14 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 "hist": {str(b): n for b, n in sorted(rd["hist"].items())},
             }
 
+    _is_multi = len(paths) > 1
     meta = {
-        "source": os.path.basename(path),
-        "bytes": os.path.getsize(path),
+        # single file: file basename (report keys on it); rotated set: the
+        # segment DIRECTORY name so clients[] keeps one row per process
+        "source": (os.path.basename(os.path.dirname(paths[0]))
+                   if _is_multi else os.path.basename(paths[0])),
+        "bytes": sum(os.path.getsize(_p) for _p in paths
+                     if os.path.isfile(_p)),
         # node-side twin of the glog (the path a report reader can ssh+cat);
         # the orchestrator passes it explicitly, older callers stay empty
         "remote_path": remote_path or "",
@@ -686,7 +721,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Compute compact stats from Mooncake SDK trace lines (map)")
-    ap.add_argument("--log", required=True)
+    ap.add_argument("--log", required=True, action="append",
+                    help="glog file (repeatable: rotated segments are "
+                         "merged into one product)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--node", default=None)
     ap.add_argument("--pod", default=None)
@@ -697,8 +734,9 @@ def main(argv=None):
                     help="node-side path of the source glog (report index)")
     ap.add_argument("--top-n", type=int, default=TOP_N)
     args = ap.parse_args(argv)
-    out = args.out or (args.log + ".trace.json")
-    stats = compute_trace_stats(args.log, node=args.node, pod=args.pod,
+    logs = list(args.log or [])
+    out = args.out or (logs[0] + ".trace.json")
+    stats = compute_trace_stats(logs, node=args.node, pod=args.pod,
                                 role=args.role, size=args.size,
                                 sample_rate=args.sample_rate,
                                 top_n=args.top_n,
@@ -708,8 +746,11 @@ def main(argv=None):
         json.dump(stats, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, out)
     m = stats["meta"]
+    _src = (os.path.basename(logs[0]) if len(logs) == 1
+            else "{}/ ({} segments)".format(
+                os.path.basename(os.path.dirname(logs[0])), len(logs)))
     print("[tracestats] {} trace_lines={} slice_lines={} ops={} -> {}".format(
-        os.path.basename(args.log), m["trace_lines"], m["slice_lines"],
+        _src, m["trace_lines"], m["slice_lines"],
         sum(len(g["ops"]) for g in stats["groups"].values()), out))
     return 0
 

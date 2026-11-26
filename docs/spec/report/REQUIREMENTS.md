@@ -34,7 +34,7 @@ benchmark.py（调用方，不属于本组件）
    ▼
 map 产物（本组件的输入；格式契约由其各自脚本拥有）
    ├─ *.log.stats.json        ← scripts/logstats.py（节点上运行）
-   ├─ *.log.glog.trace.json   ← scripts/tracestats.py（节点上运行）
+   ├─ <base>.trace.json       ← scripts/tracestats.py（节点上运行；glog 分段合并）
    ├─ profiling CSV           ← 采样脚本：mem.host.csv / mem.proc.csv /
    │                            urma.flits.csv / monitor.config.json
    └─ meta.json               ← run 元信息（benchmark.py 写入）
@@ -158,7 +158,7 @@ report.py（本组件：reduce + render，纯标准库）
 - **R-ERR-1** `[已固化·v1.0 重写·DR-29·DR-48]` 错误与异常按**写路径 → 读路径**平铺（basic 单块）；每块为「节点 → 客户端」两级表：节点汇总行（实例数/总数/失败/状态码前 3）+ 客户端行（总数/失败/状态码明细），**精确到节点与客户端**；**节点行带收放按钮（▸/▾），实例行默认折叠**；保留首错误原文摘录（≤16KB）与全局状态分布；无错误时显示「无错误」。
 - **R-ERR-2** `[已固化·v1.0 修订·DR-29]` 异常窗口列表（≤100 条）：时刻 + 类型（错误突发/时延突增）+ 数值 + **归属（角色 · 节点 · 实例）**，与主图强调色竖线同源；reduce 按 (时刻,类型,节点) 去重并携带归属。
 - **R-SRC-1** `[已固化·v0.6 修订]` 现场索引卡显示：节点汇总（客户端数/日志量）、**逐 pod 的节点侧现场目录**（`<host_log_root>/<run_id>/<pod>/`；ssh `<节点IP>` 后 cd 该目录即可看到该 pod 全部日志）、每文件来源表（节点 / pod / 角色 / 文件 / 远程路径 / 大小；路径必须是**节点上真实存在**的文件）、登录与排查命令提示（ssh+cd 为主，kubectl exec 仅在需要 pod 内视角时使用）。
-- **R-SRC-2** `[已固化]` **日志目录契约**：k8s 每 run 每节点一个唯一目录（hostPath `<host_log_root>/<run_id>` 挂载到 `<pod_workspace>/logs/<run_id>`），每 pod 一个专属子目录存放该实例全部产物（`.log/.log.glog/.log.ylt.log/.log.exitrc/.samples.csv(.gz)/.summary.json/.log.glog.trace.json(.gz)/kvtest_out/`、remove-keys 四件套、remove 服务日志）；索引路径在 collect/job/map 阶段生成，**禁止渲染侧改写**；`MC_LOG_DIR` 默认指向该 per-pod 目录（位于 hostPath 映射内）。
+- **R-SRC-2** `[已固化]` **日志目录契约**：k8s 每 run 每节点一个唯一目录（hostPath `<host_log_root>/<run_id>` 挂载到 `<pod_workspace>/logs/<run_id>`），每 pod 一个专属子目录存放该实例全部产物（`.log/.log.ylt.log/.log.exitrc/.samples.csv(.gz)/.summary.json/<base>.trace.json(.gz)/kvtest_out/`、remove-keys 四件套、remove 服务日志、以及 `MC_LOG_DIR` 的 `<base>.glog.d/`——完整 glog 的 INFO 分段，glog 按 max_log_size 轮转、解析时多段合并；不再产生 `.log.glog` stderr 捕获）；索引路径在 collect/job/map 阶段生成，**禁止渲染侧改写**；`MC_LOG_DIR` 默认指向 `<per-pod>/<client>.glog.d/`（位于 hostPath 映射内，每进程/size 独立）。
 
 ### J. 节点监控（MON）
 

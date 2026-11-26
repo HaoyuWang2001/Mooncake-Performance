@@ -4409,9 +4409,9 @@ function renderSources(){
         '现场日志（原始日志不拉回，CLEAN-UP 不删除）：'));
       box.appendChild(wrapx);
       box.appendChild(el('div','note',
-        '每个 pod 一个独立目录；同目录含 .log / .log.glog / .log.ylt.log / '+
-        '.log.exitrc / .samples.csv(.gz) / .summary.json / '+
-        '.log.glog.trace.json(.gz) / kvtest_out/ / remove 服务日志。'+
+        '每个 pod 一个独立目录；同目录含 .log / .log.ylt.log / .log.exitrc / '+
+        '.samples.csv(.gz) / .summary.json / .trace.json(.gz) / '+
+        '<base>.glog.d/（glog 分段）/ kvtest_out/ / remove 服务日志。'+
         'ssh <节点IP> 后 cd 该目录即可看到全部日志；'+
         '仅在需要 pod 内视角时再 kubectl exec -it <pod> -n <ns> -- bash。'));
     } else {
@@ -7101,7 +7101,8 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
             _where = html.escape("{}/{}/<pod>/".format(_root, _run),
                                  quote=True)
             _note = ("现场日志（原始 log/glog/ylt 不拉回，每 pod 一目录，"
-                     "同目录含 .log/.log.glog/.ylt.log/.exitrc；"
+                     "同目录含 .log/.ylt.log/.exitrc 与 MC_LOG_DIR 的 "
+                     "<base>.glog.d/（glog 分段）；"
                      "CLEAN-UP 不删除）：{}。登录节点 ssh &lt;节点IP&gt;；"
                      "进入 pod：kubectl exec -it &lt;pod&gt; -n {} -- bash"
                      .format(_where, _ns or "&lt;ns&gt;"))

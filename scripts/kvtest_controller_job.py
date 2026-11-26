@@ -8,7 +8,7 @@ Runs ON the k8s controller, next to the per-run data directory the pods'
      "meta_base": {...reduce meta sans 'started'...}, "topk": 20,
      "instances": [{"samples": "<base>.samples.csv[.gz]",
                     "summary": "<base>.summary.json",
-                    "trace": "<base>.log.glog.trace.json[.gz]",
+                    "trace": "<base>.trace.json[.gz] (legacy .log.glog.trace.json also accepted)",
                     "site_dir": "<node-side per-pod log dir, optional>",
                     "node": "...", "pod": "...", "ds": "8MB",
                     "start_epoch": 1234.5, "extra_bytes": 0,

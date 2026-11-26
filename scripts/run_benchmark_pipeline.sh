@@ -50,10 +50,14 @@ if [ -f "$SCRIPT_DIR/env.mooncake.sh" ]; then
 fi
 
 # All logs for this instance belong in the hostPath-mounted per-pod directory
-# (<host_log_root>/<run_id>/<pod>/ on the node). Export it as MC_LOG_DIR so
-# SDK/glog output that honors it lands beside .log/.glog/.ylt.log instead of
-# somewhere unmapped; env.mooncake.sh may still override (sourced above).
-export MC_LOG_DIR="${MC_LOG_DIR:-$(dirname "$LOG_FILE")}"
+# (<host_log_root>/<run_id>/<pod>/ on the node). MC_LOG_DIR points at a
+# per-process subdirectory: the SDK initializes glog from it (glog_compat), so
+# the FULL glog (INFO/WARN/ERROR, rotated segments included) lands there — the
+# report parses <MC_LOG_DIR>/*.INFO.* directly and does not rely on stderr.
+# One subdirectory per process/size keeps rotated files and multi-size pod
+# reuse from mixing. env.mooncake.sh may still override (sourced above).
+export MC_LOG_DIR="${MC_LOG_DIR:-$(dirname "$LOG_FILE")/$(basename "$LOG_FILE" .log).glog.d}"
+mkdir -p "$MC_LOG_DIR"
 
 print_client_env() {
   printf '[client-env] %s POD_IP=%s NODE_NAME=%s LD_LIBRARY_PATH=%s SETUP_FABRIC_IP=%s MC_FABRIC_IP=%s MC_TCP_BIND_ADDRESS=%s SETUP_UB_DEVICE=%s MC_URMA_TRANS_MODE=%s SETUP_PROTOCOL=%s MC_LOG_DIR=%s\n' \

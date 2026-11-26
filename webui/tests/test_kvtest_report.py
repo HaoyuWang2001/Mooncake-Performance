@@ -227,7 +227,8 @@ def test_kvtest_map_prefers_raw_log_bytes(tmp_path):
     logs.mkdir()
     base = _write_instance(str(logs), 0, 9301, "8MB", [1.0], [2.0])
     (logs / (base + ".log")).write_bytes(b"x" * 300)
-    (logs / (base + ".log.glog")).write_bytes(b"y" * 120)
+    # glog 已移居 MC_LOG_DIR（不再有 .log.glog）；.ylt.log 仍是现场文件
+    (logs / (base + ".log.ylt.log")).write_bytes(b"y" * 120)
     mapped = bm._kvtest_map_stats(str(logs), _cfg())
     reader = json.load(open(
         [p for p in mapped if ".reader.stats.json" in p][0], encoding="utf-8"))
@@ -236,7 +237,7 @@ def test_kvtest_map_prefers_raw_log_bytes(tmp_path):
     assert reader["meta"]["samples_bytes"] == samples_bytes
     # no raw logs pulled (older binary / stats-only): fall back to样本大小
     (logs / (base + ".log")).unlink()
-    (logs / (base + ".log.glog")).unlink()
+    (logs / (base + ".log.ylt.log")).unlink()
     mapped = bm._kvtest_map_stats(str(logs), _cfg())
     reader = json.load(open(
         [p for p in mapped if ".reader.stats.json" in p][0], encoding="utf-8"))
