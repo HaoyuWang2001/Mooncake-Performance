@@ -17,6 +17,25 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 
 未显式指定 `--profile` 时使用 `<mode-dir>/profile.json`；该文件必须存在（缺失报错并提示从 example 复制）。文件内工具全关 → 诊断关闭（主路径零变化）。
 
+### master / store 的 spdiag
+
+启用 `tools.spdiag.enabled` 后，除 benchmark 客户端外还会执行服务端
+`spdiag restart`，结束时 `spdiag show` 并拉取结果（额外服务端只运行 spdiag）。
+basic、pipeline、kvtest 均支持；kvtest_basic 尚未接入 profiling 生命周期。
+
+- K8s：从 `global.master_addr` 的 Service DNS 推导 master Service 和 namespace，
+  并查找同 namespace 的 `mooncake-store` Service；遍历 Endpoints 中全部 ready Pod。
+  服务名不同时，在 profile 中配置
+  `tools.spdiag.services: ["my-master.prod", "my-store.prod"]`。
+  结果位于 `logs/<配置名>/profiling/service-<namespace>-<Pod名>/spdiag.show.txt`。
+- SSH：使用 `global.mooncake_store_nodes`，并将 `global.master_addr` 的 host 与
+  cluster 节点的 `ip` / `fabric_ip` 匹配。也可用 profile 的
+  `tools.spdiag.service_nodes: ["master_node", "store_node"]` 显式指定服务节点。
+  结果位于 `logs/<配置名>/profiling/<节点名>/spdiag.show.txt`。
+
+服务发现或命令失败会记录 WARN；执行端需已安装 spdiag。外部服务 Pod 不会加入
+benchmark worker 集合，也不会被 benchmark 的 Pod 清理流程删除。
+
 ## 工具矩阵
 
 | 工具 | 覆盖 | 命令形态 | 权限 |

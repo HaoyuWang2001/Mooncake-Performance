@@ -96,14 +96,20 @@ def _ledger_row(ip, node_name, pid, label, marker, cfg_name):
             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
-def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
+def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
+                    spdiag_nodes=None):
     """Start every enabled tool on every profiling node. Returns the session
     dict (or None when nothing could start). Per-tool failures are isolated:
     one broken tool only skips itself ([WARN]) and never aborts the rest."""
     import benchmark as bm  # .state ledger helpers
     nodes = _profiling_nodes(cluster, matrix, involved_nodes)
+    extra_nodes = spdiag_nodes or {}
+    service_only = set(extra_nodes) - set(nodes)
+    cluster = dict(cluster, nodes=dict(cluster.get("nodes", {}), **extra_nodes))
+    nodes += [name for name in extra_nodes if name not in nodes]
     session = {"nodes": nodes, "tools": {}, "remote_out_dir": remote_out_dir,
-               "cfg": cfg_name, "matrix_tools": matrix["tools"]}
+               "cfg": cfg_name, "matrix_tools": matrix["tools"],
+               "node_configs": {name: get_node(cluster, name) for name in nodes}}
     for node_name in nodes:
         n = get_node(cluster, node_name)
         ip = n["ip"]
@@ -115,6 +121,8 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
             continue
         started = {}
         for tool, tcfg in matrix["tools"].items():
+            if node_name in service_only and tool != "spdiag":
+                continue
             if not tcfg.get("enabled"):
                 continue
             try:
@@ -136,7 +144,7 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                                 tool, node_name))
                         continue
                 if tool == "spdiag":
-                    # node-global counters: reset and start accumulating
+                    # Reset shared memory before accumulating this configuration.
                     out = _run(ip, n, "{} restart".format(_bin(tcfg)))
                     log("[profile] spdiag restart on {} ({})".format(node_name, out or "ok"))
                     started[tool] = None
@@ -218,7 +226,9 @@ def stop_and_collect(cluster, session, local_prof_dir):
     import benchmark as bm
     try:
         for node_name, tools in session["tools"].items():
-            n = get_node(cluster, node_name)
+            n = session.get("node_configs", {}).get(node_name)
+            if n is None:
+                n = get_node(cluster, node_name)
             ip = n["ip"]
             remote_out = session["remote_out_dir"]
             collected = []

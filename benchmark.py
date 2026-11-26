@@ -3098,6 +3098,74 @@ def echo_cpu_bindings(cfg_name, local_log_dir):
             continue
 
 
+def _spdiag_service_nodes(cluster, globals_cfg, matrix):
+    """Discover service targets without adding external pods to benchmark workers."""
+    cfg = (matrix.get("tools") or {}).get("spdiag") or {}
+    if not cfg.get("enabled"):
+        return {}
+    result = {}
+    controller = cluster.get("_controller")
+    if controller is None:
+        names = list(cfg.get("service_nodes") or
+                     globals_cfg.get("mooncake_store_nodes") or [])
+        addr = str(globals_cfg.get("master_addr") or "")
+        host = urllib.parse.urlsplit("//" + addr).hostname
+        for name, node in (cluster.get("nodes") or {}).items():
+            if host and host in (node.get("ip"), node.get("fabric_ip")):
+                names.append(name)
+        for name in dict.fromkeys(names):
+            if name in (cluster.get("nodes") or {}):
+                result[name] = get_node(cluster, name)
+            else:
+                log("[WARN] [profile] unknown spdiag service node: {}".format(name))
+        if not host or not any(host in (n.get("ip"), n.get("fabric_ip"))
+                               for n in result.values()):
+            log("[WARN] [profile] master SSH node not resolved; configure "
+                "tools.spdiag.service_nodes with cluster node names")
+        return result
+    addr = str(globals_cfg.get("master_addr") or "")
+    host = urllib.parse.urlsplit(addr if "://" in addr else "//" + addr).hostname
+    svc, ns = _svc_ns_from_host(host)
+    services = cfg.get("services")
+    if services is None:
+        if not svc:
+            log("[WARN] [profile] master Service DNS unavailable; configure "
+                "tools.spdiag.services with Service DNS names")
+            return result
+        services = ["{}.{}".format(svc, ns), "mooncake-store.{}".format(ns)]
+    for service in services:
+        try:
+            service_name, namespace = _svc_ns_from_host(service)
+            if not service_name:
+                raise ValueError("expected <service>.<namespace>: {}".format(service))
+            out, rc = controller_run(
+                controller, ["-n", namespace, "get", "endpoints", service_name,
+                             "-o", "json"], check=False)
+            if rc != 0:
+                raise RuntimeError(out.strip()[:300])
+            found = False
+            for subset in json.loads(out).get("subsets", []):
+                for address in subset.get("addresses", []):
+                    ref = address.get("targetRef") or {}
+                    if ref.get("kind") != "Pod" or not ref.get("name"):
+                        continue
+                    pod = ref["name"]
+                    key = "service-{}-{}".format(namespace, pod)
+                    result[key] = {
+                        "kind": "k8s-pod", "_pod": pod, "_ns": namespace,
+                        "_ctx": controller.get("_ctx", ""),
+                        "_controller": controller,
+                        "_controller_workspace": (cluster.get("k8s") or {}).get(
+                            "controller_workspace", ""),
+                        "ip": address["ip"], "fabric_ip": address["ip"]}
+                    found = True
+            if not found:
+                raise RuntimeError("no ready Pod endpoints")
+        except Exception as exc:
+            log("[WARN] [profile] spdiag Service {}: {}".format(service, exc))
+    return result
+
+
 def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
     apply_cli_overrides(cfg, args)
     matrix = getattr(args, "_matrix", None)
@@ -3210,7 +3278,9 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             try:
                 profile_sess = prof_core.start_profiling(
                     cluster, matrix, involved_nodes, cfg_name,
-                    remote_profiling_dir(remote_log_dir, cfg_name))
+                    remote_profiling_dir(remote_log_dir, cfg_name),
+                    spdiag_nodes=_spdiag_service_nodes(
+                        cluster, globals_cfg, matrix))
             except Exception as exc:
                 log("[WARN] [profile] start failed: {}".format(exc))
         current_ds = None
@@ -3986,7 +4056,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     try:
                         profile_sess = prof_core.start_profiling(
                             cluster, matrix, involved_nodes, cfg_name,
-                            remote_profiling_dir(remote_log_dir, cfg_name))
+                            remote_profiling_dir(remote_log_dir, cfg_name),
+                            spdiag_nodes=_spdiag_service_nodes(
+                                cluster, globals_cfg, matrix))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
             if plan.get("dual"):
@@ -4192,7 +4264,9 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
                     try:
                         profile_sess = prof_core.start_profiling(
                             cluster, matrix, involved_nodes, cfg_name,
-                            remote_profiling_dir(remote_log_dir, cfg_name))
+                            remote_profiling_dir(remote_log_dir, cfg_name),
+                            spdiag_nodes=_spdiag_service_nodes(
+                                cluster, globals_cfg, matrix))
                     except Exception as exc:
                         log("[WARN] [profile] start failed: {}".format(exc))
                 for w in plan["writers"]:
@@ -4949,6 +5023,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     kvtest needs no etcd rendezvous and no value.bin (the binary fills its
     own registered buffers)."""
     apply_cli_overrides(cfg, args)
+    matrix = getattr(args, "_matrix", None)
     scenario = cfg["scenario"]
     cfg_name = os.path.splitext(os.path.basename(cfg.get("__cfg_path__", scenario)))[0]
     dry = args.dry_run
@@ -5075,6 +5150,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     cluster_session = build_cluster_session(cluster, globals_cfg, remote_dir)
     ensure_configmap(cluster, scenario_params, cluster_session, ts, cfg_name, dry)
     instance_pids = []
+    profile_sess = None
     duration = float(cfg.get("duration", 30))
     try:
         if is_k8s:
@@ -5353,6 +5429,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             key_pool = pools[ds]
             all_instances = _instance_view()
             lhost_counter = {}
+            # Ported from main: whole_run includes instance boot/health gates.
+            if (matrix and not dry and prof_core and profile_sess is None
+                    and matrix.get("trigger", "whole_run") == "whole_run"):
+                try:
+                    profile_sess = prof_core.start_profiling(
+                        cluster, matrix, involved_nodes, cfg_name,
+                        remote_profiling_dir(remote_log_dir, cfg_name),
+                        spdiag_nodes=_spdiag_service_nodes(
+                            cluster, globals_cfg, matrix))
+                except Exception as exc:
+                    log("[WARN] [profile] start failed: {}".format(exc))
             if plan.get("dual"):
                 # one process hosts writer+reader: prepare all configs (and
                 # the peer child's remove-keys/setup) BEFORE any process
@@ -5417,6 +5504,16 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     time.sleep(min(
                         1.0, max(0.05, seconds - (time.time() - started))))
 
+            # Ported from main: per_stage starts before releasing the clients.
+            if matrix and not dry and prof_core and profile_sess is None:
+                try:
+                    profile_sess = prof_core.start_profiling(
+                        cluster, matrix, involved_nodes, cfg_name,
+                        remote_profiling_dir(remote_log_dir, cfg_name),
+                        spdiag_nodes=_spdiag_service_nodes(
+                            cluster, globals_cfg, matrix))
+                except Exception as exc:
+                    log("[WARN] [profile] start failed: {}".format(exc))
             _parallel_start_barrier(args)
             cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = time.time()
             _kvtest_write_report_meta(local_log_dir, cfg)
@@ -5561,6 +5658,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         pull_stage_logs(host, node, [remove_log], local_log_dir, dry)
         if not dry:
             _verify_store_clean(cluster, globals_cfg, cfg_name, "config end")
+        if profile_sess is not None:
+            prof_core.stop_and_collect(
+                cluster, profile_sess,
+                os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
@@ -5569,6 +5670,13 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # after sweep-end. Hand the sweep-end pass this config's coordinates.
         return {"host": host, "node": primary_node_name, "runner": remote_runner_pipeline,
                 "remote_log_dir": remote_log_dir}
+    except StopRequested:
+        # Collect while benchmark pods still exist; main handles stop cleanup.
+        if profile_sess is not None:
+            prof_core.stop_and_collect(
+                cluster, profile_sess,
+                os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
+        raise
     except Exception:
         # FAIL path: preserve every remote log (summary.json is flushed by
         # /stop) and free ports, then re-raise for main's [FAIL]
@@ -5579,6 +5687,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                 remove_node=locals().get("primary_node_name"),
                                 remove_runner=locals().get("remote_runner_pipeline"),
                                 globals_cfg=globals_cfg)
+            if profile_sess is not None:
+                prof_core.stop_and_collect(
+                    cluster, profile_sess,
+                    os.path.join(local_result_dir, "logs", cfg_name, "profiling"))
             reap_state_entries(cluster)
             if is_k8s:
                 cluster["_k8s_keep_ns"] = True
