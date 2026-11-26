@@ -388,6 +388,18 @@ def _kvtest_instance_dir(remote_log_dir, node, role, iid, port):
                              "i{}_p{}".format(iid, port))
 
 
+def _kvtest_push_cmd(inst_dir, payload, cfg_file):
+    """Per-process kvtest config push (INERT base64 write over ssh/exec).
+
+    The directory created here is the PROCESS directory
+    (<pod>/<role>_i<iid>_p<port>/), not the pod dir: the config file, the
+    narrative .log, the nohup ledger and the whole 现场 (kvtest_out, glog.d)
+    live in that subdirectory, so creating only the pod dir makes the
+    redirect fail with "No such file or directory" on split pods."""
+    return ("mkdir -p '{d}' && printf '%s' '{b}' | base64 -d > '{f}'"
+            .format(d=inst_dir, b=payload, f=cfg_file))
+
+
 def _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s):
     """报表「现场索引」所需的运行上下文（host 目录 + run id + 登录提示）。"""
     ctx = {"run_id": ts, "remote_log_dir": remote_log_dir}
@@ -8200,10 +8212,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 # the push itself is deferred to _push_instances: the serial
                 # build above owns the order-sensitive port/NUMA slot
                 # assignment, only the per-instance execs overlap.
-                entry["_push_cmd"] = (
-                    "mkdir -p '{d}' && printf '%s' '{b}' | base64 -d > '{f}'"
-                    .format(d=_kvtest_pod_dir(remote_log_dir, n),
-                            b=payload, f=cfg_file))
+                entry["_push_cmd"] = _kvtest_push_cmd(
+                    inst_dir, payload, cfg_file)
             entry["_role"] = role
             entry["_ccmd"] = ("nohup {p}bash {runner} {log} {cfgf} {bin} "
                               "> {nohup} 2>&1 & echo $!").format(
