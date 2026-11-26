@@ -873,8 +873,10 @@ def test_render_report_has_rel_base_and_adapter(tmp_path):
     assert 'src="data.js"' in src
     # phase footnote: built at runtime by the app JS from phase_counts —
     # the JS source carries the template and __MC_FULL_READY__ hook
-    assert "已按阶段标记剔除" in src
+    # 阶段脚注：标记驱动的剔除与单窗口 warmup 剔除共用同一措辞
+    assert "已按阶段剔除" in src
     assert "phase_counts" in src and "pc.warmup||0" in src
+    assert "m.warmup_s" in src        # 无标记但单窗口 warmup 时也显示脚注
 
 
 def test_render_overview_has_rel_base_and_adapter(tmp_path):
