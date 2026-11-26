@@ -358,6 +358,8 @@ def _summary_of(stats, pools=None):
     max_depth = 0
     verify_failures = 0
     ts_from = ts_to = None
+    fts_from = fts_to = None
+    has_cutoff = False
     hist = {}
     wall = 0.0
     gmax = gmin = None
@@ -392,6 +394,14 @@ def _summary_of(stats, pools=None):
         if meta.get("ts_to") is not None:
             ts_to = meta["ts_to"] if ts_to is None else max(
                 ts_to, meta["ts_to"])
+        if meta.get("warmup_cutoff") is not None:
+            has_cutoff = True
+        if meta.get("formal_ts_from") is not None:
+            fts_from = meta["formal_ts_from"] if fts_from is None else min(
+                fts_from, meta["formal_ts_from"])
+        if meta.get("formal_ts_to") is not None:
+            fts_to = meta["formal_ts_to"] if fts_to is None else max(
+                fts_to, meta["formal_ts_to"])
         for b, n in (st.get("histogram") or {}).items():
             hist[int(b)] = hist.get(int(b), 0) + n
         for kind, payload in st.get("summaries") or []:
@@ -401,7 +411,14 @@ def _summary_of(stats, pools=None):
             total_bytes += int(payload.get("bytes", 0) or 0)
             wall = max(wall, float(payload.get("wall_s", 0) or 0))
     span = (ts_to - ts_from) if (ts_from is not None and ts_to is not None) else 0.0
-    wall = wall or span
+    fspan = (fts_to - fts_from) if (fts_from is not None
+                                    and fts_to is not None) else 0.0
+    if has_cutoff and fspan > 0:
+        # warmup 并入窗口：正式时长 = 正式域跨度（C++ elapsed_seconds 含
+        # warmup 区，不能直接用于 qps/吞吐口径）
+        wall = fspan
+    else:
+        wall = wall or span
 
     edges = _hist_edges(stats)
 
@@ -535,14 +552,18 @@ def _kvtest_read_product_pool(st):
     pool = None
     if os.path.isfile(samples):
         ops = set((st.get("ops") or {}).keys()) or None
+        cut = m.get("warmup_cutoff")
         pool = {"lats": [], "secs": {}}
         for row in ls.iter_kvtest_rows(samples, m.get("ts_from"), ops):
             if row["status"] != "OK" or row["lat"] is None:
                 continue
-            pool["lats"].append(row["lat"])
             ep = row.get("epoch")
             if ep is not None:
+                # 图表桶保留 warmup 区（图上仍绘制）
                 pool["secs"].setdefault(int(ep), []).append(row["lat"])
+            if cut is not None and ep is not None and ep < float(cut):
+                continue          # warmup 行不进正式分位数/summary
+            pool["lats"].append(row["lat"])
         pool["lats"].sort()
     _KVTEST_PRODUCT_POOL[path] = pool
     return pool
@@ -741,6 +762,10 @@ def reduce_size(stats, meta):
             excerpt = st["error_excerpt"]
             excerpt_status = st.get("error_excerpt_status")
     summary = _summary_of(stats, _kvtest_scope_pools(stats))
+    _cuts = [float((st.get("meta") or {}).get("warmup_cutoff"))
+             for st in stats
+             if (st.get("meta") or {}).get("warmup_cutoff") is not None]
+    warmup_cutoff = min(_cuts) if _cuts else None
     span = 0.0
     if summary.get("ts_from") is not None and summary.get("ts_to") is not None:
         span = float(summary["ts_to"]) - float(summary["ts_from"])
@@ -831,6 +856,8 @@ def reduce_size(stats, meta):
     return {
         "summary": summary,
         "span": round(span, 1),
+        # warmup 结束点（epoch，图表域）：前端在该位置画一条竖线
+        "warmup_cutoff": warmup_cutoff,
         "tiers": tiers_meta,
         "role_summaries": role_summaries,
         "embed_tier": embed,
@@ -2690,6 +2717,14 @@ function markLines(){
       data.push({xAxis:a.t*1000,
         lineStyle:{color:C.hero,width:1,opacity:0.15},
         label:{show:false}});});
+  /* warmup 结束点：前 warmup 秒已并入测量窗口（图上绘制）但不计入正式
+     统计；这里标一条竖线给出边界。 */
+  if(z&&z.warmup_cutoff!=null&&isFinite(Number(z.warmup_cutoff))){
+    data.push({xAxis:Number(z.warmup_cutoff)*1000,
+      lineStyle:{color:C.fg,width:1,type:'dashed',opacity:0.75},
+      label:{show:true,position:'insideEndTop',formatter:'warmup 结束',
+             color:C.mut}});
+  }
   return data.length?{symbol:'none',silent:true,data:data}:null;
 }
 /* 无数据窗口（两次运行/两次参数组之间）：单参数 run 与多 combo sweep 都会
@@ -5753,6 +5788,18 @@ function buildStageChart(cur){
   const o=axisCommon();
   o.grid=STAGE_GRID;
   o.tooltip=lfTooltip({trigger:'axis'});
+  /* trace 域的 warmup 结束线（meta.warmup_cutoff 由 tracestats 计算） */
+  if(series.length){
+    const _tm=((cur&&cur.data&&cur.data.meta)||(traceOf()||{}).meta||{});
+    const _wc=_tm.warmup_cutoff;
+    if(_wc!=null&&isFinite(Number(_wc))){
+      series[0].markLine={symbol:'none',silent:true,
+        data:[{xAxis:Number(_wc)*1000,
+          lineStyle:{color:C.fg,width:1,type:'dashed',opacity:0.75},
+          label:{show:true,position:'insideEndTop',formatter:'warmup 结束',
+                 color:C.mut}}]};
+    }
+  }
   o.tooltip.valueFormatter=function(v){return fmtUs(v);};
   o.tooltip.formatter=function(ps){
     if(!ps||!ps.length) return '';
@@ -6521,9 +6568,9 @@ function renderTrace(){
   const m=(t&&t.meta)||{};
   const rates=Object.keys(m.sample_rates||{});
   let phaseTxt;
-  if(m.markers){
+  if(m.markers||(m.warmup_s!=null&&Number(m.warmup_s)>0)){
     const pc=m.phase_counts||{};
-    phaseTxt=' · 已按阶段标记剔除：预热 '+(pc.warmup||0)+
+    phaseTxt=' · 已按阶段剔除：预热 '+(pc.warmup||0)+
       ' / 启动 '+(pc.setup||0)+' / 收尾 '+(pc.teardown||0)+
       '（计入统计 '+(pc.measured||0)+'）';
   }else{

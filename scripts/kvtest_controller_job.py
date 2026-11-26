@@ -91,6 +91,7 @@ def _map_one(d, inst):
             samples, top_n=100, context=20,
             node=inst.get("node") or "", pod=inst.get("pod") or "",
             role=role, remote_path=remote_path, size=inst.get("ds"),
+            warmup_cutoff=inst.get("warmup_until"),
             rows_factory=lambda p, _ops=ops, _start=start:
                 ls.iter_kvtest_rows(p, _start, _ops),
             summaries=[("summary", payload)] if payload is not None else [],

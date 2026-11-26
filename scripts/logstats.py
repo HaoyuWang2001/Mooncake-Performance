@@ -258,7 +258,8 @@ def _row_epoch(row):
 
 def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                   role=None, remote_path=None, size=None, rows_factory=None,
-                  summaries=None, source_name=None, extra_meta=None):
+                  summaries=None, source_name=None, extra_meta=None,
+                  warmup_cutoff=None):
     """Build one client's stats product (the map stage).
 
     rows_factory: optional callable(path) -> row iterator; defaults to the
@@ -268,6 +269,10 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         the orchestrator synthesizes them from summary.json).
     source_name: display/provenance name written to meta.source.
     extra_meta: additional meta keys (e.g. {"format": "kvtest_samples"}).
+    warmup_cutoff: epoch seconds; rows BEFORE it are the warmup region — they
+        feed ONLY the time-bucket charts (drawn, with a boundary line) and are
+        excluded from every formal statistic (totals/op stats/histograms/
+        slowest/errors). None keeps the legacy single-phase behaviour.
     """
     row_source = rows_factory or iter_rows
     top_n = max(1, int(top_n or 0))   # a 0-capacity heap indexes slowest[0]
@@ -292,6 +297,11 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     abnormal = []                   # 异常请求（未完成/失败）清单，<=LIST_CAP
     seconds = {}                    # epoch-second -> bucket dict
     ts_from = ts_to = None
+    # warmup region bookkeeping: chart domain = ts_from/to (all rows),
+    # formal domain = formal_ts_from/to (rows at/after the cutoff)
+    warmup_rows = 0
+    warmup_fail = 0
+    formal_ts_from = formal_ts_to = None
 
     for row in row_source(path):
         rows += 1
@@ -299,6 +309,37 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         kc = row["kc"]
         status = row["status"]
         okrow = status == "OK"
+        ep = _row_epoch(row)
+        if (warmup_cutoff is not None and ep is not None
+                and ep < float(warmup_cutoff)):
+            # warmup 区：只进图表时间桶（图上绘制），不进任何正式统计。
+            # 失败行交给下方 errors 二次扫描统一入桶，避免重复计数。
+            warmup_rows += 1
+            if ts_from is None or ep < ts_from:
+                ts_from = ep
+            if ts_to is None or ep > ts_to:
+                ts_to = ep
+            if okrow and row["lat"] is not None:
+                sec = int(ep)
+                buck = seconds.get(sec)
+                if buck is None:
+                    buck = seconds[sec] = {"c": 0, "ok": 0, "fail": 0,
+                                           "sum": 0.0, "max": 0.0,
+                                           "qsum": 0.0, "qmax": 0.0, "h": {}}
+                lat = row["lat"]
+                buck["c"] += 1
+                buck["ok"] += 1
+                buck["sum"] += lat
+                buck["max"] = max(buck["max"], lat)
+                hb = bin_of(lat, BIN_EDGES_V2)
+                buck["h"][hb] = buck["h"].get(hb, 0) + 1
+                qw = row["qw"]
+                if qw is not None:
+                    buck["qsum"] += qw
+                    buck["qmax"] = max(buck["qmax"], qw)
+            else:
+                warmup_fail += 1
+            continue
         total += 1
         key_total += kc
         opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0,
@@ -331,12 +372,15 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         else:
             opd["fail"] += 1
             opd["_keys_fail"] += kc
-        ep = _row_epoch(row)
         if ep is not None:
             if ts_from is None or ep < ts_from:
                 ts_from = ep
             if ts_to is None or ep > ts_to:
                 ts_to = ep
+            if formal_ts_from is None or ep < formal_ts_from:
+                formal_ts_from = ep
+            if formal_ts_to is None or ep > formal_ts_to:
+                formal_ts_to = ep
 
         if not okrow:
             fail += 1
@@ -407,7 +451,7 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
     # errors land in their (epoch) bucket too (for anomaly windows)
     # second pass avoided: errors were few in normal runs; add them now by
     # re-scanning ONLY when errors exist
-    if fail:
+    if fail or warmup_fail:
         for row in row_source(path):
             if row["status"] == "OK" or row["lat"] is None:
                 continue
@@ -611,6 +655,13 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "size": size,
             "rows": rows,
             "ts_from": ts_from, "ts_to": ts_to,
+            # 图表域（含 warmup）vs 正式统计域；cutoff 非空时两者不同
+            "warmup_cutoff": (float(warmup_cutoff)
+                              if warmup_cutoff is not None else None),
+            "warmup_rows": warmup_rows,
+            "warmup_fail": warmup_fail,
+            "formal_ts_from": formal_ts_from,
+            "formal_ts_to": formal_ts_to,
             "wall_s": round(ts_to - ts_from, 3) if ts_from and ts_to else None,
             "dated": ts_from is not None,
             # time-bucket t unit; "s" = epoch seconds (absent in old products,
@@ -712,10 +763,15 @@ def iter_kvtest_rows(path, start_epoch, ops=None):
             epoch = (float(start_epoch) + elapsed) if start_epoch else None
             ts = _epoch_to_ts(epoch) if epoch is not None else ""
             index = str(row.get("request_index") or "").strip()
+            try:
+                nbytes = int(float(row.get("bytes") or 0))
+            except (TypeError, ValueError):
+                nbytes = 0
             yield {"ts": ts, "op": op,
                    "key": ("req#" + index) if index else "",
                    "lat": lat, "status": status, "qw": None,
-                   "kc": 1, "lineno": lineno, "epoch": epoch}
+                   "kc": 1, "lineno": lineno, "epoch": epoch,
+                   "bytes": nbytes, "elapsed": elapsed}
 
 
 def kvtest_summary_payload(summary_path, ops=None):

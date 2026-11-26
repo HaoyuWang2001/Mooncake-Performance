@@ -406,7 +406,8 @@ def _value_hist(value_counts, cap=24):
 
 
 def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
-                        sample_rate=None, top_n=TOP_N, remote_path=None):
+                        sample_rate=None, top_n=TOP_N, remote_path=None,
+                        warmup_s=None):
     """One compact trace product from one or more glog segments.
 
     ``path`` may be a single file or a list. MC_LOG_DIR splits glog into
@@ -455,6 +456,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     ep_shift = (_resolve_ep_shift(_mark_src, marks)
                 if _mark_src is not None else 0.0)
     phase_counts = {"setup": 0, "warmup": 0, "measured": 0, "teardown": 0}
+    _warmup_until = None
 
     def _lines_multi():
         for _p in paths:
@@ -491,7 +493,18 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 ep = 0.0
             else:
                 ep += ep_shift
-            phase = _phase_of(ep, marks)
+            if warmup_s is not None and float(warmup_s or 0) > 0:
+                # 单窗口模式：前 warmup_s 秒为 warmup 区（不计入正式统计）。
+                # trace 的 start_time 是容器钟面时间，与编排机 epoch 不同域，
+                # 因此以首条 trace 行做相对锚点（分段按文件名排序=时间顺序）。
+                if _warmup_until is None and ep:
+                    _warmup_until = ep + float(warmup_s)
+                if _warmup_until is not None and ep and ep < _warmup_until:
+                    phase = "warmup"
+                else:
+                    phase = _phase_of(ep, marks)
+            else:
+                phase = _phase_of(ep, marks)
             if phase is None:
                 phase = "measured"      # legacy: no markers in this glog
             phase_counts[phase] += 1
@@ -699,6 +712,10 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         "remote_path": remote_path or "",
         "node": node, "pod": pod, "role": role, "size": size,
         "sample_rate": sample_rate,
+        # 单窗口 warmup：warmup_s 为配置值；warmup_cutoff 是解析出的
+        # trace 钟面绝对边界（首条 trace 行 + warmup_s），图表竖线用
+        "warmup_s": (float(warmup_s) if warmup_s is not None else None),
+        "warmup_cutoff": _warmup_until,
         "lines": lines_total,
         "trace_lines": lines_trace,
         "slice_lines": lines_slice,
@@ -732,6 +749,10 @@ def main(argv=None):
     ap.add_argument("--sample-rate", type=float, default=None)
     ap.add_argument("--remote-path", default=None,
                     help="node-side path of the source glog (report index)")
+    ap.add_argument("--warmup-s", type=float, default=None,
+                    help="single-window warmup seconds: rows in the first "
+                         "warmup_s (anchored at the first trace row) are "
+                         "counted as phase=warmup and excluded from stats")
     ap.add_argument("--top-n", type=int, default=TOP_N)
     args = ap.parse_args(argv)
     logs = list(args.log or [])
@@ -740,7 +761,8 @@ def main(argv=None):
                                 role=args.role, size=args.size,
                                 sample_rate=args.sample_rate,
                                 top_n=args.top_n,
-                                remote_path=args.remote_path)
+                                remote_path=args.remote_path,
+                                warmup_s=args.warmup_s)
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, separators=(",", ":"))

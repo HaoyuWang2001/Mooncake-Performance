@@ -136,13 +136,17 @@ def test_kvtest_warmup_duration_and_no_warmup_override():
     assert inherited["warmup"]["duration"] == 5
 
 
-def test_kvtest_warmup_control_barrier_order():
+def test_kvtest_single_window_no_warmup_control_cycle():
+    """warmup 不再单独成阶段：单窗口 duration+warmup，前 warmup 秒由 MP 侧
+    数据面按 cutoff 剔除；/pause /drain /reset /arm /resume 循环整体移除。"""
     source = open(os.path.join(ROOT, "benchmark.py"), encoding="utf-8").read()
-    calls = ['_control("/pause"', '_control("/drain"',
-             '_control("/reset"', '_control("/arm"',
-             '_control("/resume"']
-    positions = [source.index(call) for call in calls]
-    assert positions == sorted(positions)
+    for call in ('_control("/pause"', '_control("/drain"',
+                 '_control("/reset"', '_control("/arm"',
+                 '_control("/resume"'):
+        assert call not in source, call
+    # 单窗口 = warmup + duration
+    assert "_total_window = float(warmup_duration) + float(duration)" in source
+    assert '_wait_window(_total_window, "measurement")' in source
 
 
 # ------------------------------------------------- per-instance config build

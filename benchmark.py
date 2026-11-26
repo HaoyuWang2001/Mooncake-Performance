@@ -220,38 +220,6 @@ def _parallel_start_barrier(args):
     args._parallel_ready_done = True
     log("[parallel] rank and recall aligned at /start; continuing benchmark")
 
-
-def _parallel_measure_barrier(args):
-    """Align the first post-warmup kvtest /resume across rank and recall."""
-    ready_dir = getattr(args, "parallel_ready_dir", None)
-    role = getattr(args, "parallel_ready_role", None)
-    if not ready_dir or not role or getattr(
-            args, "_parallel_measure_ready_done", False):
-        return
-    if role not in ("rank", "recall"):
-        raise RuntimeError("invalid parallel ready role: {}".format(role))
-    os.makedirs(ready_dir, exist_ok=True)
-    marker = os.path.join(ready_dir, role + ".measure.ready")
-    tmp = marker + ".{}.tmp".format(os.getpid())
-    with open(tmp, "w", encoding="utf-8") as stream:
-        stream.write("{}\n".format(os.getpid()))
-    os.replace(tmp, marker)
-    peer = "recall" if role == "rank" else "rank"
-    peer_marker = os.path.join(ready_dir, peer + ".measure.ready")
-    log("[parallel] {} warmup drained; holding /resume, waiting for {}"
-        "".format(role, peer))
-    deadline = time.time() + _PARALLEL_READY_TIMEOUT_S
-    while not os.path.isfile(peer_marker):
-        _check_stop()
-        if time.time() >= deadline:
-            raise RuntimeError(
-                "parallel /resume barrier timed out after {}s: {} marker "
-                "not found".format(_PARALLEL_READY_TIMEOUT_S, peer))
-        time.sleep(0.2)
-    args._parallel_measure_ready_done = True
-    log("[parallel] rank and recall aligned after warmup; resuming measurement")
-
-
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 RESULTS_DIR = os.path.join(ROOT, "outputs")
 # RESULT rows whose first field is a wall-clock timestamp (HH:MM:SS.micro);
@@ -320,6 +288,8 @@ KVTEST_CSV_HEADER = [
     "notify_avg_ms", "notify_max_ms",
     "queue_wait_avg_ms", "queue_wait_max_ms",
 ]
+
+
 
 
 def collapse_config_name(rows):
@@ -2961,7 +2931,7 @@ def _hifreq_sample_rate():
 
 
 def _tracestats_cmd(py, remote_scripts, inputs, node, cluster, node_name,
-                    role, size, sample_rate, remote_path):
+                    role, size, sample_rate, remote_path, warmup_s=None):
     cmd = "{} {} {}".format(
         shlex.quote(py),
         shlex.quote(remote_scripts + "/tracestats.py"),
@@ -2977,6 +2947,8 @@ def _tracestats_cmd(py, remote_scripts, inputs, node, cluster, node_name,
         cmd += " --size {}".format(shlex.quote(str(size)))
     if sample_rate is not None:
         cmd += " --sample-rate {}".format(sample_rate)
+    if warmup_s is not None and float(warmup_s) > 0:
+        cmd += " --warmup-s {}".format(float(warmup_s))
     # 报表索引里的路径 = 节点侧真实位置（ssh 后可读），不是 pod 内路径
     if remote_path:
         cmd += " --remote-path {}".format(shlex.quote(remote_path))
@@ -3011,7 +2983,8 @@ def _run_map_cmd(cluster, node, cmd, dry):
 
 def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
                        dry=False, node_name=None, role=None, size=None,
-                       sample_rate=None, remote_path=None, out_path=None):
+                       sample_rate=None, remote_path=None, out_path=None,
+                       warmup_s=None):
     """map 阶段（C++ trace）：在节点/pod 内执行 tracestats，只回传统计产物。
 
     out_path given -> ALL inputs (glog rotated segments) merge into ONE
@@ -3024,7 +2997,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
         cmd = _tracestats_cmd(py, remote_scripts, glog_paths, node, cluster,
                               node_name, role, size, sample_rate,
                               remote_path or _pod_path_to_site(
-                                  cluster, out_path))
+                                  cluster, out_path), warmup_s)
         cmd += " --out {}".format(shlex.quote(out_path))
         t0 = time.time()
         ok = _run_map_cmd(cluster, node, cmd, dry)
@@ -3041,7 +3014,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
         cmd = _tracestats_cmd(py, remote_scripts, [log_path], node, cluster,
                               node_name, role, size, sample_rate,
                               remote_path or _pod_path_to_site(
-                                  cluster, trace_file))
+                                  cluster, trace_file), warmup_s)
         t0 = time.time()
         ok = _run_map_cmd(cluster, node, cmd, dry)
         if not dry:
@@ -3419,7 +3392,8 @@ def _build_report_params(cfg, meta, nodes=0):
         add("采集时长", "{} s".format(cfg.get("duration")))
     warm = cfg.get("warmup") or {}
     if warm.get("duration"):
-        add("预热时长", "{} s".format(warm["duration"]))
+        add("预热时长", "{} s（并入正式窗口，前 {}s 不计入统计）".format(
+            warm["duration"], warm["duration"]))
     add("batch_size", cfg.get("batch_size"))
     add("操作", cfg.get("operation"))
     add("key_count", cfg.get("key_count"))
@@ -3598,8 +3572,8 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
         if engine == "kvtest":
             _side = _kvtest_read_report_meta(local_log_dir)
             for _k in ("run_id", "remote_log_dir", "host_log_root",
-                       "k8s_namespace"):
-                if _side.get(_k):
+                       "k8s_namespace", "warmup_s"):
+                if _side.get(_k) is not None:
                     meta[_k] = _side[_k]
         meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
         data = rp.reduce_scenario(
@@ -7190,6 +7164,8 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
         site_dir = (_pod_path_to_site(
             cluster, posixpath.join(remote_log_dir, pod))
             if (remote_log_dir and pod) else "")
+        _warm = float((cfg or {}).get("_kvtest_warmup_duration") or 0)
+        _start = start_epochs.get(str(ds))
         instances.append({
             "samples": samples,
             "summary": base + ".summary.json",
@@ -7199,7 +7175,11 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
                                   "i{}".format(entry["iid"])),
             "pod": pod,
             "ds": ds,
-            "start_epoch": start_epochs.get(str(ds)),
+            "start_epoch": _start,
+            # warmup ends this many seconds after the /start anchor; rows
+            # before it are chart-only (excluded from the formal statistics)
+            "warmup_until": ((float(_start) + _warm)
+                             if (_start is not None and _warm > 0) else None),
             "extra_bytes": int(extra_bytes.get(base) or 0),
             "writer_ops": sorted(KVTEST_WRITE_OPS),
             "reader_ops": sorted(KVTEST_READ_OPS),
@@ -7264,6 +7244,8 @@ def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
         "global_cfg": os.path.basename(getattr(args, "global_cfg", "") or ""),
         "profile_cfg": os.path.basename(getattr(args, "profile", "") or ""),
         "early_stop": False, "unit": ds, "unit_size": ds,
+        # 前 warmup_s 秒并入窗口但不计入正式统计（图表仍绘制并标注边界）
+        "warmup_s": float((cfg or {}).get("_kvtest_warmup_duration") or 0),
     }
     for _k, _v in (context or {}).items():
         if _v:
@@ -7347,7 +7329,7 @@ def _gunzip_local_dir(local_dir):
 
 
 def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
-                             globals_cfg, best_effort=True):
+                             globals_cfg, best_effort=True, warmup_s=None):
     """pod 内 tracestats：glog -> <base>.trace.json（只回传统计，glog 不传输）。
 
     Glog 来源 = MC_LOG_DIR 的 <base>.glog.d/ 下全部 *.INFO.*（glog 按
@@ -7370,7 +7352,8 @@ def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
             node_name=entry["node"], role=role, size=entry.get("_ds"),
             sample_rate=_hifreq_sample_rate(),
             remote_path=site,
-            out_path=pbase + ".trace.json")
+            out_path=pbase + ".trace.json",
+            warmup_s=warmup_s)
     except Exception as exc:
         if not best_effort:
             raise
@@ -7750,6 +7733,11 @@ def _kvtest_map_stats(local_log_dir, cfg):
     iid_pods = cfg.get("_kvtest_iid_pods") or {}
     remote_log_root = side.get("remote_log_dir") or ""
     extra_bytes = cfg.get("_kvtest_extra_bytes") or {}
+    _warm = float(side.get("warmup_s")
+                  if side.get("warmup_s") is not None
+                  else (cfg.get("_kvtest_warmup_duration")
+                        if cfg.get("_kvtest_warmup_duration") is not None
+                        else (cfg.get("warmup_s") or 0)))
     written = []
     for path in sorted(glob.glob(os.path.join(
             local_log_dir, "*.kvtest_*.samples.csv"))):
@@ -7778,6 +7766,9 @@ def _kvtest_map_stats(local_log_dir, cfg):
             remote_path = path
         summary_path = path[:-len(".samples.csv")] + ".summary.json"
         start = _kvtest_start_epoch(cfg, ds, path, summary_path)
+        # 前 warmup 秒并入窗口但不计入正式统计（图表仍绘制）
+        _cutoff = ((float(start) + _warm)
+                   if (_warm > 0 and start) else None)
         for role, ops in (("writer", KVTEST_WRITE_OPS),
                           ("reader", KVTEST_READ_OPS)):
             summaries = []
@@ -7786,7 +7777,7 @@ def _kvtest_map_stats(local_log_dir, cfg):
                 summaries.append(("summary", payload))
             stats = ls.compute_stats(
                 path, top_n=100, context=20, node=node, pod=pod, role=role,
-                remote_path=remote_path, size=ds,
+                remote_path=remote_path, size=ds, warmup_cutoff=_cutoff,
                 rows_factory=lambda p, _ops=ops, _start=start:
                     ls.iter_kvtest_rows(p, _start, _ops),
                 summaries=summaries,
@@ -7929,17 +7920,18 @@ def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
         if remote_scripts and globals_cfg is not None:
             files.extend(_kvtest_remote_trace_map(
                 cluster, entry, remote_log_dir, remote_scripts,
-                globals_cfg, best_effort=True))
+                globals_cfg, best_effort=True,
+                warmup_s=cfg.get("_kvtest_warmup_duration")))
         groups.append((node_entry, files,
                        "kvtest i{}".format(entry["iid"])))
     try:
         _pipeline_pull_parallel(cluster, groups, local_log_dir, False)
     except Exception as exc:
         log("[WARN] [STOP] kvtest artifact pull failed: {}".format(exc))
-    _kvtest_write_report_meta(
-        local_log_dir, cfg,
-        _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s)
-        if ts else None)
+    _stop_ctx = (_kvtest_report_context(cluster, ts, remote_log_dir, is_k8s)
+                 if ts else {})
+    _stop_ctx["warmup_s"] = float(cfg.get("_kvtest_warmup_duration") or 0)
+    _kvtest_write_report_meta(local_log_dir, cfg, _stop_ctx)
     _STOP_CTX["report"] = {
         "cfg": cfg, "cfg_name": cfg_name, "result_dir": result_dir,
         "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
@@ -8571,49 +8563,32 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _parallel_start_barrier(args)
                 _control("/start", "/start")
                 if not dry:
-                    # /start is the epoch origin for samples' elapsed_us; a
-                    # warmup run refreshes it at /arm below (a STOP during
-                    # warmup then still maps onto the warmup window)
+                    # /start is the epoch origin for samples' elapsed_us AND
+                    # for the warmup cutoff below. There is no separate
+                    # warmup phase any more: the C++ runs ONE measured window
+                    # (its warmup phase never runs — the instance config
+                    # carries no warmup_duration) and the first
+                    # warmup_duration seconds are classified as warmup by the
+                    # MP data plane (excluded from the formal statistics,
+                    # still drawn in the charts with a boundary line).
                     cfg.setdefault("_kvtest_start_epochs", {})[str(ds)] = \
                         time.time()
 
-                if warmup_duration > 0:
-                    stage = "warmup ({})".format(ds)
-                    _wait_window(warmup_duration, "warmup")
-                    # Match the Python pipeline warmup boundary: stop new
-                    # writes, drain every outbound notify, then drain every
-                    # inbound reader queue before clearing metrics/samples.
-                    # No warmup request can leak into the measured
-                    # distribution.
-                    transition_timeout = max(45, health_timeout_s)
-                    _control("/pause", "warmup /pause", transition_timeout)
-                    _control("/drain", "warmup /drain", transition_timeout)
-                    _control("/reset", "warmup /reset", transition_timeout)
-                    stage = "measurement arm ({})".format(ds)
-                    _parallel_measure_barrier(args)
-                    _control("/arm", "measurement /arm", transition_timeout)
-                    if not dry:
-                        # warmup run: the measured epoch starts at /arm
-                        # (summary elapsed_seconds and samples' elapsed_us
-                        # share this origin; warmup was cleared by /reset)
-                        cfg.setdefault(
-                            "_kvtest_start_epochs", {})[str(ds)] = time.time()
-                    _control("/resume", "measurement /resume",
-                             transition_timeout)
-                    log("[kvtest] warmup complete: queues drained, metrics "
-                        "reset, measurement armed")
-
-                # ---- measurement window: /start (no warmup) or /arm (warmup)
-                # established the measured epoch. summary elapsed_seconds
-                # therefore excludes launch, health gates and warmup.
-                # Pre-warm the run-level remove service under the (long)
-                # measurement window: config-end remove then pays only the
-                # drain (~2s), not a fresh ~40s store-client cold start.
+                # ---- single measured window = warmup + formal duration.
+                # No /pause//reset//arm//resume cycle: keys are written once
+                # (no self-collision at the boundary), and the MP-side cutoff
+                # (start epoch + warmup_s) splits warmup from formal rows.
+                _total_window = float(warmup_duration) + float(duration)
                 _remove_service_prewarm_async(cluster, globals_cfg, ts,
                                               cfg_name, dry,
-                                              window_s=duration)
+                                              window_s=_total_window)
                 stage = "measurement ({})".format(ds)
-                _wait_window(duration, "measurement")
+                if warmup_duration > 0:
+                    log("[kvtest] measurement window: {:g}s "
+                        "(first {:g}s warmup, excluded from formal stats; "
+                        "drawn in charts)".format(_total_window,
+                                                  float(warmup_duration)))
+                _wait_window(_total_window, "measurement")
             except StopRequested:
                 # /stop first: the C++ collector flushes its request samples
                 # only there, and the partial HTML report is built from them
@@ -8745,7 +8720,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                       entry["_out_dir"]))
                     _trace_files = _kvtest_remote_trace_map(
                         cluster, entry, remote_log_dir, remote_scripts,
-                        globals_cfg)
+                        globals_cfg,
+                        warmup_s=cfg.get("_kvtest_warmup_duration"))
                     _extra_bytes[base] = _kvtest_small_log_bytes(
                         cluster, entry, remote_log_dir)
                     # 压缩大件再传输（~8-12x）；失败时透明回退原文件名
@@ -8834,6 +8810,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 _ctx["site_dirs"] = _kvtest_site_dirs(
                     cluster, remote_log_dir, cfg)
                 _ctx["remote_names"] = _kvtest_remote_names(_groups)
+                _ctx["warmup_s"] = float(
+                    cfg.get("_kvtest_warmup_duration") or 0)
                 _kvtest_write_report_meta(local_log_dir, cfg, _ctx)
             if not _ctrl_done:
                 log("[kvtest] pulled: {} files / {} instances ({:.1f} min, "
@@ -9555,8 +9533,14 @@ def _kvtest_reduced_for_size(local_log_dir, ds, role):
     return ((blk.get("role_summaries") or {}).get(role)) or None
 
 
-def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None):
-    """Load request-level OK latencies keyed by (size, iid, node, op)."""
+def _load_kvtest_sample_rows(local_log_dir, cfg_name, iid_nodes=None):
+    """Load request-level rows keyed by (size, iid, node, op).
+
+    ALL statuses are kept: with warmup folded into the single measured
+    window the CSV recomputes the formal totals from the samples themselves
+    (the C++ summary counters include the warmup region). Each row carries
+    the relative ``elapsed`` seconds (same origin as /start), so the warmup
+    cutoff needs no epoch/clock alignment."""
     legacy_re = re.compile(
         r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
         r"(?P<ds>.+)\.samples\.csv$".format(re.escape(cfg_name)))
@@ -9581,14 +9565,26 @@ def _load_kvtest_ok_samples(local_log_dir, cfg_name, iid_nodes=None):
         try:
             with open(path, newline="", encoding="utf-8") as stream:
                 for row in csv.DictReader(stream):
-                    if row.get("status") != "OK":
-                        continue
                     operation = row.get("operation", "")
                     if not operation:
                         continue
+                    status = (row.get("status") or "").strip()
+                    try:
+                        lat = float(row["latency_ms"])
+                    except (TypeError, ValueError, KeyError):
+                        lat = None
+                    try:
+                        elapsed = float(row.get("elapsed_us") or 0.0) / 1e6
+                    except (TypeError, ValueError):
+                        elapsed = 0.0
+                    try:
+                        nbytes = int(float(row.get("bytes") or 0))
+                    except (TypeError, ValueError):
+                        nbytes = 0
                     key = (match.group("ds"), iid, node, operation)
-                    samples.setdefault(key, []).append(
-                        float(row["latency_ms"]))
+                    samples.setdefault(key, []).append({
+                        "elapsed": elapsed, "lat": lat,
+                        "status": status, "bytes": nbytes})
         except (OSError, ValueError, KeyError, csv.Error) as exc:
             log("[WARN] kvtest samples {}: {} (skipped)".format(
                 os.path.basename(path), exc))
@@ -10077,17 +10073,43 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 continue
             summaries.setdefault(m.group("ds"), []).append(
                 (iid, nodename, summary))
-        ok_samples = _load_kvtest_ok_samples(
+        sample_rows = _load_kvtest_sample_rows(
             local_log_dir, name, iid_nodes=iid_nodes)
+        # warmup 已并入单窗口：前 warm_sec 秒的行不计入正式统计（但样本里
+        # 仍有它们，图表照常绘制）。elapsed_us 与 /start 同源，用相对时长
+        # 过滤即可。活跑用 cfg 的 _kvtest_warmup_duration；--rebuild-report
+        # 从 meta 的 warmup_s 取；旧产物无字段 -> 0（旧样本本身就不含 warmup）。
+        warm_sec = float(
+            cfg.get("_kvtest_warmup_duration")
+            if cfg.get("_kvtest_warmup_duration") is not None
+            else (cfg.get("warmup_s") or 0))
 
-        def sample_values(ds, iid, nodename, operation, expected):
-            values = ok_samples.get((ds, iid, nodename, operation), [])
-            if len(values) != expected:
+        def sample_rows_of(ds, iid, nodename, operation, expected):
+            """样本完整 -> 返回 formal 行（切掉 warmup 区）；否则 None 走回退。"""
+            rows_ = sample_rows.get((ds, iid, nodename, operation), [])
+            ok_all = sum(1 for r in rows_
+                         if r["status"] == "OK" and r["lat"] is not None)
+            if ok_all != expected:
                 log("[WARN] kvtest {} i{} {} samples incomplete: {} OK rows, "
                     "summary success={}; using summary fallback".format(
-                        ds, iid, operation, len(values), expected))
+                        ds, iid, operation, ok_all, expected))
                 return None
-            return values
+            if warm_sec > 0:
+                return [r for r in rows_ if r["elapsed"] >= warm_sec]
+            return list(rows_)
+
+        def rows_stats(rows_):
+            """formal 行 -> fill_metrics/fill_notify/fill_queue 需要的 stats。"""
+            ok_rows = [r for r in (rows_ or [])
+                       if r["status"] == "OK" and r["lat"] is not None]
+            return {"total": len(rows_ or []),
+                    "success": len(ok_rows),
+                    "failure": len(rows_ or []) - len(ok_rows),
+                    "bytes": sum(r["bytes"] for r in ok_rows)}
+
+        def rows_values(rows_):
+            return [r["lat"] for r in (rows_ or [])
+                    if r["status"] == "OK" and r["lat"] is not None]
 
         for ds in data_size_list(cfg):
             wall = duration
@@ -10096,23 +10118,36 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             writer_exact = reader_exact = True
             for iid, nodename, summary in sorted(summaries.get(ds, [])):
                 ops = summary.get("operations") or {}
-                instance_wall = float(summary.get("elapsed_seconds", 0) or
-                                      duration)
+                elapsed = float(summary.get("elapsed_seconds", 0) or duration)
+                # C++ elapsed_seconds 是单窗口（含 warmup）；正式时长扣掉
+                # warmup 区，qps/吞吐口径才正确
+                instance_wall = (max(0.0, elapsed - warm_sec)
+                                 if warm_sec > 0 else elapsed)
                 if writer_op in ops:
                     writer_st = op_stats(summary, writer_op)
-                    writer_values = sample_values(
+                    wrows = sample_rows_of(
                         ds, iid, nodename, writer_op,
                         int(writer_st.get("success", 0) or 0))
+                    writer_values = (rows_values(wrows)
+                                     if wrows is not None else None)
                     row = base_row("writer", "i{}".format(iid), nodename, ds)
-                    fill_metrics(row, writer_st, instance_wall, writer_values)
+                    fill_metrics(
+                        row, rows_stats(wrows) if wrows is not None
+                        else writer_st, instance_wall, writer_values)
                     notify_operation = (
                         "notify_rpc" if "notify_rpc" in ops
                         else "notify_http")
                     notify_st = op_stats(summary, notify_operation)
-                    notify_values = sample_values(
+                    nrows = sample_rows_of(
                         ds, iid, nodename, notify_operation,
                         int(notify_st.get("success", 0) or 0))
-                    fill_notify(row, summary, notify_values)
+                    notify_values = (rows_values(nrows)
+                                     if nrows is not None else None)
+                    fill_notify(
+                        row,
+                        ({"operations": {notify_operation: rows_stats(nrows)}}
+                         if nrows is not None else summary),
+                        notify_values)
                     writer_rows.append(row)
                     if writer_values is None:
                         writer_exact = False
@@ -10120,17 +10155,28 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                         writer_pooled.extend(writer_values)
                 if reader_op in ops:
                     reader_st = op_stats(summary, reader_op)
-                    reader_values = sample_values(
+                    rrows = sample_rows_of(
                         ds, iid, nodename, reader_op,
                         int(reader_st.get("success", 0) or 0))
+                    reader_values = (rows_values(rrows)
+                                     if rrows is not None else None)
                     row = base_row("reader", "i{}".format(iid), nodename, ds)
-                    fill_metrics(row, reader_st, instance_wall, reader_values)
+                    fill_metrics(
+                        row, rows_stats(rrows) if rrows is not None
+                        else reader_st, instance_wall, reader_values)
                     queue_st = op_stats(summary, "notify_queue_wait")
-                    queue_values = sample_values(
+                    qrows = sample_rows_of(
                         ds, iid, nodename, "notify_queue_wait",
                         int(queue_st.get("success", 0) or 0))
-                    fill_queue(row, summary, queue_values)
-                    # data verification runs on the read path
+                    queue_values = (rows_values(qrows)
+                                    if qrows is not None else None)
+                    fill_queue(
+                        row,
+                        ({"operations": {"notify_queue_wait": rows_stats(qrows)}}
+                         if qrows is not None else summary),
+                        queue_values)
+                    # data verification runs on the read path (C++ scalar;
+                    # cannot be split by time -> keeps the warmup region)
                     row["verify_failures"] = int(
                         summary.get("verify_failures", 0) or 0)
                     reader_rows.append(row)
