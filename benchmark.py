@@ -3605,7 +3605,8 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
         data = rp.reduce_scenario(
             loaded, meta,
             monitors=rp.reduce_monitors(local_log_dir, t0=t0, t1=t1),
-            traces=rp.load(traces_by_unit.get(key, [])))
+            traces=rp.load(traces_by_unit.get(key, [])),
+            monitor_sites=rp.reduce_monitor_sites(local_log_dir))
         out_dir = os.path.join(local_log_dir, "report", u["name"])
         html, _datajs = rp.render_scenario(
             data, out_dir, echarts,
@@ -10712,7 +10713,8 @@ def rebuild_reports(ts):
             data = rp.reduce_scenario(
                 loaded, meta,
                 monitors=rp.reduce_monitors(d, t0=t0, t1=t1),
-                traces=rp.load(traces_by_unit.get(key, [])))
+                traces=rp.load(traces_by_unit.get(key, [])),
+                monitor_sites=rp.reduce_monitor_sites(d))
             out_d = os.path.join(d, "report", u["name"])
             # 回写修正后的 meta.json：后续重建/打开读到一致的参数
             try:

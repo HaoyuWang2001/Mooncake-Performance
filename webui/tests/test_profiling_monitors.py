@@ -354,3 +354,21 @@ def test_reduce_monitors_window_slice(tmp_path):
     # 无窗口 = 原行为
     full = rp.reduce_monitors(str(log_dir))
     assert full["mem_host"][0]["series"]["n0_used_mb"] == [100.0, 150.0]
+
+
+def test_reduce_monitor_sites_reads_config_and_sizes(tmp_path):
+    """日志现场监控行：节点 IP、监控 pod 名、节点侧 profiling 目录、文件数/字节。"""
+    d = tmp_path / "logs" / "cfg" / "profiling" / "10.0.0.9"
+    d.mkdir(parents=True)
+    (d / "monitor.config.json").write_text(json.dumps({
+        "node_ip": "10.0.0.9", "pod": "mc-mon-abcd",
+        "remote_dir": "/var/lib/mb/ts/profiling/cfg",
+        "mem": {}, "urma": {}}), encoding="utf-8")
+    (d / "mem.host.csv").write_text("ts,n0_used_mb\n1,2\n", encoding="utf-8")
+    (d / "urma.err.log").write_text("x\n", encoding="utf-8")
+    sites = rp.reduce_monitor_sites(str(tmp_path / "logs" / "cfg"))
+    assert set(sites) == {"10.0.0.9"}
+    s = sites["10.0.0.9"]
+    assert s["pod"] == "mc-mon-abcd"
+    assert s["remote_dir"] == "/var/lib/mb/ts/profiling/cfg"
+    assert s["files"] == 3 and s["bytes"] > 0

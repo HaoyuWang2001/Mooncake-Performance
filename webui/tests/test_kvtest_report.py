@@ -461,10 +461,12 @@ def test_kvtest_report_field_index_uses_real_host_dir(tmp_path):
     datajs = (out / "data.js").read_text(encoding="utf-8")
     assert "host_log_root" in datajs and "/var/lib/mooncake-bench" in datajs
     assert "20261121-1244" in datajs
+    # 现场日志表的行在 reduce 侧生成：pod 目录必须是节点侧真实路径
+    # （旧 sidecar 的 pod 内路径经挂载逆变换成 <host_log_root>/<run_id>/<pod>）
+    assert "/var/lib/mooncake-bench/20261121-1244/pod-x" in datajs, datajs[-2000:]
     html = (out / "report.html").read_text(encoding="utf-8")
-    assert "现场日志（原始日志不拉回" in html
-    assert "kubectl exec -it" in html
-    assert "每个 pod 一个独立目录" in html
+    assert "logsite-table" in html and "日志路径" in html
+    assert "节点与登录现场" not in html and "其它产物索引" not in html
     # overview 的节点日志量说明由 Python 渲染真值
     overview = bm._render_run_overview(str(root), "kvtest")
     ov = open(overview, encoding="utf-8").read()

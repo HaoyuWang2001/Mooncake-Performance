@@ -60,6 +60,17 @@ def test_summary_of_computes_p90_exact_pools():
     assert n_a["p90_ms"] is None
 
 
+def _site_stats(tmp_path, name, role, node, pod, base):
+    """stats 带 k8s pod + 节点侧 remote_path（现场日志表输入）。"""
+    p = _stats(tmp_path, name, role, node=node)
+    st = json.load(open(p, encoding="utf-8"))
+    st["meta"]["pod"] = pod
+    st["meta"]["remote_path"] = "{}/{}/{}.log".format(base, pod, name)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, separators=(",", ":"))
+    return p
+
+
 def test_reduce_roles_clients_sources(tmp_path):
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
     b = _stats(tmp_path, "b.reader", "reader", node="n2")
@@ -123,7 +134,7 @@ def test_data_js_loader_points_to_real_file(tmp_path):
     src = open(html, encoding="utf-8").read()
     assert '<script src="data.js"' in src
     assert 'src="True"' not in src
-    assert 'id="datanote"' in src          # 加载失败时的降级提示容器
+    assert 'id="logsite"' in src           # 现场日志表容器
     assert os.path.basename(dj) == "data.js"
 
 
@@ -1934,38 +1945,96 @@ def test_control_style_consistency():
     assert 'class="tconsole' not in rp._SEC_TRACE
 
 
-def test_client_site_tree_readonly_rows(tmp_path):
-    """日志现场：节点行可展开/收起（实例默认折叠），客户端行为只读（点击无交互）。"""
-    a = _stats(tmp_path, "a.writer", "writer", node="n1")
-    b = _stats(tmp_path, "b.reader", "reader", node="n2")
-    data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"})
-    res = _js_check(tmp_path, data, "--click-client")
-    if res is None:
-        return
-    assert res["errors"] == []
-    assert res["node_row_clickable"] is True
-    # 默认折叠所有实例：点击前没有客户端行
-    assert res["client_row_present_before"] is False
-    # 点击节点后实例行出现，且客户端行只读（无 onclick）
-    assert res["client_row_present"] is True
-    assert res["client_row_clickable"] is False
-    assert res["rows_after_nodes"] != res["rows_before"]   # 展开/收起生效
-    # 对图表无副作用（不叠加曲线、不改选择）
-    assert res["selobjs_before"] == res["selobjs_after"]
-    assert res["main_series_before"] == res["main_series_after"]
-
-
-def test_client_site_header_and_columns(tmp_path):
-    """合并卡：日志现场（角色/节点/总数/成功/失败/日志 + 贡献列）。"""
-    a = _stats(tmp_path, "a.writer", "writer", node="n1")
-    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+def test_logsite_single_table_and_removed_sections(tmp_path):
+    """日志现场 = 唯一一张「现场日志」表（节点/角色/pod/日志属性/日志路径）；
+    节点汇总、登录现场、其它产物索引、贡献列、data.js 降级提示全部删除。"""
+    root, ts = "/var/lib/mooncake-bench", "20261126-1200"
+    a = _site_stats(tmp_path, "a.writer", "writer", "10.0.0.1", "pod-a",
+                    root + "/" + ts)
+    b = _site_stats(tmp_path, "b.reader", "reader", "10.0.0.1", "pod-a",
+                    root + "/" + ts)
+    data = rp.reduce_scenario(rp.load([a, b]),
+                              {"config": "cfg", "mode": "pipeline",
+                               "host_log_root": root, "run_id": ts})
     html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
     src = open(html, encoding="utf-8").read()
-    assert "<h2>日志现场</h2>" in src
-    # 性能指标列已移出本卡（段1/曲线负责）：旧表头不得回潮
+    assert "<h2>日志现场</h2>" in src and 'id="logsite"' in src
+    assert "日志属性" in src and "日志路径" in src
+    for gone in ("节点与登录现场", "其它产物索引", "对慢点追踪的贡献",
+                 'id="datanote"', 'id="sources"', 'id="clients"'):
+        assert gone not in src, gone
+    # 性能指标列不得回潮
     for bad in ('<th class="n">p50</th>', '<th class="n">p99</th>',
                 '<th class="n">队列等待均值</th>'):
         assert bad not in src, bad
+
+
+def test_logsite_out_of_tree_source_gets_own_row(tmp_path):
+    """结构性不变量：remote_path 落在规范目录外时，该产物以自身目录成行，
+    绝不静默丢失（所有产物都能在表内找到路径）。"""
+    root, ts = "/var/lib/mooncake-bench", "20261126-1200"
+    base = root + "/" + ts
+    a = _site_stats(tmp_path, "a.writer", "writer", "10.0.0.1", "pod-a", base)
+    b = _stats(tmp_path, "b.writer", "writer", node="10.0.0.1")
+    st = json.load(open(b, encoding="utf-8"))
+    st["meta"]["pod"] = "pod-a"
+    st["meta"]["remote_path"] = "/elsewhere/odd/b.writer.log"
+    with open(b, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, separators=(",", ":"))
+    data = rp.reduce_scenario(rp.load([a, b]),
+                              {"config": "cfg", "mode": "pipeline",
+                               "host_log_root": root, "run_id": ts})
+    pods = [r for r in data["logsite"] if r["tier"] == "pod"]
+    assert any(r["dir"] == "/elsewhere/odd" for r in pods), pods
+    # 已知产物全部入表（不丢）
+    listed = sum(r["files"] for r in pods)
+    distinct = {(s["node"], s["source"], s["remote_path"])
+                for s in data["sources"]}
+    assert listed == len(distinct), (listed, distinct)
+
+
+def test_logsite_rows_flattened_and_monitor_states(tmp_path):
+    """行 = 节点行（聚合）+ pod 行 + 监控行；节点列只在节点行填。
+    监控开着带 pod 名与目录；未开则 pod/属性/路径均为 -。"""
+    root, ts = "/var/lib/mooncake-bench", "20261126-1200"
+    base = root + "/" + ts
+    a = _site_stats(tmp_path, "a.writer", "writer", "10.0.0.1", "pod-a", base)
+    b = _site_stats(tmp_path, "b.reader", "reader", "10.0.0.1", "pod-a", base)
+    c = _site_stats(tmp_path, "c.writer", "writer", "10.0.0.2", "pod-b", base)
+    sites = {"10.0.0.1": {"pod": "mc-mon-xyz",
+                          "remote_dir": base + "/profiling/cfg",
+                          "files": 3, "bytes": 4096}}
+    data = rp.reduce_scenario(
+        rp.load([a, b, c]),
+        {"config": "cfg", "mode": "pipeline",
+         "host_log_root": root, "run_id": ts}, monitor_sites=sites)
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    rows = res["logsite_rows"]
+    node_rows = [r for r in rows if r["tier"] == "node"]
+    pod_rows = [r for r in rows if r["tier"] == "pod"]
+    mon_rows = [r for r in rows if r["tier"] == "monitor"]
+    assert len(node_rows) == 2 and len(pod_rows) == 2 and len(mon_rows) == 2
+    n1 = [r for r in node_rows if r["cells"][0] == "10.0.0.1"][0]
+    assert n1["cells"][1] == "" and n1["cells"][2] == ""
+    assert "5 个子项" in n1["cells"][3], n1        # 2 pod 文件 + 3 监控文件
+    assert n1["cells"][4].endswith(ts), n1
+    p1 = [r for r in pod_rows if r["cells"][2] == "pod-a"][0]
+    assert p1["cells"][0] == ""                    # pod 行不填节点列
+    assert p1["cells"][1] == "reader、writer"
+    assert "B" in p1["cells"][3] and "个子项" not in p1["cells"][3]
+    assert p1["cells"][4] == base + "/pod-a", p1
+    on = [r for r in mon_rows if r["cells"][2] == "mc-mon-xyz"][0]
+    assert on["cells"][0] == "" and on["cells"][1] == "监控"
+    assert on["cells"][3] == "4.0 KB" and on["cells"][4] == base + "/profiling/cfg"
+    off = [r for r in mon_rows if r["cells"][2] == "-"][0]
+    assert off["cells"][1] == "监控"
+    assert off["cells"][3] == "-" and off["cells"][4] == "-"
+    # 展平：整表 nowrap 类 + wrapx 水平滑动容器
+    assert "logsite-table" in (res.get("logsite_table_cls") or "")
+    assert res.get("logsite_wrapx") is True
 
 
 def test_pipeline_and_basic_templates_split(tmp_path):
@@ -2809,29 +2878,6 @@ def test_errors_split_by_role_and_client(tmp_path):
     assert "a.writer" in ex and "b.reader" in ex, ex
 
 
-def test_client_site_contribution_and_writer_first(tmp_path):
-    """日志现场：同节点内 writer 在 reader 前；有 trace 才显示贡献列。"""
-    a = _stats(tmp_path, "a.writer", "writer", node="n1")
-    b = _stats(tmp_path, "b.reader", "reader", node="n1")
-    tr = _trace_stats2(tmp_path, "x.glog", node="n1", pod="p1")
-    data = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"},
-                              traces=[tr])
-    res = _js_check(tmp_path, data, "--expand-clients")
-    if res is None:
-        return
-    assert res["errors"] == []
-    ct = res["clients_text_expanded"]
-    assert res["client_rows_expanded"] == 2, res
-    assert "对慢点追踪的贡献" in ct, ct
-    assert ct.index("a.writer") < ct.index("b.reader"), ct
-    # 无 trace：整个贡献列隐藏
-    d2 = rp.reduce_scenario(rp.load([a, b]), {"config": "cfg"})
-    r2 = _js_check(tmp_path, d2)
-    if r2 is None:
-        return
-    assert "对慢点追踪的贡献" not in r2["clients_text"], r2["clients_text"]
-
-
 def test_section_order_and_footer_note(tmp_path):
     """章节顺序：SDK → 错误与异常 → 日志现场 →（监控）→ 页脚；
     页脚解释 map-reduce 与数据正确性并在最底部。"""
@@ -3551,31 +3597,15 @@ def test_a07_anomalies_capped_at_50(tmp_path):
     assert res.get("main_markline_n") == 50, res.get("main_markline_n")
 
 
-def test_a08_data_missing_degrades_to_note(tmp_path):
-    """R-SHELL-2：data.js 加载失败（__mcDataMissing）=> datanote 显示，
-    明细表降级仍可渲染（行数 > 0），页面不崩。"""
+def test_a08_data_js_absent_page_still_works(tmp_path):
+    """R-SHELL-2：data.js 缺失只降级为内嵌子集，页面/日志现场表不崩。"""
     a = _stats(tmp_path, "a.writer", "writer")
-    b = _stats(tmp_path, "b.reader", "reader")
-    data = rp.reduce_scenario(rp.load([a, b]), {"config": "c"})
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
     res = _js_check(tmp_path, data, env={"VC_DATAMISSING": "1"})
     if res is None:
         return
     assert res["errors"] == []
-    assert res.get("datanote_visible") != "none", res.get("datanote_visible")
-
-
-def test_a09_data_loaded_hides_note(tmp_path):
-    """R-SHELL-2 正例：data.js 在场（VC_FULLSIM）=> datanote 保持隐藏。"""
-    a = _stats(tmp_path, "a.writer", "writer")
-    data = rp.reduce_scenario(rp.load([a]), {"config": "c"})
-    res = _js_check(tmp_path, data, env={"VC_FULLSIM": "1"})
-    if res is None:
-        return
-    assert res["errors"] == []
-    # as-built（桩 DOM）：inline style="display:none" 不进桩，仅 JS 修改可观测。
-    # data.js 在场时 renderTable 从不触碰 datanote => style.display 保持未设置；
-    # 与失败路径（A08 中被显式置 ''）相区分：此处必须读作空串。
-    assert res.get("datanote_visible") == "", res.get("datanote_visible")
+    assert (res.get("logsite_text") or "").strip(), res.get("logsite_text")
 
 
 def test_a10_subtitle_sequence(tmp_path):
@@ -3925,7 +3955,7 @@ def test_c01_dr24_alignment_lock(tmp_path):
         assert dead not in src, "死 CSS 回潮: {}".format(dead)
     # 3) 表头命名（skill 文案规则6：指标名 avg/max；队列等待均值不截断）
     assert "总数" in src and "成功" in src and "失败" in src
-    assert "<h2>日志现场</h2>" in src and "对慢点追踪的贡献" in src
+    assert "<h2>日志现场</h2>" in src and "日志属性" in src
     assert "队列等待均</th>" not in src
     # 4) h3 标题无交互括号注记（说明移入 title 属性）
     import re as _re
