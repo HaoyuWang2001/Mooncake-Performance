@@ -240,10 +240,14 @@ def plot_series(vals, times, title, out_png, outlier_ms, include_outliers,
             ax.plot([x for x, _ in main], [v for _, v in main],
                     linewidth=0.5, markersize=2, marker=".", color="tab:gray",
                     label=f"samples (n={len(main)})")
-        elif main:
-            ax.scatter([x for x, _ in main], [v for _, v in main],
-                       s=4, marker=".", color="tab:gray", alpha=alpha,
-                       label=f"{label} (n={len(main)})", rasterized=True)
+        elif report_window is not None:
+            # Connect every selected request, including tail spikes. Outliers
+            # receive an additional red marker without breaking the series.
+            series = [(x, v) for x, v, keep in zip(xs, vals, selected) if keep]
+            ax.plot([x for x, _ in series], [v for _, v in series],
+                    linewidth=0.5, markersize=2, marker=".", color="tab:gray",
+                    alpha=alpha, label=f"{label} (n={len(series)})",
+                    rasterized=True)
         if outliers:
             ax.scatter([x for x, _ in outliers], [v for _, v in outliers],
                        s=28, marker="x", color="red", alpha=alpha, zorder=5,

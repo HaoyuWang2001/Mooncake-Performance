@@ -168,12 +168,17 @@ def test_kvtest_window_shows_only_window_points_and_stats(tmp_path, monkeypatch)
             out=None, type='both', outlier=10))
         assert len(outputs) == 1   # no trimmed plot drops startup/tail points
         ax = pl.plt.gcf().axes[0]
-        assert sum(len(c.get_offsets()) for c in ax.collections) == 2
+        assert not ax.collections
         outside = [c for c in ax.collections if 'outside' in c.get_label()]
-        inside = [c for c in ax.collections if c.get_label().startswith('stats samples')]
+        inside = [line for line in ax.lines if line.get_label().startswith('stats samples')]
         assert not outside
-        assert sum(len(c.get_offsets()) for c in inside) == 2
-        lines = {l.get_label().split('=')[0]:l for l in ax.lines if '=' in l.get_label()}
+        assert len(inside) == 1
+        assert list(inside[0].get_xdata()) == [120,329]
+        assert list(inside[0].get_ydata()) == [2,4]
+        assert inside[0].get_marker() == '.'
+        assert inside[0].get_linestyle() == '-'
+        assert inside[0].get_linewidth() > 0
+        lines = {l.get_label().split('=')[0]:l for l in ax.lines if l.get_label().startswith(('avg=', 'p99=', 'p999=', 'p9999=', 'Pmax='))}
         assert set(lines) == {'avg','p99','p999','p9999','Pmax'}
         assert lines['avg'].get_ydata()[0] == 3
         assert lines['Pmax'].get_ydata()[0] == 4
@@ -209,3 +214,24 @@ def test_plot_window_cli_overrides_sidecar(tmp_path):
     assert pl._report_window(str(path),SimpleNamespace(report_start_s=150,report_end_s=600)) == (150,600)
     with pytest.raises(ValueError):
         pl._report_window(str(path),SimpleNamespace(report_start_s=750))
+
+
+
+def test_window_point_line_connects_outliers(tmp_path, monkeypatch):
+    pl = _load_plot_module()
+    original_close = pl.plt.close
+    monkeypatch.setattr(pl.plt, 'close', lambda fig: None)
+    try:
+        pl.plot_series([999,2,100,4,888], [119,120,200,329,330], 'point line',
+                       str(tmp_path/'point_line.png'), 10, True,
+                       time_axis='elapsed', report_window=(120,330))
+        ax = pl.plt.gcf().axes[0]
+        series = next(line for line in ax.lines
+                      if line.get_label().startswith('stats samples'))
+        assert list(series.get_xdata()) == [120,200,329]
+        assert list(series.get_ydata()) == [2,100,4]
+        assert series.get_marker() == '.' and series.get_linestyle() == '-'
+        assert sum(len(c.get_offsets()) for c in ax.collections) == 1
+        assert ax.collections[0].get_offsets()[0][0] == 200
+    finally:
+        original_close('all')
