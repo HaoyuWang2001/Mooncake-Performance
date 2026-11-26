@@ -2613,6 +2613,12 @@ const LAT_COLORS = LF_DARK
 const LAT_LINES=[['avg','avg',1.0],['p50','p50',0.8],['p99','p99',0.8],
   ['p999','p999',0.8],['p9999','p9999',0.8],['min','min',0.8],
   ['max','max',0.8],['qw','队列等待',0.8]];
+/* 全局统计横线（仅端到端时延图）：正式窗口的 role_summaries 值，图表生成
+   时即确定，不随所选 pod/node/实例改变；读写各自一套（curRole）。
+   默认只展示 avg / p99 / p9999 三条。 */
+const GLOB_LINES=[['avg','avg'],['p50','p50'],['p95','p95'],
+  ['p99','p99'],['p999','p999'],['p9999','p9999']];
+const globShown={avg:true,p50:false,p95:false,p99:true,p999:false,p9999:true};
 const MAIN_GRID={left:56,right:104,top:44,bottom:58};
 const QPS_GRID={left:56,right:104,top:48,bottom:34};
 function latColor(k){return LAT_COLORS[k]||C.fg;}
@@ -2709,6 +2715,32 @@ function latLineSeries(col,x,meta,key){
       z:(k==='p99')?6:3,
       data:data};
   });
+}
+/* 全局参考横线：取当前角色（写/读）的 role_summaries——正式窗口统计，与
+   所选对象无关；basic（无 role_summaries）或值缺失则不画。虚线 + 同指标
+   颜色 = 「同色同指标、虚线=全局常量」。不进入端点标签（mainLabelMeta）。 */
+function globRoleSummary(){
+  const z=Z(); if(!z) return null;
+  const rs=z.role_summaries||{};
+  if(rs[curRole]) return rs[curRole];
+  return rs.writer||rs.reader||null;
+}
+function globalRefLines(x0,x1){
+  if(x0==null||x1==null||x1<x0) return [];
+  const rr=globRoleSummary(); if(!rr) return [];
+  const out=[];
+  GLOB_LINES.forEach(function(L){
+    const k=L[0];
+    if(!globShown[k]) return;
+    const v=rr[k+'_ms'];
+    if(v==null||!isFinite(Number(v))) return;
+    const val=Number(v);
+    out.push({name:'全局'+L[1],type:'line',showSymbol:false,clip:true,
+      lineStyle:{width:1,type:'dashed',color:latColor(k),opacity:0.9},
+      itemStyle:{color:latColor(k)}, z:2,
+      data:[[x0,val],[x1,val]]});
+  });
+  return out;
 }
 function markLines(){
   const z=Z(); const data=[];
@@ -2819,6 +2851,26 @@ function renderLatSel(){
     };
     box.appendChild(b);
   });
+  renderGlobSel();
+}
+/* 全局横线显隐（仅端到端时延图；默认 avg/p99/p9999） */
+function renderGlobSel(){
+  const box=document.getElementById('globSel'); if(!box) return;
+  box.innerHTML='';
+  GLOB_LINES.forEach(function(L){
+    const k=L[0];
+    const b=el('button',globShown[k]?'':'off');
+    const dot=el('span','dot'); dot.style.background=latColor(k);
+    b.appendChild(dot);
+    b.appendChild(el('span',null,'全局'+L[1]));
+    b.title=globShown[k]?('点击隐藏全局'+L[1]+'横线'):
+                         ('点击显示全局'+L[1]+'横线');
+    b.onclick=function(){
+      globShown[k]=!globShown[k];
+      renderGlobSel(); buildChart();
+    };
+    box.appendChild(b);
+  });
 }
 function ensureSel(){
   const all=objAll();
@@ -2857,6 +2909,15 @@ function buildChart(){
   ensureSel();
   const tier=currentTier();
   const opt=selObjs.length>1?multiOpt(tier):richOpt(tier,selObjs[0]);
+  /* 全局统计横线：仅端到端时延图；x 域取首条「线」曲线的首尾 */
+  if(opt.series&&opt.series.length){
+    const _ln=opt.series.filter(function(ss){return ss.type==='line';})[0];
+    const _d0=(_ln&&_ln.data)||[];
+    if(_d0.length){
+      const gl=globalRefLines(_d0[0][0],_d0[_d0.length-1][0]);
+      if(gl.length) opt.series=opt.series.concat(gl);
+    }
+  }
   if(opt.series&&opt.series.length&&!opt.series[0].markLine){
     const ml=markLines(null,null,null);      // 异常窗口竖线
     if(ml) opt.series[0].markLine=ml;
@@ -2885,6 +2946,13 @@ function richOpt(tier,key){
       ['p50(ms)',col.p50[i]],['p99(ms)',col.p99[i]],['p999(ms)',col.p999[i]],
       ['最大(ms)',col.max[i]],['队列等待均(ms)',col.qw[i]],
       ['队列等待峰(ms)',col.qwmax[i]]];
+    const _rr=globRoleSummary()||{};
+    GLOB_LINES.forEach(function(L){
+      if(!globShown[L[0]]) return;
+      const _v=_rr[L[0]+'_ms'];
+      if(_v==null||!isFinite(Number(_v))) return;
+      rows.push(['全局 '+L[1]+'(ms)', Math.round(Number(_v)*10000)/10000]);
+    });
     return '<b>'+fullts(t)+'</b><br>'+
       rows.map(function(r){return r[0]+'：'+r[1];}).join('<br>');
   };
@@ -4749,7 +4817,7 @@ function renderAll(){
   });
   safe('object-tree',function(){
     renderObjTree(); renderControls();});
-  safe('lat-sel',renderLatSel);
+  safe('lat-sel',function(){renderLatSel(); renderGlobSel();});
   safe('latency-chart',buildChart);
   safe('histogram',renderHist);
   safe('slow-strip',renderSlowStrip);
@@ -6747,6 +6815,8 @@ _SEC_LATENCY = """<div class="card"><h2>端到端时延曲线</h2>
 <button id="outlierBtn">离群点</button>
 <span class="tl-label">时延曲线选择</span>
 <span id="latSel" class="lat-sel-btns"></span>
+<span class="tl-label" title="仅端到端时延图：当前角色（写/读）的全局统计值，不随所选对象变化">全局横线</span>
+<span id="globSel" class="lat-sel-btns"></span>
 </div>
 <div class="chart-frame">
 <div class="zslider" id="zslider">
