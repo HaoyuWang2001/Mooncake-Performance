@@ -233,8 +233,9 @@ def test_profiling_targets_uses_daemonset(monkeypatch):
     involved = _involved(c)
     monkeypatch.setattr(bm, "ensure_k8s_monitor_daemonset",
                         lambda cl, ts, cfg, inv, dry=False: ["mc-mon-a"])
+    # involved pods (in-container tools) + monitor pseudo-nodes (mem/urma)
     assert bm._profiling_targets(c, _monitor_matrix(), involved, "ts", "kv1") \
-        == ["mc-mon-a"]
+        == ["bench-a", "bench-b", "mc-mon-a"]
 
 
 def test_profiling_targets_falls_back_to_pods(monkeypatch):
@@ -247,6 +248,61 @@ def test_profiling_targets_falls_back_to_pods(monkeypatch):
     monkeypatch.setattr(bm, "ensure_k8s_monitor_daemonset", fail)
     assert bm._profiling_targets(c, _monitor_matrix(), involved, "ts", "kv1") \
         == involved
+
+
+def test_start_profiling_splits_monitor_and_inpod_tools(monkeypatch):
+    """monitor 伪节点只跑节点级采样（mem/urma）；involved pod 只跑容器内工具
+    （spdiag/perf/...）。修复前 spdiag 被派到 monitor pod：那里没有任何打点
+    进程、SHM 从未创建，`restart` 以 SIGBUS(rc=135) 崩溃。"""
+    pc = bm.prof_core
+    assert pc is not None
+    calls = []
+
+    def fake_run(ip, node, cmd, quiet=True):
+        calls.append((node.get("_pod"), cmd))
+        if "command -v" in cmd:
+            return "OK"
+        if "nohup" in cmd:
+            return "4242"
+        if "restart" in cmd or "start" in cmd:
+            return "spdiag started (SHM: /spdiag_shm_default)"
+        return ""
+
+    monkeypatch.setattr(pc, "_run", fake_run)
+    monkeypatch.setattr(pc, "scp_push", lambda *a, **k: None)
+    monkeypatch.setattr(bm, "state_append", lambda rows: None)
+    nodes = {
+        "bench-a": {"kind": "k8s-pod", "_pod": "bench-a", "ip": "10.42.0.1",
+                    "host_ip": "10.1.1.1"},
+        "mon-a": {"kind": "k8s-pod", "_pod": "mon-a", "_monitor": True,
+                  "_host_exec": "nsenter -t 1 -m -n --", "ip": "10.42.0.9",
+                  "host_ip": "10.1.1.1"},
+    }
+    cluster = {"_controller": {"ip": "10.0.0.1", "_ctx": ""}, "nodes": nodes}
+    matrix = {"tools": {
+        "spdiag": {"enabled": True, "bin": "spdiag", "sudo": False},
+        "mem": {"enabled": True, "bin": "bash", "interval_s": 1,
+                "proc_pattern": "mooncake_kvtest"},
+        "urma": {"enabled": False}},
+        "nodes": "auto", "trigger": "whole_run",
+        "outliers": {"threshold_ms": 1.0, "window_ms": 200, "auto": True}}
+    sess = pc.start_profiling(cluster, matrix, ["bench-a", "mon-a"], "cfg",
+                              "/tmp/out")
+    bench = [c for p, c in calls if p == "bench-a"]
+    mon = [c for p, c in calls if p == "mon-a"]
+    spdiag_cmds = [c for c in bench
+                   if "spdiag" in c and "command -v" not in c]
+    # 启动容错：restart 失败回退 start
+    assert spdiag_cmds, bench
+    assert all("restart" in c and "start" in c and "||" in c
+               for c in spdiag_cmds), spdiag_cmds
+    assert not any("mem_monitor.sh" in c for c in bench), bench
+    assert any("mem_monitor.sh" in c for c in mon), mon
+    assert not any("spdiag" in c for c in mon), mon
+    assert any("monitor.config.json" in c for c in mon), mon
+    assert not any("monitor.config.json" in c for c in bench), bench
+    assert sess and set(sess["tools"]["bench-a"]) == {"spdiag"}
+    assert sess and set(sess["tools"]["mon-a"]) == {"mem"}
 
 
 def test_stop_profiling_collects_then_tears_down(monkeypatch):

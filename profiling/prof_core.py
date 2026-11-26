@@ -3,8 +3,8 @@
 
 由 benchmark.py 调用（--profile / 默认 <mode-dir>/profile.json）：
   load_matrix()          解析矩阵（enabled 过滤 + 默认值合并）
-  start_profiling()      场景启动：逐节点探测工具 -> spdiag restart ->
-                         perf/bpftrace nohup 后台（pid 记入 .state 台账，
+  start_profiling()      场景启动：逐节点探测工具 -> spdiag restart（失败
+                         回退 start）-> perf/bpftrace nohup 后台（pid 记入 .state 台账，
                          marker 记录预期 cmdline，reap 防误杀按 marker 校验）
   stop_and_collect()     场景结束：SIGINT 停采样（perf 优雅落盘）->
                          spdiag show -> scp 收集至 outputs/<ts>/profiling/
@@ -147,9 +147,18 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
     nodes = _profiling_nodes(cluster, matrix, involved_nodes)
     session = {"nodes": nodes, "tools": {}, "remote_out_dir": remote_out_dir,
                "cfg": cfg_name, "matrix_tools": matrix["tools"]}
+    # k8s mixed target lists: the monitor DaemonSet pseudo-nodes (``_monitor``)
+    # host ONLY the node-level samplers (mem/urma); the involved benchmark pods
+    # run ONLY the in-container tools (spdiag/perf/runqlat/offcputime). Without
+    # a monitor pseudo-node (ssh mode, or the pod-level DaemonSet fallback)
+    # every target keeps running every enabled tool.
+    node_map = cluster.get("nodes") or {}
+    has_monitor = any((node_map.get(name) or {}).get("_monitor")
+                      for name in nodes)
     for node_name in nodes:
         n = get_node(cluster, node_name)
         ip = n["ip"]
+        is_monitor = bool(n.get("_monitor"))
         try:
             # remote output dir must exist before any tool writes into it
             _run(ip, n, "mkdir -p {}".format(remote_out_dir))
@@ -173,7 +182,10 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
             # 日志现场表：监控 pod 名 + 节点侧 profiling 目录（ssh 后 cd 可进）
             mon_cfg["pod"] = str(n.get("_pod") or node_name)
             mon_cfg["remote_dir"] = remote_out_dir
-        if mon_cfg:
+        # monitor.config.json describes the node-level sampler; with a monitor
+        # DaemonSet present only its pseudo-nodes write it (the involved pods
+        # never run mem/urma in that case).
+        if mon_cfg and (is_monitor or not has_monitor):
             try:
                 _run(ip, n, "printf '%s' {} > {}/{}".format(
                     shlex.quote(json.dumps(mon_cfg, ensure_ascii=False)),
@@ -184,6 +196,12 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
         started = {}
         for tool, tcfg in matrix["tools"].items():
             if not tcfg.get("enabled"):
+                continue
+            # split routing (see has_monitor above): node-level samplers stay
+            # on the monitor pseudo-nodes, in-container tools on the benchmark
+            # pods. spdiag MUST NOT target a monitor pod: nothing instrumented
+            # runs there, so its SHM is never initialized.
+            if has_monitor and (tool in MONITOR_ARTIFACTS) != is_monitor:
                 continue
             try:
                 # presence probe (absolute bin path checked directly).
@@ -217,8 +235,14 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
                                 tool, node_name))
                         continue
                 if tool == "spdiag":
-                    # node-global counters: reset and start accumulating
-                    out = _run(ip, n, "{} restart".format(_bin(tcfg)))
+                    # reset and start accumulating. In a fresh container/pod
+                    # the spdiag SHM (/spdiag_shm_default) was never created
+                    # by an instrumented process, so `restart` dies with
+                    # SIGBUS (kubectl exec rc=135); `start` creates and sizes
+                    # the SHM, hence the fallback. A successful restart keeps
+                    # the reset-and-keep-running semantics.
+                    out = _run(ip, n, "{} restart 2>/dev/null || {} start".format(
+                        _bin(tcfg), _bin(tcfg)))
                     log("[profile] spdiag restart on {} ({})".format(node_name, out or "ok"))
                     started[tool] = None
                 elif tool == "perf":
@@ -356,6 +380,30 @@ def _wait_pid_gone(ip, node, pid, sudo="", polls=8, interval_s=1):
     time.sleep(0.3)
 
 
+def _spdiag_show_file(remote_out_dir, session, node):
+    """Remote file `spdiag show` writes to for one target.
+
+    k8s benchmark pods write into their OWN per-pod log subdirectory because
+    every pod on a node mounts the same hostPath run dir: split writer/reader
+    pods would otherwise overwrite one another's spdiag output. The session's
+    remote_out_dir is ``<log_dir>/profiling/<cfg>`` (remote_profiling_dir), so
+    the pod level slots in before it:
+    ``<log_dir>/<pod>/profiling/<cfg>/spdiag.show.txt``
+    (host side ``<host_log_root>/<ts>/<pod>/profiling/<cfg>/spdiag.show.txt``).
+    ssh nodes keep the historical path (one profiling target per host, so no
+    collision). The collected basename stays spdiag.show.txt for both, so the
+    text-tree generation and the report/WebUI pairing are unchanged."""
+    pod = (node or {}).get("_pod")
+    if not pod:
+        return "{}/spdiag.show.txt".format(remote_out_dir)
+    if "/profiling/" not in remote_out_dir:
+        # unexpected custom layout: keep at least the pod isolation
+        return "{}/{}/spdiag.show.txt".format(remote_out_dir, pod)
+    log_dir = remote_out_dir.rsplit("/profiling/", 1)[0]
+    return "{}/{}/profiling/{}/spdiag.show.txt".format(
+        log_dir, pod, session.get("cfg", ""))
+
+
 def stop_and_collect(cluster, session, local_prof_dir):
     """Stop sampling, dump spdiag, collect artifacts. Never raises."""
     if not session:
@@ -392,13 +440,17 @@ def stop_and_collect(cluster, session, local_prof_dir):
         ip = n["ip"]
         remote_out = session["remote_out_dir"]
         collected = []
+        remote_paths = {}
         for tool, pid in tools.items():
             tcfg = session["matrix_tools"].get(tool, {})
             try:
                 if tool == "spdiag":
-                    out_file = "{}/spdiag.show.txt".format(remote_out)
+                    out_file = _spdiag_show_file(remote_out, session, n)
+                    _run(ip, n, "mkdir -p {}".format(
+                        out_file.rsplit("/", 1)[0]))
                     _run(ip, n, "{} show > {}".format(_bin(tcfg), out_file))
                     collected.append("spdiag.show.txt")
+                    remote_paths["spdiag.show.txt"] = out_file
                 elif tool in MONITOR_ARTIFACTS:
                     # Wait for the sampler to EXIT before pulling: a live
                     # appender trips scp_pull's post-copy size check. A
@@ -444,7 +496,8 @@ def stop_and_collect(cluster, session, local_prof_dir):
         os.makedirs(node_local, exist_ok=True)
         for fname in collected:
             try:
-                scp_pull(ip, n, "{}/{}".format(remote_out, fname), node_local)
+                scp_pull(ip, n, remote_paths.get(fname)
+                         or "{}/{}".format(remote_out, fname), node_local)
                 log("[profile] collected {}/{}".format(node_name, fname))
             except Exception as exc:
                 log("[WARN] [profile] collect {}/{}: {}".format(node_name, fname, exc))

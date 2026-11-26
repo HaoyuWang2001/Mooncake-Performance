@@ -21,7 +21,7 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 
 | 工具 | 覆盖 | 命令形态 | 权限 |
 | --- | --- | --- | --- |
-| `spdiag` | 侵入式代码段耗时聚合（GetReplicaList 等） | `spdiag restart` → 运行 → `spdiag show > spdiag.show.txt` | 节点级全局 |
+| `spdiag` | 侵入式代码段耗时聚合（GetReplicaList 等） | `spdiag restart`（失败回退 `start`：新容器/pod 无 SHM 时 restart 会 SIGBUS）→ 运行 → `spdiag show > spdiag.show.txt` | ssh：节点级全局；k8s：benchmark client pod 内（每 pod 独立 SHM） |
 | `perf` | on-CPU 任意函数火焰图（系统级 `-a`） | `sudo -n perf record -F 99 -a -g --call-graph fp -o perf.data`，SIGINT 后轮询落盘再收集；stderr 存 `perf.data.err` 一并收集 | sudo（可关） |
 | `runqlat` | 调度延迟直方图（bt/runqlat.bt，周期输出带时间戳） | `sudo -n env INTERVAL=10 bpftrace runqlat.bt`（.bt 启动时推送到远端 profiling 目录） | sudo（可关） |
 | `offcputime` | off-CPU/持锁等待（bt/offcputime.bt，大事件明细带时间戳） | `sudo -n env MIN_BLOCK_US=1000 bpftrace offcputime.bt`（同上） | sudo（可关） |
@@ -38,8 +38,9 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 
 - **启动**：场景开始（`trigger=whole_run`）或测量窗（`per_stage`：pipeline/kvtest
   为 writer/实例启动前）→ 逐 involved 节点（`nodes=auto` 或显式列表）探测 → spdiag
-  restart → 采样进程 nohup 后台，**pid 记入 `.state` 台账**（崩溃后可清；marker
-  记录预期 cmdline 防误杀）
+  restart（失败回退 `start`：新容器/pod 的 `/spdiag_shm_default` 尚未创建时 restart
+  会以 SIGBUS 退出）→ 采样进程 nohup 后台，**pid 记入 `.state` 台账**（崩溃后可清；
+  marker 记录预期 cmdline 防误杀）
 - **结束**（成功/失败/STOP 都执行）：SIGINT 停采样（perf 优雅落盘）→ `spdiag show` →
   scp 收集至 `outputs/<ts>/logs/<配置名>/profiling/<节点>/`（spdiag 表同时生成文本打点树）→ 清台账
 - **异常值自动报告**：run 结束提取 RESULT 行 > `outliers.threshold_ms` →
@@ -66,6 +67,11 @@ k8s 模式下 run 的"节点"其实是 pod：直接在 client pod 里跑采样�
   `<pod_workspace>/logs/<ts>`）：脚本与 CSV 落节点磁盘，收集链路与报表 reduce 零改动
 - 采样循环进程留在容器内（仅每次 mdcli 调用跨界），pod 删除/namespace 清理即回收，
   不会在宿主留下孤儿进程
+- **工具分流**：monitor DaemonSet 只承载节点级采样（mem/urma）；spdiag/perf/runqlat/
+  offcputime 始终在 involved 的 benchmark client pod 内执行（spdiag 的 SHM
+  `/spdiag_shm_default` 是每容器独立的，monitor pod 里没有打点进程）。spdiag 的
+  `show` 落在 pod 自己的日志子目录 `<host_log_root>/<ts>/<pod>/profiling/<配置名>/`，
+  同节点多 pod（split writer/reader）不会互相覆盖
 
 宿主内存（`mem.host.csv`）与 URMA 端口（`urma.flits.csv`）因此是**每节点一份**；
 报表 `monitor.config.json: node_ip` 取宿主 IP，同主机多 pod 的宿主内存曲线自动去重。

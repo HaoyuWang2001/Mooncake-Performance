@@ -5589,6 +5589,14 @@ def _k8s_deployment_pods(cluster, run_label, role):
 # The sampler loop itself stays INSIDE the container (only each mdcli call
 # crosses into the host), so pod deletion / namespace teardown always kills
 # it — no orphan host process to reap.
+#
+# Routing: these pseudo-nodes are handed to start_profiling ALONGSIDE the
+# involved benchmark pods. prof_core routes the node-level samplers
+# (MONITOR_ARTIFACTS: mem/urma) to the ``_monitor`` pseudo-nodes ONLY, and the
+# in-container tools (spdiag/perf/runqlat/offcputime) to the benchmark pods
+# ONLY. spdiag is per-container (SHM /spdiag_shm_default) and no instrumented
+# process runs in a monitor pod, so it must never target one: `restart` there
+# dies with SIGBUS (rc=135).
 _K8S_MONITOR_TIMEOUT_S = 60
 
 
@@ -5796,9 +5804,11 @@ def _profiling_targets(cluster, matrix, involved_nodes, ts, cfg_name,
     """Pick the nodes start_profiling should target.
 
     ssh mode: unchanged involved nodes.
-    k8s mode: one monitor DaemonSet pod per HOST (node-level mem + host
-    mdcli); falls back to the involved pods (pod-level) when the DaemonSet
-    cannot be created — profiling must never fail the scenario."""
+    k8s mode: the involved benchmark pods PLUS one monitor DaemonSet pod per
+    HOST (node-level mem + host mdcli); prof_core routes each tool to its
+    fitting targets by the pseudo-nodes' ``_monitor`` flag. Falls back to the
+    involved pods (pod-level monitors) when the DaemonSet cannot be created —
+    profiling must never fail the scenario."""
     if not matrix or prof_core is None:
         return involved_nodes
     tools = matrix.get("tools") or {}
@@ -5808,12 +5818,16 @@ def _profiling_targets(cluster, matrix, involved_nodes, ts, cfg_name,
     if cluster.get("_controller") is None:
         return involved_nodes
     try:
-        return ensure_k8s_monitor_daemonset(
+        monitor_pods = ensure_k8s_monitor_daemonset(
             cluster, ts, cfg_name, involved_nodes, dry)
     except Exception as exc:
         log("[WARN] [profile] monitor DaemonSet unavailable -> falling back "
             "to pod-level monitors: {}".format(exc))
         return involved_nodes
+    # Both target kinds travel in one list; start_profiling splits the tools
+    # by the _monitor flag (node-level samplers vs in-container tools).
+    return list(involved_nodes) + [p for p in monitor_pods
+                                   if p not in involved_nodes]
 
 
 def _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
