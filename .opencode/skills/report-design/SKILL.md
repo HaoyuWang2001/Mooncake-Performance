@@ -131,9 +131,9 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - 章节顺序：SDK 全链路 → 错误与异常 → 日志现场 → 节点监控 → 页脚（最底部）。
 - **错误与异常**：写→读平铺，节点→客户端两级表（含状态码前 3），保留首错误摘录；
   **节点行带收放按钮（▸/▾），实例行默认折叠**；异常窗口带「角色 · 节点 · 实例」归属。
-- **日志现场**（原「实例与日志现场」）：节点树（节点行可展开，**实例默认折叠**；
-  客户端行只读）→ 客户端行 writer 前 reader 后；列=角色/节点/客户端/总数/成功/失败/日志 +
-  **对慢点追踪的贡献**（无 trace 整列隐藏）；不含性能指标列；现场索引（节点汇总/登录命令/glog 产物）并入。
+- **日志现场**：唯一一张「现场日志」表（展平）：节点行（聚合：x 个子项 · 大小 + 节点根目录）
+  → pod 行（角色/pod/大小/pod 目录）→ 监控行（监控 pod/大小/profiling 目录；未开监控三列为 -）；
+  节点列只在节点行填写；全表水平滑动。已删除实例树/总数成功失败/贡献列/节点登录现场/其它产物索引。
 - **页脚**：数据文件（report.html 自包含 + data.js）、map→reduce 流程、正确性口径
   （总计=同桶按请求数加权平均、max 取最大、直方图全量、离群剔除口径）。
 
@@ -154,8 +154,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 ### 6. 交互边界
 
 - **曲线叠加只由对象树勾选控制**；其他位置（实例明细表等）不得改变曲线/选中集。
-- 日志现场：**客户端行只读**（不点击、不嵌小图）；仅**节点行**可展开/收起，**实例默认折叠**；
-  错误与异常的节点行也带收放按钮且实例默认折叠。
+- 日志现场：单表只读（无折叠/无点击）；错误与异常的节点行保留收放按钮且实例默认折叠。
 - 允许的展开交互：慢点追踪表行（展开该请求的块图）、实例节点行、分级时延块图聚焦（下一级展开）。分级时延块展开：树序全部 L1 + 残差；所有有二级子区间且值>0 的 L1 同时展开二级（含「未归因」）。
 - QPS 副图图例可看不可点（`selectedMode:false`，固定显示）；副图上方无小标题。
 - 平移/缩放滑块窗口不加描边；zslider 把手为填充色（不是描边）。
@@ -187,7 +186,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 234 条 · ✓208 · ◐24 · ✗1 · n/a1
+> **覆盖率（自动校验）**：共 231 条 · ✓207 · ◐23 · ✗0 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -199,7 +198,7 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C0.V6 每个图表容器 `role="img"` + `aria-label` —— R-SHELL-12 〔test_b02_chart_role_and_aria_labels〕
 - C0.V7 页脚最底部：数据文件（report.html 自包含 + data.js）、map→reduce 流程、正确性口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕
 - C0.I1 主题按钮三态循环 auto→light→dark，写入 localStorage —— R-SHELL-4 〔test_b05_theme_manual_toggle〕
-- C0.I2 data.js 缺失降级：明细表按 p99 前 20 名 + `datanote` 提示；加载后自动隐藏并渲染全量 —— R-SHELL-2 〔test_a08_data_missing_degrades_to_note, test_a09_data_loaded_hides_note, test_data_js_loader_points_to_real_file〕
+- C0.I2 data.js 可选懒加载：缺失时静默使用内嵌子集，页面不崩、无独立降级提示 —— R-SHELL-2 〔test_a08_data_js_absent_page_still_works, test_data_js_loader_points_to_real_file〕
 - C0.I3 WebUI raw 模式适配：相对链接改写为 `/api/file?path=…&mode=raw`（`..` 逐级解析） —— R-SHELL-2 〔test_render_report_has_rel_base_and_adapter, test_adapter_resolves_parent_relative_links〕
 - C0.D1 单文件自包含：CSS/ECharts/主题内联，零外部请求；生成器纯标准库 —— R-SHELL-1 〔test_render_self_contained_and_data_js, test_a15_report_stdlib_only〕
 - C0.D2 注入 HTML 的用户可控字符串一律转义 —— R-SHELL-9 〔test_html_meta_is_escaped〕
@@ -415,20 +414,17 @@ description: Use when editing, reviewing, or adding any UI in scripts/report.py'
 - C16.B1 全局错误地图丢失节点/客户端精度 —— DR-29 〔test_errors_split_by_role_and_client〕
 - C16.B2 异常窗口时刻的时区错位（节点 UTC vs 宿主 CST） —— DR-18 〔test_slowest_ts_epoch_matches_buckets〕
 
-### C17 日志现场（合并卡；原「实例与日志现场」）
+### C17 日志现场（现场日志单表）
 
-- C17.V1 节点树：节点行可展开/收起（**实例默认折叠**）→ 客户端行；同一节点内 **writer 在前、reader 在后** —— R-INST-1 〔test_client_site_tree_readonly_rows, test_client_site_contribution_and_writer_first〕
+- C17.V1 唯一一张「现场日志」表，列 = 节点 / 角色 / pod / 日志属性 / 日志路径；行 = 节点行（聚合）+ pod 行 + 每节点至多一个监控行；**展平不折叠** —— R-INST-1 〔test_logsite_single_table_and_removed_sections, test_logsite_rows_flattened_and_monitor_states〕
+- C17.V2 节点行：节点列填节点 IP，日志属性 = `x 个子项 · xx KB`（该节点已知产物合计），日志路径 = 节点日志根目录；角色/pod 列留空 —— R-INST-1 〔test_logsite_rows_flattened_and_monitor_states〕
+- C17.V3 pod 行：节点列留空；角色 = 该 pod 日志角色集合（如 `reader、writer`）；pod 列填 pod 名；日志属性 = 大小；日志路径 = pod 目录全路径 —— R-INST-1 〔test_logsite_rows_flattened_and_monitor_states〕
+- C17.V4 监控行：角色「监控」；开监控时填监控 pod 名 + 大小 + 节点侧 profiling 目录；未开时 pod/属性/路径均为 `-`（行仍在） —— R-INST-1 〔test_logsite_rows_flattened_and_monitor_states, test_reduce_monitor_sites_reads_config_and_sizes〕
+- C17.V5 整表 `nowrap` + `.wrapx` 全表水平滑动；节点行加粗 —— R-INST-1 〔test_logsite_rows_flattened_and_monitor_states〕
+- C17.V6 已删除：客户端实例树（总数/成功/失败/贡献列）、节点汇总、登录命令、其它产物索引、data.js 降级提示；性能指标不得回潮 —— R-INST-1/R-SHELL-2 〔test_logsite_single_table_and_removed_sections, test_a08_data_js_absent_page_still_works〕
 - C17.V7 **节点身份 = 节点 IP**（k8s=宿主机 `status.hostIP`，ssh=管理 IP；同主机多 pod 节点级合并；pod 名保留在 `meta.pod`）—— 节点标签直接取数据，不做前端映射 —— R-INST-4 〔test_node_display_k8s_uses_host_ip, test_node_display_ssh_uses_management_ip, test_reduce_monitors_labels_by_node_ip_and_dedupes_host〕
-- C17.V2 列 = 角色 / 节点 / 客户端 / 总数 / 成功 / 失败 / 日志 + **对慢点追踪的贡献**（Top-N 条数） —— R-INST-1 〔test_client_site_header_and_columns, test_client_site_contribution_and_writer_first〕
-- C17.V3 无 C++ trace 时「贡献」整列隐藏 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
-- C17.V4 日志列 = 大小 · 文件名（CSS 截断），title = 远程全路径 —— R-INST-1 〔✗〕
-- C17.V5 不再展示性能指标（avg/p50/p99/队列等待） —— R-INST-1 〔test_client_site_header_and_columns〕
-- C17.V6 「节点与登录现场」小节：节点汇总 + 登录命令 + 非客户端产物（glog/monitor）索引 —— R-SRC-1 〔◐〕
-- C17.I1 客户端行只读（无点击/不叠加曲线）；仅节点行可点击展开 —— R-INST-3 〔test_client_site_tree_readonly_rows〕
-- C17.I2 节点行展开状态跨重渲染保持（clientOpen 记忆；初始为折叠） —— R-INST-1 〔test_client_site_tree_readonly_rows〕
-- C17.D1 贡献 = 该客户端（名称/pod）在慢点追踪 Top-N 中的条数 —— R-INST-1 〔test_client_site_contribution_and_writer_first〕
-- C17.B1 性能指标列残留（旧 13 列表格） —— DR-29 〔test_client_site_header_and_columns〕
-- C17.B2 实例表点击曾叠加主图曲线 —— R-INST-3 〔test_client_site_tree_readonly_rows〕
+- C17.D1 结构性不变量：任何 source 产物必须落在某行日志路径之下；落不进规范目录的强制以 `dirname` 自成一行（永不静默丢产物）；汇总子项数 = 去重后的已知产物数 —— R-INST-1/R-SRC-2 〔test_logsite_out_of_tree_source_gets_own_row, test_logsite_rows_flattened_and_monitor_states〕
+- C17.B1 日志路径曾在渲染侧改写/给出 pod 内视角（ssh 后 cd 不进）—— 路径必须由产物生成时写入节点侧真实路径 —— R-SRC-2 〔test_pod_path_to_site_maps_mount, test_logsite_single_table_and_removed_sections〕
 
 ### C18 节点监控（内存 / URMA）
 

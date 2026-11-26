@@ -1367,11 +1367,13 @@ def _engine_of(meta):
     return "kvtest" if m.get("mode") == "kvtest" else "python"
 
 
-def reduce_scenario(stats, meta, monitors=None, traces=None):
+def reduce_scenario(stats, meta, monitors=None, traces=None,
+                    monitor_sites=None):
     """Full scenario report data: stats grouped by data-size (caller passes a
     flat list where possible; the size label is taken from meta["size"] when
     present, else 'all'). `monitors` (from reduce_monitors) is scenario-level
-    and independent of data-size."""
+    and independent of data-size; `monitor_sites` (from reduce_monitor_sites)
+    feeds the 现场日志 table's per-node monitor row."""
     by_size = {}
     for st in stats:
         size = (st.get("meta") or {}).get("size") or meta.get("size") or "all"
@@ -1402,7 +1404,142 @@ def reduce_scenario(stats, meta, monitors=None, traces=None):
                              or meta.get("size") or "all") == size])
     sources, nodes = _sources(stats, trace_list)
     return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
-            "monitors": monitors or {}}
+            "monitors": monitors or {},
+            "logsite": build_logsite(meta, sources, monitor_sites)}
+
+
+# ---------------------------------------------------------------------------
+# 日志现场（现场日志表）：节点行 + pod 行 + 监控行；路径一律节点侧真实目录
+# ---------------------------------------------------------------------------
+
+MONITOR_ROW_ROLE = "监控"
+
+
+def reduce_monitor_sites(local_log_dir):
+    """Per-node monitor artifact sites for the 现场日志 table.
+
+    Returns {node_label: {"pod": <monitor pod>, "remote_dir": <node-side
+    profiling dir>, "files": N, "bytes": B}} keyed by the node display name
+    (monitor.config.json node_ip, else the artifact dir name)."""
+    sites = {}
+    try:
+        for root, _dirs, files in os.walk(local_log_dir):
+            fset = set(files)
+            if not (fset & {MEM_HOST, MEM_PROC, URMA_FLITS, MONITOR_CONFIG,
+                            "mem.err.log", "urma.err.log"}):
+                continue
+            rcfg = {}
+            if MONITOR_CONFIG in fset:
+                try:
+                    with open(os.path.join(root, MONITOR_CONFIG),
+                              "r", encoding="utf-8") as f:
+                        rcfg = json.load(f) or {}
+                except (OSError, ValueError):
+                    rcfg = {}
+            disp = str(rcfg.get("node_ip") or os.path.basename(root))
+            nbytes = 0
+            for fn in files:
+                try:
+                    nbytes += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+            sites[disp] = {"pod": str(rcfg.get("pod") or ""),
+                           "remote_dir": str(rcfg.get("remote_dir") or ""),
+                           "files": len(files), "bytes": nbytes}
+    except Exception:
+        pass
+    return sites
+
+
+def build_logsite(meta, sources, monitor_sites=None):
+    """现场日志表行：每节点一个节点行（聚合）+ 若干 pod 行 + 恰好一个监控行。
+
+    - 节点行：files/bytes = 该节点全部已知产物合计；dir = 节点日志根目录
+      （meta.host_log_root/run_id，缺省取同节点 pod 目录公共父级）
+    - pod 行：role = 该 pod 日志的角色集合；files/bytes 去重后合计
+    - 监控行：有监控产物时带监控 pod 与 profiling 目录；未开监控时
+      pod/bytes/dir 为空（渲染为 -），但该行始终存在
+    - 结构性不变量：任何 source 的 remote_path 必须落在其 pod 行的目录下；
+      落不进的强制以自身 dirname 成行（永不静默丢产物）。"""
+    meta = meta or {}
+    root = str(meta.get("host_log_root") or "").rstrip("/")
+    run_id = str(meta.get("run_id") or "")
+    base = (root + "/" + run_id) if (root and run_id) else ""
+    # 挂载逆变换（仅旧产物兜底）：pod 内路径 /<pod_ws>/logs/<run_id>/… 的节点
+    # 孪生路径 = <host_log_root>/<run_id>/…。新产物在写盘时已是节点路径，此处
+    # no-op；旧 sidecar/本地 fallback 的 pod 内路径借此仍能给出 ssh 可进目录。
+    remote_root = str(meta.get("remote_log_dir") or "").rstrip("/")
+
+    def _twin(path):
+        p = str(path or "")
+        if (base and remote_root
+                and (p == remote_root or p.startswith(remote_root + "/"))):
+            return base + p[len(remote_root):]
+        return p
+
+    pods = {}
+    extras = {}
+    for src in sources or []:
+        node = str(src.get("node") or "?")
+        pod = str(src.get("pod") or "")
+        rpath = _twin(src.get("remote_path") or "")
+        name = str(src.get("source") or "")
+        row_dir = (base + ("/" + pod if pod else "")) if base else (
+            os.path.dirname(rpath) if rpath else "")
+        inside = (not row_dir) or (not rpath) or (
+            rpath == row_dir or rpath.startswith(row_dir.rstrip("/") + "/"))
+        key = (node, pod, row_dir) if inside else (
+            node, os.path.dirname(rpath) if rpath else "")
+        tgt = pods if inside else extras
+        row = tgt.get(key)
+        if row is None:
+            row = tgt[key] = {"node": node,
+                              "pod": pod if inside else (pod or "-"),
+                              "dir": row_dir if inside else key[1],
+                              "roles": set(), "files": set(), "bytes": 0}
+        if src.get("role"):
+            row["roles"].add(str(src["role"]))
+        if name and name not in row["files"]:
+            row["files"].add(name)
+            row["bytes"] += int(src.get("bytes") or 0)
+    by_node = {}
+    for row in list(pods.values()) + list(extras.values()):
+        by_node.setdefault(row["node"], []).append(row)
+    sites = monitor_sites or {}
+    for node in sites:
+        by_node.setdefault(node, [])
+    rows = []
+    for node in sorted(by_node):
+        items = sorted(by_node[node],
+                       key=lambda r: (str(r.get("pod") or ""), r["dir"]))
+        site = sites.get(node) or {}
+        site_bytes = int(site.get("bytes") or 0)
+        site_files = int(site.get("files") or 0)
+        node_dir = base
+        if not node_dir:
+            dirs = [r["dir"] for r in items if r["dir"]]
+            if dirs:
+                try:
+                    node_dir = os.path.commonpath(dirs)
+                except ValueError:
+                    node_dir = os.path.dirname(dirs[0])
+        mon_dir = _twin(site.get("remote_dir") or "")
+        if not node_dir and mon_dir:
+            node_dir = os.path.dirname(os.path.dirname(mon_dir.rstrip("/")))
+        rows.append({"tier": "node", "node": node, "role": "", "pod": "",
+                     "files": sum(len(r["files"]) for r in items) + site_files,
+                     "bytes": sum(r["bytes"] for r in items) + site_bytes,
+                     "dir": node_dir})
+        for r in items:
+            rows.append({"tier": "pod", "node": node, "pod": r["pod"],
+                         "role": "、".join(sorted(r["roles"])),
+                         "files": len(r["files"]), "bytes": r["bytes"],
+                         "dir": r["dir"]})
+        rows.append({"tier": "monitor", "node": node,
+                     "role": MONITOR_ROW_ROLE,
+                     "pod": str(site.get("pod") or ""),
+                     "files": site_files, "bytes": site_bytes, "dir": mon_dir})
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1891,6 +2028,9 @@ cursor:pointer;font-size:12px;padding:0 5px}
 #latToolbar::-webkit-scrollbar,#tLatToolbar::-webkit-scrollbar{display:none}
 #latToolbar>*,#tLatToolbar>*{flex:0 0 auto;margin:0}   /* 清掉嵌套 .toolbar 的 margin-bottom（否则内容整体上移、与前两个按钮错行） */
 #latToolbar .toolbar,#tLatToolbar .toolbar{flex-wrap:nowrap}
+.logsite-table{width:max-content;min-width:100%}
+.logsite-table th,.logsite-table td{white-space:nowrap}
+.logsite-table tr.node-row td{font-weight:700}
 .params{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
 gap:0 26px}
 .prow{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid var(--grid);
@@ -3588,7 +3728,7 @@ function renderComboBar(){
         selObjs=keep.length?keep:['all'];
       }
       renderComboBar(); renderObjTree(); renderControls();
-      renderSummary(); renderClientSite(); renderSlowStrip();
+      renderSummary(); renderSlowStrip();
       buildChart(); buildQpsChart();
     };
     box.appendChild(b);
@@ -4157,103 +4297,8 @@ function renderVolume(){
   t.appendChild(tb);
   const wrapx=el('div','wrapx'); wrapx.appendChild(t); box.appendChild(wrapx);
 }
-/* 日志现场（合并卡）：节点树（节点可展开，实例默认折叠）+ 客户端行（writer 在前）
-   + 日志文件/大小 + 对慢点追踪的贡献（无 C++ trace 时整列隐藏）。 */
-let clientOpen={};
-function contribMap(z){
-  /* 贡献 = 该客户端在各写/读组 Top-K 中的条数之和 */
-  const m={};
-  const gs=(z&&z.trace&&z.trace.groups)||{};
-  Object.keys(gs).forEach(function(g){
-    ((gs[g]||{}).top||[]).forEach(function(r){
-      const k=String(r.client||'').replace(/\.log$/,'');
-      if(k) m[k]=(m[k]||0)+1;
-    });
-  });
-  return m;
-}
-function renderClientSite(){
-  const box=document.getElementById('clients'); if(!box) return;
-  box.innerHTML='';
-  const z=Z(); if(!z){box.appendChild(el('div','note','无数据'));return;}
-  const note=document.getElementById('datanote');
-  if(note&&window.__mcDataMissing)note.style.display='';
-  const clients=(FULL&&FULL.sizes&&FULL.sizes[curSize]&&
-    FULL.sizes[curSize].clients)||z.clients||[];
-  const cs=clients.filter(function(c){return clientInCombo(c.name);});
-  const contrib=contribMap(z);
-  const hasTrace=Object.keys(contrib).length>0;
-  function contribOf(c){
-    if(!contrib) return 0;
-    return (contrib[c.name]||0)+(c.pod?(contrib[c.pod]||0):0);
-  }
-  function logName(c){
-    const p=String(c.remote_path||c.source||'');
-    const b=p.split('/').pop()||c.name;
-    return fmtBytes(c.bytes)+' · '+b;
-  }
-  const nodes={};
-  cs.forEach(function(c){
-    const n=c.node||'未归属节点';
-    (nodes[n]=nodes[n]||[]).push(c);
-  });
-  const names=Object.keys(nodes).sort();
-  const ro={writer:0,reader:1};
-  names.forEach(function(n){
-    nodes[n].sort(function(a,b){
-      return ((ro[a.role]===undefined?9:ro[a.role])-
-              (ro[b.role]===undefined?9:ro[b.role]))||
-        String(a.name).localeCompare(String(b.name));
-    });
-  });
-  const t=el('table');
-  const thead=el('thead'); const hr=el('tr');
-  ['节点','角色','客户端','总数','成功','失败','日志'].forEach(function(h,i){
-    hr.appendChild(el('th',(i>=3&&i<=5)?'n':'',h));});
-  if(hasTrace) hr.appendChild(el('th','n','对慢点追踪的贡献'));
-  thead.appendChild(hr); t.appendChild(thead);
-  const tb=el('tbody');
-  names.forEach(function(n){
-    const list=nodes[n];
-    const open=clientOpen[n]===true;   /* 默认折叠所有实例 */
-    const tr=el('tr','node-row');
-    tr.style.cursor='pointer';
-    tr.title='点击展开/收起该节点的客户端';
-    tr.onclick=function(){clientOpen[n]=!open;renderClientSite();};
-    const td=el('td','node-name',(open?'▾ ':'▸ ')+n);
-    td.colSpan=3; tr.appendChild(td);
-    const tot=list.reduce(function(a,c){return a+(Number(c.total)||0);},0);
-    const okc=list.reduce(function(a,c){return a+(Number(c.ok)||0);},0);
-    const fc=list.reduce(function(a,c){return a+(Number(c.fail)||0);},0);
-    tr.appendChild(el('td','n',String(tot)));
-    tr.appendChild(el('td','n',String(okc)));
-    tr.appendChild(el('td','n',String(fc)));
-    const bytes=list.reduce(function(a,c){return a+(Number(c.bytes)||0);},0);
-    tr.appendChild(el('td','mono',list.length+' 个文件 · '+fmtBytes(bytes)));
-    if(hasTrace){
-      tr.appendChild(el('td','n',String(list.reduce(function(a,c){
-        return a+contribOf(c);},0))));
-    }
-    tb.appendChild(tr);
-    if(open) list.forEach(function(c){
-      const tr2=el('tr','client-row');
-      tr2.appendChild(el('td',''));
-      tr2.appendChild(el('td','',c.role||'-'));
-      tr2.appendChild(el('td','mono',c.name));
-      tr2.appendChild(el('td','n',String(c.total)));
-      tr2.appendChild(el('td','n',String(c.ok)));
-      tr2.appendChild(el('td','n',String(c.fail)));
-      const lg=el('td','mono logcell',logName(c));
-      lg.title=String(c.remote_path||c.source||'');
-      tr2.appendChild(lg);
-      if(hasTrace) tr2.appendChild(el('td','n',String(contribOf(c))));
-      tb.appendChild(tr2);
-    });
-  });
-  t.appendChild(tb);
-  const wrapx=el('div','wrapx'); wrapx.appendChild(t);
-  box.appendChild(wrapx);
-}
+/* 日志现场：唯一一张「现场日志」表（节点行 + pod 行 + 监控行）。
+   展平不折叠；全表 nowrap + .wrapx 水平滑动。节点列只在节点行填写。 */
 let errOpen={};          /* 错误与异常：节点级收放（默认折叠实例） */
 function renderErrors(){
   const z=Z(); if(!z) return;
@@ -4358,89 +4403,40 @@ function renderErrors(){
     wrap.appendChild(ul);
   }
 }
-function renderSources(){
-  const box=document.getElementById('sources'); box.innerHTML='';
-  const nodes=D.nodes||[]; const srcs=D.sources||[];
-  const M=D.meta||{};
-  const hostRoot=M.host_log_root||''; const runId=M.run_id||'';
-  const ns=M.k8s_namespace||''; const remoteDir=M.remote_log_dir||'';
-  if(nodes.length){
-    const t=el('table'); const thead=el('thead'); const hr=el('tr');
-    ['节点','客户端数','日志量'].forEach(function(h,i){
-      hr.appendChild(el('th',i?'n':'',h));});
-    thead.appendChild(hr); t.appendChild(thead); const tb=el('tbody');
-    nodes.forEach(function(n){
-      const tr=el('tr');
-      tr.appendChild(el('td','mono',n.node));
-      tr.appendChild(el('td','n',String(n.pods)));
-      tr.appendChild(el('td','n',fmtBytes(n.bytes))); tb.appendChild(tr);});
-    t.appendChild(tb); box.appendChild(t);
-  }
-  /* 现场日志目录：原始 log/glog/ylt/exitrc 留在节点上（不拉回），
-     这里给出逐 pod 的目录与登录方式（k8s=宿主 IP；ssh=管理 IP）。 */
-  const seen={}; const locs=[];
-  (srcs||[]).forEach(function(x){
-    if(!x||!x.node) return;
-    const key=String(x.node)+'|'+String(x.pod||'');
-    if(seen[key]) return; seen[key]=1; locs.push(x);});
-  if(locs.length){
-    let dir0='';
-    if(hostRoot&&runId) dir0=hostRoot.replace(/\/+$/,'')+'/'+runId;
-    else if(remoteDir) dir0=remoteDir.replace(/\/+$/,'');
-    if(dir0){
-      const t=el('table'); const thead=el('thead'); const hr=el('tr');
-      ['节点(IP)','pod','现场日志目录（log/glog/ylt/exitrc 同目录）','查看']
-        .forEach(function(h,i){hr.appendChild(el('th',i===3?'':'mono',h));});
-      thead.appendChild(hr); t.appendChild(thead); const tb=el('tbody');
-      locs.forEach(function(x){
-        const tr=el('tr');
-        const dir=dir0+(x.pod?('/'+x.pod):'')+'/';
-        /* 现场目录就是节点上的绝对路径：ssh 节点后 cd 进去即全部日志。
-           pod 内视角（kubectl exec）只在需要时使用，降为次要提示。 */
-        const view='ssh '+x.node+'  ⏎  cd '+dir;
-        tr.appendChild(el('td','mono',String(x.node)));
-        tr.appendChild(el('td','mono',String(x.pod||'-')));
-        tr.appendChild(el('td','mono',dir));
-        tr.appendChild(el('td','mono',view));
-        tb.appendChild(tr);});
-      t.appendChild(tb);
-      const wrapx=el('div','wrapx'); wrapx.appendChild(t);
-      box.appendChild(el('div','note',
-        '现场日志（原始日志不拉回，CLEAN-UP 不删除）：'));
-      box.appendChild(wrapx);
-      box.appendChild(el('div','note',
-        '每个 pod 一个独立目录；同目录含 .log / .log.glog / .log.ylt.log / '+
-        '.log.exitrc / .samples.csv(.gz) / .summary.json / '+
-        '.log.glog.trace.json(.gz) / kvtest_out/ / remove 服务日志。'+
-        'ssh <节点IP> 后 cd 该目录即可看到全部日志；'+
-        '仅在需要 pod 内视角时再 kubectl exec -it <pod> -n <ns> -- bash。'));
-    } else {
-      box.appendChild(el('div','note',
-        '宿主机日志目录：<host_log_root>/<run_id>/<pod>/（CLEAN-UP 不删除）。'+
-        'ssh 节点后 cd 该目录即可看到全部日志；'+
-        '需要 pod 内视角时再 kubectl exec -it <pod> -n <ns> -- bash'));
+
+function renderLogSite(){
+  const box=document.getElementById('logsite'); if(!box) return;
+  box.innerHTML='';
+  const rows=D.logsite||[];
+  if(!rows.length){box.appendChild(el('div','note','无日志产物'));return;}
+  const t=el('table','logsite-table');
+  const thead=el('thead'); const hr=el('tr');
+  ['节点','角色','pod','日志属性','日志路径'].forEach(function(h){
+    hr.appendChild(el('th',null,h));});
+  thead.appendChild(hr); t.appendChild(thead);
+  const tb=el('tbody');
+  rows.forEach(function(r){
+    const nodeRow=r.tier==='node';
+    const tr=el('tr', nodeRow?'node-row':(
+      r.tier==='monitor'?'monitor-row':'pod-row'));
+    tr.appendChild(el('td','mono', nodeRow?String(r.node||'-'):''));
+    tr.appendChild(el('td','', nodeRow?'':String(r.role||'')));
+    tr.appendChild(el('td','mono', nodeRow?'':String(r.pod||'-')));
+    let attr='-';
+    if(nodeRow){
+      attr=String(Number(r.files)||0)+' 个子项 · '+fmtBytes(r.bytes||0);
+    }else if(r.tier==='monitor'&&!(r.files||r.bytes||r.dir)){
+      attr='-';                       /* 未开监控：pod/属性/路径全为 - */
+    }else if(r.bytes||r.files){
+      attr=fmtBytes(r.bytes||0);
     }
-  }
-  /* 客户端日志文件已在实例树中给出；这里只保留非客户端产物（trace 等） */
-  const others=(srcs||[]).filter(function(x){
-    return x&&x.kind&&x.kind!=='client';});
-  if(others.length){
-    const t=el('table'); const thead=el('thead'); const hr=el('tr');
-    ['节点','pod','角色','文件','远程路径','大小'].forEach(function(h,i){
-      hr.appendChild(el('th', i===5?'n':'', h));});
-    thead.appendChild(hr); t.appendChild(thead); const tb=el('tbody');
-    others.forEach(function(x){
-      const tr=el('tr');
-      [x.node,x.pod,x.role,x.source,x.remote_path,fmtBytes(x.bytes)].forEach(
-        function(v,i){
-          tr.appendChild(el('td',(i===5?'n mono':'mono'),
-            String(v==null?'-':v)));});
-      tb.appendChild(tr);});
-    t.appendChild(tb);
-    const wrapx=el('div','wrapx'); wrapx.appendChild(t);
-    box.appendChild(el('div','note','其它产物索引（trace / monitor）：'));
-    box.appendChild(wrapx);
-  }
+    tr.appendChild(el('td','n',attr));
+    tr.appendChild(el('td','mono', r.dir?String(r.dir):'-'));
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  const wrapx=el('div','wrapx'); wrapx.appendChild(t);
+  box.appendChild(wrapx);
 }
 
 /* ---- 对象树：总体 -> 节点 -> 客户端，每行一个复选框 -------------- */
@@ -4721,12 +4717,10 @@ function renderAll(){
   safe('latency-chart',buildChart);
   safe('histogram',renderHist);
   safe('slow-strip',renderSlowStrip);
-  safe('client-table',renderClientSite);
+  safe('logsite',renderLogSite);
   safe('volume',renderVolume);
   safe('errors',renderErrors);
   safe('trace',renderTrace);
-  safe('sources',function(){
-    if(!window.__srcDone){renderSources();window.__srcDone=true;}});
   safe('theme-toggle',renderThemeToggle);
 }
 let monCharts={};
@@ -6827,11 +6821,7 @@ _SEC_ERRORS = """<div class="card"><h2>错误与异常</h2><div id="errors"></di
 <h3 class="sec">状态分布</h3><div id="terrs"></div></div>
 """
 _SEC_CLIENTSITE = """<div class="card" id="clientsite"><h2>日志现场</h2>
-<div class="note" id="datanote" style="display:none">全量数据 data.js 未加载（例如通过
-WebUI/HTTP 直接打开）：实例表按 p99 显示前 20 名。
-把 data.js 与 report.html 放在同一目录后重新打开即可查看全量。</div>
-<div id="clients"></div>
-<h3 class="sec">节点与登录现场</h3><div id="sources"></div></div>
+<div id="logsite"></div></div>
 """
 _SEC_VOLUME = """<div class="card" id="volumecard"><h2>数据量与优化</h2>
 <div class="sub" id="volumeNote"></div>

@@ -137,9 +137,11 @@ def test_remove_service_log_lands_in_pod_site_dir(monkeypatch):
     assert "/ws/logs/20261126-1141/pod-x/remove_service.log" in launch
 
 
-def test_report_index_points_at_directory():
+def test_report_index_is_the_logsite_table():
+    """现场日志表 = 唯一现场索引：路径列给出节点侧目录（ssh+cd 即达），
+    旧「节点与登录现场」/「其它产物索引」不得回潮。"""
     src = open(os.path.join(ROOT, "scripts", "report.py"),
                encoding="utf-8").read()
-    assert "cd '+dir" in src
-    assert "ssh <节点IP> 后 cd 该目录即可看到全部日志" in src
-    assert ".samples.csv(.gz)" in src
+    assert "logsite-table" in src and "日志属性" in src and "日志路径" in src
+    assert "节点与登录现场" not in src
+    assert "其它产物索引" not in src

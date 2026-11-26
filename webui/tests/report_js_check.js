@@ -655,53 +655,6 @@ if (!errs.length) {
   out.qps_filter_mode = (qo && qo.dataZoom && qo.dataZoom[0])
     ? qo.dataZoom[0].filterMode : null;
 
-  if (process.argv.includes("--click-client")) {
-    try {
-      const box = getEl("clients");
-      const table = (box.children || []).find(function (c) {
-        return String(c.className || "").indexOf("wrapx") >= 0;});
-      const tb = table ? (table.children || [])[0] : null;
-      // 表格结构：thead + tbody
-      const body = tb && (tb.children || [])[1];
-      const rows = (body && body.children) || [];
-      const nodeRow = rows.find(function (r) {
-        return String(r.className || "").indexOf("node-row") >= 0;});
-      const clientRow = rows.find(function (r) {
-        return String(r.className || "").indexOf("client-row") >= 0;});
-      const sel = function () {
-        return (sandbox.window && sandbox.window.__MC_SEL)
-          ? sandbox.window.__MC_SEL() : [];
-      };
-      const before = JSON.stringify(sel());
-      out.main_series_before = (function () {
-        const a = charts.mainchart || [];
-        const o = a.length ? a[a.length - 1] : null;
-        return (o && o.series) ? o.series.length : null;
-      })();
-      out.node_row_clickable = !!(nodeRow && nodeRow.onclick);
-      out.client_row_present_before = !!clientRow;
-      out.rows_before = rows.length;
-      if (nodeRow && nodeRow.onclick) nodeRow.onclick();
-      const body2 = (function () {
-        const t = (getEl("clients").children || []).find(function (c) {
-          return String(c.className || "").indexOf("wrapx") >= 0;});
-        const tbl = t ? (t.children || [])[0] : null;
-        return tbl && (tbl.children || [])[1];
-      })();
-      out.rows_after_nodes = ((body2 && body2.children) || []).length;
-      const clientRow2 = ((body2 && body2.children) || []).find(function (r) {
-        return String(r.className || "").indexOf("client-row") >= 0;});
-      out.client_row_present = !!clientRow2;
-      out.client_row_clickable = !!(clientRow2 && clientRow2.onclick);
-      out.selobjs_before = before;
-      out.selobjs_after = JSON.stringify(sel());
-      out.main_series_after = (function () {
-        const a = charts.mainchart || [];
-        const o = a.length ? a[a.length - 1] : null;
-        return (o && o.series) ? o.series.length : null;
-      })();
-    } catch (e) { errs.push("clickclient: " + String(e && e.stack || e)); }
-  }
   function treeMiniLabels(root){
     const acc=[];
     (function walk(n){
@@ -1204,7 +1157,48 @@ if (!errs.length) {
     ? mainOpt().legend.selectedMode : null;
   // 错误与异常 / 日志现场（Phase 2）
   out.errors_text = textOf(getEl("errors"));
-  out.clients_text = textOf(getEl("clients"));
+  out.logsite_text = textOf(getEl("logsite"));
+  out.logsite_table_cls = (function () {
+    let found = "";
+    (function walk(n) {
+      (n.children || []).forEach(function (c) {
+        const cls = String(c.className || "");
+        if (cls.indexOf("logsite-table") >= 0) found = cls;
+        walk(c);
+      });
+    })(getEl("logsite"));
+    return found;
+  })();
+  out.logsite_wrapx = (function () {
+    let ok = false;
+    (function walk(n) {
+      (n.children || []).forEach(function (c) {
+        if (String(c.className || "").indexOf("wrapx") >= 0) ok = true;
+        walk(c);
+      });
+    })(getEl("logsite"));
+    return ok;
+  })();
+  out.logsite_rows = (function () {
+    const acc = [];
+    (function walk(n) {
+      (n.children || []).forEach(function (c) {
+        const cls = String(c.className || "");
+        const tiers = { "node-row": "node", "pod-row": "pod",
+                        "monitor-row": "monitor" };
+        for (const k in tiers) {
+          if (cls.indexOf(k) >= 0) {
+            acc.push({tier: tiers[k],
+                      cells: (c.children || []).map(function (td) {
+                        return textOf(td).trim();})});
+            break;
+          }
+        }
+        walk(c);
+      });
+    })(getEl("logsite"));
+    return acc;
+  })();
 
   function _rowsByClass(root, cls) {
     const acc = [];
@@ -1244,19 +1238,6 @@ if (!errs.length) {
       _rowsByClass(getEl("errors"), "client-row").length;
     out.err_toggles_expanded = _errToggles().length;
   }
-  if (process.argv.includes("--expand-clients")) {
-    let guard = 0;
-    while (guard++ < 100) {
-      const row = _rowsByClass(getEl("clients"), "node-row").find(function (r) {
-        return textOf(r).indexOf("▸") >= 0;});
-      if (!row || !row.onclick) break;
-      row.onclick();
-    }
-    out.clients_text_expanded = textOf(getEl("clients"));
-    out.client_rows_expanded =
-      _rowsByClass(getEl("clients"), "client-row").length;
-  }
-  out.sources_text = textOf(getEl("sources"));
   out.volume_text = textOf(getEl("volume"));
   out.volume_note = textOf(getEl("volumeNote"));
 

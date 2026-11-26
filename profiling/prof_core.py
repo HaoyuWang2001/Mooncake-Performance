@@ -170,6 +170,9 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
                 mon_cfg["node_ip"] = bm._node_display(cluster, n, node_name)
             except Exception:
                 pass
+            # 日志现场表：监控 pod 名 + 节点侧 profiling 目录（ssh 后 cd 可进）
+            mon_cfg["pod"] = str(n.get("_pod") or node_name)
+            mon_cfg["remote_dir"] = remote_out_dir
         if mon_cfg:
             try:
                 _run(ip, n, "printf '%s' {} > {}/{}".format(
