@@ -59,10 +59,11 @@ def test_controller_job_end_to_end(tmp_path):
     assert os.path.isfile(os.path.join(d, "reduced", "8MB.meta.json"))
     w = data["sizes"]["8MB"]["role_summaries"]["writer"]
     pooled = sorted([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-    # exact pooled percentiles, order-statistic convention
-    assert w["p50_ms"] == round(ls._exact_percentile(pooled, 0.50), 4)
-    assert w["p99_ms"] == round(ls._exact_percentile(pooled, 0.99), 4)
+    # 统一口径：分位=合并直方图插值（无 sketch 环境），min/max/avg 精确
     assert w["max_ms"] == 6.0 and w["avg_ms"] == round(sum(pooled) / 6, 4)
+    assert 1.0 <= w["p50_ms"] <= 6.0
+    assert (w["p50_ms"] <= w["p99_ms"] <= w["p999_ms"]
+            <= w["p9999_ms"] <= w["max_ms"])
     # reader role has no rows in this scenario -> absent from summaries
     assert "reader" not in data["sizes"]["8MB"]["role_summaries"]
 

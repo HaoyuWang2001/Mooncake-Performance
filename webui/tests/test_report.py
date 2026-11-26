@@ -45,19 +45,21 @@ def _stats(tmp_path, name, role, node="n1", lat=1.0, n=40, secs=4):
     return p + ".stats.json"
 
 
-def test_summary_of_computes_p90_exact_pools():
-    stats = [{
-        "global": {"key_total": 10, "key_ok": 10, "key_fail": 0,
-                   "ok": 10, "avg_ms": 5.5, "max_ms": 10.0, "min_ms": 1.0},
-        "meta": {"ts_from": 100.0, "ts_to": 110.0},
-    }]
-    lats = [float(i) for i in range(1, 11)]
-    out = rp._summary_of(stats, {"lats": lats, "missing": False})
-    assert out["p90_ms"] == round(ls._exact_percentile(lats, 0.90), 4)
-    assert out["p50_ms"] is not None
-    # unavailable raw samples -> N/A, never an approximation
-    n_a = rp._summary_of(stats, {"missing": True})
-    assert n_a["p90_ms"] is None
+def test_summary_of_uses_unified_percentile_policy(tmp_path):
+    """统一口径：中心分位=合并直方图插值；无 sketch 时尾部同样直方图。"""
+    p = tmp_path / "u.log"
+    p.write_text("".join(
+        "RESULT\t2026-11-15 10:00:{:02d}.{:06d}\tput\tk{}\t{:.6f}\tOK\n"
+        .format(i % 60, i, i, 1.0 + i) for i in range(100)), encoding="utf-8")
+    st = ls.compute_stats(str(p), size="8MB", role="writer")
+    out = rp._summary_of([st])
+    # 与产物自身（同一 policy、同一桶梯）一致
+    assert out["p50_ms"] == round(st["global"]["p50_ms"], 4)
+    assert out["p99_ms"] == round(st["global"]["p99_ms"], 4)
+    assert 45.0 <= out["p50_ms"] <= 55.0
+    assert out["pct_method"] in ("hist", "hist+digest")
+    # 既无直方图也无 digest -> N/A（不再报 0）
+    assert rp._summary_of([{"global": {}, "meta": {}}])["p50_ms"] is None
 
 
 def _site_stats(tmp_path, name, role, node, pod, base):
@@ -729,8 +731,10 @@ def test_summary_percentiles_consistent_with_csv(tmp_path):
     s = rp.reduce_size([st], {"config": "c"})["summary"]
     agg = bm._merge_stats_aggs([st])
     assert s["max_ms"] == 100.0 and s["min_ms"] == 1.0
-    assert s["p50_ms"] == agg["p50_ms"] == 51.0
-    assert s["p99_ms"] == agg["p99_ms"] == 99.0
+    # 报表 summary 与 CSV 聚合同口径（同一 unified_pct / 同一桶梯）
+    assert s["p50_ms"] == round(agg["p50_ms"], 4)
+    assert s["p99_ms"] == round(agg["p99_ms"], 4)
+    assert 45.0 <= s["p50_ms"] <= 55.0
     assert s["p999_ms"] <= s["max_ms"]
     # 多客户端：max 仍取精确最大，分位按合并直方图且不超过 max
     st2 = json.loads(json.dumps(st))

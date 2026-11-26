@@ -116,10 +116,11 @@ def test_csv_excludes_warmup_rows_and_shrinks_instance_wall(tmp_path):
     assert r["verify_failures"] == 2           # C++ 标量：无法按时段切
 
 
-def test_csv_falls_back_to_summary_when_samples_incomplete(tmp_path):
+def test_csv_uses_streaming_sample_stats_when_samples_present(tmp_path):
+    """样本存在即权威：正式统计从 samples 流式得到（不再以 summary 计数判
+    完整性——C++ summary 含 warmup 区，不能当基准）。"""
     logs = tmp_path / "logs"
     logs.mkdir()
-    # 样本只含 1 条 OK，而 summary success=2 -> 不完整 -> summary 回退
     base = _write_samples(logs, "warmup_fb", 0, 9301,
                           [(10.0, "upsert_from", 1.0, "OK")])
     _write_summary(logs, base, 0, {
@@ -134,7 +135,29 @@ def test_csv_falls_back_to_summary_when_samples_incomplete(tmp_path):
         mooncake_store_nodes=[], result_dir=str(tmp_path))
     w = next(r for r in out if r["role"] == "writer"
              and r["instance"] == "i0")
-    assert w["total"] == 2 and w["success"] == 2      # summary 原值（含 warmup）
+    assert w["total"] == 1 and w["success"] == 1      # samples 权威
+
+
+def test_csv_falls_back_to_summary_without_samples(tmp_path):
+    """无 samples（旧产物/未拉回）才回退 summary。"""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = _write_samples(logs, "warmup_ns", 0, 9301,
+                          [(10.0, "upsert_from", 1.0, "OK")])
+    os.remove(os.path.join(str(logs), base + ".samples.csv"))
+    _write_summary(logs, base, 0, {
+        "upsert_from": {"total": 2, "success": 2, "failure": 0,
+                        "count": 2, "bytes": 2 * MB}})
+    cfg = _cfg()
+    cfg["_kvtest_iid_nodes"] = {"0": "10.0.0.1"}
+    cfg["_kvtest_start_epochs"] = {"8MB": 1000.0}
+    out = bm.write_scenario_csv(
+        str(logs), cfg, "ts",
+        os.path.join(str(tmp_path), "warmup_ns.json"), cluster=None,
+        mooncake_store_nodes=[], result_dir=str(tmp_path))
+    w = next(r for r in out if r["role"] == "writer"
+             and r["instance"] == "i0")
+    assert w["total"] == 2 and w["success"] == 2
 
 
 # ---------------------------------------------------------------- Map 层
@@ -219,16 +242,6 @@ def _stats_product(tmp_path, role="writer", cutoff=1005.0,
         "seconds": [], "histogram": {},
     }), encoding="utf-8")
     return str(prod)
-
-
-def test_pool_lats_exclude_warmup_buckets_keep_all(tmp_path):
-    rp._KVTEST_PRODUCT_POOL.clear()
-    st = json.load(open(_stats_product(tmp_path), encoding="utf-8"))
-    st["_path"] = _stats_product(tmp_path)
-    pool = rp._kvtest_read_product_pool(st)
-    assert pool["lats"] == [1.0, 2.0]                 # warmup 40/41 被剔除
-    assert set(pool["secs"]) == {1001, 1002, 1010, 1020}  # 图表桶保留全部
-    rp._KVTEST_PRODUCT_POOL.clear()
 
 
 def test_summary_of_uses_formal_wall_not_cpp_elapsed(tmp_path):

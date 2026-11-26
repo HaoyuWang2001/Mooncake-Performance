@@ -6,6 +6,8 @@
   "master_addr": "mooncake-master.mooncake.svc.cluster.local:50051",
   "metadata_server": "http://mooncake-master.mooncake.svc.cluster.local:9003/metadata",
   "venv": "",
+  "_quantiles_comment": "分位口径：quantiles.req_k = REQ sketch 精度（尾部 p99/p999/p9999）；留空用默认 24。依赖 datasketches（镜像/venv 需安装，缺失时优雅降级为直方图插值）",
+  "quantiles": {"req_k": 24},
   "local_buffer_size": "1GB",
   "store_total_size": "",
   "tenant_id": "default",

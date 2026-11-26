@@ -15,9 +15,10 @@ Runs ON the k8s controller, next to the per-run data directory the pods'
                     "writer_ops": [...], "reader_ops": [...]}]}
 
 For every instance it performs the SAME logstats map the orchestrator runs
-locally (identical product schema, sibling samples.csv located through the
-product path so reduce-side exact pooling works), then ONE reduce per
-data-size unit, writing <out_dir>/<unit>.reduced.json + <unit>.meta.json.
+locally (identical product schema incl. the REQ percentile digests), then ONE
+reduce per data-size unit, writing <out_dir>/<unit>.reduced.json +
+<unit>.meta.json and a per-instance FORMAL stats block (`instances`) that the
+scenario CSV consumes — same percentile policy as the report.
 The orchestrator pulls those, renders HTML locally and assembles the
 CSV/overview — raw samples never leave the cluster and the controller never
 renders. Any error exits non-zero -> the orchestrator falls back to the
@@ -63,7 +64,7 @@ def _trace_bytes(path):
         return 0
 
 
-def _map_one(d, inst):
+def _map_one(d, inst, digest_k=None):
     """Both role products of one instance — the orchestrator-local
     _kvtest_map_stats semantics, verbatim."""
     samples = _maybe_gunzip(os.path.join(d, inst["samples"]))
@@ -91,7 +92,7 @@ def _map_one(d, inst):
             samples, top_n=100, context=20,
             node=inst.get("node") or "", pod=inst.get("pod") or "",
             role=role, remote_path=remote_path, size=inst.get("ds"),
-            warmup_cutoff=inst.get("warmup_until"),
+            warmup_cutoff=inst.get("warmup_until"), digest_k=digest_k,
             rows_factory=lambda p, _ops=ops, _start=start:
                 ls.iter_kvtest_rows(p, _start, _ops),
             summaries=[("summary", payload)] if payload is not None else [],
@@ -157,7 +158,8 @@ def main(argv=None):
     by_unit = {}
     trace_by_unit = {}
     for inst in job["instances"]:
-        for role, product, samples, src in _map_one(d, inst):
+        for role, product, samples, src in _map_one(
+                d, inst, job.get("digest_k")):
             m = _DS_RE.search(os.path.basename(product))
             ds = (m.group("ds") if m else src.get("ds") or "all")
             by_unit.setdefault(ds, []).append(product)
@@ -187,7 +189,36 @@ def main(argv=None):
         data = rp.reduce_scenario(
             loaded, meta, monitors=[],
             traces=rp.load(trace_by_unit.get(ds, [])))
-        rp._KVTEST_PRODUCT_POOL.clear()
+        # CSV 专用 per-instance 正式统计（post-warmup 计数/均值/极值 +
+        # 统一分位口径）；与报表 reduce 消费同一 logstats 助手，口径严格一致。
+        _inst_out = []
+        _warm = None
+        for inst in job["instances"]:
+            su, se = inst.get("warmup_until"), inst.get("start_epoch")
+            if su is not None and se is not None and float(su) > float(se):
+                _warm = float(su) - float(se)
+            if inst.get("iid") is None:
+                continue
+            try:
+                _samples = _maybe_gunzip(os.path.join(d, inst["samples"]))
+                _ops = (set(inst.get("writer_ops") or [])
+                        | set(inst.get("reader_ops") or [])
+                        | {"notify_rpc", "notify_http",
+                           "notify_queue_wait"})
+                _stats = ls.kvtest_instance_ops_stats(
+                    _samples, _ops, warmup_sec=_warm,
+                    digest_k=job.get("digest_k"),
+                    start_epoch=inst.get("start_epoch"))
+            except Exception as exc:
+                print("[job] WARN instance stats i{}: {}".format(
+                    inst.get("iid"), exc), flush=True)
+                _stats = {}
+            _inst_out.append({"iid": inst["iid"],
+                              "node": inst.get("node") or "",
+                              "pod": inst.get("pod") or "",
+                              "ops": _stats})
+        if _inst_out:
+            data["instances"] = _inst_out
         red = os.path.join(out_dir, "{}.reduced.json".format(ds))
         with open(red + ".tmp", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, separators=(",", ":"))

@@ -162,5 +162,9 @@ def test_mixed_op_filter_splits_put_and_get(tmp_path):
     put = bm.parse_benchmark_log([str(sp)], op_filter="put")
     get = bm.parse_benchmark_log([str(sp)], op_filter="get")
     assert put["total"] == 10 and get["total"] == 10
-    assert put["p50_ms"] == 2.0 and get["p50_ms"] == 5.0
-    assert put["p99_ms"] == 2.0 and get["p99_ms"] == 5.0
+    # 统一口径：与产物 op 分位（同一 policy/桶梯）一致，且不超过真实 max
+    assert put["p50_ms"] == round(st["ops"]["put"]["p50_ms"], 4)
+    assert get["p50_ms"] == round(st["ops"]["get"]["p50_ms"], 4)
+    assert put["p99_ms"] == round(st["ops"]["put"]["p99_ms"], 4)
+    assert get["p99_ms"] == round(st["ops"]["get"]["p99_ms"], 4)
+    assert put["max_ms"] == 2.0 and get["max_ms"] == 5.0

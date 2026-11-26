@@ -18,6 +18,14 @@ def _write(tmp_path, text, name="x.writer.log"):
     return str(p)
 
 
+def _hist_pct(hist, q, edges=None, cap=None):
+    """统一口径下的桶直方图插值（测试用，可传真实 max 截顶）。"""
+    v = round(ls.hist_percentile(
+        {int(k): v for k, v in (hist or {}).items()}, q,
+        ls.BIN_EDGES_V2 if edges is None else edges), 6)
+    return min(v, cap) if cap is not None else v
+
+
 def _mk_lines(n, lat=1.0, ts_fmt="{:02d}:{:02d}:{:02d}.{:06d}"):
     out = []
     for i in range(n):
@@ -37,8 +45,10 @@ def test_new_dated_format_and_basic_fields(tmp_path):
     st = ls.compute_stats(_write(tmp_path, text))
     g = st["global"]
     assert g["total"] == 5 and g["ok"] == 4 and g["fail"] == 1
-    assert g["p50_ms"] == 3.0 and g["max_ms"] == 4.0  # nearest-rank (client _percentile)
-    assert g["exact"] is True
+    # 统一口径：分位=桶直方图插值（近似），max 严格精确
+    assert g["p50_ms"] == _hist_pct(st["histogram"], 0.50)
+    assert g["max_ms"] == 4.0
+    assert "exact" not in g
     assert st["errors"] == {"ERR:-200": 1}
     assert st["ops"]["put"]["fail"] == 1
     assert st["slowest"][0]["key"] == "k5" and st["slowest"][0]["status"] == "ERR:-200"
@@ -74,7 +84,8 @@ def test_legacy_undated_rows_still_counted(tmp_path):
     )
     st = ls.compute_stats(_write(tmp_path, text))
     g = st["global"]
-    assert g["ok"] == 2 and g["p50_ms"] == 1.0  # nearest-rank
+    assert g["ok"] == 2
+    assert g["p50_ms"] == _hist_pct(st["histogram"], 0.50)
     assert st["meta"]["dated"] is False
     assert st["seconds"] == []        # no time buckets without dates
 
@@ -172,7 +183,8 @@ def test_summaries_and_per_op_stats(tmp_path):
     assert summary["wall_s"] == 5.0 and summary["max_depth"] == 7
     # per-op latency stats
     put = st["ops"]["put"]
-    assert put["ok"] == 3 and put["p50_ms"] == 2.0 and put["max_ms"] == 3.0
+    assert put["ok"] == 3 and put["max_ms"] == 3.0
+    assert put["p50_ms"] == _hist_pct(put["hist"], 0.50)
     get = st["ops"]["get"]
     assert get["ok"] == 2 and get["avg_ms"] == 8.5 and get["min_ms"] == 8.0
 
@@ -217,19 +229,19 @@ def test_dated_timestamp_is_local_epoch(tmp_path, monkeypatch):
         time.tzset()
 
 
-def test_exact_limit_degrade_keeps_exact_min_max(tmp_path, monkeypatch):
-    """超过精确窗口后不再累积样本，但 min/max 仍必须精确（原由直方图插值）。"""
-    monkeypatch.setattr(ls, "EXACT_LIMIT", 10)
+def test_min_max_always_exact_percentiles_hist(tmp_path):
+    """统一口径：min/max 永远精确；分位一律桶直方图插值（不再有精确窗口）。"""
     text = "".join(
         "RESULT\t2026-11-12 10:00:{:02d}.{:06d}\tput\tk{}\t{:.1f}\tOK\n".format(
             i % 60, i, i, 1.0 + i) for i in range(100))
     st = ls.compute_stats(_write(tmp_path, text))
     g = st["global"]
-    assert g["exact"] is False
     assert g["min_ms"] == 1.0 and g["max_ms"] == 100.0
     op = st["ops"]["put"]
     assert op["min_ms"] == 1.0 and op["max_ms"] == 100.0
-    assert 90.0 <= g["p99_ms"] <= 130.0     # 分位由直方图近似
+    assert g["p99_ms"] == _hist_pct(st["histogram"], 0.99,
+                                    cap=st["global"]["max_ms"])
+    assert 90.0 <= g["p99_ms"] <= 130.0
 
 
 def test_rows_without_timestamp_are_counted(tmp_path):
@@ -240,7 +252,8 @@ def test_rows_without_timestamp_are_counted(tmp_path):
     st = ls.compute_stats(_write(tmp_path, text))
     g = st["global"]
     assert g["total"] == 3 and g["ok"] == 2 and g["fail"] == 1
-    assert g["p50_ms"] == 1.0 and g["max_ms"] == 2.0
+    assert g["p50_ms"] == _hist_pct(st["histogram"], 0.50)
+    assert g["max_ms"] == 2.0
     assert st["meta"]["rows"] == 3 and st["meta"]["dated"] is False
     assert st["seconds"] == [] and st["errors"] == {"ERR:-200": 1}
 
@@ -284,7 +297,9 @@ def test_outliers_excluded_from_bucket_stats(tmp_path):
     lines.append(
         "RESULT\t2026-11-12 10:00:01.000000\tput\tkF\t1.000000\tERR:-1\n")
     st = ls.compute_stats(_write(tmp_path, "".join(lines)))
-    assert st["meta"]["outlier_threshold_ms"] == 10.0
+    # 阈值 = 合并直方图插值的 p99 × 10（统一口径下 p99≈1.019）
+    assert st["meta"]["outlier_threshold_ms"] == round(
+        st["global"]["p99_ms"] * 10.0, 6)
     assert len(st["outliers"]) == 1
     assert st["outliers"][0]["lat_ms"] == 100.0
     assert st["outliers"][0]["key"] == "kX"
