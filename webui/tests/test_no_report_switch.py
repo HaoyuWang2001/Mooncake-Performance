@@ -102,17 +102,17 @@ def test_dry_run_still_skips_reports(monkeypatch):
 
 def test_kvtest_reports_gated_by_no_report(monkeypatch):
     calls = []
-    monkeypatch.setattr(bm, "_kvtest_map_stats",
-                        lambda *a, **k: calls.append("map"))
-    monkeypatch.setattr(bm, "_generate_reports",
-                        lambda *a, **k: calls.append("reduce"))
+    monkeypatch.setattr(bm, "_kvtest_finalize_stage",
+                        lambda *a, **k: calls.append("finalize") or ["r"])
+    monkeypatch.setattr(bm, "_kvtest_render_stage",
+                        lambda *a, **k: calls.append("render"))
     cfg = {}
     assert bm._kvtest_generate_reports(cfg, "/tmp/none",
                                        _report_args(no_report=True)) is None
     assert calls == []
     bm._kvtest_generate_reports(cfg, "/tmp/none",
                                 _report_args(png=True, pull_raw_logs=True))
-    assert calls == ["map", "reduce"]
+    assert calls == ["finalize", "render"]
 
 
 def _stop_args(**kw):

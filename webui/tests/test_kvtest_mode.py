@@ -34,11 +34,17 @@ def _kv_cfg(**over):
 
 # ------------------------------------------------------------------ planning
 
-def test_kvtest_plan_dual_iids_follow_client_ids():
+def test_kvtest_plan_split_processes_from_client_pods():
     plan = bm.kvtest_plan(_kv_cfg(), node_count=2)
-    assert plan["dual"] is True
-    assert len(plan["clients"]) == 4                 # 2 per node x 2 nodes
-    assert [c["iid"] for c in plan["clients"]] == [c["id"] for c in plan["clients"]]
+    # a client block ALWAYS means split: one writer + one reader process per
+    # client pod; the legacy dual process is gone.
+    assert plan["dual"] is False and plan["split_pod"] is True
+    assert "clients" in plan and len(plan["clients"]) == 4
+    assert len(plan["writers"]) == 4 and len(plan["readers"]) == 4
+    assert [w["iid"] for w in plan["writers"]] == [0, 1, 2, 3]
+    assert [r["iid"] for r in plan["readers"]] == [4, 5, 6, 7]
+    assert [w["pair_index"] for w in plan["writers"]] == [0, 1, 2, 3]
+    assert [r["pair_index"] for r in plan["readers"]] == [0, 1, 2, 3]
     assert plan["writer_threads"] == 1
 
 
@@ -90,16 +96,12 @@ def test_kvtest_plan_split_pairs_processes_in_client_pods():
     assert all(r["port"] == 9201 for r in plan["readers"])
 
 
-def test_kvtest_plan_rejects_invalid_split_shape():
+def test_kvtest_plan_ignores_removed_process_mode():
     cfg = _kv_cfg()
-    cfg["client"]["process_mode"] = "invalid"
-    try:
-        bm.kvtest_plan(cfg, node_count=2)
-        raise AssertionError("should raise")
-    except RuntimeError as exc:
-        assert "process_mode" in str(exc)
+    cfg["client"]["process_mode"] = "invalid"      # removed knob: WARN only
+    plan = bm.kvtest_plan(cfg, node_count=2)
+    assert plan["split_pod"] is True and plan["process_mode"] == "split"
 
-    cfg["client"]["process_mode"] = "split"
     cfg["writer"]["port_base"] = 9101
     cfg["reader"]["port_base"] = 9101
     try:
@@ -153,22 +155,25 @@ def test_kvtest_single_window_no_warmup_control_cycle():
 
 def test_build_kvtest_instance_config_rpc_notify():
     plan = bm.kvtest_plan(_kv_cfg(), node_count=1)
-    entry = plan["clients"][0]
+    entry = plan["writers"][0]
     entry["_qps"] = 53
     entry["_out_dir"] = "/remote/kvtest_out/i0"
     entry["_lhost_port"] = 12345
     entry["_cpu_affinity"] = "0-3"
-    all_instances = [{"iid": c["iid"], "port": c["port"], "role": "dual",
-                      "host": "10.1.{}.{}".format(1 + c["id"] // 2,
-                                                   c["id"])}
-                     for c in plan["clients"]]
+    all_instances = (
+        [{"iid": c["iid"], "port": c["port"], "role": "writer",
+          "host": "10.1.0.{}".format(c["local"])}
+         for c in plan["writers"]]
+        + [{"iid": c["iid"], "port": c["port"], "role": "reader",
+            "host": "10.1.0.{}".format(c["local"])}
+           for c in plan["readers"]])
     inst = bm.build_kvtest_instance_config(
         _kv_cfg(), {"local_buffer_size": 8589934592,
                     "tenant_id": "default"},
         {"SETUP_MASTER_ADDR": "10.0.0.10:50051",
          "SETUP_METADATA_SERVER": ""},
-        plan, entry, "dual", "8MB", 256, all_instances)
-    assert inst["role"] == "dual" and inst["instance_id"] == entry["iid"]
+        plan, entry, "writer", "8MB", 256, all_instances)
+    assert inst["role"] == "writer" and inst["instance_id"] == entry["iid"]
     assert inst["pipeline"] == ["upsert_from"]          # native op name
     assert inst["notify_pipeline"] == ["get_buffer"]
     assert inst["target_qps"] == 53
@@ -187,23 +192,24 @@ def test_build_kvtest_instance_config_rpc_notify():
     assert inst["store"]["metadata_server"] == \
         "http://10.0.0.10:50051/metadata"
     assert inst["store"]["master_server_address"] == "10.0.0.10:50051"
-    # nodes view: the whole cluster as kvtest peers
-    assert [n["instance_id"] for n in inst["nodes"]] == [0, 1]
-    assert all(n["role"] == "dual" for n in inst["nodes"])
+    # nodes view: the whole cluster as kvtest peers (writer + reader pairs)
+    assert [n["instance_id"] for n in inst["nodes"]] == [0, 1, 2, 3]
+    assert [n["role"] for n in inst["nodes"]] == [
+        "writer", "writer", "reader", "reader"]
     assert all(n["notify_rpc_port"] == n["port"] + 10000
                for n in inst["nodes"])
 
 
 def test_build_kvtest_instance_config_etcd_master():
     plan = bm.kvtest_plan(_kv_cfg(), node_count=1)
-    entry = plan["clients"][0]
+    entry = plan["writers"][0]
     entry["_qps"] = 52
     entry["_out_dir"] = "/remote/kvtest_out/i0"
     entry["_lhost_port"] = 12346
     inst = bm.build_kvtest_instance_config(
         _kv_cfg(), {"master_type": "etcd"},
         {"SETUP_ETCD_ENDPOINTS": "http://10.0.0.10:2379"},
-        plan, entry, "dual", "8MB", 128, [])
+        plan, entry, "writer", "8MB", 128, [])
     assert inst["store"]["metadata_server"] == "http://10.0.0.10:2379"
     assert inst["store"]["master_server_address"] == "http://10.0.0.10:2379"
 
@@ -293,23 +299,37 @@ def test_recall_smoke_numa_process_mapping():
             for entry in plan["readers"]] == [1, 1, 1, 3, 3, 3]
 
 
-def test_kvtest_artifact_flatten_includes_request_samples(monkeypatch):
+def test_kvtest_pod_map_runs_in_process_dir(monkeypatch):
     commands = []
     monkeypatch.setattr(
-        bm, "get_node", lambda cluster, name: {"ip": "10.0.0.1"})
+        bm, "get_node", lambda cluster, name: {"ip": "10.0.0.1",
+                                               "_pod": "pod-a"})
 
     def fake_ssh(ip, node, command, quiet=False):
         commands.append(command)
-        return "summary=OK samples=OK"
+        return "OK" if "test -s" in command else "[logstats] ok"
 
     monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
-    entry = {"node": "n1", "_base": "case.i0", "_out_dir": "/out/i0"}
-    ok, status = bm._kvtest_flatten_artifacts(
-        {"nodes": {}}, entry, "/remote/logs")
-    assert ok and status.endswith("samples=OK")
-    assert "latency_samples.csv" in commands[0]
-    assert "/remote/logs/case.i0.samples.csv" in commands[0]
-    assert "latency_timeseries.csv" not in commands[0]
+    entry = {"node": "n1", "iid": 3, "_role": "writer", "_ds": "8MB",
+             "_log_base": "/pod/writer_i3_p9101/case",
+             "_out_dir": "/pod/writer_i3_p9101/case_out",
+             "_inst_dir": "/pod/writer_i3_p9101"}
+    bm._kvtest_pod_map({"nodes": {}}, entry, "/scripts", {},
+                       start_epoch=1000.0, warmup_s=2.0, digest_k=24)
+    assert "--kvtest-map-instance" in commands[0]
+    assert "--instance-dir /pod/writer_i3_p9101" in commands[0]
+    assert "--warmup-s 2.0" in commands[0]
+    assert "--digest-k 24" in commands[0]
+    assert "--out-stats /pod/writer_i3_p9101/case.stats.json" in commands[0]
+    # strict: a missing product is an error (no fallback map)
+    monkeypatch.setattr(bm, "ssh_check_output",
+                        lambda *a, **k: "MISSING")
+    try:
+        bm._kvtest_pod_map({"nodes": {}}, entry, "/scripts", {},
+                           start_epoch=1000.0)
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "products missing" in str(exc)
 
 
 def test_cleanup_removes_intermediates_and_keeps_report(tmp_path):
@@ -464,162 +484,6 @@ def _summary(iid, up_total, get_total, verify):
         },
     }
 
-
-def test_kvtest_csv_rows_from_dual_summaries(tmp_path):
-    local_logs = tmp_path / "logs"
-    local_logs.mkdir()
-    # dual instances emit BOTH the writer op and the reader op
-    cases = [("nodeA", 0, 9301, 1500, 1490, 2),
-             ("nodeB", 1, 9302, 1300, 1290, 1)]
-    for node, iid, port, up, get, verify in cases:
-        fn = "kvtest_csv.{}_i{}_p{}.kvtest_8MB.summary.json".format(
-            node, iid, port)
-        summary = _summary(iid, up, get, verify)
-        if iid == 1:
-            summary["operations"]["upsert_from"]["avg_ms"] = 3.0
-            summary["operations"]["upsert_from"]["max_ms"] = 19.0
-        (local_logs / fn).write_text(json.dumps(summary), encoding="utf-8")
-    cfg = _kv_cfg()
-    # run-time records the auto pool + real client counts
-    cfg["_kvtest_key_pool"] = {"8MB": 256}
-    cfg["_writer_count"] = 2
-    cfg["_reader_count"] = 2
-    cfg_path = os.path.join(str(tmp_path), "kvtest_csv.json")
-    rows = bm.write_scenario_csv(
-        str(local_logs), cfg, "ts", cfg_path, cluster=None,
-        mooncake_store_nodes=[], result_dir=str(tmp_path))
-    # order: writer i0, writer i1, writer TOTAL, reader i0, reader i1,
-    # reader TOTAL
-    assert [(r["role"], r["instance"]) for r in rows] == [
-        ("writer", "i0"), ("writer", "i1"), ("writer", "TOTAL"),
-        ("reader", "i0"), ("reader", "i1"), ("reader", "TOTAL")]
-    w0, w1, wT, r0, r1, rT = rows
-    # per-instance writer row
-    assert w0["operation"] == "upsert_from" and w0["total"] == 1500
-    assert w0["total_bytes"] == 1500 * 8 * 1024 * 1024
-    assert w0["qps"] == 50.0                     # 1500 / 30s
-    assert w0["notify_submitted"] == 15000 and w0["notify_fail"] == 10
-    assert w0["key_pool_size"] == 256
-    assert w0["num_threads"] == 1 and w0["notify_threads"] == 10
-    assert w0["target_qps"] == 105
-    # 无原始样本且无 controller reduce 产物：计数/阈值求和与 min/max/加权均值
-    # 仍精确（均值加权 = 全样本均值），分位数一律置空（N/A）——绝不使用
-    # “分位数加权平均”这类近似。
-    assert wT["total"] == 2800 and wT["success"] == 2800
-    assert wT["notify_submitted"] == 28000 and wT["notify_fail"] == 20
-    assert wT["notify_avg_ms"] == 1.5 and wT["notify_max_ms"] == 9.0
-    assert wT["avg_ms"] == round((1500 * 1.0 + 1300 * 3.0) / 2800, 4)
-    for _k in ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "p999_ms",
-               "p9999_ms"):
-        assert wT[_k] == ""                     # N/A，绝不近似
-    assert wT["max_ms"] == 19.0                  # true max, never weighted
-    assert wT["throughput_mb_s"] == round(2800 * 8 / 30, 2)   # MB per second
-    # reader rows: queue wait + verify failures (read-path verification)
-    assert r0["operation"] == "get_buffer" and r0["verify_failures"] == 2
-    assert r0["queue_wait_avg_ms"] == 0.2 and r0["queue_wait_max_ms"] == 1.1
-    assert rT["total"] == 2780 and rT["verify_failures"] == 3
-    assert rT["queue_wait_avg_ms"] == 0.2
-    # per-config csv written with the kvtest header
-    with open(os.path.join(str(tmp_path), "kvtest_csv.csv"),
-              encoding="utf-8") as f:
-        assert next(csv.reader(f)) == bm.KVTEST_CSV_HEADER
-    # rows carry exactly the header keys the detail csv expects
-    for r in rows:
-        assert set(r.keys()) <= set(bm.KVTEST_CSV_HEADER)
-
-
-def test_kvtest_qps_is_measured_success_qps(tmp_path):
-    local_logs = tmp_path / "logs"
-    local_logs.mkdir()
-    summary = _summary(0, 100, 0, 0)
-    summary["operations"]["upsert_from"].update(
-        {"total": 100, "success": 90, "failure": 10})
-    (local_logs / "kvtest_csv.nodeA_i0_p9301.kvtest_8MB.summary.json") \
-        .write_text(json.dumps(summary), encoding="utf-8")
-    rows = bm.write_scenario_csv(
-        str(local_logs), _kv_cfg(), "ts",
-        os.path.join(str(tmp_path), "kvtest_csv.json"), cluster=None,
-        mooncake_store_nodes=[], result_dir=str(tmp_path))
-    writer, total = [r for r in rows if r["role"] == "writer"]
-    assert writer["qps"] == 3.0  # 90 successful / 30s
-    assert total["qps"] == 3.0
-
-
-def test_kvtest_total_latency_recomputed_from_merged_ok_samples(tmp_path):
-    local_logs = tmp_path / "logs"
-    local_logs.mkdir()
-    cases = [("nodeA", 0, 9301, [1.0, 2.0]),
-             ("nodeB", 1, 9302, [100.0])]
-    for node, iid, port, values in cases:
-        base = bm._kvtest_artifact_base("kvtest_csv", iid, port, "8MB")
-        summary = _summary(iid, len(values), 0, 0)
-        summary["operations"].pop("get_buffer")
-        summary["operations"].pop("notify_queue_wait")
-        summary["operations"]["notify_rpc"].update(
-            {"total": 0, "success": 0, "failure": 0, "count": 0})
-        # Deliberately wrong summary latency fields: raw OK samples must win.
-        summary["operations"]["upsert_from"].update(
-            {"avg_ms": -1, "p50_ms": -1, "p90_ms": -1,
-             "p99_ms": -1, "p999_ms": -1, "p9999_ms": -1,
-             "max_ms": -1})
-        (local_logs / (base + ".summary.json")).write_text(
-            json.dumps(summary), encoding="utf-8")
-        rows = [
-            "elapsed_us,instance_id,operation,request_index,latency_ms,status,bytes"
-        ]
-        for index, value in enumerate(values):
-            rows.append("{}, {},upsert_from,{},{},OK,8388608".format(
-                index + 1, iid, index, value).replace(", ", ","))
-        # Failed requests are retained in the raw file but excluded from all
-        # latency distribution statistics.
-        rows.append("99,{},upsert_from,99,9999,ERR,0".format(iid))
-        (local_logs / (base + ".samples.csv")).write_text(
-            "\n".join(rows) + "\n", encoding="utf-8")
-
-    cfg = _kv_cfg()
-    cfg["_kvtest_iid_nodes"] = {"0": "nodeA", "1": "nodeB"}
-    result = bm.write_scenario_csv(
-        str(local_logs), cfg, "ts",
-        os.path.join(str(tmp_path), "kvtest_csv.json"), cluster=None,
-        mooncake_store_nodes=[], result_dir=str(tmp_path))
-    w0, w1, total = [r for r in result if r["role"] == "writer"]
-    assert w0["avg_ms"] == 1.5 and w0["max_ms"] == 2.0
-    assert w1["avg_ms"] == 100.0 and w1["max_ms"] == 100.0
-    assert total["avg_ms"] == 34.3333
-    assert total["min_ms"] == 1.0
-    assert total["max_ms"] == 100.0
-    # 统一口径：TOTAL 分位 = 实例行同源合并（直方图插值；本环境无 sketch）。
-    # 小样本（3 条）下尾部按桶内秩插值，单调且不超过真实 max。
-    assert 1.0 <= total["p50_ms"] <= 2.5
-    assert (total["p50_ms"] <= total["p95_ms"] <= total["p99_ms"]
-            <= total["p999_ms"] <= total["p9999_ms"] <= total["max_ms"])
-    # Strictly greater: the 2ms sample is not part of >2000us.
-    assert total[">2000us"] == 1
-    assert total[">20000us"] == 1
-
-
-def test_kvtest_csv_skips_bad_summary_json(tmp_path, capsys):
-    local_logs = tmp_path / "logs"
-    local_logs.mkdir()
-    (local_logs / "kvtest_csv.nodeA_i0_p9301.kvtest_8MB.summary.json") \
-        .write_text("{not json", encoding="utf-8")
-    good = _summary(1, 100, 100, 0)
-    (local_logs / "kvtest_csv.nodeB_i1_p9302.kvtest_8MB.summary.json") \
-        .write_text(json.dumps(good), encoding="utf-8")
-    cfg = _kv_cfg()
-    cfg["_kvtest_key_pool"] = {"8MB": 256}
-    rows = bm.write_scenario_csv(
-        str(local_logs), cfg, "ts", os.path.join(str(tmp_path), "kvtest_csv.json"),
-        cluster=None, mooncake_store_nodes=[], result_dir=str(tmp_path))
-    # only the healthy instance produced rows (grouped: writers + TOTAL,
-    # then readers + TOTAL)
-    assert [(r["role"], r["instance"]) for r in rows] == [
-        ("writer", "i1"), ("writer", "TOTAL"),
-        ("reader", "i1"), ("reader", "TOTAL")]
-    assert "(skipped)" in capsys.readouterr().out
-
-
-# -------------------------------------------------- rank+recall parallel
 
 def _smoke_path(name):
     return os.path.join(ROOT, "configs", "kvtest", "smoke", name)

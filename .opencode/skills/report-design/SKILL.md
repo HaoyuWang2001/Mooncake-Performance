@@ -433,7 +433,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C17.V6 已删除：客户端实例树（总数/成功/失败/贡献列）、节点汇总、登录命令、其它产物索引、data.js 降级提示；性能指标不得回潮 —— R-INST-1/R-SHELL-2 〔test_logsite_single_table_and_removed_sections, test_a08_data_js_absent_page_still_works〕
 - C17.V7 **节点身份 = 节点 IP**（k8s=宿主机 `status.hostIP`，ssh=管理 IP；同主机多 pod 节点级合并；pod 名保留在 `meta.pod`）—— 节点标签直接取数据，不做前端映射 —— R-INST-4 〔test_node_display_k8s_uses_host_ip, test_node_display_ssh_uses_management_ip, test_reduce_monitors_labels_by_node_ip_and_dedupes_host〕
 - C17.D1 结构性不变量：任何 source 产物必须落在某行日志路径之下；落不进规范目录的强制以 `dirname` 自成一行（永不静默丢产物）；汇总子项数 = 去重后的已知产物数 —— R-INST-1/R-SRC-2 〔test_logsite_out_of_tree_source_gets_own_row, test_logsite_rows_flattened_and_monitor_states〕
-- C17.D2 **大小 = 节点侧 `du -sb` 实测**（配置收尾快照 `logs/<cfg>/report/site_sizes.json`；pod/监控/节点行同源消费；含 .glog.d/summary/exitrc/remove 日志等全部运行时文件）；无 du 数据回退已知产物合计 —— R-INST-1/R-SRC-2/DR-51 〔test_site_du_snapshot_k8s_writes_report_sidecar, test_site_du_snapshot_ssh_and_failure, test_logsite_and_volume_use_du_sizes, test_site_sizes_survive_intermediate_cleanup〕
+- C17.D2 **大小 = 单一口径 `meta.bytes`**：kvtest 为每进程现场目录 `<pod>/<role>_i<iid>_p<port>/` 的 apparent size（pod 内 map 开始时 `os.stat` 求和，含样本/glog/产物）；python 引擎为已知产物字节合计。日志表现场索引只由产物 `meta.remote_path` 生成（pod 行为 pod 目录、进程子目录聚合）；不再有 `du -sb` 快照/`site_sizes.json` 覆盖 —— R-INST-1/R-SRC-2/DR-51 〔test_logsite_rows_follow_process_dirs, test_finalize_merges_digests_and_builds_logsite, test_pod_map_writes_products_and_dir_bytes〕
 - C17.B1 日志路径曾在渲染侧改写/给出 pod 内视角（ssh 后 cd 不进）—— 路径必须由产物生成时写入节点侧真实路径 —— R-SRC-2 〔test_pod_path_to_site_maps_mount, test_logsite_single_table_and_removed_sections〕
 
 ### C18 节点监控（内存 / URMA）
@@ -484,7 +484,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C20.V7 body 卡片层级完整（`div` 闭合平衡） —— 模板架构 〔test_body_div_balance_cards_inside_wrap〕
 - C20.V8 **控件风格统一**：新控件必须复用既有形态（`.toolbar` 行 / `.tl-label` 标签 / `.objtree-strip` 树条 / `.tree-*` 树行 / 既有按钮）；**禁止引入新的容器底色或描边风格**；多栏布局只允许无样式 grid（先例 `.stage-split`/`.trace-cols`） —— 设计基调 〔test_control_style_consistency〕
 - C20.D1 正确性口径：总计=同桶按请求数加权平均、max 取最大、直方图全量合并、离群剔除口径 —— R-SHELL-15 〔test_section_order_and_footer_note〕
-- C20.V9 数据量与优化卡含「留存（du 实测，场景级）」：每节点一行（k8s 拆 pod 目录 + profiling，ssh 为现场根目录）+ 合计；口径 `du -sb`，注明含全部现场运行时文件 —— R-VOL-2/DR-51 〔test_logsite_and_volume_use_du_sizes, test_volume_renders_du_rows〕
+- C20.V9 数据量与优化卡的「reduce 回传」= `partial.json.gz` 一个文件（pod→controller 的 stats+trace 已在两跳内合并；原始日志留节点）；kvtest 的「原始」合计按进程目录口径计（glog 已含，不重复叠加），不再渲染「留存（du 实测）」区块 —— R-VOL-2/DR-51 〔test_finalize_merges_digests_and_builds_logsite, test_csv_is_built_from_reduced_only〕
 - C20.D2 跨节点时间戳：当前用绝对秒 + 节点时区归一；相对秒 + 编排机参考钟为欠账 —— V-6 〔◐ test_slowest_ts_epoch_matches_buckets〕
 - C20.D3 data.js 规模与嵌入预算（对象/档位/行预算） —— R-SHELL-2 〔test_objects_and_budget_trimming, test_long_run_embed_tier_and_datajs_finer〕
 - C20.I1 单区块异常隔离（`safe()`），其余区块正常渲染 —— R-SHELL-8 〔test_a14_safe_isolation_single_block〕
