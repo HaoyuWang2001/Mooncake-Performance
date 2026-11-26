@@ -299,6 +299,24 @@ def test_recall_smoke_numa_process_mapping():
             for entry in plan["readers"]] == [1, 1, 1, 3, 3, 3]
 
 
+def test_kvtest_push_cmd_creates_the_process_dir():
+    """配置下发必须建进程子目录：split 同 pod 两进程各有独立目录，
+    只建 pod 目录会让重定向到 <role>_i<iid>_p<port>/<cfg> 直接失败。"""
+    pod = {"_pod": "pod-a"}
+    dirs = []
+    for role, iid, port in (("writer", 0, 9101), ("reader", 5, 9201)):
+        inst_dir = bm._kvtest_instance_dir("/logs/ts", pod, role, iid, port)
+        cfg = inst_dir + "/case.json"
+        cmd = bm._kvtest_push_cmd(inst_dir, "e30=", cfg)
+        assert cmd.startswith("mkdir -p '{}'".format(inst_dir))
+        assert "base64 -d > '{}'".format(cfg) in cmd
+        dirs.append(inst_dir)
+    assert dirs[0] != dirs[1]
+    assert all(d.startswith("/logs/ts/pod-a/") for d in dirs)
+    # the pod dir alone would drop the role segment -> regression guard
+    assert "mkdir -p '/logs/ts/pod-a'" not in cmd
+
+
 def test_kvtest_pod_map_runs_in_process_dir(monkeypatch):
     commands = []
     monkeypatch.setattr(
