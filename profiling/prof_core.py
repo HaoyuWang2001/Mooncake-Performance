@@ -3,8 +3,8 @@
 
 由 benchmark.py 调用（--profile / 默认 <mode-dir>/profile.json）：
   load_matrix()          解析矩阵（enabled 过滤 + 默认值合并）
-  start_profiling()      场景启动：逐节点探测工具 -> spdiag restart（失败
-                         回退 start）-> perf/bpftrace nohup 后台（pid 记入 .state 台账，
+  start_profiling()      场景启动：逐节点探测工具 -> spdiag status 探测
+                         （not running->start / is running->restart）-> perf/bpftrace nohup 后台（pid 记入 .state 台账，
                          marker 记录预期 cmdline，reap 防误杀按 marker 校验）
   stop_and_collect()     场景结束：SIGINT 停采样（perf 优雅落盘）->
                          spdiag show -> scp 收集至 outputs/<ts>/profiling/
@@ -235,15 +235,29 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
                                 tool, node_name))
                         continue
                 if tool == "spdiag":
-                    # reset and start accumulating. In a fresh container/pod
-                    # the spdiag SHM (/spdiag_shm_default) was never created
-                    # by an instrumented process, so `restart` dies with
-                    # SIGBUS (kubectl exec rc=135); `start` creates and sizes
-                    # the SHM, hence the fallback. A successful restart keeps
-                    # the reset-and-keep-running semantics.
-                    out = _run(ip, n, "{} restart 2>/dev/null || {} start".format(
-                        _bin(tcfg), _bin(tcfg)))
-                    log("[profile] spdiag restart on {} ({})".format(node_name, out or "ok"))
+                    # status-driven start: `restart` expects a running
+                    # collector, `start` a stopped one — probe first and pick
+                    # the matching subcommand so the log always shows what
+                    # actually ran (the old `restart || start` blind fallback
+                    # could not be told apart afterwards). status may exit
+                    # non-zero when the collector is down, hence `|| true`;
+                    # an unrecognized status output skips this target with a
+                    # WARN and never fails the scenario.
+                    status = _run(ip, n, "{} status 2>/dev/null || true".format(
+                        _bin(tcfg)))
+                    if "not running" in status:
+                        sub = "start"
+                    elif "is running" in status:
+                        sub = "restart"
+                    else:
+                        log("[WARN] [profile] spdiag status on {}: "
+                            "unrecognized {!r} -> skipped".format(
+                                node_name, status.strip()[:120]))
+                        continue
+                    out = _run(ip, n, "{} {}".format(_bin(tcfg), sub))
+                    log("[profile] spdiag {} on {} (status: {}; {})".format(
+                        sub, node_name, status.strip() or "?",
+                        out or "ok"))
                     started[tool] = None
                 elif tool == "perf":
                     out_file = "{}/{}".format(remote_out_dir, tcfg.get("output", "perf.data"))

@@ -1,5 +1,5 @@
 {
-  "_note": "k8s 通道 profiling 矩阵模板（复制为 configs/_k8s/profile.json，gitignored）。spdiag/perf/runqlat/offcputime 在 involved benchmark client pod 内跑（与 mem/urma 同时开启也不会被派到 monitor DaemonSet：两者按 _monitor 标记分流），工具取决于镜像（sudo 字段在 k8s 下无意义，pod 内即 root）；spdiag 启动为 restart 失败回退 start（新 pod 无 SHM 时 restart 会 SIGBUS）。mem/urma 由每 run 的 monitor DaemonSet 以节点级方式采样（hostPID + 宿主工具经 nsenter/chroot 借用；镜像无需 mdcli）：urma 需节点上装有 mdcli（先按 profiling/README.md 的可达性烟测验证），否则自动跳过；mem 的 proc_pattern 在 kvtest 场景自动改用 kvtest 二进制名。nodes=auto 表示本配置涉及的宿主节点。",
+  "_note": "k8s 通道 profiling 矩阵模板（复制为 configs/_k8s/profile.json，gitignored）。spdiag/perf/runqlat/offcputime 在 involved benchmark client pod 内跑（与 mem/urma 同时开启也不会被派到 monitor DaemonSet：两者按 _monitor 标记分流），工具取决于镜像（sudo 字段在 k8s 下无意义，pod 内即 root）；spdiag 启动为 status 驱动（`spdiag status`：not running → start / is running → restart）。mem/urma 由每 run 的 monitor DaemonSet 以节点级方式采样（hostPID + 宿主工具经 nsenter/chroot 借用；镜像无需 mdcli）：urma 需节点上装有 mdcli（先按 profiling/README.md 的可达性烟测验证），否则自动跳过；mem 的 proc_pattern 在 kvtest 场景自动改用 kvtest 二进制名。nodes=auto 表示本配置涉及的宿主节点。",
   "nodes": "auto",
   "trigger": "whole_run",
   "tools": {

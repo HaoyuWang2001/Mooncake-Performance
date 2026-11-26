@@ -257,15 +257,18 @@ def test_start_profiling_splits_monitor_and_inpod_tools(monkeypatch):
     pc = bm.prof_core
     assert pc is not None
     calls = []
+    holder = {"status": "spdiag is not running (SHM: /spdiag_shm_default)"}
 
     def fake_run(ip, node, cmd, quiet=True):
         calls.append((node.get("_pod"), cmd))
+        if "status" in cmd:
+            return holder["status"]
         if "command -v" in cmd:
             return "OK"
         if "nohup" in cmd:
             return "4242"
-        if "restart" in cmd or "start" in cmd:
-            return "spdiag started (SHM: /spdiag_shm_default)"
+        if cmd.strip().startswith("spdiag "):
+            return "spdiag ok (SHM: /spdiag_shm_default)"
         return ""
 
     monkeypatch.setattr(pc, "_run", fake_run)
@@ -286,23 +289,41 @@ def test_start_profiling_splits_monitor_and_inpod_tools(monkeypatch):
         "urma": {"enabled": False}},
         "nodes": "auto", "trigger": "whole_run",
         "outliers": {"threshold_ms": 1.0, "window_ms": 200, "auto": True}}
+
+    def launches(pod):
+        return [c for p, c in calls if p == pod
+                and c.strip().startswith("spdiag ")
+                and "status" not in c]
+
+    # status=not running -> start；status 探测先于启动
     sess = pc.start_profiling(cluster, matrix, ["bench-a", "mon-a"], "cfg",
                               "/tmp/out")
-    bench = [c for p, c in calls if p == "bench-a"]
-    mon = [c for p, c in calls if p == "mon-a"]
-    spdiag_cmds = [c for c in bench
-                   if "spdiag" in c and "command -v" not in c]
-    # 启动容错：restart 失败回退 start
-    assert spdiag_cmds, bench
-    assert all("restart" in c and "start" in c and "||" in c
-               for c in spdiag_cmds), spdiag_cmds
-    assert not any("mem_monitor.sh" in c for c in bench), bench
-    assert any("mem_monitor.sh" in c for c in mon), mon
-    assert not any("spdiag" in c for c in mon), mon
-    assert any("monitor.config.json" in c for c in mon), mon
-    assert not any("monitor.config.json" in c for c in bench), bench
+    assert any("status" in c for p, c in calls if p == "bench-a")
+    assert launches("bench-a") == ["spdiag start"], launches("bench-a")
+    assert not any("mem_monitor.sh" in c for p, c in calls if p == "bench-a")
+    assert any("mem_monitor.sh" in c for p, c in calls if p == "mon-a")
+    assert not any("spdiag" in c for p, c in calls if p == "mon-a")
+    assert any("monitor.config.json" in c for p, c in calls if p == "mon-a")
+    assert not any("monitor.config.json" in c for p, c in calls if p == "bench-a")
     assert sess and set(sess["tools"]["bench-a"]) == {"spdiag"}
     assert sess and set(sess["tools"]["mon-a"]) == {"mem"}
+
+    # status=is running -> restart（清零累计继续）
+    calls.clear()
+    holder["status"] = "spdiag is running (SHM: /spdiag_shm_default)"
+    sess2 = pc.start_profiling(cluster, matrix, ["bench-a", "mon-a"], "cfg",
+                               "/tmp/out")
+    assert launches("bench-a") == ["spdiag restart"], launches("bench-a")
+    assert sess2 and set(sess2["tools"]["bench-a"]) == {"spdiag"}
+
+    # status 输出无法识别 -> WARN 跳过该目标，不阻塞其余
+    calls.clear()
+    holder["status"] = "spdiag says something weird"
+    sess3 = pc.start_profiling(cluster, matrix, ["bench-a", "mon-a"], "cfg",
+                               "/tmp/out")
+    assert launches("bench-a") == [], launches("bench-a")
+    assert "bench-a" not in sess3["tools"]
+    assert sess3 and "mem" in sess3["tools"]["mon-a"]
 
 
 def test_stop_profiling_collects_then_tears_down(monkeypatch):
