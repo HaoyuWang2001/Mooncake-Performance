@@ -161,10 +161,11 @@ report.py（本组件：reduce + render，纯标准库）
 
 ### J. 节点监控（MON）
 
-- **R-MON-1** `[已固化]` 节点监控卡含三图：宿主内存（mem.host.csv）、进程 RSS（mem.proc.csv）、URMA 端口流量（urma.flits.csv）。
+- **R-MON-1** `[已固化·DR-49]` 节点监控卡含三图：宿主内存（mem.host.csv）、进程 RSS（mem.proc.csv）、URMA 端口流量（urma.flits.csv）。**产物目录名 = 节点 IP**（k8s=宿主 IP / ssh=管理 IP；显示名重复时回退原名，绝不互相覆盖），报表标签与目录名一致（旧产物按 `monitor.config.json` 的 `node_ip`）。**有监控产物但没有可用序列时渲染占位卡列出原因**（URMA 采集失败原文 / CSV 无数据行 / 时间窗无交叠），只有完全无 profiling 产物才整卡隐藏。
 - **R-MON-2** `[已固化·DR-7]` 进程 RSS 增幅正负条按节点展示增幅（MB 与百分比）；疑似泄露判定为「增幅 ≥ 阈值 且 增幅 MB ≥ 下限」，阈值经 monitor.config.json 可配（`mem.leak_growth_pct` / `mem.leak_min_mb`），默认 **30% / 200MB**。
 - **R-MON-3** `[已固化]` URMA 计数器差分遇负增量（计数器回绕/复位归零）时标记 resync 并跳过紧随的一拍，不产生假尖峰。
-- **R-MON-4** `[已固化·v0.5 修订·DR-23]` 无 profiling 产物时整卡隐藏；部分缺失（如仅有 mem 无 urma）时只显示有数据的图，卡片标题与图注同步去掉对应分句，不留下空图占位或对不存在内容的说明。
+- **R-MON-4** `[已固化·v0.5 修订·DR-23·DR-49]` 无 profiling 产物时整卡隐藏；部分缺失（如仅有 mem 无 urma）时只显示有数据的图，卡片标题与图注同步去掉对应分句，不留下空图占位或对不存在内容的说明；此时若有失败原因（如 URMA slot 探测失败），以原因注记形式展示，不静默。
+- **R-MON-5** `[已固化·DR-49]` **监控时间基准与 URMA slot 探测**：kvtest 采样器启动时注入编排器时钟基准 `EPOCH_BASE`，采样时间戳 = `EPOCH_BASE + 节点时钟流逝`（编排器时钟域，与 kvtest stats 的 `/start` 时间窗同域，不受节点/编排机时钟偏差影响）；python 引擎保持节点绝对时间（其 stats 为节点钟域）。若时间窗与采样仍无交叠（旧产物/异常时钟），reduce 回退全量采样并注记「疑似时钟偏差」，绝不因裁空丢图。URMA `slot` 以 `mdcli` 报错中的 `available slot id` 为准（配置值仅作首选提示），自动切换并记录 probe 日志。
 
 ### K. run 总览（OV）
 
@@ -285,6 +286,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-46 | 2026-11-20 | 节点身份统一为节点 IP（用户需求）：k8s 注册 pod 时取 `status.hostIP`；map `--node` 与监控标签改用节点 IP（ssh=管理 IP）；同主机多 pod 节点级合并（host 内存去重、进程/URMA 保留）；pod 名保留在 meta.pod/客户端名；重复 IP/缺 IP 回退名称；历史产物无法回溯（pod 已删） | 用户决策 |
 | DR-47 | 2026-11-23 | **报表形态（scenario）与引擎（engine）解耦**：kvtest 与 python 并列，各有 basic/pipeline 形态；格式唯一依据 `meta.scenario`，`meta.engine` 仅标注/排查；旧 `mode="kvtest"` 归一化为 `scenario="pipeline" + engine="kvtest"`；kvtest 配置可用 `report_scenario` 声明形态（缺省 pipeline），生成链按「显式参数 > report_scenario > cfg.scenario(basic|pipeline) > kvtest→pipeline > basic」推断；副标题增「引擎」徽记；修复 kvtest 报表同节点 writer/reader 两行重复 | 用户需求 |
 | DR-48 | 2026-11-25 | ① 错误与异常：节点级新增收放按钮（▸/▾），实例行默认折叠（节点汇总行仍显示实例数/总数/失败/聚合状态码）；② 「实例与日志现场」更名为「日志现场」，节点行默认折叠（实例默认不展开），展开状态仍跨重渲染记忆 | 用户需求 |
+| DR-49 | 2026-11-25 | 黄区 k8s 监控三修：① kvtest 采样器注入编排器时钟基准 EPOCH_BASE（编排机与节点时钟差 5 分钟导致时间窗裁空、监控图整卡消失）；时间窗裁空回退全量+注记；python 引擎不改（stats 为节点钟域）；② profiling 产物目录改为节点 IP（原为 monitor pod 名），显示名冲突回退原名，monitor.config.json 保留；③ URMA slot 以 mdcli 报错的 available slot id 为准自动切换（配置仅提示）并记录 probe；④ 有产物无序列时渲染占位卡列出原因，不再静默隐藏 | 用户需求 |
 
 ---
 

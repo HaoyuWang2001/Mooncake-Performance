@@ -129,10 +129,20 @@ def _ledger_row(ip, node_name, pid, label, marker, cfg_name):
             "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
-def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
+def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
+                    epoch_base=None):
     """Start every enabled tool on every profiling node. Returns the session
     dict (or None when nothing could start). Per-tool failures are isolated:
-    one broken tool only skips itself ([WARN]) and never aborts the rest."""
+    one broken tool only skips itself ([WARN]) and never aborts the rest.
+
+    epoch_base: orchestrator clock (epoch seconds) at sampler start. When
+    given, the mem/urma samplers stamp samples as
+    ``epoch_base + (node_clock_now - node_clock_at_start)`` — i.e. in the
+    ORCHESTRATOR clock domain, which is the domain of the kvtest stats
+    (t0/t1 from /start). Node/orchestrator clock skew (minutes!) then no
+    longer shifts every sample outside the report time window. Python
+    scenarios keep node-absolute timestamps (their stats are node-clock
+    based), so they pass None."""
     import benchmark as bm  # .state ledger helpers
     nodes = _profiling_nodes(cluster, matrix, involved_nodes)
     session = {"nodes": nodes, "tools": {}, "remote_out_dir": remote_out_dir,
@@ -233,6 +243,9 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir):
                     scp_push(ip, n, [local_script], remote_out_dir)
                     envs = ["OUT_DIR={}".format(shlex.quote(remote_out_dir)),
                             "INTERVAL_S={}".format(int(tcfg.get("interval_s", 1)))]
+                    if epoch_base is not None:
+                        # orchestrator-clock reference (see start_profiling)
+                        envs.append("EPOCH_BASE={}".format(int(epoch_base)))
                     if tool == "mem":
                         envs.append("PROC_PATTERN={}".format(shlex.quote(
                             str(tcfg.get("proc_pattern")
@@ -346,6 +359,29 @@ def stop_and_collect(cluster, session, local_prof_dir):
         return
     import benchmark as bm
     items = list(session["tools"].items())
+    # local artifact dir per target: node display name (= node IP in the
+    # report), so a human browsing logs/<cfg>/profiling/ sees hosts, not pod
+    # names. monitor.config.json (node_ip) stays as-is; legacy pod-name dirs
+    # keep reducing correctly. Duplicate display names (misconfigured ssh
+    # cluster sharing one management IP) fall back to the original name.
+    dir_names = {}
+    used_dirs = set()
+    for node_name, _tools in items:
+        disp = node_name
+        try:
+            n = get_node(cluster, node_name)
+            disp = bm._node_display(cluster, n, node_name) or node_name
+        except Exception:
+            disp = node_name
+        if disp in used_dirs:
+            disp = node_name
+        if disp in used_dirs:
+            i = 2
+            while "{}#{}".format(node_name, i) in used_dirs:
+                i += 1
+            disp = "{}#{}".format(node_name, i)
+        used_dirs.add(disp)
+        dir_names[node_name] = disp
 
     def _one(item):
         node_name, tools = item
@@ -401,7 +437,7 @@ def stop_and_collect(cluster, session, local_prof_dir):
                 log("[WARN] [profile] stop {} on {}: {}".format(tool, node_name, exc))
         if any(t in MONITOR_ARTIFACTS for t in tools):
             collected.append(MONITOR_CONFIG_FILE)
-        node_local = os.path.join(local_prof_dir, node_name)
+        node_local = os.path.join(local_prof_dir, dir_names[node_name])
         os.makedirs(node_local, exist_ok=True)
         for fname in collected:
             try:

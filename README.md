@@ -894,7 +894,7 @@ outputs/<时间戳，如 20261010-1308>/
         ├── <配置名>.prepare-store.log
         ├── <配置名>.remove-keys.log
         ├── <配置名>.<run>.log.stats.json   # ← 默认只回传该紧凑统计（原始日志留远端）
-        ├── profiling/<节点>/   # 该配置的 profiling 产物（多配置 run 互不覆盖）
+        ├── profiling/<节点 IP>/  # 该配置的 profiling 产物（目录名=节点显示名；多配置互不覆盖）
         │   ├── spdiag.show.txt
         │   ├── spdiag_tree.<接口>.txt   # 自动生成的文本打点树（见 10.4）
         │   └── perf.data / *.out ...
@@ -992,6 +992,18 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   总会发送两者（默认关闭），内存紧张的环境可关掉它们避免监控 DaemonSet
   与压测争内存。
   保留报表成功后的全部中间产物。`--dry-run` 仍全部跳过。
+- **k8s 节点级监控（容器内采样、宿主工具借用）**：每宿主一个 monitor
+  DaemonSet（hostPID + nsenter/chroot 借用宿主的 mdcli），产物落在
+  `logs/<配置>/profiling/<节点 IP>/`（目录名即报表节点显示名；历史 run 的 pod 名
+  目录仍按 `monitor.config.json` 的 `node_ip` 标图）。**时间基准**：kvtest 采样器
+  在启动时注入编排器时钟 `EPOCH_BASE`，行时间戳 = `EPOCH_BASE + 节点时钟流逝`，
+  与 `/start` 的 stats 时间窗同域——编排机与节点时钟相差几分钟也不会再把监控
+  采样裁空；python 引擎仍用节点绝对时间（其 stats 本身就是节点钟）。若时间窗
+  仍与采样无交叠（旧产物/异常时钟），reduce 会**回退全量采样并注记**「疑似时钟
+  偏差」。**URMA slot** 以 `mdcli` 报错里的 `available slot id` 为准（profile 的
+  `slot` 仅作首选提示），自动切换并记录 probe 日志。有监控产物但没有可用序列时
+  不再整卡消失：卡片渲染「占位说明」列出原因（URMA 采集失败原文 / CSV 无数据行 /
+  时间窗无交叠）；完全未开监控才隐藏整卡。
 - **待办（已记录）**：store 容量周期采样时间线（P3）、增量 map / 节点日志轮转上限、
   按点数预算的更细粒度分层、k8s 事后一次性 pod 远端重建。
 - **产物版本标记**（旧 run 兼容）：`stats.json` 带 `meta.bucket_unit`（时间桶 t 恒为

@@ -8252,7 +8252,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         _profiling_targets(cluster, matrix, involved_nodes,
                                            ts, cfg_name, dry),
                         cfg_name,
-                        remote_profiling_dir(remote_log_dir, cfg_name))
+                        remote_profiling_dir(remote_log_dir, cfg_name),
+                        epoch_base=time.time())
                 except Exception as exc:
                     log("[WARN] [profile] start failed: {}".format(exc))
             if plan.get("dual"):
@@ -8339,7 +8340,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         _profiling_targets(cluster, matrix, involved_nodes,
                                            ts, cfg_name, dry),
                         cfg_name,
-                        remote_profiling_dir(remote_log_dir, cfg_name))
+                        remote_profiling_dir(remote_log_dir, cfg_name),
+                        epoch_base=time.time())
                 except Exception as exc:
                     log("[WARN] [profile] start failed: {}".format(exc))
             stage = "/start ({})".format(ds)
