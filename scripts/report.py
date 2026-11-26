@@ -264,25 +264,16 @@ def _tier_policy(span, base_step=1):
     return scales, embed
 
 
-def _series_columns(merged, step, edges=None, pools=None):
+def _series_columns(merged, step, edges=None):
     """Columnar series for the chart (compact JSON, fixed key order).
 
-    pools: exact per-second raw samples of this object's scope — the
-    per-bucket percentiles come from a plain sort (absolute true values),
-    and are null when the scope's raw samples are unavailable (never a
-    histogram approximation)."""
+    Per-bucket percentiles come from the merged per-second histograms
+    (single policy: histogram interpolation — the same center path the
+    summaries use; the chain has no raw-sample pool any more)."""
     edges = ls.BIN_EDGES if edges is None else edges
     out = {"t": [], "c": [], "ok": [], "fail": [], "avg": [], "p50": [],
            "p99": [], "p999": [], "p9999": [], "min": [], "max": [],
            "qw": [], "qwmax": []}
-    agg = None
-    if pools is not None:
-        agg = {}
-        for sec, lats in (pools.get("buckets") or {}).items():
-            agg.setdefault(sec - sec % step, []).extend(lats)
-        for lats in agg.values():
-            lats.sort()
-        unavailable = bool(pools.get("missing"))
     prev_t = None
     for t in sorted(merged):
         c, ok, fail, s, mx, qs, qm, h = merged[t]
@@ -291,47 +282,22 @@ def _series_columns(merged, step, edges=None, pools=None):
         out["ok"].append(int(ok))
         out["fail"].append(int(fail))
         out["avg"].append(round(s / ok, 4) if ok else 0.0)
-        if pools is None:
-            out["p50"].append(round(ls.hist_percentile(h, 0.50, edges), 4)
-                              if h else 0.0)
-            out["p99"].append(round(ls.hist_percentile(h, 0.99, edges), 4)
-                              if h else 0.0)
-            out["p999"].append(round(ls.hist_percentile(h, 0.999, edges), 4)
-                               if h else 0.0)
-            out["p9999"].append(round(ls.hist_percentile(h, 0.9999, edges), 4)
-                                if h else 0.0)
-            # min：直方图最低非空分箱的下界（对数分箱 -> 近似最小值）
-            mn = 0.0
-            if h:
-                try:
-                    mn = float(edges[min(int(k) for k in h)])
-                except (ValueError, IndexError):
-                    mn = 0.0
-            out["min"].append(round(mn, 4))
-        else:
-            lats = (agg.get(t) or [])
-            if unavailable:
-                out["p50"].append(None)
-                out["p99"].append(None)
-                out["p999"].append(None)
-                out["p9999"].append(None)
-                out["min"].append(None)
-            elif lats:
-                out["p50"].append(
-                    round(ls._exact_percentile(lats, 0.50), 4))
-                out["p99"].append(
-                    round(ls._exact_percentile(lats, 0.99), 4))
-                out["p999"].append(
-                    round(ls._exact_percentile(lats, 0.999), 4))
-                out["p9999"].append(
-                    round(ls._exact_percentile(lats, 0.9999), 4))
-                out["min"].append(round(lats[0], 4))
-            else:
-                out["p50"].append(0.0)
-                out["p99"].append(0.0)
-                out["p999"].append(0.0)
-                out["p9999"].append(0.0)
-                out["min"].append(0.0)
+        out["p50"].append(round(ls.hist_percentile(h, 0.50, edges), 4)
+                          if h else 0.0)
+        out["p99"].append(round(ls.hist_percentile(h, 0.99, edges), 4)
+                          if h else 0.0)
+        out["p999"].append(round(ls.hist_percentile(h, 0.999, edges), 4)
+                           if h else 0.0)
+        out["p9999"].append(round(ls.hist_percentile(h, 0.9999, edges), 4)
+                            if h else 0.0)
+        # min：直方图最低非空分箱的下界（对数分箱 -> 近似最小值）
+        mn = 0.0
+        if h:
+            try:
+                mn = float(edges[min(int(k) for k in h)])
+            except (ValueError, IndexError):
+                mn = 0.0
+        out["min"].append(round(mn, 4))
         out["max"].append(round(mx, 4))
         # logstats accumulates queue wait on successful rows only -> divide
         # by ok (not by every row, which understated it by the failure rate)
@@ -341,13 +307,11 @@ def _series_columns(merged, step, edges=None, pools=None):
     return out
 
 
-def _summary_of(stats, pools=None):
+def _summary_of(stats):
     """Cluster summary from merged per-instance globals.
 
-    pools: exact raw samples of this scope (kvtest) — percentiles come from
-    a plain sort over the pooled samples (absolute true values) and are None
-    ("N/A") when any instance's raw samples are unavailable; never a
-    histogram approximation. None keeps the legacy reconstruction."""
+    Percentiles follow the single pipeline policy (ls.unified_pct): center
+    from the merged histogram, tails from the merged REQ sketches."""
     combos = combos_of(stats)
     total = ok = fail = ok_rows = 0
     lat_sum = 0.0
@@ -361,9 +325,10 @@ def _summary_of(stats, pools=None):
     fts_from = fts_to = None
     has_cutoff = False
     hist = {}
+    _digest_items = []
+    _pct_k = None
     wall = 0.0
     gmax = gmin = None
-    single = None
     for st in stats:
         g = st.get("global") or {}
         meta = st.get("meta") or {}
@@ -373,8 +338,6 @@ def _summary_of(stats, pools=None):
         if g.get("min_ms") is not None:
             gmin = float(g["min_ms"]) if gmin is None else min(gmin,
                                                                float(g["min_ms"]))
-        if len(stats) == 1:
-            single = g
         total += g.get("key_total") or 0
         ok += g.get("key_ok") or 0
         fail += g.get("key_fail") or 0
@@ -404,6 +367,11 @@ def _summary_of(stats, pools=None):
                 fts_to, meta["formal_ts_to"])
         for b, n in (st.get("histogram") or {}).items():
             hist[int(b)] = hist.get(int(b), 0) + n
+        _dg = (st.get("digest") or {})
+        if _dg.get("global"):
+            _digest_items.append(_dg["global"])
+            if _pct_k is None and _dg.get("k"):
+                _pct_k = _dg.get("k")
         for kind, payload in st.get("summaries") or []:
             if kind != "summary":
                 continue
@@ -422,26 +390,17 @@ def _summary_of(stats, pools=None):
 
     edges = _hist_edges(stats)
 
-    def pct(q, key):
-        # kvtest scopes: exact pooled raw samples, or N/A when unavailable —
-        # approximation is forbidden by design.
-        if pools is not None:
-            if pools.get("missing"):
-                return None
-            if pools.get("lats"):
-                return round(ls._exact_percentile(pools["lats"], q), 4)
-            return 0.0
-        # single client: the map product already holds EXACT percentiles (the
-        # CSV uses the same values); otherwise reconstruct from the merged
-        # histogram and never report more than the true maximum.
-        if single is not None and single.get("exact") and single.get(key) is not None:
-            return round(float(single[key]), 4)
-        if not hist:
-            return 0.0
-        v = ls.hist_percentile(hist, q, edges)
-        return round(min(v, gmax) if gmax is not None else v, 4)
+    def pct(q, key=None):
+        # Single policy (scripts/quantiles.py): center <= p95 from the merged
+        # histogram, tails from the merged REQ sketches; never above the true
+        # maximum.  N/A only when neither source exists.
+        v = ls.unified_pct(hist, _digest_items, q, edges, gmax=gmax)
+        return None if v is None else round(v, 4)
 
+    _pct_method = ("hist+digest" if (_digest_items and ls.have_sketch())
+                   else "hist")
     return {
+        "pct_method": _pct_method, "pct_k": _pct_k,
         "total": total, "ok": ok, "fail": fail,
         "fail_rate": (fail / total) if total else 0.0,
         "hist_bins": [[int(k), int(v)] for k, v in sorted(hist.items())],
@@ -532,93 +491,20 @@ def _samples(rows):
 # null ("N/A"), NEVER to a histogram approximation.
 # ---------------------------------------------------------------------------
 
-_KVTEST_PRODUCT_POOL = {}
-
-
-def _kvtest_read_product_pool(st):
-    """Read one kvtest product's sibling samples.csv once (cached by path).
-
-    Returns {"lats": [sorted OK latencies], "secs": {epoch_s: [lats]}} or
-    None when the raw samples are unavailable."""
-    m = st.get("meta") or {}
-    path = st.get("_path") or ""
-    role = m.get("role") or ""
-    suffix = ".{}.stats.json".format(role)
-    if not path or not path.endswith(suffix):
-        return None
-    if path in _KVTEST_PRODUCT_POOL:
-        return _KVTEST_PRODUCT_POOL[path]
-    samples = path[:-len(suffix)]
-    pool = None
-    if os.path.isfile(samples):
-        ops = set((st.get("ops") or {}).keys()) or None
-        cut = m.get("warmup_cutoff")
-        pool = {"lats": [], "secs": {}}
-        for row in ls.iter_kvtest_rows(samples, m.get("ts_from"), ops):
-            if row["status"] != "OK" or row["lat"] is None:
-                continue
-            ep = row.get("epoch")
-            if ep is not None:
-                # 图表桶保留 warmup 区（图上仍绘制）
-                pool["secs"].setdefault(int(ep), []).append(row["lat"])
-            if cut is not None and ep is not None and ep < float(cut):
-                continue          # warmup 行不进正式分位数/summary
-            pool["lats"].append(row["lat"])
-        pool["lats"].sort()
-    _KVTEST_PRODUCT_POOL[path] = pool
-    return pool
-
-
-def _kvtest_scope_pools(stats_list):
-    """Merged raw OK samples of one product scope (all/role/node/instance).
-
-    None when the scope holds no kvtest product (python-engine groups keep
-    the histogram merge); otherwise {"lats": [sorted], "buckets": {sec:
-    [lats]}, "missing": [instance labels with unavailable raw samples]}."""
-    pools = {"lats": [], "buckets": {}, "missing": []}
-    seen = False
-    for st in stats_list:
-        m = st.get("meta") or {}
-        if (m.get("format") or "") != "kvtest_samples":
-            continue
-        seen = True
-        per = _kvtest_read_product_pool(st)
-        if per is None:
-            pools["missing"].append(m.get("source") or st.get("_path") or "?")
-            continue
-        pools["lats"].extend(per["lats"])
-        for sec, lats in per["secs"].items():
-            pools["buckets"].setdefault(sec, []).extend(lats)
-    if not seen:
-        return None
-    pools["lats"].sort()
-    return pools
-
-
-def _scope_pct(pools, q):
-    """Exact percentile of a pooled scope, or None when unavailable."""
-    if pools is None or pools.get("missing") or not pools.get("lats"):
-        return None
-    return round(ls._exact_percentile(pools["lats"], q), 4)
-
-
-def _obj_tiers(rows, edges, offered, min_step, adaptive_step, pools=None):
+def _obj_tiers(rows, edges, offered, min_step, adaptive_step):
     """Build the tier dict for one chart object.
 
     min_step: finest time tier to materialise (= embed tier for nodes,
     data.js allowance for roles). adaptive_step: 自适应档的折叠步长（秒）。
-    pools: exact per-second raw samples of this object's scope (None keeps
-    the histogram reconstruction)."""
+    Per-bucket percentiles use the merged per-second histograms."""
     tiers = {}
     for s in offered:
         if s < min_step:
             continue
-        tiers[str(s)] = _series_columns(_tier_rows(rows, s), s, edges,
-                                        pools=pools)
+        tiers[str(s)] = _series_columns(_tier_rows(rows, s), s, edges)
     if adaptive_step:
         tiers[COUNT_KEY] = _series_columns(
-            _tier_rows(rows, adaptive_step), adaptive_step, edges,
-            pools=pools)
+            _tier_rows(rows, adaptive_step), adaptive_step, edges)
     return tiers
 
 
@@ -761,7 +647,7 @@ def reduce_size(stats, meta):
             best = n
             excerpt = st["error_excerpt"]
             excerpt_status = st.get("error_excerpt_status")
-    summary = _summary_of(stats, _kvtest_scope_pools(stats))
+    summary = _summary_of(stats)
     _cuts = [float((st.get("meta") or {}).get("warmup_cutoff"))
              for st in stats
              if (st.get("meta") or {}).get("warmup_cutoff") is not None]
@@ -786,8 +672,7 @@ def reduce_size(stats, meta):
     # 也要有这一条 —— 对象树的顶层与「总体 vs 节点 vs 客户端」对比
     # 都依赖它（否则总体曲线根本不存在）。
     all_rows = _obj_seconds(stats)
-    all_tiers = _obj_tiers(all_rows, edges, offered, fine_roles, adaptive,
-                           pools=_kvtest_scope_pools(stats))
+    all_tiers = _obj_tiers(all_rows, edges, offered, fine_roles, adaptive)
     used += _tier_rowcount(all_tiers)
     # basic 是「单场景 sweep」，顶层对象就是所有节点/实例的平均 —— 叫「总览」；
     # pipeline 保留「总体（全部）」（其对象树还有 writer/reader 角色层）。
@@ -800,8 +685,7 @@ def reduce_size(stats, meta):
         if role == "all":
             continue          # 与「总体（全部）」是同一条，不重复建
         rows = _obj_seconds(group)
-        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive,
-                           pools=_kvtest_scope_pools(group))
+        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive)
         used += _tier_rowcount(tiers)
         objects[role] = {"label": _role_label(role), "kind": "role",
                          "tiers": tiers}
@@ -815,8 +699,7 @@ def reduce_size(stats, meta):
                 by_role.setdefault(_role_of(st), []).append(st)
             for role, gg in sorted(by_role.items()):
                 rows = _obj_seconds(gg)
-                tiers = _obj_tiers(rows, edges, offered, embed, adaptive,
-                                   pools=_kvtest_scope_pools(gg))
+                tiers = _obj_tiers(rows, edges, offered, embed, adaptive)
                 used += _tier_rowcount(tiers)
                 node_bytes = sum(int((st.get("meta") or {}).get("bytes") or 0)
                                  for st in gg)
@@ -825,8 +708,7 @@ def reduce_size(stats, meta):
                     "role": role, "bytes": node_bytes, "tiers": tiers}
         else:
             rows = _obj_seconds(group)
-            tiers = _obj_tiers(rows, edges, offered, embed, adaptive,
-                               pools=_kvtest_scope_pools(group))
+            tiers = _obj_tiers(rows, edges, offered, embed, adaptive)
             used += _tier_rowcount(tiers)
             node_bytes = sum(int((st.get("meta") or {}).get("bytes") or 0)
                              for st in group)
@@ -836,8 +718,7 @@ def reduce_size(stats, meta):
     # clients: 与角色/节点同一套时间尺度 + 自适应
     for st, c in zip(stats, clients):
         rows = st.get("seconds") or []
-        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive,
-                           pools=_kvtest_scope_pools([st]))
+        tiers = _obj_tiers(rows, edges, offered, fine_roles, adaptive)
         objects["client:" + c["name"]] = {
             "label": c["name"], "kind": "client", "node": c["node"],
             "role": c["role"], "p99_ms": c["p99_ms"], "tiers": tiers}
@@ -845,8 +726,7 @@ def reduce_size(stats, meta):
     role_summaries = {}
     for role, group in role_stats.items():
         if role in ("writer", "reader"):
-            role_summaries[role] = _summary_of(
-                group, _kvtest_scope_pools(group))
+            role_summaries[role] = _summary_of(group)
     tiers_meta = [{"key": str(s), "label": TIER_LABELS[s], "step": s}
                   for s in offered]
     tiers_meta.append({"key": COUNT_KEY, "label": COUNT_LABEL,
@@ -856,6 +736,9 @@ def reduce_size(stats, meta):
     return {
         "summary": summary,
         "span": round(span, 1),
+        # 统计口径（报告顶部注记 + 前端说明）：hist+digest / hist
+        "pct_method": summary.get("pct_method"),
+        "pct_k": summary.get("pct_k"),
         # warmup 结束点（epoch，图表域）：前端在该位置画一条竖线
         "warmup_cutoff": warmup_cutoff,
         "tiers": tiers_meta,
@@ -3957,6 +3840,18 @@ function renderSummary(){
   pg.innerHTML=''; pbox.innerHTML='';
   if(ug) ug.innerHTML='';
   if(rc){rc.innerHTML=''; rc.style.display='none';}
+  /* 报告顶部口径注记：哪些统计值用哪种方式获取（受控近似，如实标注） */
+  const pn=document.getElementById('pctNote');
+  if(pn){
+    const _pm=z.pct_method||'hist'; const _pk=z.pct_k;
+    pn.style.display='';
+    pn.textContent=(_pm==='hist+digest')
+      ? ('统计口径：count/avg/min/max 精确；p50/p90/p95 = 合并直方图插值'
+         +'（≈1-2%）；p99/p999/p9999 = REQ sketch（k='+(_pk||'?')
+         +'，尾部 ≤0.6%）')
+      : ('统计口径：count/avg/min/max 精确；p50/p90/p95 = 合并直方图插值'
+         +'（≈1-2%）；p99/p999/p9999 = 直方图插值（本环境未启用 REQ sketch）');
+  }
   renderParams(pbox);
   if(!s){
     if(secP)secP.style.display='';
@@ -6864,6 +6759,7 @@ _SEC_SUMMARY = """
 <label class="tl-label" id="sizeSelLabel" for="sizeSel">数据大小</label>
 <select id="sizeSel"></select>
 </div>
+<div class="note" id="pctNote" style="display:none"></div>
 <h3 class="sec" id="secPerf">性能统计</h3>
 <div id="perfcards" class="grid"></div>
 <div id="rolecards" style="display:none"></div>

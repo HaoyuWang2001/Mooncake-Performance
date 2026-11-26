@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""kvtest 精确池化：合并分位数 = 全样本池化排序取值（绝对真值），缺样本 = N/A。"""
+"""kvtest 统一分位口径：中心=合并直方图插值，尾部=REQ sketch（无库时同为直方图）。
+
+精确原始样本池化（pools）已退役——单一路径便于维护（见 scripts/quantiles.py）。
+"""
 import json
 import os
 import sys
@@ -49,57 +52,44 @@ def _mk_product(tmpdir, iid, lats_per_sec, op="upsert_from", role="writer",
     return st
 
 
-def test_pools_merge_and_exact_pct(tmp_path):
+def test_summary_uses_hist_interpolation(tmp_path):
     st1 = _mk_product(str(tmp_path), 1, {0: [1.0, 2.0, 3.0]})
     st2 = _mk_product(str(tmp_path), 2, {0: [4.0, 5.0]})
-    pools = rp._kvtest_scope_pools([st1, st2])
-    assert pools["missing"] == []
-    assert pools["lats"] == [1.0, 2.0, 3.0, 4.0, 5.0]
-    assert pools["buckets"] == {1000: [1.0, 2.0, 3.0, 4.0, 5.0]}
-    summary = rp._summary_of([st1, st2], pools)
-    # exact: pooled sorted [1,2,3,4,5], p50 = index round(.5*4)=2 -> 3.0
-    assert summary["p50_ms"] == 3.0
-    assert summary["min_ms"] == 1.0 or summary["min_ms"] == 0.1  # gmin from globals
-    # single-exact/histogram path must NOT have been used
-    assert summary["p99_ms"] == round(ls._exact_percentile(
-        pools["lats"], 0.99), 4)
+    # 产物 histogram 为空 -> 中心/尾部都无源 -> N/A（不再报 0）
+    s0 = rp._summary_of([st1, st2])
+    assert s0["p50_ms"] is None and s0["p99_ms"] is None
+    assert s0["avg_ms"] == 3.0             # avg 精确（加权等价于全样本均值）
+    # 带直方图的产物：分位来自合并直方图插值，且不超过真实 max
+    for st in (st1, st2):
+        st["histogram"] = {str(ls.bin_of(v, ls.BIN_EDGES_V2)): 1
+                           for v in ((1.0, 2.0, 3.0) if st is st1
+                                     else (4.0, 5.0))}
+    out = rp._summary_of([st1, st2])
+    assert out["p50_ms"] is not None and out["p99_ms"] is not None
+    assert out["p50_ms"] <= 5.0 and out["p99_ms"] <= 5.0
+    assert out["min_ms"] == 1.0
 
 
-def test_missing_samples_degrades_to_na(tmp_path):
-    st1 = _mk_product(str(tmp_path), 1, {0: [1.0, 2.0]})
-    st2 = _mk_product(str(tmp_path), 2, {0: [3.0]}, missing=True)
-    pools = rp._kvtest_scope_pools([st1, st2])
-    assert len(pools["missing"]) == 1
-    summary = rp._summary_of([st1, st2], pools)
-    for k in ("p50_ms", "p95_ms", "p99_ms", "p999_ms", "p9999_ms"):
-        assert summary[k] is None          # N/A, never an approximation
-    assert summary["avg_ms"] == 2.0        # avg/min/max stay exact
-    merged = {1000: (3, 3, 0, 6.0, 3.0, 0.0, 0.0, {})}
-    cols = rp._series_columns(merged, 1, pools=pools)
-    assert cols["p99"] == [None] and cols["min"] == [None]
-    assert cols["avg"] == [2.0] and cols["max"] == [3.0]
+def test_series_columns_use_bucket_histograms(tmp_path):
+    merged = {1000: (2, 2, 0, 3.0, 2.0, 0, 0,
+                     {str(ls.bin_of(1.0, ls.BIN_EDGES)): 1,
+                      str(ls.bin_of(2.0, ls.BIN_EDGES)): 1}),
+              1001: (1, 1, 0, 10.0, 10.0, 0, 0,
+                     {str(ls.bin_of(10.0, ls.BIN_EDGES)): 1})}
+    cols = rp._series_columns(merged, 1, ls.BIN_EDGES)
+    assert cols["avg"] == [1.5, 10.0] and cols["max"] == [2.0, 10.0]
+    # 桶级分位 = 桶内直方图插值（近似，非精确池化）
+    assert cols["p50"][0] > 0 and abs(cols["p50"][1] - 10.0) < 2.0
+    assert cols["min"][0] > 0
 
 
-def test_series_columns_exact_per_second(tmp_path):
-    st1 = _mk_product(str(tmp_path), 1, {0: [1.0, 2.0], 1: [10.0]})
-    pools = rp._kvtest_scope_pools([st1])
-    merged = {1000: (2, 2, 0, 3.0, 2.0, 0, 0, {}),
-              1001: (1, 1, 0, 10.0, 10.0, 0, 0, {})}
-    cols = rp._series_columns(merged, 1, pools=pools)
-    # order-statistic convention (same as the map's exact percentiles):
-    # [1.0, 2.0] -> p50 = index round(.5*(n-1)) = 0 -> 1.0
-    assert cols["p50"] == [1.0, 10.0]
-    assert cols["min"] == [1.0, 10.0]
-    assert cols["max"] == [2.0, 10.0]
-
-
-def test_no_kvtest_products_keeps_legacy(tmp_path):
+def test_python_engine_products_keep_hist_path(tmp_path):
     st = _mk_product(str(tmp_path), 1, {0: [1.0]})
-    st["meta"]["format"] = "python_log"           # python-engine product
-    assert rp._kvtest_scope_pools([st]) is None
-    # _summary_of without pools keeps the histogram path (zero-fallback)
+    st["meta"]["format"] = "python_log"           # 无 digest 的旧/引擎产物
+    st["histogram"] = {str(ls.bin_of(1.0, ls.BIN_EDGES_V2)): 1}
     summary = rp._summary_of([st])
-    assert summary["p99_ms"] == 0.0
+    assert summary["p99_ms"] is not None
+    assert summary["pct_method"] == "hist"
 
 
 def test_reduce_render_cli_roundtrip(tmp_path, monkeypatch, capsys):

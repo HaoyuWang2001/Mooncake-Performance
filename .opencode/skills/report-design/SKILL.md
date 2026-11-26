@@ -194,7 +194,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 > 测试改名由 `test_skill_rulebook_integrity` 自动拦截；✗ 即下一批测试待办。
 > **组件索引**：C0 · C1 · C2 · C3 · C4 · C5 · C6 · C7 · C8 · C9 · C10 · C11 · C12 · C13 · C14 · C15 · C16 · C17 · C18 · C19 · C20
 >
-> **覆盖率（自动校验）**：共 233 条 · ✓209 · ◐23 · ✗0 · n/a1
+> **覆盖率（自动校验）**：共 234 条 · ✓210 · ◐23 · ✗0 · n/a1
 
 ### C0 外壳（页头 / 主题 / 大小选择 / 页脚 / 降级 / 自包含）
 
@@ -224,7 +224,8 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C1.V5 basic 保持合并卡，不受分角色逻辑影响 —— R-PERF-5 〔test_basic_summary_unchanged_by_role_split〕
 - C1.V6 吞吐用 MB/s（bytes/wall）；QPS 不在性能卡 —— R-PERF-2/4 〔test_summary_throughput_uses_bytes〕
 - C1.I1 多 combo：性能统计为合并口径并在第三行下方注明；单 combo 仍列 —— R-PERF-4 〔test_summary_reports_multiple_combos, test_summary_single_combo_still_listed〕
-- C1.D1 分位数口径与 CSV 一致（直方图归并） —— R-PERF-1 〔test_summary_percentiles_consistent_with_csv〕
+- C1.D1 分位数口径与 CSV 一致（单一 policy：p50/p90/p95=合并直方图插值，p99/p999/p9999=合并 REQ sketch；库缺失时尾部回退直方图）—— R-PERF-1/R-PERF-6/DR-53 〔test_summary_percentiles_consistent_with_csv, test_wrapper_roundtrip_and_merge, test_summary_of_prefers_digest_tails〕
+- C1.D3 **统计口径注记**：测试概览顶部（`#pctNote`）数据驱动注明「count/avg/min/max 精确；p50/p90/p95=合并直方图插值（≈1-2%）；p99/p999/p9999=REQ sketch（k=N，尾部 ≤0.6%）」；无 sketch 环境写明「直方图插值（本环境未启用 REQ sketch）」—— R-PERF-6/DR-53 〔test_report_pct_note_present〕
 - C1.D2 wall_s=0 不产生 Infinity/NaN —— R-PERF-1 〔test_zero_wall_has_no_infinity〕
 - C1.B1 combo 回调引用未定义函数（renderMain/renderQps/renderTable）曾致图表空白 —— DR-29 〔test_combo_switch_click_works〕
 - C1.B2 表头截断「队列等待均」、曲线名「平均/最大」回潮 —— DR-24 〔test_c01_dr24_alignment_lock〕

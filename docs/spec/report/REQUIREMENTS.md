@@ -80,6 +80,7 @@ report.py（本组件：reduce + render，纯标准库）
 
 ### B. 性能统计卡（PERF）
 
+- **R-PERF-6** `[v1.1 新增·DR-53]` **分位口径（受控近似，单一管线）**：count/avg/min/max 精确；p50/p90/p95 = 合并直方图插值（us-v1 桶）；p99/p999/p9999 = 合并 REQ sketch（Apache DataSketches，`quantiles.req_k` 可配、默认 24）；sketch 缺失时尾部分位回退直方图插值并在报表标注；报表顶部（测试概览）以数据驱动注记统计值获取方式与实测误差量级，size 块携带 `pct_method`；CSV 与报表消费同一 `logstats.unified_pct` 口径（controller 模式经 reduced.json 的 instances 块）。
 - **R-PERF-1** `[已固化·DR-13·v1.1 修订·DR-41]` 性能统计分三行：第一行 = 吞吐 + 平均时延 / P99 / P9999（三项加粗）；第二行 = p50 / p95 / p999 / 最大（常规字重）；**第三行 = 总数 / 成功 / 失败 / 失败率 / QPS**（常规字重；原「信息展示」子区已删除）。
 - **R-PERF-2** `[已固化·DR-13]` 性能统计不再包含 QPS，也不显示「QPS 达成率」刻度卡（实际 QPS 见信息展示）。
 - **R-PERF-3** `[已固化]` 队列等待均值/峰值（及最大队列深度）仅在日志含对应数据时显示于第二行。
@@ -299,6 +300,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-49 | 2026-11-25 | 黄区 k8s 监控三修：① kvtest 采样器注入编排器时钟基准 EPOCH_BASE（编排机与节点时钟差 5 分钟导致时间窗裁空、监控图整卡消失）；时间窗裁空回退全量+注记；python 引擎不改（stats 为节点钟域）；② profiling 产物目录改为节点 IP（原为 monitor pod 名），显示名冲突回退原名，monitor.config.json 保留；③ URMA slot 以 mdcli 报错的 available slot id 为准自动切换（配置仅提示）并记录 probe；④ 有产物无序列时渲染占位卡列出原因，不再静默隐藏 | 用户需求 |
 | DR-50 | 2026-11-26 | 日志现场改版（用户需求）：唯一一张「现场日志」表（节点行聚合 + pod 行 + 每节点一个监控行；列=节点/角色/pod/日志属性/日志路径；展平不折叠、全表水平滑动、节点列仅节点行填写）；删除客户端实例树（总数/成功/失败/贡献列）、节点汇总、登录命令、其它产物索引与 data.js 降级提示；监控行未开启时三列为 `-`；新增结构性不变量（任何产物必须落在表内路径下，落不进的自成一行）；prof_core 在 monitor.config.json 记录监控 pod 与节点侧 profiling 目录；python 引擎经节点侧 remote_path 同步（无需额外 meta） | 用户需求 |
 | DR-51 | 2026-11-26 | 现场日志大小改为节点侧 **du -sb 实测**（用户需求：不再依赖 map/pull 源头记录的已知产物字节，避免遗漏 .glog.d/summary/exitrc/remove 服务日志等运行时文件）：成功收尾时（profiling 落盘后、pod 销毁前）每宿主一次 du 快照（k8s=kubectl exec 进存活 client pod / ssh=远端直跑），pod 内路径换算为节点侧真实路径，写入 `logs/<cfg>/report/site_sizes.json`（report/ 内：成功清理保留、rebuild 可复用）；失败/STOP 不采集并回退旧口径；现场日志表 pod/监控/节点行与 V-7「数据量与优化」新增「留存（du 实测，场景级）」同源消费 | 用户需求 |
+| DR-53 | 2026-11-26 | **受控近似分位口径（单一管线）**（用户需求）：引入 Apache DataSketches REQ sketch（尾部聚焦）作为尾部分位来源——count/avg/min/max/count 精确；**p50/p90/p95 = 合并直方图插值**（us-v1 桶，误差≈桶宽，实测 p50≈0.1%/p95≈1.4%）；**p99/p999/p9999 = 合并 REQ sketch**（k 可配 `quantiles.req_k`，默认 24；实测尾部 ≤0.6%）；**退役**精确原始样本池化与 map 侧 5M 精确窗口（map/reduce 内存均降为 O(1)，口径不随规模切换）；sketch 在 map 阶段按 op/产物生成（warmup 区不插入），reduce 按 scope 合并；库缺失时优雅降级为直方图并如实标注；报表顶部与 size 块标注 `pct_method`（hist+digest / hist）；controller 数据面在 reduced.json 增发 per-instance 正式统计块（instances），CSV 实例行与 TOTAL 行消费同源 helper，与报表严格同口径 | 用户需求 |
 | DR-52 | 2026-11-26 | 端到端时延图新增**全局统计横线**（用户需求）：六条水平参考线 avg/p50/p95/p99/p999/p9999 取当前角色（pipeline writer/reader；basic 无 role_summaries 不画）的正式窗口 `role_summaries` 值，**图表生成时即确定、不随所选 pod/node/实例变化**；同指标同色 + 虚线 + 沉于分桶曲线下方、无端点标签；图例为「时延曲线选择」后的「全局横线」按钮组（默认仅 avg/p99/p9999 可见），tooltip 按可见性追加全局行；**仅端到端图绘制**——分级时延曲线不绘制（同构原则的显式例外） | 用户需求 |
 
 ---

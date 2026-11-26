@@ -55,7 +55,37 @@ EDGES_BY_VERSION = {1: BIN_EDGES, 2: BIN_EDGES_V2}
 # 钳在 2.4ms 附近（max 仍精确，造成 p99 < max 的荒谬结果）。
 BIN_EDGES_US = [0.001 * (1.2 ** i) for i in range(121)]
 BIN_EDGES_US[0] = 0.0
-EXACT_LIMIT = 5_000_000        # 样本数上限内用精确分位数，超出用直方图
+# 分位口径（单一管线，见 scripts/quantiles.py）：q <= QUANTILE_HIST_MAX_Q
+# 用合并直方图插值；之上的尾部用 REQ sketch（无 sketch 时回退直方图）。
+QUANTILE_HIST_MAX_Q = 0.95
+
+try:                            # 第三方库可缺失（旧镜像/纯 python 环境）
+    import quantiles as _qt
+except Exception:               # pragma: no cover
+    _qt = None
+
+
+def have_sketch():
+    """True when the third-party sketch library is importable right now."""
+    return _qt is not None and _qt.available()
+
+
+def unified_pct(hist, digest_items=None, q=0.5, edges=None, gmax=None):
+    """One percentile under the single policy.
+
+    hist: merged bin histogram {bin: count}; digest_items: serialized REQ
+    sketches (base64 list). q above QUANTILE_HIST_MAX_Q prefers the sketch;
+    everything else (or sketch unavailable) uses histogram interpolation,
+    never above the true maximum."""
+    edges = BIN_EDGES_V2 if edges is None else edges
+    if q > QUANTILE_HIST_MAX_Q and digest_items and _qt is not None:
+        v = _qt.quantile_from(digest_items, q)
+        if v is not None:
+            return float(v) if gmax is None else min(float(v), gmax)
+    if not hist:
+        return None
+    v = hist_percentile(hist, q, edges)
+    return float(v) if gmax is None else min(float(v), gmax)
 # 成功请求的时延阈值计数（微秒 -> CSV 的 ">Nus" 列）。与
 # benchmark.LATENCY_THRESHOLD_US 保持一致：stats-first 与原始日志两条
 # CSV 路径输出同一套列，阈值口径都是「严格大于」。
@@ -259,7 +289,7 @@ def _row_epoch(row):
 def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                   role=None, remote_path=None, size=None, rows_factory=None,
                   summaries=None, source_name=None, extra_meta=None,
-                  warmup_cutoff=None):
+                  warmup_cutoff=None, digest_k=None):
     """Build one client's stats product (the map stage).
 
     rows_factory: optional callable(path) -> row iterator; defaults to the
@@ -273,15 +303,19 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         feed ONLY the time-bucket charts (drawn, with a boundary line) and are
         excluded from every formal statistic (totals/op stats/histograms/
         slowest/errors). None keeps the legacy single-phase behaviour.
+    digest_k: REQ sketch k for the percentile digests (None disables the
+        sketch — tails then fall back to histogram interpolation).
     """
     row_source = rows_factory or iter_rows
     top_n = max(1, int(top_n or 0))   # a 0-capacity heap indexes slowest[0]
     rows = 0
     total = ok = fail = 0
     key_total = key_ok = key_fail = 0
-    lats = []                       # OK-only (exact percentile window)
-    lat_min = lat_max = None        # exact extremes, kept past the window
-    exact_ok = True                 # still holding every OK sample?
+    lat_min = lat_max = None        # exact extremes
+    _dk = (_qt.resolve_k(digest_k)
+           if (_qt is not None and digest_k is not None) else None)
+    digest_all = _qt.make(_dk) if _dk is not None else None
+    op_digests = {}                 # op -> sketch
     lat_sum = 0.0
     qw_sum = 0.0
     qw_n = 0
@@ -344,8 +378,8 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         key_total += kc
         opd = ops.setdefault(op, {"count": 0, "ok": 0, "fail": 0, "keys": 0,
                                    "_keys_ok": 0, "_keys_fail": 0,
-                                   "_lats": [], "_h": {}, "_sum": 0.0,
-                                   "_min": None, "_max": None, "_exact": True,
+                                   "_h": {}, "_sum": 0.0,
+                                   "_min": None, "_max": None,
                                    "_th": dict.fromkeys(
                                        LATENCY_THRESHOLDS_US, 0)})
         opd["count"] += 1
@@ -363,12 +397,12 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                            else min(opd["_min"], row["lat"]))
             opd["_max"] = (row["lat"] if opd["_max"] is None
                            else max(opd["_max"], row["lat"]))
-            if len(opd["_lats"]) < EXACT_LIMIT:
-                if opd["_exact"]:
-                    opd["_lats"].append(row["lat"])
-            elif opd["_exact"]:
-                opd["_exact"] = False
-                opd["_lats"] = []          # free the window, keep histogram
+            if digest_all is not None:
+                _qt.update(digest_all, row["lat"])
+                _sk = op_digests.get(op)
+                if _sk is None:
+                    _sk = op_digests[op] = _qt.make(_dk)
+                _qt.update(_sk, row["lat"])
         else:
             opd["fail"] += 1
             opd["_keys_fail"] += kc
@@ -412,12 +446,6 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         lat_sum += lat
         lat_min = lat if lat_min is None else min(lat_min, lat)
         lat_max = lat if lat_max is None else max(lat_max, lat)
-        if len(lats) < EXACT_LIMIT:
-            if exact_ok:
-                lats.append(lat)
-        elif exact_ok:
-            exact_ok = False
-            lats = []                      # free the window, keep histogram
         b = bin_of(lat, BIN_EDGES_V2)
         hist[b] = hist.get(b, 0) + 1
         qw = row["qw"]
@@ -476,26 +504,29 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                     "ts_epoch": row.get("epoch"),
                     "qw_ms": (round(row["qw"], 6) if row["qw"] is not None else None)})
 
-    # exact or histogram percentiles (min/max stay exact either way)
-    exact = exact_ok and ok > 0
-    if exact and lats:
-        lats.sort()
-        def pct(q):
-            return round(_exact_percentile(lats, q), 6)
-    else:
-        def pct(q):
-            return round(hist_percentile(hist, q, BIN_EDGES_V2), 6)
+    # 统一分位口径：hist <= p95，尾部 REQ sketch（无 sketch 回退直方图）；
+    # min/max 始终精确
+    _digest_b64 = _qt.serialize(digest_all) if digest_all is not None else None
+    _digest_items = [_digest_b64] if _digest_b64 else None
+
+    def pct(q):
+        v = unified_pct(hist, _digest_items, q, BIN_EDGES_V2, gmax=lat_max)
+        return round(v, 6) if v is not None else 0.0
 
     # per-op finalized stats (counts + latency percentiles per op name)
     ops_out = {}
+    _op_digest_b64 = {}
+    for _op, _sk in op_digests.items():
+        if _sk is not None:
+            _b = _qt.serialize(_sk)
+            if _b:
+                _op_digest_b64[_op] = _b
     for op, opd in ops.items():
-        if opd["_exact"] and opd["_lats"]:
-            ls = sorted(opd["_lats"])
-            def opct(q, _ls=ls):
-                return round(_exact_percentile(_ls, q), 6)
-        else:
-            def opct(q, _h=opd["_h"]):
-                return round(hist_percentile(_h, q, BIN_EDGES_V2), 6)
+        _items = ([_op_digest_b64[op]] if op in _op_digest_b64 else None)
+
+        def opct(q, _h=opd["_h"], _items=_items, _mx=opd["_max"]):
+            v = unified_pct(_h, _items, q, BIN_EDGES_V2, gmax=_mx)
+            return round(v, 6) if v is not None else 0.0
         opmin = round(opd["_min"], 6) if opd["_min"] is not None else 0.0
         opmax = round(opd["_max"], 6) if opd["_max"] is not None else 0.0
         ops_out[op] = {
@@ -505,7 +536,6 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             # per-op histogram: CSV's stats-first path must be able to filter
             # by op (mixed put/get runs) without falling back to raw logs
             "hist": {str(b): n for b, n in sorted(opd["_h"].items())},
-            "exact": bool(opd["_exact"]),
             "avg_ms": round(opd["_sum"] / opd["ok"], 6) if opd["ok"] else 0.0,
             "min_ms": opmin, "max_ms": opmax,
             "p50_ms": opct(0.50), "p90_ms": opct(0.90), "p95_ms": opct(0.95),
@@ -689,7 +719,6 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
             "qw_avg_ms": round(qw_sum / qw_n, 6) if qw_n else None,
             "qw_max_ms": round(qw_max, 6) if qw_n else None,
             "qw_n": qw_n,
-            "exact": exact,
         },
         "histogram": {str(b): n for b, n in sorted(hist.items())},
         "ops": ops_out,
@@ -705,6 +734,12 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         "abnormal": abnormal,
         "outliers": outliers,
     }
+    if _digest_b64 or _op_digest_b64:
+        stats["digest"] = {
+            "fmt": _qt.FMT, "k": _dk,
+            "global": _digest_b64,
+            "ops": _op_digest_b64,
+        }
     if extra_meta:
         stats["meta"].update(extra_meta)
     return stats
@@ -719,6 +754,78 @@ KVTEST_WRITE_OPS = frozenset(
     ("upsert", "upsert_from", "batch_upsert_from", "remove"))
 KVTEST_READ_OPS = frozenset(
     ("get", "get_buffer", "batch_get_buffer", "exist"))
+
+
+def kvtest_instance_ops_stats(path, ops, warmup_sec=None, digest_k=None,
+                              start_epoch=None):
+    """Streaming per-op FORMAL stats for one kvtest request-sample CSV.
+
+    One pass, bounded memory: per op it returns exact counts/bytes/avg/min/max
+    plus the shared percentile policy (hist interpolation <= p95, REQ sketch
+    tails) — the SAME helper the report reduce uses, so CSV and report can
+    never drift.  ``warmup_sec`` skips rows whose relative elapsed is inside
+    the warmup region (single-window mode); ``digest_k`` enables the sketch.
+    The per-op histogram/digest are returned so callers can merge scopes
+    (e.g. one CSV TOTAL row) with identical semantics."""
+    qt = _qt
+    k = (qt.resolve_k(digest_k)
+         if (qt is not None and digest_k is not None) else None)
+    acc = {}
+    for row in iter_kvtest_rows(path, start_epoch, ops):
+        el = row.get("elapsed")
+        if warmup_sec and el is not None and el < float(warmup_sec):
+            continue
+        op = row["op"]
+        st = acc.get(op)
+        if st is None:
+            st = acc[op] = {"total": 0, "success": 0, "failure": 0,
+                            "bytes": 0, "lat_sum": 0.0, "min": None,
+                            "max": None, "hist": {},
+                            "th": dict.fromkeys(LATENCY_THRESHOLDS_US, 0),
+                            "sketch": (qt.make(k) if k is not None else None)}
+        st["total"] += 1
+        lat = row.get("lat")
+        if row.get("status") == "OK" and lat is not None:
+            st["success"] += 1
+            st["bytes"] += int(row.get("bytes") or 0)
+            st["lat_sum"] += lat
+            st["min"] = lat if st["min"] is None else min(st["min"], lat)
+            st["max"] = lat if st["max"] is None else max(st["max"], lat)
+            b = bin_of(lat, BIN_EDGES_V2)
+            st["hist"][b] = st["hist"].get(b, 0) + 1
+            for threshold in LATENCY_THRESHOLDS_US:
+                if lat > threshold / 1000.0:
+                    st["th"][threshold] += 1
+            if st["sketch"] is not None:
+                qt.update(st["sketch"], lat)
+        else:
+            st["failure"] += 1
+    out = {}
+    for op, st in acc.items():
+        b64 = (qt.serialize(st["sketch"])
+               if (qt is not None and st["sketch"] is not None) else None)
+        items = [b64] if b64 else None
+        ok = st["success"]
+        res = {
+            "total": st["total"], "success": ok,
+            "failure": st["failure"], "bytes": st["bytes"],
+            "avg_ms": round(st["lat_sum"] / ok, 6) if ok else 0.0,
+            "min_ms": round(st["min"], 6) if st["min"] is not None else 0.0,
+            "max_ms": round(st["max"], 6) if st["max"] is not None else 0.0,
+            # merge inputs for scope-level (TOTAL) percentiles
+            "hist": {str(b): n for b, n in sorted(st["hist"].items())},
+            **{column: st["th"][threshold]
+               for column, threshold in zip(LATENCY_THRESHOLD_COLUMNS,
+                                            LATENCY_THRESHOLDS_US)},
+            "digest": b64,
+        }
+        for q, key in ((0.50, "p50_ms"), (0.90, "p90_ms"),
+                       (0.95, "p95_ms"), (0.99, "p99_ms"),
+                       (0.999, "p999_ms"), (0.9999, "p9999_ms")):
+            v = unified_pct(st["hist"], items, q, gmax=st["max"])
+            res[key] = round(v, 6) if v is not None else 0.0
+        out[op] = res
+    return out
 
 
 def _epoch_to_ts(epoch):
@@ -821,6 +928,9 @@ def main(argv=None):
                         help="kvtest: per-instance summary.json (wall/bytes)")
     parser.add_argument("--source-name", default=None,
                         help="meta.source override (default: input basename)")
+    parser.add_argument("--digest-k", type=int, default=None,
+                        help="REQ sketch k for percentile digests "
+                             "(omit to disable the sketch)")
     parser.add_argument("--top-n", type=int, default=100)
     parser.add_argument("--context", type=int, default=20)
     # provenance stamped by the orchestrator's map stage (used by the report's
@@ -851,6 +961,7 @@ def main(argv=None):
             remote_path=args.remote_path, size=args.size,
             rows_factory=lambda p: iter_kvtest_rows(p, args.start_epoch, ops),
             summaries=summaries, source_name=args.source_name,
+            digest_k=args.digest_k,
             extra_meta={"format": "kvtest_samples"})
     else:
         src_path = args.log
@@ -858,7 +969,8 @@ def main(argv=None):
                               context=args.context, node=args.node,
                               pod=args.pod, role=args.role,
                               remote_path=args.remote_path, size=args.size,
-                              source_name=args.source_name)
+                              source_name=args.source_name,
+                              digest_k=args.digest_k)
     out = args.out or (src_path + ".stats.json")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

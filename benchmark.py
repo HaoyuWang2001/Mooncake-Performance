@@ -3058,7 +3058,7 @@ def _resolve_glog_inputs(cluster, node_entry, glog_dir, legacy_file,
 
 def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
                      dry=False, node_name=None, role=None, size=None,
-                     roles=None):
+                     roles=None, digest_k=None):
     """map 阶段：在节点/pod 内对每个 RESULT 日志执行 logstats，就地生成
     <log>.stats.json（编排器默认只回传统计产物，原始日志留在节点上）。
     产物 meta 里写入 node/pod/role/远程路径，供报表分节点统计与现场索引。"""
@@ -3083,6 +3083,8 @@ def run_logstats_map(cluster, node, log_paths, remote_scripts, globals_cfg,
         # 报表索引里的路径 = 节点侧真实文件（ssh 后可读），不是 pod 内路径
         cmd += " --remote-path {}".format(shlex.quote(
             _pod_path_to_site(cluster, log_path)))
+        if digest_k is not None:
+            cmd += " --digest-k {}".format(int(digest_k))
         ok = True
         t0 = time.time()
         if dry:
@@ -3138,7 +3140,8 @@ def _map_and_pull_logs(cluster, groups, local_log_dir, dry, globals_cfg,
                     break
         stats = run_logstats_map(cluster, node, result_logs, remote_scripts,
                                  globals_cfg, dry=dry, node_name=name,
-                                 role=role, size=size, roles=roles)
+                                 role=role, size=size, roles=roles,
+                                 digest_k=_quantile_k(globals_cfg))
         # glog 来源：每个客户端的 MC_LOG_DIR 目录 <base>.glog.d/*.INFO.*
         # （旧镜像回退 <base>.glog 的 stderr 捕获）；轮转多段合并成一个产物。
         traces = []
@@ -5106,7 +5109,8 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
             # explicitly requested (--pull-raw-logs / --png)
             _stats_files = run_logstats_map(
                 cluster, node, [remote_log], remote_scripts, globals_cfg,
-                dry=dry, node_name=primary_node_name, size=ds)
+                dry=dry, node_name=primary_node_name, size=ds,
+                digest_k=_quantile_k(globals_cfg))
             _gl_base = remote_log[:-len(".log")] if remote_log.endswith(
                 ".log") else remote_log
             _gl_files, _gl_site = _resolve_glog_inputs(
@@ -7233,7 +7237,8 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
                                 cfg_name, ds, instance_pids, groups,
                                 local_log_dir, extra_bytes,
                                 qps_target=0, nodes=0,
-                                remote_log_dir=None, is_k8s=True):
+                                remote_log_dir=None, is_k8s=True,
+                                digest_k=None):
     """Controller-side kvtest data plane: cp artifacts pod->controller,
     run the staged map+reduce driver there, pull back only the compact
     reduced/meta/summary products. Raises on any failure so the caller can
@@ -7287,6 +7292,7 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
         _warm = float((cfg or {}).get("_kvtest_warmup_duration") or 0)
         _start = start_epochs.get(str(ds))
         instances.append({
+            "iid": entry["iid"],
             "samples": samples,
             "summary": base + ".summary.json",
             "trace": trace,
@@ -7306,6 +7312,7 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
         })
     job = {"dir": cdir,
            "out_dir": posixpath.join(cdir, "reduced"),
+           "digest_k": digest_k,
            "meta_base": _kvtest_report_meta_base(
                cfg, args, cfg_name, ds,
                qps_target=qps_target, nodes=nodes,
@@ -7898,6 +7905,7 @@ def _kvtest_map_stats(local_log_dir, cfg):
             stats = ls.compute_stats(
                 path, top_n=100, context=20, node=node, pod=pod, role=role,
                 remote_path=remote_path, size=ds, warmup_cutoff=_cutoff,
+                digest_k=cfg.get("_kvtest_digest_k"),
                 rows_factory=lambda p, _ops=ops, _start=start:
                     ls.iter_kvtest_rows(p, _start, _ops),
                 summaries=summaries,
@@ -8149,6 +8157,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                            "(missing or invalid)")
     warmup_duration = _kvtest_warmup_duration(cfg, args)
     cfg["_kvtest_warmup_duration"] = warmup_duration
+    cfg["_kvtest_digest_k"] = _quantile_k(globals_cfg)
     writer_op = _kvtest_writer_operation(cfg)
     reader_op = _kvtest_reader_operation(cfg)
     if writer_op not in KVTEST_WRITER_OPS:
@@ -8884,7 +8893,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         instance_pids, _groups, local_log_dir,
                         _extra_bytes, qps_target=plan.get("total_qps") or 0,
                         nodes=int(cfg.get("_kvtest_nodes") or 0),
-                        remote_log_dir=remote_log_dir, is_k8s=is_k8s)
+                        remote_log_dir=remote_log_dir, is_k8s=is_k8s,
+                        digest_k=cfg.get("_kvtest_digest_k"))
                     _ctrl_done = True
                     log("[kvtest] controller data-plane done in {:.1f}s "
                         "(pod->controller single hop; orchestrator keeps no "
@@ -9344,29 +9354,6 @@ def parse_benchmark_log(paths, op_filter=None):
     })
 
 
-def _kvtest_latency_stats(values):
-    """Python/basic-compatible latency statistics over successful samples."""
-    ordered = sorted(values)
-    n = len(ordered)
-    return {
-        "min_ms": ordered[0] if ordered else 0.0,
-        "avg_ms": (sum(ordered) / n) if n else 0.0,
-        "p50_ms": percentile(ordered, 0.50),
-        "p90_ms": percentile(ordered, 0.90),
-        "p95_ms": percentile(ordered, 0.95),
-        "p99_ms": percentile(ordered, 0.99),
-        "p999_ms": percentile(ordered, 0.999),
-        "p9999_ms": percentile(ordered, 0.9999),
-        "max_ms": ordered[-1] if ordered else 0.0,
-        **{
-            column: sum(1 for latency in ordered
-                        if latency > threshold_us / 1000.0)
-            for threshold_us, column in zip(
-                LATENCY_THRESHOLD_US, LATENCY_THRESHOLD_COLUMNS)
-        },
-    }
-
-
 _LOGSTATS_MOD = [None]
 
 
@@ -9392,6 +9379,18 @@ def _logstats_module():
     return _LOGSTATS_MOD[0]
 
 
+def _quantile_k(globals_cfg):
+    """Resolved REQ sketch k from global.json (quantiles.req_k), or None
+    when the datasketches library is unavailable in this environment."""
+    try:
+        import quantiles as _q
+    except Exception:
+        return None
+    q = ((globals_cfg or {}).get("quantiles") or {})
+    return _q.resolve_k(q.get("req_k")) if q.get("req_k") is not None \
+        else _q.DEFAULT_K
+
+
 def _merge_stats_op(stats_list, op, ls):
     """Aggregate ONE op across stats files (CSV rows of mixed put/get runs)."""
     total = ok = fail = 0
@@ -9405,8 +9404,12 @@ def _merge_stats_op(stats_list, op, ls):
     versions = set()
     ts_from = ts_to = None
     th_counts = dict.fromkeys(LATENCY_THRESHOLD_COLUMNS, 0)
+    _digest_items = []
     for st in stats_list:
         o = (st.get("ops") or {}).get(op) or {}
+        _dg = ((st.get("digest") or {}).get("ops") or {}).get(op)
+        if _dg:
+            _digest_items.append(_dg)
         for column in LATENCY_THRESHOLD_COLUMNS:
             th_counts[column] += int(o.get(column, 0) or 0)
         n_ok = int(o.get("ok") or 0)
@@ -9442,18 +9445,10 @@ def _merge_stats_op(stats_list, op, ls):
     wall = wall or span
     edges = ls.EDGES_BY_VERSION.get(max(versions), ls.BIN_EDGES) if versions \
         else ls.BIN_EDGES
-    single_op = None
-    if len(stats_list) == 1:
-        single_op = (stats_list[0].get("ops") or {}).get(op) or {}
-
-    def pct(q, key):
-        # single file with exact per-op percentiles -> use them verbatim
-        if single_op and single_op.get("exact") and single_op.get(key) is not None:
-            return round(float(single_op[key]), 4)
-        if not hist:
-            return 0.0
-        v = ls.hist_percentile(hist, q, edges)
-        return round(min(v, gmax) if gmax is not None else v, 4)
+    def pct(q, key=None):
+        # 统一分位口径（与报表/CSV 实例行同一 helper）
+        v = ls.unified_pct(hist, _digest_items or None, q, edges, gmax=gmax)
+        return 0.0 if v is None else round(v, 4)
 
     return {
         "total": total,
@@ -9561,6 +9556,7 @@ def _merge_stats_aggs(stats_list, op_filter=None):
     ts_from = ts_to = None
     wall_summary = 0.0
     hist = {}
+    _digest_items = []
     th_counts = dict.fromkeys(LATENCY_THRESHOLD_COLUMNS, 0)
     for st in stats_list:
         g = st.get("global") or {}
@@ -9587,6 +9583,9 @@ def _merge_stats_aggs(stats_list, op_filter=None):
                 ts_to, meta["ts_to"])
         for b, n in (st.get("histogram") or {}).items():
             hist[int(b)] = hist.get(int(b), 0) + n
+        _dg = (st.get("digest") or {})
+        if _dg.get("global"):
+            _digest_items.append(_dg["global"])
         for kind, payload in st.get("summaries") or []:
             if kind != "summary":
                 continue
@@ -9612,12 +9611,11 @@ def _merge_stats_aggs(stats_list, op_filter=None):
         "avg_ms": (lat_sum / n_rows) if n_rows else 0.0,
         "min_ms": (ls.hist_percentile(hist, 0.0, hist_edges) if hist else 0.0),
         "max_ms": (ls.hist_percentile(hist, 1.0, hist_edges) if hist else 0.0),
-        "p50_ms": (ls.hist_percentile(hist, 0.50, hist_edges) if hist else 0.0),
-        "p90_ms": (ls.hist_percentile(hist, 0.90, hist_edges) if hist else 0.0),
-        "p95_ms": (ls.hist_percentile(hist, 0.95, hist_edges) if hist else 0.0),
-        "p99_ms": (ls.hist_percentile(hist, 0.99, hist_edges) if hist else 0.0),
-        "p999_ms": (ls.hist_percentile(hist, 0.999, hist_edges) if hist else 0.0),
-        "p9999_ms": (ls.hist_percentile(hist, 0.9999, hist_edges) if hist else 0.0),
+        **{key: (ls.unified_pct(hist, _digest_items or None, q, hist_edges)
+                 if hist else 0.0)
+           for q, key in ((0.50, "p50_ms"), (0.90, "p90_ms"),
+                          (0.95, "p95_ms"), (0.99, "p99_ms"),
+                          (0.999, "p999_ms"), (0.9999, "p9999_ms"))},
         **th_counts,
         "lat_sum_ms": lat_sum,
         "ok": ok,
@@ -9641,77 +9639,35 @@ def _glob_log_sources(directory, pattern):
             key = key[:-len(".stats.json")]
         found[key] = p        # stats version added last -> wins
     return [found[k] for k in sorted(found)]
+_KVTEST_REDUCED_DOC = {}
+
+
+def _kvtest_reduced_doc(local_log_dir, ds):
+    """Cached report/<ds>/reduced.json (None when absent/corrupt)."""
+    key = (os.path.abspath(local_log_dir), str(ds))
+    if key in _KVTEST_REDUCED_DOC:
+        return _KVTEST_REDUCED_DOC[key]
+    doc = None
+    try:
+        with open(os.path.join(local_log_dir, "report", str(ds),
+                               "reduced.json"), "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        doc = None
+    _KVTEST_REDUCED_DOC[key] = doc
+    return doc
+
+
 def _kvtest_reduced_for_size(local_log_dir, ds, role):
     """Exact merged percentiles of one role's TOTAL row from a
     controller-reduce reduced.json (report/<ds>/reduced.json); None when
     absent (the caller then leaves the percentile columns empty — never a
     weighted approximation)."""
-    try:
-        with open(os.path.join(local_log_dir, "report", ds, "reduced.json"),
-                  "r", encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, ValueError):
+    doc = _kvtest_reduced_doc(local_log_dir, ds)
+    if doc is None:
         return None
     blk = ((doc.get("sizes") or {}).get(ds) or {})
     return ((blk.get("role_summaries") or {}).get(role)) or None
-
-
-def _load_kvtest_sample_rows(local_log_dir, cfg_name, iid_nodes=None):
-    """Load request-level rows keyed by (size, iid, node, op).
-
-    ALL statuses are kept: with warmup folded into the single measured
-    window the CSV recomputes the formal totals from the samples themselves
-    (the C++ summary counters include the warmup region). Each row carries
-    the relative ``elapsed`` seconds (same origin as /start), so the warmup
-    cutoff needs no epoch/clock alignment."""
-    legacy_re = re.compile(
-        r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
-        r"(?P<ds>.+)\.samples\.csv$".format(re.escape(cfg_name)))
-    compact_re = re.compile(
-        r"^{}\.i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
-        r"(?P<ds>.+)\.samples\.csv$".format(
-            re.escape(_kvtest_artifact_prefix(cfg_name))))
-    iid_nodes = iid_nodes or {}
-    samples = {}
-    pattern = os.path.join(local_log_dir, "*.kvtest_*.samples.csv")
-    for path in sorted(glob.glob(pattern)):
-        match = compact_re.match(os.path.basename(path))
-        legacy = False
-        if not match:
-            match = legacy_re.match(os.path.basename(path))
-            legacy = bool(match)
-        if not match:
-            continue
-        iid = int(match.group("iid"))
-        node = (match.group("node") if legacy else
-                iid_nodes.get(str(iid), "i{}".format(iid)))
-        try:
-            with open(path, newline="", encoding="utf-8") as stream:
-                for row in csv.DictReader(stream):
-                    operation = row.get("operation", "")
-                    if not operation:
-                        continue
-                    status = (row.get("status") or "").strip()
-                    try:
-                        lat = float(row["latency_ms"])
-                    except (TypeError, ValueError, KeyError):
-                        lat = None
-                    try:
-                        elapsed = float(row.get("elapsed_us") or 0.0) / 1e6
-                    except (TypeError, ValueError):
-                        elapsed = 0.0
-                    try:
-                        nbytes = int(float(row.get("bytes") or 0))
-                    except (TypeError, ValueError):
-                        nbytes = 0
-                    key = (match.group("ds"), iid, node, operation)
-                    samples.setdefault(key, []).append({
-                        "elapsed": elapsed, "lat": lat,
-                        "status": status, "bytes": nbytes})
-        except (OSError, ValueError, KeyError, csv.Error) as exc:
-            log("[WARN] kvtest samples {}: {} (skipped)".format(
-                os.path.basename(path), exc))
-    return samples
 
 
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
@@ -10051,7 +10007,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
         def op_stats(summary, op):
             return (summary.get("operations", {}) or {}).get(op) or {}
 
-        def fill_metrics(row, st, wall, values=None):
+        def fill_metrics(row, st, wall):
             total = int(st.get("total", 0) or 0)
             ok = int(st.get("success", 0) or 0)
             fail = int(st.get("failure", 0) or 0)
@@ -10065,15 +10021,13 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
                                       if wall > 0 else 0.0)
             row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
-            stats = (_kvtest_latency_stats(values) if values is not None
-                     else st)
             for k in lat_keys:
-                row[k] = round(float(stats.get(k, 0) or 0), 4)
+                row[k] = round(float(st.get(k, 0) or 0), 4)
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
 
-        def fill_notify(row, summary, values=None):
+        def fill_notify(row, summary):
             operation = ("notify_rpc"
                          if "notify_rpc" in (summary.get("operations") or {})
                          else "notify_http")
@@ -10081,21 +10035,17 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             row["notify_submitted"] = int(nt.get("total", 0) or 0)
             row["notify_ok"] = int(nt.get("success", 0) or 0)
             row["notify_fail"] = int(nt.get("failure", 0) or 0)
-            stats = (_kvtest_latency_stats(values) if values is not None
-                     else nt)
             row["notify_avg_ms"] = round(
-                float(stats.get("avg_ms", 0) or 0), 4)
+                float(nt.get("avg_ms", 0) or 0), 4)
             row["notify_max_ms"] = round(
-                float(stats.get("max_ms", 0) or 0), 4)
+                float(nt.get("max_ms", 0) or 0), 4)
 
-        def fill_queue(row, summary, values=None):
+        def fill_queue(row, summary):
             q = op_stats(summary, "notify_queue_wait")
-            stats = (_kvtest_latency_stats(values) if values is not None
-                     else q)
             row["queue_wait_avg_ms"] = round(
-                float(stats.get("avg_ms", 0) or 0), 4)
+                float(q.get("avg_ms", 0) or 0), 4)
             row["queue_wait_max_ms"] = round(
-                float(stats.get("max_ms", 0) or 0), 4)
+                float(q.get("max_ms", 0) or 0), 4)
 
         def weighted_of(inst_rows, value_key, weight_key="total"):
             weighted = [(float(r.get(value_key, 0) or 0),
@@ -10105,7 +10055,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             return round(sum(v * w for v, w in weighted) / weight, 4) \
                 if weight else 0.0
 
-        def total_row(role, inst_rows, ds, wall, pooled_values=None):
+        def total_row(role, inst_rows, ds, wall, merged_stats=None):
             # Counts/bytes sum exactly. With complete request samples the
             # latency distribution is recomputed over the merged OK samples.
             row = base_row(role, "TOTAL", "", ds)
@@ -10127,37 +10077,37 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 float(r.get("throughput_mb_s", 0) or 0) for r in inst_rows)
             row["throughput_gb_s"] = sum(
                 float(r.get("throughput_gb_s", 0) or 0) for r in inst_rows)
-            if pooled_values is not None:
-                stats = _kvtest_latency_stats(pooled_values)
-                for k in lat_keys:
-                    row[k] = round(stats[k], 4)
+            # 精确项永远来自实例行（与分位来源无关）：极值/阈值计数/
+            # 加权均值（加权均值在数学上等于全样本均值）
+            for k in lat_keys:
+                if k in LATENCY_THRESHOLD_COLUMNS:
+                    row[k] = sum(int(r.get(k, 0) or 0) for r in inst_rows)
+                elif k == "min_ms":
+                    row[k] = min((float(r.get(k, 0) or 0)
+                                  for r in inst_rows
+                                  if int(r.get("success", 0) or 0) > 0),
+                                 default=0.0)
+                elif k == "max_ms":
+                    row[k] = max((float(r.get(k, 0) or 0)
+                                  for r in inst_rows), default=0.0)
+                elif k == "avg_ms":
+                    row[k] = weighted_of(inst_rows, k, weight_key="success")
+            _pct_keys = ("p50_ms", "p90_ms", "p95_ms", "p99_ms",
+                         "p999_ms", "p9999_ms")
+            if merged_stats is not None:
+                # 实例行同源合并（同一 unified_pct policy，per-op scope）
+                for k in _pct_keys:
+                    v = merged_stats.get(k)
+                    row[k] = round(float(v), 4) if v is not None else ""
             else:
-                # 无原始样本时绝不使用加权近似：优先 controller reduce 的
-                # 精确合并值（report/<ds>/reduced.json），否则分位列留空（N/A）。
-                # avg/min/max/阈值计数仍然精确（极值/求和天然无损）。
+                # 无实例统计时优先 controller reduce 的合并值，否则留空 N/A
                 _red = _kvtest_reduced_for_size(local_log_dir, ds, role)
-                for k in lat_keys:
-                    if k == "min_ms":
-                        row[k] = min((float(r.get(k, 0) or 0)
-                                      for r in inst_rows
-                                      if int(r.get("success", 0) or 0) > 0),
-                                     default=0.0)
-                    elif k == "max_ms":
-                        row[k] = max((float(r.get(k, 0) or 0)
-                                      for r in inst_rows), default=0.0)
-                    elif k in LATENCY_THRESHOLD_COLUMNS:
-                        row[k] = sum(int(r.get(k, 0) or 0)
-                                     for r in inst_rows)
-                    elif k == "avg_ms":
-                        # 加权均值在数学上等于全样本均值（精确，非近似）
-                        row[k] = weighted_of(
-                            inst_rows, k, weight_key="success")
-                    elif _red is not None and _red.get(k) is not None:
+                for k in _pct_keys:
+                    if _red is not None and _red.get(k) is not None:
                         row[k] = round(float(_red[k]), 4)
                     else:
                         row[k] = ""
-                        log("[WARN] kvtest TOTAL quantile unavailable (no raw "
-                            "samples and no controller reduce product); left "
+                        log("[WARN] kvtest TOTAL quantile unavailable; left "
                             "empty: {} {} {}".format(ds, role, k))
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
@@ -10196,49 +10146,73 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 continue
             summaries.setdefault(m.group("ds"), []).append(
                 (iid, nodename, summary))
-        sample_rows = _load_kvtest_sample_rows(
-            local_log_dir, name, iid_nodes=iid_nodes)
-        # warmup 已并入单窗口：前 warm_sec 秒的行不计入正式统计（但样本里
-        # 仍有它们，图表照常绘制）。elapsed_us 与 /start 同源，用相对时长
-        # 过滤即可。活跑用 cfg 的 _kvtest_warmup_duration；--rebuild-report
-        # 从 meta 的 warmup_s 取；旧产物无字段 -> 0（旧样本本身就不含 warmup）。
+        # 每实例正式统计（CSV 实例行 + TOTAL 合并输入）：
+        #   controller 模式 -> reduced.json 的 instances 块（job 算出）
+        #   本地/STOP 模式 -> 从本地 samples.csv 流式重算
+        # 两者都由 ls.kvtest_instance_ops_stats 产生且与报表 reduce 同一
+        # 分位口径（hist <= p95 / REQ sketch 尾部）。
         warm_sec = float(
             cfg.get("_kvtest_warmup_duration")
             if cfg.get("_kvtest_warmup_duration") is not None
             else (cfg.get("warmup_s") or 0))
+        _digest_k = cfg.get("_kvtest_digest_k")
+        _local_samples = {}
+        _samples_re = re.compile(
+            r"^.*i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_(?P<ds>.+?)"
+            r"\.samples\.csv$")
+        for _sp in sorted(glob.glob(os.path.join(
+                local_log_dir, "*.kvtest_*.samples.csv"))):
+            _m = _samples_re.match(os.path.basename(_sp))
+            if _m:
+                _local_samples[(_m.group("ds"), int(_m.group("iid")))] = _sp
+        _csv_ops = (set(KVTEST_WRITE_OPS) | set(KVTEST_READ_OPS)
+                    | {"notify_rpc", "notify_http", "notify_queue_wait"})
 
-        def sample_rows_of(ds, iid, nodename, operation, expected):
-            """样本完整 -> 返回 formal 行（切掉 warmup 区）；否则 None 走回退。"""
-            rows_ = sample_rows.get((ds, iid, nodename, operation), [])
-            ok_all = sum(1 for r in rows_
-                         if r["status"] == "OK" and r["lat"] is not None)
-            if ok_all != expected:
-                log("[WARN] kvtest {} i{} {} samples incomplete: {} OK rows, "
-                    "summary success={}; using summary fallback".format(
-                        ds, iid, operation, ok_all, expected))
+        def instance_ops(ds, iid):
+            red = _kvtest_reduced_doc(local_log_dir, ds)
+            if red is not None:
+                for it in red.get("instances") or []:
+                    try:
+                        if int(it.get("iid", -1)) == int(iid):
+                            return it.get("ops") or None
+                    except (TypeError, ValueError):
+                        continue
+            path = _local_samples.get((str(ds), int(iid)))
+            if not path:
                 return None
-            if warm_sec > 0:
-                return [r for r in rows_ if r["elapsed"] >= warm_sec]
-            return list(rows_)
+            try:
+                return _logstats_module().kvtest_instance_ops_stats(
+                    path, _csv_ops, warmup_sec=warm_sec or None,
+                    digest_k=_digest_k)
+            except Exception as exc:
+                log("[WARN] kvtest {} i{} instance stats: {}".format(
+                    ds, iid, exc))
+                return None
 
-        def rows_stats(rows_):
-            """formal 行 -> fill_metrics/fill_notify/fill_queue 需要的 stats。"""
-            ok_rows = [r for r in (rows_ or [])
-                       if r["status"] == "OK" and r["lat"] is not None]
-            return {"total": len(rows_ or []),
-                    "success": len(ok_rows),
-                    "failure": len(rows_ or []) - len(ok_rows),
-                    "bytes": sum(r["bytes"] for r in ok_rows)}
-
-        def rows_values(rows_):
-            return [r["lat"] for r in (rows_ or [])
-                    if r["status"] == "OK" and r["lat"] is not None]
+        def merge_ops(ops_list):
+            """合并多实例同 op 的正式统计（TOTAL 分位输入，同一 policy）。"""
+            hist = {}
+            digests = []
+            for st in ops_list:
+                for b, n in (st.get("hist") or {}).items():
+                    hist[int(b)] = hist.get(int(b), 0) + int(n)
+                if st.get("digest"):
+                    digests.append(st["digest"])
+            if not hist:
+                return None
+            out = {}
+            for q, key in ((0.50, "p50_ms"), (0.90, "p90_ms"),
+                           (0.95, "p95_ms"), (0.99, "p99_ms"),
+                           (0.999, "p999_ms"), (0.9999, "p9999_ms")):
+                v = _logstats_module().unified_pct(
+                    hist, digests or None, q)
+                out[key] = round(v, 4) if v is not None else None
+            return out
 
         for ds in data_size_list(cfg):
             wall = duration
             writer_rows, reader_rows = [], []
-            writer_pooled, reader_pooled = [], []
-            writer_exact = reader_exact = True
+            writer_op_stats, reader_op_stats = [], []
             for iid, nodename, summary in sorted(summaries.get(ds, [])):
                 ops = summary.get("operations") or {}
                 elapsed = float(summary.get("elapsed_seconds", 0) or duration)
@@ -10246,74 +10220,55 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 # warmup 区，qps/吞吐口径才正确
                 instance_wall = (max(0.0, elapsed - warm_sec)
                                  if warm_sec > 0 else elapsed)
+                inst_ops = instance_ops(ds, iid) or {}
                 if writer_op in ops:
-                    writer_st = op_stats(summary, writer_op)
-                    wrows = sample_rows_of(
-                        ds, iid, nodename, writer_op,
-                        int(writer_st.get("success", 0) or 0))
-                    writer_values = (rows_values(wrows)
-                                     if wrows is not None else None)
                     row = base_row("writer", "i{}".format(iid), nodename, ds)
-                    fill_metrics(
-                        row, rows_stats(wrows) if wrows is not None
-                        else writer_st, instance_wall, writer_values)
+                    wst = inst_ops.get(writer_op)
+                    if wst is None:
+                        log("[WARN] kvtest {} i{} {} formal stats unavailable; "
+                            "using summary (includes warmup)".format(
+                                ds, iid, writer_op))
+                        wst = op_stats(summary, writer_op)
+                    else:
+                        writer_op_stats.append(wst)
+                    fill_metrics(row, wst, instance_wall)
                     notify_operation = (
                         "notify_rpc" if "notify_rpc" in ops
                         else "notify_http")
-                    notify_st = op_stats(summary, notify_operation)
-                    nrows = sample_rows_of(
-                        ds, iid, nodename, notify_operation,
-                        int(notify_st.get("success", 0) or 0))
-                    notify_values = (rows_values(nrows)
-                                     if nrows is not None else None)
+                    nst = inst_ops.get(notify_operation)
                     fill_notify(
                         row,
-                        ({"operations": {notify_operation: rows_stats(nrows)}}
-                         if nrows is not None else summary),
-                        notify_values)
+                        ({"operations": {notify_operation: nst}}
+                         if nst is not None else summary))
                     writer_rows.append(row)
-                    if writer_values is None:
-                        writer_exact = False
-                    else:
-                        writer_pooled.extend(writer_values)
                 if reader_op in ops:
-                    reader_st = op_stats(summary, reader_op)
-                    rrows = sample_rows_of(
-                        ds, iid, nodename, reader_op,
-                        int(reader_st.get("success", 0) or 0))
-                    reader_values = (rows_values(rrows)
-                                     if rrows is not None else None)
                     row = base_row("reader", "i{}".format(iid), nodename, ds)
-                    fill_metrics(
-                        row, rows_stats(rrows) if rrows is not None
-                        else reader_st, instance_wall, reader_values)
-                    queue_st = op_stats(summary, "notify_queue_wait")
-                    qrows = sample_rows_of(
-                        ds, iid, nodename, "notify_queue_wait",
-                        int(queue_st.get("success", 0) or 0))
-                    queue_values = (rows_values(qrows)
-                                    if qrows is not None else None)
+                    rst = inst_ops.get(reader_op)
+                    if rst is None:
+                        log("[WARN] kvtest {} i{} {} formal stats unavailable; "
+                            "using summary (includes warmup)".format(
+                                ds, iid, reader_op))
+                        rst = op_stats(summary, reader_op)
+                    else:
+                        reader_op_stats.append(rst)
+                    fill_metrics(row, rst, instance_wall)
+                    qst = inst_ops.get("notify_queue_wait")
                     fill_queue(
                         row,
-                        ({"operations": {"notify_queue_wait": rows_stats(qrows)}}
-                         if qrows is not None else summary),
-                        queue_values)
+                        ({"operations": {"notify_queue_wait": qst}}
+                         if qst is not None else summary))
                     # data verification runs on the read path (C++ scalar;
                     # cannot be split by time -> keeps the warmup region)
                     row["verify_failures"] = int(
                         summary.get("verify_failures", 0) or 0)
                     reader_rows.append(row)
-                    if reader_values is None:
-                        reader_exact = False
-                    else:
-                        reader_pooled.extend(reader_values)
             # grouped like the pipeline CSV: all writers + TOTAL, then all
             # readers + TOTAL
             rows.extend(writer_rows)
             if writer_rows:
                 row = total_row(
                     "writer", writer_rows, ds, wall,
-                    writer_pooled if writer_exact else None)
+                    merge_ops(writer_op_stats))
                 for k in ("notify_submitted", "notify_ok", "notify_fail"):
                     row[k] = sum(r.get(k, 0) for r in writer_rows)
                 row["notify_avg_ms"] = weighted_of(
@@ -10326,7 +10281,7 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             if reader_rows:
                 row = total_row(
                     "reader", reader_rows, ds, wall,
-                    reader_pooled if reader_exact else None)
+                    merge_ops(reader_op_stats))
                 row["verify_failures"] = sum(
                     r.get("verify_failures", 0) for r in reader_rows)
                 row["queue_wait_avg_ms"] = weighted_of(

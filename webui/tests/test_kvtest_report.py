@@ -159,7 +159,11 @@ def test_kvtest_map_writes_per_role_products(tmp_path):
     assert writer["meta"]["size"] == "8MB"
     assert writer["meta"]["source"].endswith(".writer.samples.csv")
     assert writer["global"]["ok"] == 2 and writer["global"]["fail"] == 0
-    assert writer["global"]["p99_ms"] == 2.0
+    # 统一口径：分位来自桶直方图插值（与产物 histogram 一致）
+    _h = {int(k): v for k, v in writer["histogram"].items()}
+    assert writer["global"]["p99_ms"] == round(
+        min(ls.hist_percentile(_h, 0.99, ls.BIN_EDGES_V2),
+            writer["global"]["max_ms"]), 6)
     assert set(writer["ops"]) == {"upsert_from"}
     assert reader["global"]["ok"] == 1
     assert set(reader["ops"]) == {"get_buffer"}

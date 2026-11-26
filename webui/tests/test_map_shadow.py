@@ -40,7 +40,8 @@ def test_map_and_pull_lists_only_produced_files(monkeypatch, tmp_path):
 
 def _fake_maps(monkeypatch, seen):
     def fake_logstats(cluster, node, logs, scripts, g, dry=False,
-                      node_name=None, role=None, size=None, roles=None):
+                      node_name=None, role=None, size=None, roles=None,
+                      digest_k=None):
         seen["roles"] = dict(roles or {})
         seen["role"] = role
         seen["logs"] = list(logs)
