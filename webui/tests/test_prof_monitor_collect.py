@@ -108,6 +108,42 @@ def test_stop_and_collect_display_collision_falls_back(tmp_path, monkeypatch):
     assert "dup-host" in pulled
 
 
+def test_spdiag_show_uses_per_pod_cfg_dir(tmp_path, monkeypatch):
+    """k8s: spdiag show 落到 <log>/<pod>/profiling/<cfg>/spdiag.show.txt
+    （同节点多 pod 不互相覆盖）；ssh 目标保持原路径；收集名不变。"""
+    import benchmark as bm
+    shows, pulls = {}, {}
+
+    def fake_run(ip, node, cmd, quiet=True):
+        if " show > " in cmd:
+            shows[node.get("_pod") or "ssh"] = cmd
+        return ""
+
+    def fake_pull(ip, node, remote, local_dir, dry_run=False):
+        pulls[node.get("_pod") or "ssh"] = remote
+
+    nodes = {"pod-a": {"ip": "10.0.0.1", "_pod": "pod-a", "_monitor": False},
+             "host-b": {"ip": "10.0.0.2"}}
+    monkeypatch.setattr(prof_core, "_run", fake_run)
+    monkeypatch.setattr(prof_core, "scp_pull", fake_pull)
+    monkeypatch.setattr(prof_core, "get_node", lambda c, name: nodes[name])
+    monkeypatch.setattr(bm, "state_remove", lambda *a, **k: None)
+    session = {"tools": {"pod-a": {"spdiag": None},
+                         "host-b": {"spdiag": None}},
+               "matrix_tools": {"spdiag": {"bin": "spdiag", "sudo": False}},
+               "remote_out_dir": "/pw/logs/ts/profiling/cfg1",
+               "cfg": "cfg1"}
+    prof_core.stop_and_collect({"nodes": nodes}, session, str(tmp_path))
+    assert "/pw/logs/ts/pod-a/profiling/cfg1/spdiag.show.txt" in \
+        shows["pod-a"], shows
+    assert pulls["pod-a"].endswith(
+        "/pw/logs/ts/pod-a/profiling/cfg1/spdiag.show.txt")
+    assert "/pw/logs/ts/profiling/cfg1/spdiag.show.txt" in shows["ssh"], shows
+    assert "/pod-a/" not in shows["ssh"]
+    assert pulls["ssh"].endswith(
+        "/pw/logs/ts/profiling/cfg1/spdiag.show.txt")
+
+
 def test_start_profiling_injects_epoch_base(monkeypatch, tmp_path):
     """kvtest 传入 epoch_base 时启动命令带 EPOCH_BASE；python 不传则不带。"""
     import benchmark as bm
