@@ -36,22 +36,6 @@ def test_pod_path_to_site_passthrough():
     assert bm._pod_path_to_site(K8S, "relative/x.log") == "relative/x.log"
 
 
-def test_site_dirs_and_remote_names():
-    cfg = {"_kvtest_iid_pods": {"0": "pod-a", "1": "pod-b"}}
-    dirs = bm._kvtest_site_dirs(
-        K8S, "/workspace/mp/logs/20261126-1141", cfg)
-    assert dirs == {
-        "0": "/var/lib/mooncake-bench/20261126-1141/pod-a",
-        "1": "/var/lib/mooncake-bench/20261126-1141/pod-b"}
-    names = bm._kvtest_remote_names([(
-        None,
-        ["/w/logs/ts/pod-a/a.samples.csv.gz",
-         "/w/logs/ts/pod-a/a.summary.json"],
-        "kvtest i0")])
-    assert names == {"a.samples.csv": "a.samples.csv.gz",
-                     "a.summary.json": "a.summary.json"}
-
-
 def test_meta_base_merges_context():
     args = SimpleNamespace(cluster="c.json", global_cfg="g.json",
                            profile="p.json")
@@ -66,36 +50,34 @@ def test_meta_base_merges_context():
     assert meta["k8s_namespace"] == "ns"
 
 
-def test_local_map_uses_node_site_path(tmp_path, monkeypatch):
-    d = str(tmp_path)
-    name = "kv1.i0_p9301.kvtest_8KB.samples.csv"
-    with open(os.path.join(d, name), "w", encoding="utf-8") as f:
-        f.write("h\n")
-    with open(os.path.join(d, "kvtest_report_meta.json"), "w",
-              encoding="utf-8") as f:
-        json.dump({"iid_nodes": {"0": "10.0.0.1"},
-                   "iid_pods": {"0": "pod-a"},
-                   "start_epochs": {"8KB": 1000.0},
-                   "remote_log_dir": "/workspace/mp/logs/ts",
-                   "site_dirs": {"0": "/var/lib/mooncake-bench/ts/pod-a"},
-                   "remote_names": {name: name + ".gz"}}, f)
-
-    def _compute(*a, **k):
-        return {"meta": {"rows": 1, "bytes": 1,
-                         "node": k.get("node"), "pod": k.get("pod"),
-                         "role": k.get("role"), "size": k.get("size"),
-                         "source": k.get("source_name"),
-                         "remote_path": k.get("remote_path")},
-                "global": {}}
-
-    fake = SimpleNamespace(kvtest_summary_payload=lambda p, ops: None,
-                           compute_stats=_compute)
-    monkeypatch.setattr(bm, "_logstats_module", lambda: fake)
-    written = bm._kvtest_map_stats(d, {})
-    assert written
-    doc = json.load(open(written[0], encoding="utf-8"))
-    assert doc["meta"]["remote_path"] == (
-        "/var/lib/mooncake-bench/ts/pod-a/" + name + ".gz")
+def test_logsite_rows_follow_process_dirs():
+    """logsite 由产物 meta.remote_path 生成：pod 行=pod 目录（进程子目录
+    聚合），字节=meta.bytes 之和；监控行始终存在。"""
+    from types import SimpleNamespace
+    import report as rp
+    meta = {"run_id": "20261126-1141",
+            "host_log_root": "/var/lib/mooncake-bench"}
+    base = "/var/lib/mooncake-bench/20261126-1141/pod-a"
+    sources = [
+        {"node": "10.0.0.1", "pod": "pod-a", "role": "writer",
+         "source": "case.writer.stats.json.gz",
+         "remote_path": base + "/writer_i0_p9101/case.writer.stats.json.gz",
+         "bytes": 1000},
+        {"node": "10.0.0.1", "pod": "pod-a", "role": "reader",
+         "source": "case.reader.stats.json.gz",
+         "remote_path": base + "/reader_i4_p9201/case.reader.stats.json.gz",
+         "bytes": 2000},
+    ]
+    rows = rp.build_logsite(meta, sources, {})
+    pod = next(r for r in rows if r["tier"] == "pod")
+    assert pod["dir"] == base
+    assert pod["bytes"] == 3000
+    assert pod["files"] == 2
+    assert set(pod["role"].split("、")) == {"writer", "reader"}
+    node = next(r for r in rows if r["tier"] == "node")
+    assert node["dir"] == "/var/lib/mooncake-bench/20261126-1141"
+    assert any(r["tier"] == "monitor" for r in rows)
+    assert all("du" not in str(r) for r in rows)
 
 
 def test_runners_set_mc_log_dir():
@@ -144,24 +126,18 @@ def test_resolve_glog_inputs_info_then_legacy(monkeypatch):
 
     legacy = "/ws/logs/ts/pod-a/x.log.glog"
     monkeypatch.setattr(bm, "ssh_check_output", lambda *a, **k: legacy)
+    # python 引擎保留旧回退；kvtest（allow_legacy=False）严格不回落
     files, site = bm._resolve_glog_inputs(
         K8S, node, "/ws/logs/ts/pod-a/x.glog.d", legacy)
     assert files == [legacy]
     assert site == "/var/lib/mooncake-bench/ts/pod-a/x.log.glog"
+    assert bm._resolve_glog_inputs(
+        K8S, node, "/ws/logs/ts/pod-a/x.glog.d", legacy,
+        allow_legacy=False) == ([], "")
 
     monkeypatch.setattr(bm, "ssh_check_output", lambda *a, **k: "")
     assert bm._resolve_glog_inputs(
         K8S, node, "/ws/logs/ts/pod-a/x.glog.d", legacy) == ([], "")
-
-
-def test_trace_bytes_accepts_new_and_legacy_names(tmp_path):
-    logs = tmp_path
-    (logs / "x.trace.json").write_text(
-        json.dumps({"meta": {"bytes": 123}}), encoding="utf-8")
-    (logs / "y.log.glog.trace.json").write_text(
-        json.dumps({"meta": {"bytes": 456}}), encoding="utf-8")
-    assert bm._kvtest_trace_bytes(str(logs), "x") == 123
-    assert bm._kvtest_trace_bytes(str(logs), "y") == 456
 
 
 def test_kvtest_config_declares_key_prefixes():

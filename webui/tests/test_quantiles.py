@@ -176,31 +176,26 @@ def test_instance_ops_stats_streaming(tmp_path, fake_lib):
     assert op["p99_ms"] == 30.0                        # sketch 尾部
 
 
-def test_csv_consumes_controller_instances_block(tmp_path, fake_lib):
-    """controller 模式：CSV 实例行/TOTAL 与报表同源（instances 块 + 同一 policy）。"""
+def test_csv_consumes_reduced_instances_block(tmp_path, fake_lib):
+    """CSV 只读 reduced：实例行来自 instances 块，TOTAL 分位来自
+    role_summaries（下载 digest 合并后的同一口径）。"""
     logs = tmp_path / "logs"
     logs.mkdir()
-    # summary 的数值故意写错：实例行必须用 instances 块
-    base = bm._kvtest_artifact_base("kv_inst", 0, 9301, "8MB")
-    (logs / (base + ".summary.json")).write_text(json.dumps({
-        "instance_id": 0, "elapsed_seconds": 10.0, "verify_failures": 0,
-        "operations": {"upsert_from": {"total": 2, "success": 2,
-                                       "failure": 0, "bytes": 2048,
-                                       "avg_ms": -1, "p50_ms": -1}}}),
-        encoding="utf-8")
-    # controller reduce 产物：instances 块
     rep = logs / "report" / "8MB"
     rep.mkdir(parents=True)
+    pcts = {"p50_ms": 1.4, "p90_ms": 1.9, "p95_ms": 1.95,
+            "p99_ms": 2.0, "p999_ms": 2.0, "p9999_ms": 2.0}
     (rep / "reduced.json").write_text(json.dumps({
-        "sizes": {"8MB": {"role_summaries": {}}},
-        "instances": [{"iid": 0, "node": "n1", "pod": "p1", "ops": {
-            "upsert_from": {"total": 2, "success": 2, "failure": 0,
-                            "bytes": 2048, "avg_ms": 1.5, "min_ms": 1.0,
-                            "max_ms": 2.0,
-                            "hist": {str(ls.bin_of(1.0, ls.BIN_EDGES_V2)): 1,
-                                     str(ls.bin_of(2.0, ls.BIN_EDGES_V2)): 1},
-                            "p50_ms": 1.4, "p90_ms": 1.9, "p95_ms": 1.95,
-                            "p99_ms": 2.0, "p999_ms": 2.0, "p9999_ms": 2.0}}}]}),
+        "sizes": {"8MB": {"role_summaries": {"writer": dict(
+            pcts, avg_ms=1.5, min_ms=1.0, max_ms=2.0)}}},
+        "instances": [{"iid": 0, "node": "n1", "pod": "p1",
+                       "role": "writer", "op": "upsert_from",
+                       "elapsed_seconds": 10.0, "warmup_s": 0.0,
+                       "wall_s": 10.0, "verify_failures": None,
+                       "meta_bytes": 0, "total": 2, "success": 2,
+                       "failure": 0, "bytes": 2048, "avg_ms": 1.5,
+                       "min_ms": 1.0, "max_ms": 2.0, "pcts": pcts,
+                       "thresholds": {}, "notify": None, "queue": None}]}),
         encoding="utf-8")
     cfg = {"scenario": "kvtest", "work_mode": "rank", "protocol": "ub",
            "data_size": ["8MB"], "duration": 30, "batch_size": 1,
@@ -217,11 +212,8 @@ def test_csv_consumes_controller_instances_block(tmp_path, fake_lib):
     total = next(r for r in out if r["role"] == "writer"
                  and r["instance"] == "TOTAL")
     assert total["avg_ms"] == 1.5
-    # TOTAL 分位 = 实例行 hist 合并插值（与报表同一 policy/桶梯）
-    _h = {ls.bin_of(1.0, ls.BIN_EDGES_V2): 1,
-          ls.bin_of(2.0, ls.BIN_EDGES_V2): 1}
-    assert total["p50_ms"] == round(
-        ls.hist_percentile(_h, 0.50, ls.BIN_EDGES_V2), 4)
+    # TOTAL 分位 = role_summaries（finalize 后的合并值），不是实例行近似
+    assert total["p50_ms"] == 1.4 and total["p99_ms"] == 2.0
     assert total["max_ms"] == 2.0
 
 

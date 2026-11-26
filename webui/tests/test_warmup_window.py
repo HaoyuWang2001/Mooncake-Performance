@@ -65,40 +65,66 @@ def _write_summary(logs, base, iid, operations, elapsed=35.0):
                    "verify_failures": 2, "operations": operations}, f)
 
 
-def test_csv_excludes_warmup_rows_and_shrinks_instance_wall(tmp_path):
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    # warmup 区（0..5s）：2 条写、1 条 notify；正式区（>=5s）：2 OK + 1 ERR
-    # 写、2 条读、2 条 notify
-    rows = [
-        (1.0, "upsert_from", 40.0, "OK"),
-        (2.0, "upsert_from", 41.0, "OK"),
-        (1.0, "notify_http", 1.0, "OK"),
+def _map_and_finalize(tmp_path, role, rows, ops, elapsed=35.0, verify=0):
+    import importlib.util
+    logs = tmp_path / ("logs_" + role)
+    logs.mkdir(exist_ok=True)
+    base = _write_samples(logs, "warmup_csv", 0, 9301, rows)
+    _write_summary(logs, base, 0, ops, elapsed=elapsed)
+    inst_dir = logs / ("inst_" + role)
+    inst_dir.mkdir(exist_ok=True)
+    with open(str(inst_dir / "keep.log"), "w") as f:
+        f.write("x" * 64)
+    stats, csvstats = ls.kvtest_map_instance(
+        str(logs / (base + ".samples.csv")),
+        str(logs / (base + ".summary.json")), role,
+        node="10.0.0.1", pod="pod-a", size="8MB", start_epoch=1000.0,
+        warmup_s=5.0, digest_k=24, iid=0, instance_dir=str(inst_dir),
+        remote_path=str(logs / (base + ".stats.json.gz")))
+    for doc, name in ((stats, ".stats.json"), (csvstats, ".csvstats.json")):
+        with open(str(logs / (base + name)), "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+    mod_path = os.path.join(ROOT, "scripts", "kvtest_partial_reduce.py")
+    spec = importlib.util.spec_from_file_location(
+        "kvtest_partial_reduce", mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    out = str(logs / "report" / "8MB" / "partial.json.gz")
+    mod.run({"dir": str(logs), "out": out, "ds": "8MB",
+             "meta": {"config": "cfg", "mode": "pipeline",
+                      "engine": "kvtest"},
+             "instances": [{"iid": 0, "node": "10.0.0.1", "pod": "pod-a",
+                            "role": role, "size": "8MB",
+                            "stats": base + ".stats.json",
+                            "csvstats": base + ".csvstats.json",
+                            "trace": None}]})
+    return logs, out
+
+
+def test_csv_excludes_warmup_rows_and_shrinks_instance_wall(tmp_path,
+                                                            fake_sketch):
+    writer_rows = [
+        (1.0, "upsert_from", 40.0, "OK"),      # warmup
+        (2.0, "upsert_from", 41.0, "OK"),      # warmup
+        (1.0, "notify_http", 1.0, "OK"),       # warmup notify
         (10.0, "upsert_from", 1.0, "OK"),
         (20.0, "upsert_from", 2.0, "OK"),
         (12.0, "upsert_from", 3.0, "ERR"),
-        (11.0, "get_buffer", 0.5, "OK"),
-        (21.0, "get_buffer", 0.6, "OK"),
         (10.0, "notify_http", 1.0, "OK"),
         (20.0, "notify_http", 1.0, "OK"),
     ]
-    base = _write_samples(logs, "warmup_csv", 0, 9301, rows)
-    _write_summary(logs, base, 0, {
-        # summary 计数含 warmup（C++ 单窗口）——CSV 必须按样本重算
+    _logs, partial = _map_and_finalize(tmp_path, "writer", writer_rows, {
         "upsert_from": {"total": 5, "success": 4, "failure": 1,
                         "count": 5, "bytes": 4 * MB,
                         "avg_ms": 99.0, "max_ms": 999.0},
-        "get_buffer": {"total": 2, "success": 2, "failure": 0,
-                       "count": 2, "bytes": 2 * MB},
         "notify_http": {"total": 3, "success": 3, "failure": 0,
                         "count": 3, "bytes": 0},
     })
+    bm._kvtest_finalize_stage(str(tmp_path / "logs_writer"))
     cfg = _cfg()
-    cfg["_kvtest_iid_nodes"] = {"0": "10.0.0.1"}
-    cfg["_kvtest_start_epochs"] = {"8MB": 1000.0}
-    cfg_path = os.path.join(str(tmp_path), "warmup_csv.json")
     out = bm.write_scenario_csv(
-        str(logs), cfg, "ts", cfg_path, cluster=None,
+        str(tmp_path / "logs_writer"), cfg, "ts",
+        os.path.join(str(tmp_path), "warmup_csv.json"), cluster=None,
         mooncake_store_nodes=[], result_dir=str(tmp_path))
     w = next(r for r in out if r["role"] == "writer"
              and r["instance"] == "i0")
@@ -109,55 +135,28 @@ def test_csv_excludes_warmup_rows_and_shrinks_instance_wall(tmp_path):
     assert w["qps"] == round(2 / 30.0, 2)
     assert w["notify_submitted"] == 2          # warmup 的 notify 不计入
     assert w["notify_ok"] == 2
+
+
+def test_csv_reader_verify_from_summary_without_formal_split(tmp_path,
+                                                             fake_sketch):
+    _logs, _partial = _map_and_finalize(
+        tmp_path, "reader",
+        [(10.0, "get_buffer", 0.5, "OK"),
+         (21.0, "get_buffer", 0.6, "OK")],
+        {"get_buffer": {"total": 2, "success": 2, "failure": 0,
+                        "count": 2, "bytes": 2 * MB}},
+        verify=2)
+    bm._kvtest_finalize_stage(str(tmp_path / "logs_reader"))
+    cfg = _cfg()
+    out = bm.write_scenario_csv(
+        str(tmp_path / "logs_reader"), cfg, "ts",
+        os.path.join(str(tmp_path), "warmup_reader.json"), cluster=None,
+        mooncake_store_nodes=[], result_dir=str(tmp_path))
     r = next(r for r in out if r["role"] == "reader"
              and r["instance"] == "i0")
     assert r["total"] == 2 and r["success"] == 2
     assert r["wall_s"] == 30.0
     assert r["verify_failures"] == 2           # C++ 标量：无法按时段切
-
-
-def test_csv_uses_streaming_sample_stats_when_samples_present(tmp_path):
-    """样本存在即权威：正式统计从 samples 流式得到（不再以 summary 计数判
-    完整性——C++ summary 含 warmup 区，不能当基准）。"""
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    base = _write_samples(logs, "warmup_fb", 0, 9301,
-                          [(10.0, "upsert_from", 1.0, "OK")])
-    _write_summary(logs, base, 0, {
-        "upsert_from": {"total": 2, "success": 2, "failure": 0,
-                        "count": 2, "bytes": 2 * MB}})
-    cfg = _cfg()
-    cfg["_kvtest_iid_nodes"] = {"0": "10.0.0.1"}
-    cfg["_kvtest_start_epochs"] = {"8MB": 1000.0}
-    out = bm.write_scenario_csv(
-        str(logs), cfg, "ts",
-        os.path.join(str(tmp_path), "warmup_fb.json"), cluster=None,
-        mooncake_store_nodes=[], result_dir=str(tmp_path))
-    w = next(r for r in out if r["role"] == "writer"
-             and r["instance"] == "i0")
-    assert w["total"] == 1 and w["success"] == 1      # samples 权威
-
-
-def test_csv_falls_back_to_summary_without_samples(tmp_path):
-    """无 samples（旧产物/未拉回）才回退 summary。"""
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    base = _write_samples(logs, "warmup_ns", 0, 9301,
-                          [(10.0, "upsert_from", 1.0, "OK")])
-    os.remove(os.path.join(str(logs), base + ".samples.csv"))
-    _write_summary(logs, base, 0, {
-        "upsert_from": {"total": 2, "success": 2, "failure": 0,
-                        "count": 2, "bytes": 2 * MB}})
-    cfg = _cfg()
-    cfg["_kvtest_iid_nodes"] = {"0": "10.0.0.1"}
-    cfg["_kvtest_start_epochs"] = {"8MB": 1000.0}
-    out = bm.write_scenario_csv(
-        str(logs), cfg, "ts",
-        os.path.join(str(tmp_path), "warmup_ns.json"), cluster=None,
-        mooncake_store_nodes=[], result_dir=str(tmp_path))
-    w = next(r for r in out if r["role"] == "writer"
-             and r["instance"] == "i0")
-    assert w["total"] == 2 and w["success"] == 2
 
 
 # ---------------------------------------------------------------- Map 层
@@ -302,12 +301,7 @@ def test_report_charts_carry_warmup_boundary_line():
     assert "'warmup 结束'" in src
 
 
-def test_sidecar_and_meta_base_carry_warmup_s(tmp_path):
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    bm._kvtest_write_report_meta(str(logs), {}, {"warmup_s": 5.0})
-    side = bm._kvtest_read_report_meta(str(logs))
-    assert side["warmup_s"] == 5.0
+def test_meta_base_carries_warmup_s():
     cfg = {"_kvtest_warmup_duration": 5.0}
     meta = bm._kvtest_report_meta_base(
         cfg, __import__("types").SimpleNamespace(

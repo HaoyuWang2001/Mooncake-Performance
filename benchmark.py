@@ -14,6 +14,7 @@ import argparse
 import base64
 import csv
 import glob
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -375,9 +376,16 @@ def _kvtest_pod_dir(remote_log_dir, node):
     return remote_log_dir
 
 
-def _kvtest_pod_base(remote_log_dir, base, node):
-    """kvtest 单个实例的远端路径前缀（<pod_dir>/<base>，带 pod 子目录）。"""
-    return _pod_base("{}/{}".format(remote_log_dir.rstrip("/"), base), node)
+def _kvtest_instance_dir(remote_log_dir, node, role, iid, port):
+    """Per-process artifact directory: <pod_dir>/<role>_i<iid>_p<port>/.
+
+    Split mode co-locates a writer and a reader process in one pod; every
+    process keeps ALL of its artifacts (logs, glog segments, kvtest_out, map
+    products) in this directory so role footprints never mix (du/meta.bytes
+    and the map inputs are per process)."""
+    pod_dir = _kvtest_pod_dir(remote_log_dir, node).rstrip("/")
+    return "{}/{}_{}".format(pod_dir, role or "client",
+                             "i{}_p{}".format(iid, port))
 
 
 def _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s):
@@ -391,41 +399,6 @@ def _kvtest_report_context(cluster, ts, remote_log_dir, is_k8s):
         except Exception:
             pass
     return ctx
-
-
-def _kvtest_site_dirs(cluster, remote_log_dir, cfg):
-    """iid -> node-side per-pod log directory (the "ssh + cd" target).
-
-    Only k8s runs have a hostPath twin; ssh-mode/old layouts yield {} so the
-    report keeps its previous behaviour."""
-    pods = (cfg or {}).get("_kvtest_iid_pods") or {}
-    out = {}
-    for iid, pod in pods.items():
-        if not pod or not remote_log_dir:
-            continue
-        src = posixpath.join(remote_log_dir, pod)
-        site = _pod_path_to_site(cluster, src)
-        if site and site != src:
-            out[str(iid)] = site
-    return out
-
-
-def _kvtest_remote_names(groups):
-    """Locally pulled logical name -> actual node-side name.
-
-    kvtest gzips samples/trace in place on the pod, so the node keeps
-    <x>.samples.csv.gz while the pulled copy is gunzipped back to
-    <x>.samples.csv. The report must point at the file that actually exists
-    on the node."""
-    out = {}
-    for _n, files, _label in groups or []:
-        for f in files or []:
-            name = os.path.basename(f)
-            if name.endswith(".gz"):
-                out[name[:-len(".gz")]] = name
-            else:
-                out.setdefault(name, name)
-    return out
 
 
 def data_size_list(cfg):
@@ -1584,15 +1557,18 @@ _KVTEST_PID_MARKER = "run_kvtest.sh"
 def kvtest_plan(cfg, node_count=1):
     """Build the kvtest process plan on top of the pipeline topology.
 
-    A ``client`` block normally means one dual-role process per client.  The
-    kvtest-only ``client.process_mode=split`` variant keeps the same client
-    pod count but creates a writer and a reader process inside every pod.
+    A ``client`` block always means one writer + one reader PROCESS per client
+    pod (split).  The dual mode (one process doing both roles) is gone: the
+    artifact contract needs strictly separated per-process directories and
+    per-process digests, so mixing both roles in one process is unsupported.
+    ``client.process_mode`` is a removed knob — presence is only warned about.
+
     Without a ``client`` block, writer and reader processes remain separately
-    deployed as in pipeline mode.
+    deployed as in pipeline mode (separate).
 
     kvtest namespaces keys and notify senders by ``instance_id``, so every
-    actual process gets a cluster-global id.  Dual clients take 0..C-1;
-    separate/co-located-split writers take 0..W-1 and readers continue at W.
+    actual process gets a cluster-global id: writers take 0..W-1 and readers
+    continue at W.
     """
     plan = pipeline_plan(cfg, node_count=node_count)
     writer_cfg = cfg.get("writer", {}) or {}
@@ -1600,49 +1576,43 @@ def kvtest_plan(cfg, node_count=1):
     plan["writer_threads"] = max(1, int(writer_cfg.get("num_threads", 1) or 1))
     if plan.get("dual"):
         client_cfg = cfg.get("client", {}) or {}
-        process_mode = str(client_cfg.get("process_mode", "dual") or
-                           "dual").strip().lower()
-        if process_mode not in ("dual", "split"):
+        if "process_mode" in client_cfg:
+            log("[WARN] kvtest client.process_mode 已删除（固定 split，"
+                "同 pod 内 writer/reader 两个进程）；忽略配置值 {}"
+                .format(client_cfg.get("process_mode")))
+        writer_base = int(writer_cfg.get("port_base", 9101))
+        reader_base = int(reader_cfg.get("port_base", 9201))
+        if writer_base == reader_base:
             raise RuntimeError(
-                "kvtest client.process_mode must be dual or split (got {})"
-                "".format(process_mode))
-        plan["process_mode"] = process_mode
-        if process_mode == "dual":
-            for c in plan["clients"]:
-                c["iid"] = c["id"]
-        else:
-            writer_base = int(writer_cfg.get("port_base", 9101))
-            reader_base = int(reader_cfg.get("port_base", 9201))
-            if writer_base == reader_base:
-                raise RuntimeError(
-                    "kvtest split mode requires different writer.port_base "
-                    "and reader.port_base")
-            clients = plan["clients"]
-            writers = []
-            readers = []
-            for index, client in enumerate(clients):
-                writer = dict(client)
-                writer.update({
-                    "iid": index,
-                    "pair_index": index,
-                    "port": writer_base + client["local"],
-                })
-                reader = dict(client)
-                reader.update({
-                    "iid": len(clients) + index,
-                    "pair_index": index,
-                    "port": reader_base + client["local"],
-                })
-                writers.append(writer)
-                readers.append(reader)
-            plan.update({
-                "dual": False,
-                "split_pod": True,
-                "writers": writers,
-                "readers": readers,
-                "writer_port_base": writer_base,
-                "reader_port_base": reader_base,
+                "kvtest split requires different writer.port_base "
+                "and reader.port_base")
+        clients = plan["clients"]
+        writers = []
+        readers = []
+        for index, client in enumerate(clients):
+            writer = dict(client)
+            writer.update({
+                "iid": index,
+                "pair_index": index,
+                "port": writer_base + client["local"],
             })
+            reader = dict(client)
+            reader.update({
+                "iid": len(clients) + index,
+                "pair_index": index,
+                "port": reader_base + client["local"],
+            })
+            writers.append(writer)
+            readers.append(reader)
+        plan.update({
+            "dual": False,
+            "split_pod": True,
+            "process_mode": "split",
+            "writers": writers,
+            "readers": readers,
+            "writer_port_base": writer_base,
+            "reader_port_base": reader_base,
+        })
     else:
         plan["process_mode"] = "separate"
         base = len(plan["writers"])
@@ -2629,6 +2599,7 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                  ("mooncake_benchmark_client.py", SCRIPTS_DIR),
                  ("bench_etcd.py", SCRIPTS_DIR),
                  ("logstats.py", SCRIPTS_DIR),
+                 ("quantiles.py", SCRIPTS_DIR),
                  ("tracestats.py", SCRIPTS_DIR),
                  ("remove_service.py", SCRIPTS_DIR),
                  ("env.sh", None)]
@@ -2705,6 +2676,7 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                       os.path.join(SCRIPTS_DIR, "mooncake_benchmark_client.py"),
                       os.path.join(SCRIPTS_DIR, "bench_etcd.py"),
                       os.path.join(SCRIPTS_DIR, "logstats.py"),
+                      os.path.join(SCRIPTS_DIR, "quantiles.py"),
                       os.path.join(SCRIPTS_DIR, "tracestats.py")]
         if os.path.exists(mooncake_env_path):
             push_files.append(mooncake_env_path)
@@ -3026,7 +2998,7 @@ def run_tracestats_map(cluster, node, glog_paths, remote_scripts, globals_cfg,
 
 
 def _resolve_glog_inputs(cluster, node_entry, glog_dir, legacy_file,
-                         dry=False):
+                         dry=False, allow_legacy=True):
     """Resolve one process's glog inputs for the trace map.
 
     MC_LOG_DIR splits glog into <prog>.<host>.<user>.log.INFO.<date>-<time>.
@@ -3040,9 +3012,10 @@ def _resolve_glog_inputs(cluster, node_entry, glog_dir, legacy_file,
     otherwise); ([], "") means this process produced no glog."""
     if dry:
         return [legacy_file], _pod_path_to_site(cluster, legacy_file)
+    _fallback = ("if [ -z \"$F\" ] && [ -f {f} ]; then F={f}; fi; "
+                 if allow_legacy else "")
     cmd = ("F=$(find {d} -maxdepth 1 -type f -name '*.INFO.*' 2>/dev/null "
-           "| sort); if [ -z \"$F\" ] && [ -f {f} ]; then F={f}; fi; "
-           "printf '%s\\n' \"$F\"").format(
+           "| sort); " + _fallback + "printf '%s\\n' \"$F\"").format(
                d=shlex.quote(glog_dir), f=shlex.quote(legacy_file))
     try:
         out = ssh_check_output(node_entry["ip"], node_entry, cmd, quiet=True)
@@ -3052,6 +3025,8 @@ def _resolve_glog_inputs(cluster, node_entry, glog_dir, legacy_file,
     if not files:
         return [], ""
     if files[0] == legacy_file:
+        if not allow_legacy:
+            return [], ""
         return files, _pod_path_to_site(cluster, legacy_file)
     return files, _pod_path_to_site(cluster, glog_dir)
 
@@ -3280,7 +3255,7 @@ def _is_client_log(name):
         return False
     if ".kvtest_" in name:
         # C++ kvtest instance logs carry no RESULT rows; the map for that
-        # scenario is built from <...>.samples.csv (see _kvtest_map_stats)
+        # scenario is built from the two-stage reduced products
         return False
     return True
 
@@ -3533,14 +3508,6 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
     cfg_name = os.path.splitext(os.path.basename(
         cfg.get("__cfg_path__") or "scenario"))[0]
     echarts = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
-    # 节点侧现场日志实测大小（配置收尾 du 快照；缺失则报表回退旧口径）
-    site_sizes = None
-    try:
-        with open(os.path.join(local_log_dir, "report", "site_sizes.json"),
-                  "r", encoding="utf-8") as f:
-            site_sizes = json.load(f) or None
-    except (OSError, ValueError):
-        site_sizes = None
     units = _unit_groups(stats, mode)
     traces_by_unit = {}
     for tp in traces_all:
@@ -3579,20 +3546,12 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
             "unit_clients": u["c"],
             "unit_threads": u["t"],
         }
-        # kvtest 现场索引：host 日志根目录 / run_id / namespace（来自侧车）
-        if engine == "kvtest":
-            _side = _kvtest_read_report_meta(local_log_dir)
-            for _k in ("run_id", "remote_log_dir", "host_log_root",
-                       "k8s_namespace", "warmup_s"):
-                if _side.get(_k) is not None:
-                    meta[_k] = _side[_k]
         meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
         data = rp.reduce_scenario(
             loaded, meta,
             monitors=rp.reduce_monitors(local_log_dir, t0=t0, t1=t1),
             traces=rp.load(traces_by_unit.get(key, [])),
-            monitor_sites=rp.reduce_monitor_sites(local_log_dir),
-            site_sizes=site_sizes)
+            monitor_sites=rp.reduce_monitor_sites(local_log_dir))
         out_dir = os.path.join(local_log_dir, "report", u["name"])
         html, _datajs = rp.render_scenario(
             data, out_dir, echarts,
@@ -5169,9 +5128,6 @@ def run_basic_scenario(cluster, globals_cfg, cfg, ts, args):
         if profile_sess is not None:
             _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
                             dry=dry)
-        # 现场日志实测大小（pod/profile 产物已全部落盘、pod 仍存活）
-        _site_du_snapshot(cluster, ts, cfg_name, involved_nodes,
-                          local_result_dir, remote_log_dir, dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -5839,107 +5795,6 @@ def _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
 
 
 _SITE_DU_TIMEOUT_S = 120
-
-
-def _site_du_snapshot(cluster, ts, cfg_name, involved_nodes, local_result_dir,
-                      remote_log_dir, dry=False):
-    """配置收尾时在节点侧实测现场日志目录大小（du -sb，apparent bytes）。
-
-    时机：成功路径、profiling 落盘之后、pod 销毁之前（失败/STOP 不调用）。
-    k8s 经 kubectl exec 进该宿主任一存活 client pod（pod 内路径 = 挂载视图），
-    ssh 直接远端执行；输出路径统一换算为节点侧真实路径。
-    结果写入 logs/<cfg>/report/site_sizes.json（report/ 内：成功清理保留、
-    --rebuild-report 可复用）。WARN-only：du 不可用时静默回退旧口径。"""
-    if dry:
-        return None
-    is_k8s = cluster.get("_controller") is not None
-    k8s = {}
-    host_root = ""
-    if is_k8s:
-        try:
-            k8s = k8s_settings(cluster)
-            host_root = (k8s.get("host_log_root") or "").rstrip("/")
-            pod_ws = (k8s.get("pod_workspace") or "").rstrip("/")
-        except Exception:
-            return None
-        if not host_root or not pod_ws:
-            return None
-        root_view = pod_ws + "/logs/" + ts
-    else:
-        root_view = str(remote_log_dir or "").rstrip("/")
-        if not root_view:
-            return None
-    root_site = (_pod_path_to_site(cluster, root_view) if is_k8s
-                 else root_view).rstrip("/")
-    cmd = "du -sb {root} {root}/* {root}/profiling/* 2>/dev/null".format(
-        root=root_view)
-    # 每宿主一次：k8s 挑一个存活 client pod；ssh 直接 ssh 节点
-    targets = {}
-    for node_name in sorted(involved_nodes or []):
-        try:
-            n = get_node(cluster, node_name)
-        except Exception:
-            continue
-        try:
-            disp = _node_display(cluster, n, node_name) or node_name
-        except Exception:
-            disp = node_name
-        if is_k8s:
-            host = n.get("host_ip") or ""
-            pod = n.get("_pod") or ""
-            if not host or not pod or host in targets:
-                continue
-            targets[host] = (disp, n, pod)
-        else:
-            targets[disp] = (disp, n, "")
-    nodes = {}
-    for _key, (disp, n, pod) in sorted(targets.items()):
-        try:
-            if is_k8s:
-                ns = k8s.get("namespace") or ""
-                out, rc = controller_run(
-                    cluster["_controller"],
-                    ["-n", ns, "exec", pod, "--", "sh", "-c", cmd],
-                    check=False, timeout=_SITE_DU_TIMEOUT_S)
-                if rc != 0:
-                    raise RuntimeError("kubectl exec rc={}".format(rc))
-            else:
-                out = ssh_check_output(n["ip"], n, cmd, quiet=True)
-        except Exception as exc:
-            log("[WARN] [site] du failed on {}: {}".format(disp, exc))
-            continue
-        dirs = {}
-        total = 0
-        for line in str(out or "").splitlines():
-            raw = line.split("\t", 1)
-            if len(raw) != 2 or not raw[0].strip().isdigit():
-                continue
-            size = int(raw[0].strip())
-            path = raw[1].strip().rstrip("/")
-            if not path:
-                continue
-            site_path = _pod_path_to_site(cluster, path) if is_k8s else path
-            dirs[site_path] = size
-            if site_path == root_site:
-                total = size
-        if not dirs:
-            log("[WARN] [site] du produced no data on {} (du missing?)"
-                .format(disp))
-            continue
-        nodes[disp] = {"total": total, "root": root_site, "dirs": dirs}
-    if not nodes:
-        return None
-    out_dir = os.path.join(local_result_dir, "logs", cfg_name, "report")
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, "site_sizes.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump({"nodes": nodes}, f, ensure_ascii=False,
-                      separators=(",", ":"))
-    except OSError as exc:
-        log("[WARN] [site] write site_sizes.json failed: {}".format(exc))
-        return None
-    return {"nodes": nodes}
 
 
 def _pipeline_reader_launch_cmd(launch_prefix, remote_runner, merged_log,
@@ -6800,9 +6655,6 @@ def run_pipeline_scenario(cluster, globals_cfg, cfg, ts, args):
         if profile_sess is not None:
             _stop_profiling(cluster, profile_sess, local_result_dir, cfg_name,
                             dry=dry)
-        # 现场日志实测大小（pod/profile 产物已全部落盘、pod 仍存活）
-        _site_du_snapshot(cluster, ts, cfg_name, involved_nodes,
-                          local_result_dir, remote_log_dir, dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod (store keys are not in the
         # pod workspace); cleanup_pods runs in main() after sweep-end
@@ -7024,7 +6876,9 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "enable_jitter": bool(kv.get("enable_jitter", True)),
         "start_paused": True,
         "data_sizes": [ds_label],
-        "metrics_interval_ms": int(kv.get("metrics_interval_ms", 3000) or 3000),
+        # metrics_<iid>.csv 已废弃（MP 不消费；窗口统计与 seconds 桶重复）：
+        # 固定 0 = C++ 不写窗口文件、不起 flush 线程。显式配置仅 WARN。
+        "metrics_interval_ms": 0,
         "output_dir": entry["_out_dir"],
         "cpu_affinity": entry.get("_cpu_affinity", ""),
         "verify_level": kv.get("verify_level", "size"),
@@ -7233,16 +7087,80 @@ def _controller_cp_groups(cluster, groups, cdir, workers=None):
         return list(pool.map(_one, groups))
 
 
+def _kvtest_pod_map(cluster, entry, remote_scripts, globals_cfg,
+                    start_epoch=None, warmup_s=None, digest_k=None):
+    """Run the pod-side SINGLE-PASS map for one kvtest process.
+
+    Reads latency_samples.csv once and writes BOTH products (role stats +
+    csvstats) into the process directory, reading summary.json in place.
+    meta.bytes = apparent size of the process dir captured before writing.
+    STRICT: any failure (or a missing product) raises — the old controller
+    map / local sample pull does not exist any more."""
+    n = get_node(cluster, entry["node"])
+    pbase = entry["_log_base"]
+    iid = int(entry["iid"])
+    role = str(entry.get("_role") or "")
+    ds = str(entry.get("_ds") or "")
+    inst_dir = entry["_inst_dir"]
+    samples = entry["_out_dir"] + "/latency_samples.csv"
+    summary = entry["_out_dir"] + "/summary.json"
+    out_stats = pbase + ".stats.json"
+    out_csv = pbase + ".csvstats.json"
+    remote_path = pbase + ".stats.json.gz"
+    script = posixpath.join(remote_scripts, "logstats.py")
+    # k8s: the pod image carries python3 (datasketches installed there).
+    # ssh: the same venv the python-engine map uses (datasketches installed
+    # in it); fall back to python3 when no venv is configured.
+    py = "python3"
+    if not (n.get("_pod") or n.get("kind") == "k8s-pod"):
+        try:
+            py = resolve_venv(cluster, globals_cfg) or "python3"
+        except Exception:
+            py = "python3"
+    cmd = ("{py} {sc} --kvtest-map-instance --kvtest-samples {sa} "
+           "--summary {su} --role {role} --size {ds} --iid {iid} "
+           "--instance-dir {d} --start-epoch {start} "
+           "--out-stats {os} --out-csvstats {oc} "
+           "--node {node} --pod {pod} --remote-path {rp}").format(
+               py=shlex.quote(py), sc=shlex.quote(script),
+               sa=shlex.quote(samples),
+               su=shlex.quote(summary), role=shlex.quote(role),
+               ds=shlex.quote(ds), iid=iid, d=shlex.quote(inst_dir),
+               start=float(start_epoch or 0), os=shlex.quote(out_stats),
+               oc=shlex.quote(out_csv),
+               node=shlex.quote(_node_display(cluster, n, entry["node"])),
+               pod=shlex.quote((n or {}).get("_pod") or ""),
+               rp=shlex.quote(remote_path))
+    if warmup_s:
+        cmd += " --warmup-s {}".format(float(warmup_s))
+    if digest_k:
+        cmd += " --digest-k {}".format(int(digest_k))
+    out = ssh_check_output(n["ip"], n, cmd, quiet=True)
+    log_detail("[map] pod {} i{} {}".format(role, iid, (out or "").strip()))
+    check = ssh_check_output(
+        n["ip"], n,
+        "test -s {a} && test -s {b} && echo OK".format(
+            a=shlex.quote(out_stats), b=shlex.quote(out_csv)),
+        quiet=True)
+    if "OK" not in (check or ""):
+        raise RuntimeError(
+            "kvtest i{}: pod map products missing ({} / {})".format(
+                iid, out_stats, out_csv))
+    return [out_stats, out_csv]
+
+
 def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
                                 cfg_name, ds, instance_pids, groups,
-                                local_log_dir, extra_bytes,
-                                qps_target=0, nodes=0,
-                                remote_log_dir=None, is_k8s=True,
-                                digest_k=None):
-    """Controller-side kvtest data plane: cp artifacts pod->controller,
-    run the staged map+reduce driver there, pull back only the compact
-    reduced/meta/summary products. Raises on any failure so the caller can
-    fall back to the local path (pods still hold everything)."""
+                                local_log_dir, qps_target=0, nodes=0,
+                                remote_log_dir=None, is_k8s=True):
+    """Controller-side kvtest PARTIAL reduce.
+
+    The pods already ran the map (stats + csvstats, with REQ digests); this
+    copies the products pod->controller ONCE, runs the stdlib-only partial
+    reducer there (no datasketches, no logsite, no monitor injection) and
+    pulls back one compact partial.json.gz. The orchestrator merges the
+    digests, injects monitors and builds the logsite. Raises on any failure
+    (the collection contract is strict; there is no local fallback)."""
     c = cluster["_controller"]
     ws = k8s_settings(cluster).get("controller_workspace") or "/tmp"
     cdir = posixpath.join(ws, "data", "{}__{}__{}".format(ts, cfg_name, ds))
@@ -7251,106 +7169,120 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
     _controller_cp_groups(cluster, groups, cdir)
     scripts_dst = posixpath.join(cdir, "scripts")
     stage = [os.path.join(SCRIPTS_DIR, n) for n in
-             ("logstats.py", "report.py", "kvtest_controller_job.py")]
+             ("logstats.py", "report.py", "kvtest_partial_reduce.py")]
     controller_put(c, stage, scripts_dst)
-    out, rc = controller_exec(
-        c, "python3 -c 'import json,csv,heapq,gzip,argparse'")
-    if rc != 0:
-        raise RuntimeError("controller python3 probe failed: {}".format(
-            (out or "")[:200]))
-    # which pod files actually exist (R1 gzip decides the samples/trace
-    # transfer form) — one scan of the group manifests
     names = set()
     for _n, files, _l in groups:
         for f in files:
             names.add(os.path.basename(f))
-    iid_nodes = cfg.get("_kvtest_iid_nodes") or {}
-    iid_pods = cfg.get("_kvtest_iid_pods") or {}
-    start_epochs = cfg.get("_kvtest_start_epochs") or {}
     instances = []
     for entry, _pid in instance_pids:
         base = entry["_base"]
-        if (base + ".samples.csv.gz") in names:
-            samples = base + ".samples.csv.gz"
-        elif (base + ".samples.csv") in names:
-            samples = base + ".samples.csv"
-        else:
-            raise RuntimeError(
-                "kvtest i{}: no samples artifact for the controller job"
-                "".format(entry["iid"]))
-        trace = None
-        for cand in (base + ".trace.json", base + ".trace.json.gz",
-                     base + ".log.glog.trace.json",
-                     base + ".log.glog.trace.json.gz"):
-            if cand in names:
-                trace = cand
-                break
-        pod = iid_pods.get(str(entry["iid"]), "")
-        site_dir = (_pod_path_to_site(
-            cluster, posixpath.join(remote_log_dir, pod))
-            if (remote_log_dir and pod) else "")
-        _warm = float((cfg or {}).get("_kvtest_warmup_duration") or 0)
-        _start = start_epochs.get(str(ds))
-        instances.append({
-            "iid": entry["iid"],
-            "samples": samples,
-            "summary": base + ".summary.json",
-            "trace": trace,
-            "site_dir": site_dir,
-            "node": iid_nodes.get(str(entry["iid"]),
-                                  "i{}".format(entry["iid"])),
-            "pod": pod,
-            "ds": ds,
-            "start_epoch": _start,
-            # warmup ends this many seconds after the /start anchor; rows
-            # before it are chart-only (excluded from the formal statistics)
-            "warmup_until": ((float(_start) + _warm)
-                             if (_start is not None and _warm > 0) else None),
-            "extra_bytes": int(extra_bytes.get(base) or 0),
-            "writer_ops": sorted(KVTEST_WRITE_OPS),
-            "reader_ops": sorted(KVTEST_READ_OPS),
-        })
+        need = (base + ".stats.json.gz", base + ".csvstats.json.gz",
+                base + ".trace.json.gz")
+        for cand in need:
+            if cand not in names:
+                raise RuntimeError(
+                    "kvtest i{}: missing pod product {} (node keeps "
+                    "everything; rerun the collection)".format(
+                        entry["iid"], cand))
+        instances.append({"iid": int(entry["iid"]),
+                          "node": (cfg.get("_kvtest_iid_nodes") or {}).get(
+                              str(entry["iid"]), entry["node"]),
+                          "pod": (cfg.get("_kvtest_iid_pods") or {}).get(
+                              str(entry["iid"]), ""),
+                          "role": entry.get("_role") or "",
+                          "size": ds,
+                          "stats": need[0], "csvstats": need[1],
+                          "trace": need[2]})
     job = {"dir": cdir,
-           "out_dir": posixpath.join(cdir, "reduced"),
-           "digest_k": digest_k,
-           "meta_base": _kvtest_report_meta_base(
-               cfg, args, cfg_name, ds,
-               qps_target=qps_target, nodes=nodes,
+           "out": posixpath.join(cdir, ds + ".partial.json.gz"),
+           "ds": ds,
+           "meta": _kvtest_report_meta_base(
+               cfg, args, cfg_name, ds, qps_target=qps_target, nodes=nodes,
                context=_kvtest_report_context(
                    cluster, ts, remote_log_dir or "", is_k8s)),
            "instances": instances}
-    job_local = os.path.join(local_log_dir, "controller_job.json")
+    job_local = os.path.join(local_log_dir, "kvtest_partial_job.json")
     with open(job_local, "w", encoding="utf-8") as f:
         json.dump(job, f, ensure_ascii=False, indent=1)
     controller_put(c, [job_local], cdir)
     os.remove(job_local)
-    job_remote = posixpath.join(cdir, "controller_job.json")
+    job_remote = posixpath.join(cdir, "kvtest_partial_job.json")
     out, rc = controller_exec(
         c, "python3 {} --job {}".format(
             shlex.quote(posixpath.join(scripts_dst,
-                                        "kvtest_controller_job.py")),
+                                        "kvtest_partial_reduce.py")),
             shlex.quote(job_remote)))
-    log_detail("[kvtest] controller job: {}".format((out or "")[-800:]))
+    log_detail("[kvtest] controller partial: {}".format((out or "")[-800:]))
     if rc != 0:
-        raise RuntimeError("controller map+reduce job failed (rc={}): {}"
-                           "".format(rc, (out or "")[-200:]))
-    for _n, files, _l in groups:
-        for f in files:
-            if f.endswith(".summary.json"):
-                controller_get_file(
-                    c, posixpath.join(cdir, os.path.basename(f)),
-                    local_log_dir)
-    for name in ("{}.reduced.json".format(ds), "{}.meta.json".format(ds)):
-        controller_get_file(
-            c, posixpath.join(cdir, "reduced", name), red_dir)
-    # reduced.json is the durable re-renderable artifact of this unit
-    os.replace(os.path.join(red_dir, "{}.reduced.json".format(ds)),
-               os.path.join(red_dir, "reduced.json"))
-    os.replace(os.path.join(red_dir, "{}.meta.json".format(ds)),
-               os.path.join(red_dir, "meta.json"))
+        raise RuntimeError("controller partial reduce failed (rc={}): {}"
+                           .format(rc, (out or "")[-400:]))
+    controller_get_file(c, posixpath.join(cdir, ds + ".partial.json.gz"),
+                        red_dir)
+    got = os.path.join(red_dir, ds + ".partial.json.gz")
+    os.replace(got, os.path.join(red_dir, "partial.json.gz"))
     if not _controller_keep_data(globals_cfg):
         controller_exec(c, "rm -rf {}".format(shlex.quote(cdir)))
     return cdir
+
+
+def _kvtest_local_partial_reduce(cluster, cfg, args, ts, cfg_name, ds,
+                                  local_log_dir, instance_pids, groups,
+                                  plan, is_k8s, remote_log_dir):
+    """ssh/local data plane: run the SAME partial reducer against the pulled
+    .gz products, writing report/<ds>/partial.json.gz. The pulled products
+    are intermediates and are removed afterwards (samples/summary only when
+    the operator explicitly pulled raw)."""
+    import importlib.util
+    path = os.path.join(SCRIPTS_DIR, "kvtest_partial_reduce.py")
+    spec = importlib.util.spec_from_file_location(
+        "kvtest_partial_reduce", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    red_dir = os.path.join(local_log_dir, "report", ds)
+    os.makedirs(red_dir, exist_ok=True)
+    names = set()
+    for _n, files, _l in groups:
+        for f in files:
+            names.add(os.path.basename(f))
+    instances = []
+    for entry, _pid in instance_pids:
+        base = entry["_base"]
+        need = [base + ".stats.json.gz", base + ".csvstats.json.gz",
+                base + ".trace.json.gz"]
+        for cand in need:
+            if cand not in names:
+                raise RuntimeError(
+                    "kvtest i{}: missing pulled product {} (node keeps "
+                    "everything)".format(entry["iid"], cand))
+        instances.append({"iid": int(entry["iid"]),
+                          "node": (cfg.get("_kvtest_iid_nodes") or {}).get(
+                              str(entry["iid"]), entry["node"]),
+                          "pod": (cfg.get("_kvtest_iid_pods") or {}).get(
+                              str(entry["iid"]), ""),
+                          "role": entry.get("_role") or "",
+                          "size": ds,
+                          "stats": need[0], "csvstats": need[1],
+                          "trace": need[2]})
+    job = {"dir": local_log_dir,
+           "out": os.path.join(red_dir, "partial.json.gz"),
+           "ds": ds,
+           "meta": _kvtest_report_meta_base(
+               cfg, args, cfg_name, ds,
+               qps_target=plan.get("total_qps") or 0,
+               nodes=int(cfg.get("_kvtest_nodes") or 0),
+               context=_kvtest_report_context(
+                   cluster, ts, remote_log_dir or "", is_k8s)),
+           "instances": instances}
+    mod.run(job)
+    for name in names:
+        if name.endswith((".stats.json.gz", ".csvstats.json.gz",
+                          ".trace.json.gz")):
+            try:
+                os.remove(os.path.join(local_log_dir, name))
+            except OSError:
+                pass
 
 
 def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
@@ -7359,10 +7291,9 @@ def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
     'started', which only the data itself knows).
 
     ``context`` carries the 现场索引 (run_id / host_log_root /
-    remote_log_dir / k8s_namespace) so the report produced from the
-    controller's reduced.json can point at the on-node log directories —
-    the same four fields the orchestrator-local path merges from the
-    sidecar."""
+    remote_log_dir / k8s_namespace) so both the controller partial and the
+    orchestrator finalize can point at the on-node per-process directories
+    (the sidecar no longer exists)."""
     meta = {
         "config": cfg_name, "mode": "pipeline", "scenario": "pipeline",
         "engine": "kvtest", "launch_mode": "single",
@@ -7384,58 +7315,21 @@ def _kvtest_report_meta_base(cfg, args, cfg_name, ds,
     return meta
 
 
-def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
-                              retry_s=0):
-    """Copy one instance's nested artifacts into the pullable log root.
-
-    Return ``(ok, status)``. ``summary.json`` feeds CSV aggregation and the
-    request samples feed the Python-compatible point-line plot. The obsolete
-    windowed timeseries is deliberately not copied.
-    """
-    n = get_node(cluster, entry["node"])
-    base = entry["_base"]
-    # 收编到该 pod 自己的日志目录（<pod_dir>/<base>.*），现场即一目录全量
-    tgt = _kvtest_pod_base(remote_log_dir, base, n)
-    pod_dir = _kvtest_pod_dir(remote_log_dir, n)
-    command = (
-        "mkdir -p '{d}'; summary=OK; samples=MISSING; "
-        "cp '{o}/summary.json' '{t}.summary.json' 2>/dev/null || "
-        "summary=MISSING; "
-        "cp '{o}/latency_samples.csv' '{t}.samples.csv' 2>/dev/null "
-        "&& samples=OK; "
-        "printf 'summary=%s samples=%s' \"$summary\" \"$samples\""
-    ).format(o=entry["_out_dir"], d=pod_dir, t=tgt)
-    last = "not attempted"
-    for attempt in range(max(1, int(attempts))):
-        try:
-            last = ssh_check_output(n["ip"], n, command, quiet=True).strip()
-        except Exception as exc:
-            last = "copy command failed: {}".format(exc)
-        # samples=MISSING is accepted for compatibility with older binaries;
-        # new binaries expose one-request-per-row latency_samples.csv.
-        if last.startswith("summary=OK samples="):
-            return True, last
-        if attempt + 1 < attempts and retry_s:
-            time.sleep(retry_s)
-    return False, last
-
-
 def _kvtest_gzip_remote_files(cluster, node_name, files):
-    """gzip files in place on the pod (samples.csv / trace.json compress
-    ~8-12x, cutting the pod->controller transfer). Returns the .gz paths on
-    success; on ANY failure returns the original paths so the pull keeps
-    working uncompressed (transparent fallback, never a hard error)."""
+    """gzip files in place on the pod (stats/csvstats/trace compress well).
+
+    STRICT: any gzip failure is an error — the transport contract is the
+    .gz product, there is no uncompressed fallback."""
     if not files:
         return []
     n = get_node(cluster, node_name)
     script = "; ".join("gzip -f {}".format(shlex.quote(f)) for f in files)
     try:
         ssh_check_output(n["ip"], n, script, quiet=True)
-        return [f + ".gz" for f in files]
     except Exception as exc:
-        log_detail("[kvtest] in-pod gzip skipped ({}): {}".format(
+        raise RuntimeError("kvtest in-pod gzip failed for {}: {}".format(
             os.path.basename(files[0]), exc))
-        return list(files)
+    return [f + ".gz" for f in files]
 
 
 def _gunzip_local_dir(local_dir):
@@ -7465,15 +7359,16 @@ def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
     （k8s=宿主节点 IP），报表的节点归属是 IP 而不是 pod 名。返回可回传的
     trace 路径列表（失败为空）。"""
     n = get_node(cluster, entry["node"])
-    pbase = _kvtest_pod_base(remote_log_dir, entry["_base"], n)
+    pbase = entry["_log_base"]
     role = entry.get("_role")
     if role in ("dual", "", None):
         role = None
     try:
         files, site = _resolve_glog_inputs(
-            cluster, n, pbase + ".glog.d", pbase + ".log.glog")
+            cluster, n, pbase + ".glog.d", pbase + ".log.glog",
+            allow_legacy=False)
         if not files:
-            return []
+            raise RuntimeError("no .glog.d/*.INFO.* segments for " + pbase)
         return run_tracestats_map(
             cluster, n, files, remote_scripts, globals_cfg,
             node_name=entry["node"], role=role, size=entry.get("_ds"),
@@ -7487,36 +7382,6 @@ def _kvtest_remote_trace_map(cluster, entry, remote_log_dir, remote_scripts,
         log_detail("[report] kvtest remote trace failed for i{}: {}".format(
             entry.get("iid"), exc))
         return []
-
-
-def _kvtest_small_log_bytes(cluster, entry, remote_log_dir):
-    """该实例 .log/.ylt.log/.nohup 的远端字节数（glog 走 trace meta.bytes）。
-
-    只 stat 不传内容；失败按 0 处理（这几个文件通常为空/极小）。"""
-    n = get_node(cluster, entry["node"])
-    pbase = _kvtest_pod_base(remote_log_dir, entry["_base"], n)
-    cmd = ("stat -c %s '{a}.log' '{a}.ylt.log' '{a}.nohup' 2>/dev/null "
-           "| awk '{{s+=$1}} END{{print s+0}}'").format(a=pbase)
-    try:
-        out = ssh_check_output(n["ip"], n, cmd, quiet=True)
-        return int((out or "").strip() or 0)
-    except Exception:
-        return 0
-
-
-def _kvtest_trace_bytes(local_log_dir, base):
-    """本地 trace 产物里的 glog 真实字节数（trace meta.bytes）。
-
-    New products are <base>.trace.json (glog lives in MC_LOG_DIR segments);
-    pre-rename runs carry <base>.log.glog.trace.json — both are accepted."""
-    for name in (base + ".trace.json", base + ".log.glog.trace.json"):
-        try:
-            with open(os.path.join(local_log_dir, name), "r",
-                      encoding="utf-8") as f:
-                return int((json.load(f).get("meta") or {}).get("bytes") or 0)
-        except (OSError, ValueError):
-            continue
-    return 0
 
 
 KEEP_INTERMEDIATE_DIRS = ("report", "profiling")
@@ -7721,296 +7586,111 @@ _KVTEST_SAMPLES_RE = re.compile(
     r"\.samples\.csv$")
 
 
-KVTEST_REPORT_META = "kvtest_report_meta.json"
+def _kvtest_finalize_stage(local_log_dir, early_stop=False):
+    """Orchestrator finalize: partial.json.gz -> reduced.json.
 
-
-def _kvtest_write_report_meta(local_log_dir, cfg, context=None):
-    """Persist the run context the report and --rebuild-report need.
-
-    Artifact filenames are deliberately compact (no node/pod names) and the
-    /start epoch only lives in the orchestrator's memory, so a failed run
-    would otherwise lose node attribution and the sample timeline.
-    ``context`` carries the 现场索引 data（run_id / remote_log_dir /
-    host_log_root / k8s_namespace）so the report can point at the on-node
-    log directories without pulling them."""
-    payload = {
-        "format": "kvtest_report_meta",
-        "nodes": cfg.get("_kvtest_nodes"),
-        "iid_nodes": cfg.get("_kvtest_iid_nodes") or {},
-        "iid_pods": cfg.get("_kvtest_iid_pods") or {},
-        "start_epochs": cfg.get("_kvtest_start_epochs") or {},
-        "writer_operation": _kvtest_writer_operation(cfg),
-        "reader_operation": _kvtest_reader_operation(cfg),
-    }
-    if context:
-        payload.update({k: v for k, v in context.items() if v})
-    path = os.path.join(local_log_dir, KVTEST_REPORT_META)
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
-    except OSError as exc:
-        log_detail("[report] kvtest report meta write failed: {}".format(exc))
-
-
-def _kvtest_read_report_meta(local_log_dir):
-    """The sidecar written by _kvtest_write_report_meta ({} when absent)."""
-    try:
-        with open(os.path.join(local_log_dir, KVTEST_REPORT_META),
-                  "r", encoding="utf-8") as f:
-            doc = json.load(f) or {}
-        return doc if isinstance(doc, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _kvtest_summary_doc(path):
-    """Parse one instance summary.json (None when missing/corrupt)."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-        return doc if isinstance(doc, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
-def _kvtest_apply_summary_metrics(stats, summary_doc):
-    """Surface C++ aggregates the request samples cannot carry.
-
-    The binary reports reader value-verification failures and the notify
-    queue wait only in summary.json; without this the HTML report cannot show
-    the two correctness/backlog signals at all (the CSV already has them)."""
-    if not summary_doc:
-        return
-    try:
-        verify = int(summary_doc.get("verify_failures") or 0)
-    except (TypeError, ValueError):
-        verify = 0
-    if verify:
-        stats["global"]["verify_failures"] = verify
-    qw = (summary_doc.get("operations") or {}).get("notify_queue_wait") or {}
-    try:
-        avg = float(qw.get("avg_ms") or 0.0)
-        mx = float(qw.get("max_ms") or 0.0)
-        n = int(qw.get("total") or qw.get("count") or 0)
-    except (TypeError, ValueError):
-        return
-    if n > 0 and (avg > 0 or mx > 0):
-        stats["global"]["qw_avg_ms"] = round(avg, 6)
-        stats["global"]["qw_max_ms"] = round(mx, 6)
-        stats["global"]["qw_n"] = n
-
-
-def _kvtest_instance_log_bytes(local_log_dir, base):
-    """Raw per-instance log volume (log + glog + nohup + exitrc).
-
-    The map product's meta.bytes is what the report shows as the node's log
-    volume; for kvtest the map input is samples.csv, which is far smaller than
-    the actual client logs. Prefer the real log files when they were pulled.
-    """
-    total = 0
-    for suffix in (".log", ".log.ylt.log", ".nohup", ".log.exitrc"):
-        try:
-            total += os.path.getsize(os.path.join(local_log_dir, base + suffix))
-        except OSError:
-            pass
-    return total
-
-
-def _kvtest_start_epoch(cfg, ds, samples_path, summary_path):
-    """Epoch origin of one instance's samples (the /start trigger).
-
-    A live run records it per data_size; ``--rebuild-report`` and failed-pull
-    artifacts fall back to (summary mtime - elapsed_seconds), which is the
-    /stop write time minus the C++ measurement window."""
-    starts = cfg.get("_kvtest_start_epochs") or {}
-    try:
-        return float(starts[str(ds)])
-    except (KeyError, TypeError, ValueError):
-        pass
-    elapsed = 0.0
-    try:
-        with open(summary_path, "r", encoding="utf-8") as f:
-            elapsed = float((json.load(f) or {}).get("elapsed_seconds") or 0)
-    except (OSError, ValueError, TypeError):
-        elapsed = 0.0
-    try:
-        return max(0.0, os.path.getmtime(samples_path) - elapsed)
-    except OSError:
-        return 0.0
-
-
-def _kvtest_map_stats(local_log_dir, cfg):
-    """Map stage for kvtest: samples.csv -> per-role <...>.stats.json.
-
-    Runs on the orchestrator (the samples are already pulled for the CSV and
-    the request-level plot), writes the exact logstats product schema so the
-    unchanged reduce stage renders the standard HTML report.
-    """
-    ls = _logstats_module()
-    side = _kvtest_read_report_meta(local_log_dir)
-    if not cfg.get("_kvtest_start_epochs") and side.get("start_epochs"):
-        cfg = dict(cfg, _kvtest_start_epochs=side["start_epochs"])
-    if not cfg.get("_kvtest_iid_nodes") and side.get("iid_nodes"):
-        cfg = dict(cfg, _kvtest_iid_nodes=side["iid_nodes"])
-    if not cfg.get("_kvtest_iid_pods") and side.get("iid_pods"):
-        cfg = dict(cfg, _kvtest_iid_pods=side["iid_pods"])
-    iid_nodes = cfg.get("_kvtest_iid_nodes") or {}
-    iid_pods = cfg.get("_kvtest_iid_pods") or {}
-    remote_log_root = side.get("remote_log_dir") or ""
-    extra_bytes = cfg.get("_kvtest_extra_bytes") or {}
-    _warm = float(side.get("warmup_s")
-                  if side.get("warmup_s") is not None
-                  else (cfg.get("_kvtest_warmup_duration")
-                        if cfg.get("_kvtest_warmup_duration") is not None
-                        else (cfg.get("warmup_s") or 0)))
+    Merges the deferred REQ sketches (digest tails), injects the node
+    monitors/monitor sites and builds the logsite table. Idempotent: a unit
+    whose reduced.json already exists is left untouched. STRICT: a partial
+    without its digest block raises."""
+    rp = _report_module()
     written = []
-    for path in sorted(glob.glob(os.path.join(
-            local_log_dir, "*.kvtest_*.samples.csv"))):
-        match = _KVTEST_SAMPLES_RE.match(os.path.basename(path))
-        if not match:
+    for partial in sorted(glob.glob(os.path.join(
+            local_log_dir, "report", "*", "partial.json.gz"))):
+        unit_dir = os.path.dirname(partial)
+        red = os.path.join(unit_dir, "reduced.json")
+        if os.path.isfile(red):
+            written.append(red)
             continue
-        iid = int(match.group("iid"))
-        ds = match.group("ds")
-        node = iid_nodes.get(str(iid), "i{}".format(iid))
-        pod = iid_pods.get(str(iid), "")
-        base = os.path.basename(path)[:-len(".samples.csv")]
-        # 远程路径指向节点现场（ssh 后 cd 可用的真实文件）：优先 sidecar 的
-        # 节点 per-pod 目录（site_dirs），文件名按 gzip 后的实际名
-        # （remote_names），旧 sidecar 回退 pod 内路径。
-        _name = os.path.basename(path)
-        site_dir = (side.get("site_dirs") or {}).get(str(iid)) or ""
-        if site_dir:
-            remote_path = "{}/{}".format(
-                site_dir,
-                (side.get("remote_names") or {}).get(_name) or _name)
-        elif remote_log_root:
-            remote_path = ("{}/{}/{}".format(remote_log_root, pod, _name)
-                           if pod else
-                           "{}/{}".format(remote_log_root, _name))
-        else:
-            remote_path = path
-        summary_path = path[:-len(".samples.csv")] + ".summary.json"
-        start = _kvtest_start_epoch(cfg, ds, path, summary_path)
-        # 前 warmup 秒并入窗口但不计入正式统计（图表仍绘制）
-        _cutoff = ((float(start) + _warm)
-                   if (_warm > 0 and start) else None)
-        for role, ops in (("writer", KVTEST_WRITE_OPS),
-                          ("reader", KVTEST_READ_OPS)):
-            summaries = []
-            payload = ls.kvtest_summary_payload(summary_path, ops)
-            if payload is not None:
-                summaries.append(("summary", payload))
-            stats = ls.compute_stats(
-                path, top_n=100, context=20, node=node, pod=pod, role=role,
-                remote_path=remote_path, size=ds, warmup_cutoff=_cutoff,
-                digest_k=cfg.get("_kvtest_digest_k"),
-                rows_factory=lambda p, _ops=ops, _start=start:
-                    ls.iter_kvtest_rows(p, _start, _ops),
-                summaries=summaries,
-                source_name="{}.{}.samples.csv".format(base, role),
-                extra_meta={"format": "kvtest_samples",
-                            "scenario": "kvtest"})
-            if not stats["meta"]["rows"]:
-                continue
-            if role == "reader":
-                # verify_failures / notify queue wait exist only in summary.json
-                _kvtest_apply_summary_metrics(
-                    stats, _kvtest_summary_doc(summary_path))
-            raw_bytes = _kvtest_instance_log_bytes(local_log_dir, base)
-            stats["meta"]["samples_bytes"] = stats["meta"]["bytes"]
-            if raw_bytes:
-                # 旧产物 / --rebuild-report 现场有原始日志时以实测为准
-                stats["meta"]["bytes"] = raw_bytes
-            else:
-                # stats-only：glog 真实字节取自 trace meta.bytes（原始 glog
-                # 未拉回），再补 .log/.ylt/.nohup 的远端 stat 字节
-                tbytes = _kvtest_trace_bytes(local_log_dir, base)
-                extra = int(extra_bytes.get(base) or 0)
-                if tbytes or extra:
-                    stats["meta"]["bytes"] = tbytes + extra
-            out = "{}.{}.stats.json".format(path, role)
-            tmp = out + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(stats, f, ensure_ascii=False,
-                          separators=(",", ":"))
-            os.replace(tmp, out)
-            written.append(out)
+        with gzip.open(partial, "rb") as f:
+            data = json.loads(f.read().decode("utf-8"))
+        meta = data.get("meta") or {}
+        if early_stop:
+            meta["early_stop"] = True
+        t0 = meta.get("ts_from")
+        t1 = meta.get("ts_to")
+        monitors = rp.reduce_monitors(local_log_dir, t0=t0, t1=t1)
+        sites = rp.reduce_monitor_sites(local_log_dir)
+        data = rp.finalize_digests(
+            data, monitors, sites, partial_bytes=os.path.getsize(partial))
+        tmp = red + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, red)
+        log("[report] finalize {} (digest tails merged, logsite built)"
+            .format(os.path.basename(unit_dir)))
+        written.append(red)
+    return written
+
+
+def _kvtest_render_stage(cfg, local_log_dir, args):
+    """Render one HTML report per finalized reduced.json unit."""
+    rp = _report_module()
+    echarts = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
+    cfg_name = os.path.splitext(os.path.basename(
+        (cfg or {}).get("__cfg_path__") or "scenario"))[0]
+    written = []
+    for red in sorted(glob.glob(os.path.join(
+            local_log_dir, "report", "*", "reduced.json"))):
+        with open(red, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out_dir = os.path.dirname(red)
+        html, _datajs = rp.render_scenario(
+            data, out_dir, echarts,
+            rel_base=os.path.relpath(out_dir, ROOT).replace(os.sep, "/"))
+        try:
+            with open(os.path.join(out_dir, "meta.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(data.get("meta") or {}, f, ensure_ascii=False,
+                          indent=1)
+        except OSError as exc:
+            log_detail("[report] meta.json write failed: {}".format(exc))
+        _REPORT_ACC.append({
+            "data": data, "report_html": html,
+            "config": os.path.splitext(os.path.basename(
+                (cfg or {}).get("__cfg_path__") or "scenario"))[0],
+            "unit": os.path.basename(out_dir)})
+        log("[report] {} · {} -> {}".format(
+            cfg_name, os.path.basename(out_dir),
+            os.path.relpath(html, ROOT)))
+        written.append(html)
     return written
 
 
 def _kvtest_generate_reports(cfg, local_log_dir, args, early_stop=False,
                              scenario=None):
-    """Inject the map-reduce report chain into a kvtest scenario.
+    """kvtest report chain: finalize (digests/monitors/logsite) -> render.
 
-    map:   request samples -> per-role stats.json (see _kvtest_map_stats)
-    reduce: stats.json -> one HTML report per data_size (report.py), plus the
-            run overview accumulated by the caller.
-    WARN-only: a report failure must never fail the benchmark."""
+    WARN-only at the caller boundary: a report failure never fails the
+    benchmark, but a missing/failed finalize is logged loudly (the CSV in
+    _post_process_config depends on reduced.json)."""
     if getattr(args, "no_report", False) or getattr(args, "dry_run", False):
         return None
-    # controller 数据面：map+reduce 已在 controller 完成，本地只剩渲染
     try:
-        _reds = sorted(glob.glob(os.path.join(
-            local_log_dir, "report", "*", "reduced.json")))
-        if _reds:
-            rp = _report_module()
-            echarts = os.path.join(ROOT, "webui", "web",
-                                   "vendor", "echarts.min.js")
-            written = []
-            for red in _reds:
-                with open(red, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                out_dir = os.path.dirname(red)
-                html, _datajs = rp.render_scenario(
-                    data, out_dir, echarts,
-                    rel_base=os.path.relpath(out_dir, ROOT)
-                    .replace(os.sep, "/"))
-                _REPORT_ACC.append({
-                    "data": data, "report_html": html,
-                    "config": os.path.splitext(os.path.basename(
-                        cfg.get("__cfg_path__") or "scenario"))[0],
-                    "unit": os.path.basename(out_dir)})
-                written.append(html)
-            if written:
-                log("[report] kvtest controller render: {} unit(s)".format(
-                    len(written)))
-                return written
+        if not _kvtest_finalize_stage(local_log_dir, early_stop=early_stop):
+            log_detail("[report] no kvtest partial products under {}; "
+                       "skipped".format(local_log_dir))
+            return None
+        return _kvtest_render_stage(cfg, local_log_dir, args) or None
     except Exception as exc:
-        log("[WARN] kvtest controller render failed: {}".format(exc))
-    try:
-        mapped = _kvtest_map_stats(local_log_dir, cfg)
-        if mapped:
-            log("[report] kvtest map: {} per-role stats product(s)".format(
-                len(mapped)))
-    except Exception as exc:
-        log("[WARN] kvtest map failed: {}".format(exc))
-    qps_target = 0
-    try:
-        nodes = max(1, int(cfg.get("_kvtest_nodes") or 1))
-        qps_target = kvtest_plan(cfg, node_count=nodes)["total_qps"]
-    except Exception:
-        pass
-    return _generate_reports(
-        cfg, local_log_dir, args, early_stop=early_stop,
-        qps_target=qps_target, launch_mode="single", mode="kvtest",
-        nodes=int(cfg.get("_kvtest_nodes") or 0), engine="kvtest",
-        scenario=scenario)
+        log("[WARN] kvtest report failed: {}".format(exc))
+        return None
 
 
 def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
                          local_log_dir, result_dir, instance_pids, items,
                          remote_scripts=None, globals_cfg=None, ts=None,
                          is_k8s=False):
-    """Graceful artifact collection for a STOPped kvtest run.
+    """Graceful partial collection for a STOPped kvtest run.
 
-    The C++ binary writes latency_samples.csv only while handling /stop, so a
-    partial report needs this handshake first. Every step is best-effort: a
-    STOP must still exit when the cluster is unresponsive. The collected
-    evidence is turned into a report later by _stop_reports (skip_pull), which
-    is the only place left once StopRequested unwinds the scenario."""
+    Same data plane as a normal end (pod map -> partial reduce), but every
+    step is best-effort: a STOP must still exit when the cluster is slow or
+    a controller is unreachable. Instances that fail are skipped; the rest
+    still produce a partial. _stop_reports later finalizes/renders it."""
     clear_stop()          # the collection itself must be allowed to run
+    args = _STOP_CTX.get("args")
+    warm = cfg.get("_kvtest_warmup_duration") if cfg else None
+    digest_k = cfg.get("_kvtest_digest_k") if cfg else None
     log("[STOP] kvtest: sending /stop so the C++ instances flush samples ...")
     try:
         for _what, ok, err in _pipeline_http_parallel(
@@ -8024,49 +7704,63 @@ def _kvtest_stop_collect(cluster, cfg, cfg_name, remote_log_dir,
                                label_prefix="kvtest STOP")
     except Exception as exc:
         log("[WARN] [STOP] kvtest wait failed: {}".format(exc))
-    groups = []
+    entries_ok, groups = [], []
     for entry, _pid in instance_pids:
-        base = entry["_base"]
         try:
-            ok, status = _kvtest_flatten_artifacts(
-                cluster, entry, remote_log_dir, attempts=2, retry_s=1)
+            _kvtest_pod_map(
+                cluster, entry, remote_scripts, globals_cfg,
+                start_epoch=(cfg.get("_kvtest_start_epochs") or {}).get(
+                    str(entry.get("_ds"))),
+                warmup_s=warm, digest_k=digest_k)
+            trace_files = _kvtest_remote_trace_map(
+                cluster, entry, remote_log_dir, remote_scripts, globals_cfg,
+                best_effort=False, warmup_s=warm)
+            products = [entry["_log_base"] + ".stats.json",
+                        entry["_log_base"] + ".csvstats.json"] + \
+                list(trace_files)
+            gz = _kvtest_gzip_remote_files(cluster, entry["node"], products)
+            try:
+                node_entry = get_node(cluster, entry["node"])
+            except Exception:
+                node_entry = entry
+            groups.append((node_entry, gz,
+                           "kvtest i{}".format(entry["iid"])))
+            entries_ok.append((entry, _pid))
         except Exception as exc:
-            ok, status = False, str(exc)
-        if not ok:
-            log_detail("[STOP] kvtest i{} artifacts: {}".format(
-                entry["iid"], status))
+            log("[WARN] [STOP] kvtest i{} collection skipped: {}".format(
+                entry.get("iid"), exc))
+    if groups:
         try:
-            node_entry = get_node(cluster, entry["node"])
-        except Exception:
-            node_entry = entry
-        pbase = _kvtest_pod_base(remote_log_dir, base, node_entry)
-        # STOP 与成功路径同策略：只拉 compact（summary/samples/trace），
-        # 原始 log/glog/ylt 留在节点现场（ssh <节点IP> 查看）。
-        files = [pbase + ".summary.json"]
-        if ok:
-            files.append(pbase + ".samples.csv")
-        if remote_scripts and globals_cfg is not None:
-            files.extend(_kvtest_remote_trace_map(
-                cluster, entry, remote_log_dir, remote_scripts,
-                globals_cfg, best_effort=True,
-                warmup_s=cfg.get("_kvtest_warmup_duration")))
-        groups.append((node_entry, files,
-                       "kvtest i{}".format(entry["iid"])))
-    try:
-        _pipeline_pull_parallel(cluster, groups, local_log_dir, False)
-    except Exception as exc:
-        log("[WARN] [STOP] kvtest artifact pull failed: {}".format(exc))
-    _stop_ctx = (_kvtest_report_context(cluster, ts, remote_log_dir, is_k8s)
-                 if ts else {})
-    _stop_ctx["warmup_s"] = float(cfg.get("_kvtest_warmup_duration") or 0)
-    _kvtest_write_report_meta(local_log_dir, cfg, _stop_ctx)
+            _qps = 0
+            try:
+                _qps = kvtest_plan(
+                    cfg, node_count=int(cfg.get("_kvtest_nodes") or 1)
+                )["total_qps"]
+            except Exception:
+                _qps = 0
+            if is_k8s and _controller_reduce_enabled(globals_cfg):
+                _kvtest_controller_collect(
+                    cluster, globals_cfg, cfg, args, ts, cfg_name,
+                    str(entries_ok[0][0].get("_ds")), entries_ok, groups,
+                    local_log_dir, qps_target=_qps,
+                    nodes=int(cfg.get("_kvtest_nodes") or 0),
+                    remote_log_dir=remote_log_dir, is_k8s=is_k8s)
+            else:
+                _pipeline_pull_parallel(cluster, groups, local_log_dir, False)
+                _kvtest_local_partial_reduce(
+                    cluster, cfg, args, ts, cfg_name,
+                    str(entries_ok[0][0].get("_ds")), local_log_dir,
+                    entries_ok, groups,
+                    {"total_qps": _qps}, is_k8s, remote_log_dir)
+        except Exception as exc:
+            log("[WARN] [STOP] kvtest partial reduce skipped: {}".format(exc))
     _STOP_CTX["report"] = {
         "cfg": cfg, "cfg_name": cfg_name, "result_dir": result_dir,
         "local_log_dir": local_log_dir, "remote_log_dir": remote_log_dir,
         "involved_nodes": [e["node"] for e, _p in instance_pids],
         "mode": "kvtest", "skip_pull": True,
     }
-    log("[STOP] kvtest partial artifacts collected into {}".format(
+    log("[STOP] kvtest partial products collected into {}".format(
         os.path.relpath(local_log_dir, ROOT)))
 
 
@@ -8158,6 +7852,10 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
     warmup_duration = _kvtest_warmup_duration(cfg, args)
     cfg["_kvtest_warmup_duration"] = warmup_duration
     cfg["_kvtest_digest_k"] = _quantile_k(globals_cfg)
+    if "metrics_interval_ms" in (cfg.get("kvtest") or {}):
+        log("[WARN] kvtest.metrics_interval_ms 已删除"
+            "（metrics_<iid>.csv 废弃），固定为 0；忽略配置值 {}"
+            .format((cfg.get("kvtest") or {}).get("metrics_interval_ms")))
     writer_op = _kvtest_writer_operation(cfg)
     reader_op = _kvtest_reader_operation(cfg)
     if writer_op not in KVTEST_WRITER_OPS:
@@ -8408,21 +8106,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             return n.get("fabric_ip", n.get("ip", ""))
 
         def _instance_view():
-            """Full-cluster instance list for every instance's nodes array
-            (kvtest derives notify peers from it; writers pick reader/dual
-            roles, everyone excludes themselves by instance_id)."""
+            """Full-cluster instance list for every instance's nodes array.
+
+            kvtest is always split (one writer + one reader process per client
+            pod); the removed dual mode has no representation any more."""
             view = []
-            if plan.get("dual"):
-                for c in plan["clients"]:
-                    view.append({"iid": c["iid"], "port": c["port"],
-                                 "role": "dual", "host": _entry_host(c)})
-            else:
-                for w in plan["writers"]:
-                    view.append({"iid": w["iid"], "port": w["port"],
-                                 "role": "writer", "host": _entry_host(w)})
-                for r in plan["readers"]:
-                    view.append({"iid": r["iid"], "port": r["port"],
-                                 "role": "reader", "host": _entry_host(r)})
+            for w in plan["writers"]:
+                view.append({"iid": w["iid"], "port": w["port"],
+                             "role": "writer", "host": _entry_host(w)})
+            for r in plan["readers"]:
+                view.append({"iid": r["iid"], "port": r["port"],
+                             "role": "reader", "host": _entry_host(r)})
             return view
 
 
@@ -8437,15 +8131,17 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 cfg_name, entry["iid"], entry["port"], ds)
             entry["_base"] = base
             entry["_ds"] = ds
-            # 每 pod 独立目录（k8s）：<remote_log_dir>/<pod>/<base>.*；
-            # ssh 模式保持平铺。现场同目录：.log/.log.ylt.log/.exitrc +
-            # MC_LOG_DIR 的 <base>.glog.d/（glog INFO 分段）
-            entry["_pod_dir"] = _kvtest_pod_dir(remote_log_dir, n)
-            log_base = _kvtest_pod_base(remote_log_dir, base, n)
-            # kvtest_out 也收进 pod 目录：<pod_dir>/kvtest_out/<base>（一个
-            # pod 一个目录，现场不出现平铺的共享 kvtest_out 树）
-            entry["_out_dir"] = "{}/kvtest_out/{}".format(
-                _kvtest_pod_dir(remote_log_dir, n).rstrip("/"), base)
+            entry["_role"] = role
+            # 每进程独立目录（k8s）：<pod_dir>/<role>_i<iid>_p<port>/ ——
+            # split 模式下同 pod 的 writer/reader 两个进程产物严格分离，
+            # meta.bytes(du) 与 map 输入都只面对本进程。
+            inst_dir = _kvtest_instance_dir(remote_log_dir, n, role,
+                                            entry["iid"], entry["port"])
+            entry["_inst_dir"] = inst_dir
+            entry["_pod_dir"] = inst_dir
+            log_base = inst_dir + "/" + base
+            entry["_log_base"] = log_base
+            entry["_out_dir"] = inst_dir + "/kvtest_out/" + base
             cfg_file = log_base + ".json"
             log_file = log_base + ".log"
             nohup_log = log_base + ".nohup"
@@ -8791,11 +8487,9 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
             _exited = sum(1 for exited in _exit_results if exited)
             for (entry, pid), exited in zip(instance_pids, _exit_results):
                 if not dry and pid and exited:
-                    _n = get_node(cluster, entry["node"])
                     _check_exitrc(
                         cluster, entry["node"],
-                        _kvtest_pod_base(remote_log_dir, entry["_base"], _n)
-                        + ".log.exitrc",
+                        entry["_log_base"] + ".log.exitrc",
                         "kvtest i{}".format(entry["iid"]))
             if not dry:
                 log("[kvtest] instances exited: {}/{} ({:.1f}s)".format(
@@ -8818,62 +8512,45 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                         "instances ({}) — metrics persisted before the "
                         "shutdown hang; continuing to collection".format(
                             len(_salvaged), len(_stuck), ds))
-            # ---- flatten artifacts + remote trace map + compact pull ----
+            # ---- pod map + trace map + compact transfer ----
             stage = "collect artifacts ({})".format(ds)
             log_phase("收集", level=2)
             _t_pull = time.time()
-            # 对齐 pipeline 的 stats-only 策略：原始 .log 与 MC_LOG_DIR 的
-            # glog 分段（可达数百 MB～GB/实例）一律不传输，留在节点现场；
-            # glog 的 trace 统计在 pod 内算好后只回传小 trace.json。
-            _extra_bytes = {}
+            _pull_raw = bool(getattr(args, "png", False)
+                             or getattr(args, "pull_raw_logs", False))
 
             def _collect_one(pair):
-                """Per-instance artifact pass: flatten (in-pod cp) + in-pod
-                tracestats + gzip + byte stat. Runs for every instance with
-                bounded parallelism — the former serial loop cost one exec
-                round per instance (~0.3-0.5s x 54)."""
+                """Per-process artifact pass (bounded parallel): SINGLE-PASS
+                pod map (stats + csvstats), in-pod trace map, in-pod gzip.
+                STRICT: a missing product raises — no partial collection."""
                 entry, _pid = pair
                 n = get_node(cluster, entry["node"])
-                base = entry["_base"]
-                pbase = _kvtest_pod_base(remote_log_dir, base, n)
-                status = ""
-                if not dry:
-                    ok, status = _kvtest_flatten_artifacts(
-                        cluster, entry, remote_log_dir,
-                        attempts=5, retry_s=2)
-                    if not ok:
-                        raise RuntimeError(
-                            "kvtest i{} exited but final artifacts were not "
-                            "both available after retries: {} in {}"
-                            "".format(entry["iid"], status,
-                                      entry["_out_dir"]))
-                    _trace_files = _kvtest_remote_trace_map(
-                        cluster, entry, remote_log_dir, remote_scripts,
-                        globals_cfg,
-                        warmup_s=cfg.get("_kvtest_warmup_duration"))
-                    _extra_bytes[base] = _kvtest_small_log_bytes(
-                        cluster, entry, remote_log_dir)
-                    # 压缩大件再传输（~8-12x）；失败时透明回退原文件名
-                    _trace_files = _kvtest_gzip_remote_files(
-                        cluster, entry["node"], _trace_files)
-                    samples_file = pbase + ".samples.csv"
-                else:
-                    _trace_files = []
-                    samples_file = None
-                # 只请求确实存在的文件（trace map 失败时不拉、不因此判失败）
-                _files = [pbase + ".summary.json"] + list(_trace_files)
                 if dry:
-                    _files.append(pbase + ".samples.csv")
-                elif "samples=OK" in status:
-                    _files.extend(_kvtest_gzip_remote_files(
-                        cluster, entry["node"], [samples_file]))
-                else:
-                    log("[WARN] kvtest i{} uses an older binary without "
-                        "latency_samples.csv; request-level plot unavailable"
-                        "".format(entry["iid"]))
-                return n, _files, "kvtest i{}".format(entry["iid"])
+                    return n, [], "kvtest i{}".format(entry["iid"])
+                _kvtest_pod_map(
+                    cluster, entry, remote_scripts, globals_cfg,
+                    start_epoch=(cfg.get("_kvtest_start_epochs") or {}).get(
+                        str(ds)),
+                    warmup_s=cfg.get("_kvtest_warmup_duration"),
+                    digest_k=cfg.get("_kvtest_digest_k"))
+                trace_files = _kvtest_remote_trace_map(
+                    cluster, entry, remote_log_dir, remote_scripts,
+                    globals_cfg, best_effort=False,
+                    warmup_s=cfg.get("_kvtest_warmup_duration"))
+                if not trace_files:
+                    raise RuntimeError(
+                        "kvtest i{}: tracestats produced no trace product"
+                        .format(entry["iid"]))
+                products = [entry["_log_base"] + ".stats.json",
+                            entry["_log_base"] + ".csvstats.json"] + \
+                    list(trace_files)
+                if _pull_raw:
+                    products += [entry["_out_dir"] + "/latency_samples.csv",
+                                 entry["_out_dir"] + "/summary.json"]
+                gz = _kvtest_gzip_remote_files(cluster, entry["node"],
+                                                products)
+                return n, gz, "kvtest i{}".format(entry["iid"])
 
-            _groups = []
             if dry:
                 _groups = [_collect_one(p) for p in instance_pids]
             else:
@@ -8882,85 +8559,65 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                                       len(instance_pids) or 1))
                 with ThreadPoolExecutor(max_workers=_workers) as pool:
                     _groups = list(pool.map(_collect_one, instance_pids))
-            _ctrl_done = False
-            if (not dry and is_k8s and _controller_reduce_enabled(globals_cfg)
-                    and not getattr(args, "png", False)
-                    and not getattr(args, "pull_raw_logs", False)):
-                try:
-                    _t_red = time.time()
-                    _kvtest_controller_collect(
-                        cluster, globals_cfg, cfg, args, ts, cfg_name, ds,
-                        instance_pids, _groups, local_log_dir,
-                        _extra_bytes, qps_target=plan.get("total_qps") or 0,
-                        nodes=int(cfg.get("_kvtest_nodes") or 0),
-                        remote_log_dir=remote_log_dir, is_k8s=is_k8s,
-                        digest_k=cfg.get("_kvtest_digest_k"))
-                    _ctrl_done = True
-                    log("[kvtest] controller data-plane done in {:.1f}s "
-                        "(pod->controller single hop; orchestrator keeps no "
-                        "intermediates, only reduced/meta/summary)".format(
-                            time.time() - _t_red))
-                except Exception as exc:
-                    log("[WARN] controller map+reduce failed, falling back "
-                        "to local pull: {}".format(exc))
-            if not _ctrl_done:
-                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
-                # gunzip the pulled .gz back to original names so the map/report
-                # glob surface stays unchanged, THEN account bytes per category.
-                if not dry:
-                    _gunzip_local_dir(local_log_dir)
             _pulled_bytes = 0
-            _cat_bytes = {"samples": 0, "trace": 0, "summary": 0, "other": 0}
-            if not dry and not _ctrl_done:
+            if not dry and not _pull_raw and is_k8s \
+                    and _controller_reduce_enabled(globals_cfg):
+                # controller data plane: pod->controller ONE hop, partial
+                # reduce there (stdlib only), one compact partial back.
+                _t_red = time.time()
+                _kvtest_controller_collect(
+                    cluster, globals_cfg, cfg, args, ts, cfg_name, ds,
+                    instance_pids, _groups, local_log_dir,
+                    qps_target=plan.get("total_qps") or 0,
+                    nodes=int(cfg.get("_kvtest_nodes") or 0),
+                    remote_log_dir=remote_log_dir, is_k8s=is_k8s)
+                log("[kvtest] controller partial reduce done in {:.1f}s "
+                    "(raw samples/glog stay on the nodes; only "
+                    "partial.json.gz comes back)".format(time.time() - _t_red))
+            elif not dry:
+                # ssh / explicit raw pull: move the compact gz products to the
+                # orchestrator and partial-reduce with the SAME driver (the
+                # digest tails are still deferred to the finalize stage).
+                _pipeline_pull_parallel(cluster, _groups, local_log_dir, dry)
                 for _n, _files, _l in _groups:
                     for _f in _files:
-                        _name = os.path.basename(_f)
-                        if _name.endswith(".gz"):
-                            _name = _name[:-len(".gz")]
                         try:
-                            _sz = os.path.getsize(
-                                os.path.join(local_log_dir, _name))
+                            _pulled_bytes += os.path.getsize(os.path.join(
+                                local_log_dir, os.path.basename(_f)))
                         except OSError:
-                            continue
-                        _pulled_bytes += _sz
-                        if ".samples.csv" in _name:
-                            _cat_bytes["samples"] += _sz
-                        elif ".trace.json" in _name:
-                            _cat_bytes["trace"] += _sz
-                        elif ".summary.json" in _name:
-                            _cat_bytes["summary"] += _sz
-                        else:
-                            _cat_bytes["other"] += _sz
-            if not dry:
-                # keep node mapping + this size's /start epoch local for the
-                # report map and for --rebuild-report after a later failure
-                cfg["_kvtest_extra_bytes"] = _extra_bytes
-                _ctx = _kvtest_report_context(cluster, ts, remote_log_dir,
-                                              is_k8s)
-                _ctx["site_dirs"] = _kvtest_site_dirs(
-                    cluster, remote_log_dir, cfg)
-                _ctx["remote_names"] = _kvtest_remote_names(_groups)
-                _ctx["warmup_s"] = float(
-                    cfg.get("_kvtest_warmup_duration") or 0)
-                _kvtest_write_report_meta(local_log_dir, cfg, _ctx)
-            if not _ctrl_done:
-                log("[kvtest] pulled: {} files / {} instances ({:.1f} min, "
-                    "{}; samples={:.1f}MB trace={:.1f}MB summary={:.1f}MB "
-                    "other={:.1f}MB; raw logs stay on nodes)".format(
-                    sum(len(f) for _n, f, _l in _groups), len(_groups),
-                    (time.time() - _t_pull) / 60.0, _fmt_mb(_pulled_bytes),
-                    _cat_bytes["samples"] / 1048576.0,
-                    _cat_bytes["trace"] / 1048576.0,
-                    _cat_bytes["summary"] / 1048576.0,
-                    _cat_bytes["other"] / 1048576.0))
+                            pass
+                _kvtest_local_partial_reduce(
+                    cluster, cfg, args, ts, cfg_name, ds, local_log_dir,
+                    plan, is_k8s, remote_log_dir)
+                if _pull_raw:
+                    # explicit raw pull: the legacy point-line plot consumes
+                    # plain *.samples.csv / *.summary.json locally
+                    import gzip as _gzip
+                    for _n, _files, _l in _groups:
+                        for _f in _files:
+                            _name = os.path.basename(_f)
+                            if not _name.endswith(
+                                    (".samples.csv.gz", ".summary.json.gz")):
+                                continue
+                            _src = os.path.join(local_log_dir, _name)
+                            try:
+                                with _gzip.open(_src, "rb") as _in, \
+                                        open(_src[:-3], "wb") as _out:
+                                    _out.write(_in.read())
+                            except OSError as _exc:
+                                log("[WARN] gunzip {}: {}".format(
+                                    _name, _exc))
+                log("[kvtest] pulled+partial-reduced: {} compact product(s) "
+                    "({:.1f}MB; raw logs stay on nodes)".format(
+                        sum(len(f) for _n, f, _l in _groups),
+                        _pulled_bytes / 1048576.0))
             # remove empty .nohup redirect files (non-empty kept for
             # diagnostics on the node)
             if not dry:
                 for node_name in involved_nodes:
                     n = get_node(cluster, node_name)
                     nohup_files = [
-                        _kvtest_pod_base(remote_log_dir, e["_base"], n)
-                        + ".nohup"
+                        e["_log_base"] + ".nohup"
                         for e, _p in instance_pids
                         if e["node"] == node_name]
                     if nohup_files:
@@ -8985,9 +8642,6 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
         # All kvtest instances exited naturally -> drop their ledger rows.
         if not dry:
             state_remove_cfg(cfg_name)
-        # 现场日志实测大小（remove 服务日志/profile 产物已落盘、pod 仍存活）
-        _site_du_snapshot(cluster, ts, cfg_name, involved_nodes,
-                          local_result_dir, remote_log_dir, dry=dry)
         # k8s pods stay alive past this return: main()'s sweep-end
         # remove-keys still needs a live pod; cleanup_pods runs in main()
         # after sweep-end. Hand the sweep-end pass this config's coordinates.
@@ -9642,34 +9296,6 @@ def _glob_log_sources(directory, pattern):
 _KVTEST_REDUCED_DOC = {}
 
 
-def _kvtest_reduced_doc(local_log_dir, ds):
-    """Cached report/<ds>/reduced.json (None when absent/corrupt)."""
-    key = (os.path.abspath(local_log_dir), str(ds))
-    if key in _KVTEST_REDUCED_DOC:
-        return _KVTEST_REDUCED_DOC[key]
-    doc = None
-    try:
-        with open(os.path.join(local_log_dir, "report", str(ds),
-                               "reduced.json"), "r", encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, ValueError):
-        doc = None
-    _KVTEST_REDUCED_DOC[key] = doc
-    return doc
-
-
-def _kvtest_reduced_for_size(local_log_dir, ds, role):
-    """Exact merged percentiles of one role's TOTAL row from a
-    controller-reduce reduced.json (report/<ds>/reduced.json); None when
-    absent (the caller then leaves the percentile columns empty — never a
-    weighted approximation)."""
-    doc = _kvtest_reduced_doc(local_log_dir, ds)
-    if doc is None:
-        return None
-    blk = ((doc.get("sizes") or {}).get(ds) or {})
-    return ((blk.get("role_summaries") or {}).get(role)) or None
-
-
 def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                        mooncake_store_nodes=None, result_dir=None):
     """拓扑判定（IP 匹配）：节点的 cluster.json `ip` 出现在
@@ -9945,15 +9571,23 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                                  "pipeline_read", ds_bytes))
                 rows.append(row)
     elif is_kvtest:
-        # kvtest rows come from compact per-instance summary.json artifacts;
-        # the runtime iid->node map restores node/IP/topology metadata.
-        # Throughput/qps use each C++ instance's measured elapsed_seconds,
-        # starting at its successful /start metric reset.
+        # CSV 只消费两阶段 reduce 的最终产物 report/<ds>/reduced.json：
+        # instances（pod map 的正式窗口逐进程统计）+ role_summaries
+        # （digest 合并后的 writer/reader 汇总分位）。不再读 summary/samples。
         plan = kvtest_plan(cfg)
         duration = float(cfg.get("duration", 0) or 0)
         writer_op = KVTEST_WRITER_OPS[_kvtest_writer_operation(cfg)]
         reader_op = KVTEST_READER_OPS[_kvtest_reader_operation(cfg)]
-        lat_keys = tuple(LATENCY_SUMMARY_COLUMNS)
+        reduced = {}
+        for _red in sorted(glob.glob(os.path.join(
+                local_log_dir, "report", "*", "reduced.json"))):
+            try:
+                with open(_red, "r", encoding="utf-8") as f:
+                    reduced[os.path.basename(os.path.dirname(_red))] = \
+                        json.load(f)
+            except (OSError, ValueError) as exc:
+                log("[WARN] kvtest reduced {}: {}".format(
+                    os.path.relpath(_red, ROOT), exc))
 
         def base_row(role, instance, nodename, ds):
             op = writer_op if role == "writer" else reader_op
@@ -10004,48 +9638,45 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 "target_qps": plan["total_qps"],
             }
 
-        def op_stats(summary, op):
-            return (summary.get("operations", {}) or {}).get(op) or {}
-
-        def fill_metrics(row, st, wall):
-            total = int(st.get("total", 0) or 0)
-            ok = int(st.get("success", 0) or 0)
-            fail = int(st.get("failure", 0) or 0)
+        def fill_metrics(row, inst):
+            total = int(inst.get("total") or 0)
+            ok = int(inst.get("success") or 0)
+            fail = int(inst.get("failure") or 0)
+            wall = float(inst.get("wall_s") or 0)
             row["total"] = total
             row["success"] = ok
             row["fail"] = fail
             row["fail_rate"] = (fail * 100.0 / total) if total else 0.0
-            row["total_bytes"] = int(st.get("bytes", 0) or 0)
+            row["total_bytes"] = int(inst.get("bytes") or 0)
             row["wall_s"] = wall
             row["qps"] = (ok / wall) if wall > 0 else 0.0
             row["throughput_mb_s"] = (row["total_bytes"] / wall / 1024.0 ** 2
                                       if wall > 0 else 0.0)
             row["throughput_gb_s"] = row["throughput_mb_s"] / 1024.0
-            for k in lat_keys:
-                row[k] = round(float(st.get(k, 0) or 0), 4)
+            for k in ("avg_ms", "min_ms", "max_ms"):
+                row[k] = round(float(inst.get(k) or 0), 4)
+            for k in ("p50_ms", "p90_ms", "p95_ms", "p99_ms",
+                      "p999_ms", "p9999_ms"):
+                v = (inst.get("pcts") or {}).get(k)
+                row[k] = round(float(v), 4) if v is not None else ""
+            for k in LATENCY_THRESHOLD_COLUMNS:
+                row[k] = int((inst.get("thresholds") or {}).get(k) or 0)
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
 
-        def fill_notify(row, summary):
-            operation = ("notify_rpc"
-                         if "notify_rpc" in (summary.get("operations") or {})
-                         else "notify_http")
-            nt = op_stats(summary, operation)
-            row["notify_submitted"] = int(nt.get("total", 0) or 0)
-            row["notify_ok"] = int(nt.get("success", 0) or 0)
-            row["notify_fail"] = int(nt.get("failure", 0) or 0)
-            row["notify_avg_ms"] = round(
-                float(nt.get("avg_ms", 0) or 0), 4)
-            row["notify_max_ms"] = round(
-                float(nt.get("max_ms", 0) or 0), 4)
+        def fill_notify(row, inst):
+            nt = inst.get("notify") or {}
+            row["notify_submitted"] = int(nt.get("submitted") or 0)
+            row["notify_ok"] = int(nt.get("ok") or 0)
+            row["notify_fail"] = int(nt.get("fail") or 0)
+            row["notify_avg_ms"] = round(float(nt.get("avg_ms") or 0), 4)
+            row["notify_max_ms"] = round(float(nt.get("max_ms") or 0), 4)
 
-        def fill_queue(row, summary):
-            q = op_stats(summary, "notify_queue_wait")
-            row["queue_wait_avg_ms"] = round(
-                float(q.get("avg_ms", 0) or 0), 4)
-            row["queue_wait_max_ms"] = round(
-                float(q.get("max_ms", 0) or 0), 4)
+        def fill_queue(row, inst):
+            q = inst.get("queue") or {}
+            row["queue_wait_avg_ms"] = round(float(q.get("avg_ms") or 0), 4)
+            row["queue_wait_max_ms"] = round(float(q.get("max_ms") or 0), 4)
 
         def weighted_of(inst_rows, value_key, weight_key="total"):
             weighted = [(float(r.get(value_key, 0) or 0),
@@ -10055,9 +9686,9 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
             return round(sum(v * w for v, w in weighted) / weight, 4) \
                 if weight else 0.0
 
-        def total_row(role, inst_rows, ds, wall, merged_stats=None):
-            # Counts/bytes sum exactly. With complete request samples the
-            # latency distribution is recomputed over the merged OK samples.
+        def total_row(role, inst_rows, ds, wall, summary):
+            # counts/bytes 精确求和；avg 加权；min/max/阈值来自实例行；
+            # 分位一律取 role_summaries（hist<=p95 + digest 尾部合并值）。
             row = base_row(role, "TOTAL", "", ds)
             total = sum(r["total"] for r in inst_rows)
             fail = sum(r["fail"] for r in inst_rows)
@@ -10077,198 +9708,70 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 float(r.get("throughput_mb_s", 0) or 0) for r in inst_rows)
             row["throughput_gb_s"] = sum(
                 float(r.get("throughput_gb_s", 0) or 0) for r in inst_rows)
-            # 精确项永远来自实例行（与分位来源无关）：极值/阈值计数/
-            # 加权均值（加权均值在数学上等于全样本均值）
-            for k in lat_keys:
-                if k in LATENCY_THRESHOLD_COLUMNS:
-                    row[k] = sum(int(r.get(k, 0) or 0) for r in inst_rows)
-                elif k == "min_ms":
-                    row[k] = min((float(r.get(k, 0) or 0)
-                                  for r in inst_rows
-                                  if int(r.get("success", 0) or 0) > 0),
-                                 default=0.0)
-                elif k == "max_ms":
-                    row[k] = max((float(r.get(k, 0) or 0)
-                                  for r in inst_rows), default=0.0)
-                elif k == "avg_ms":
-                    row[k] = weighted_of(inst_rows, k, weight_key="success")
-            _pct_keys = ("p50_ms", "p90_ms", "p95_ms", "p99_ms",
-                         "p999_ms", "p9999_ms")
-            if merged_stats is not None:
-                # 实例行同源合并（同一 unified_pct policy，per-op scope）
-                for k in _pct_keys:
-                    v = merged_stats.get(k)
-                    row[k] = round(float(v), 4) if v is not None else ""
-            else:
-                # 无实例统计时优先 controller reduce 的合并值，否则留空 N/A
-                _red = _kvtest_reduced_for_size(local_log_dir, ds, role)
-                for k in _pct_keys:
-                    if _red is not None and _red.get(k) is not None:
-                        row[k] = round(float(_red[k]), 4)
-                    else:
-                        row[k] = ""
-                        log("[WARN] kvtest TOTAL quantile unavailable; left "
-                            "empty: {} {} {}".format(ds, role, k))
+            for k in LATENCY_THRESHOLD_COLUMNS:
+                row[k] = sum(int(r.get(k, 0) or 0) for r in inst_rows)
+            row["min_ms"] = min(
+                (float(r.get(k, 0) or 0) for r in inst_rows
+                 for k in ("min_ms",)
+                 if int(r.get("success", 0) or 0) > 0), default=0.0)
+            row["max_ms"] = max(
+                (float(r.get("max_ms", 0) or 0) for r in inst_rows),
+                default=0.0)
+            row["avg_ms"] = weighted_of(inst_rows, "avg_ms",
+                                        weight_key="success")
+            if not summary:
+                raise RuntimeError(
+                    "kvtest CSV: reduced.json has no {} role summary for "
+                    "{}; run finalize before writing the CSV".format(
+                        role, ds))
+            for k in ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "p999_ms",
+                      "p9999_ms"):
+                v = summary.get(k)
+                if v is None:
+                    raise RuntimeError(
+                        "kvtest CSV: {} {} missing (finalize did not fill "
+                        "the digest tail)".format(role, k))
+                row[k] = round(float(v), 4)
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
             return row
 
-        # one block of rows per data_size: writer rows, writer TOTAL,
-        # reader rows, reader TOTAL (dual instances emit both sides)
-        legacy_summary_re = re.compile(
-            r"^{}\.(?P<node>.+)_i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
-            r"(?P<ds>.+)\.summary\.json$".format(re.escape(name)))
-        compact_summary_re = re.compile(
-            r"^{}\.i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_"
-            r"(?P<ds>.+)\.summary\.json$".format(
-                re.escape(_kvtest_artifact_prefix(name))))
-        iid_nodes = cfg.get("_kvtest_iid_nodes", {}) or {}
-        summaries = {}   # ds -> [(iid, node, summary_dict)]
-        for p in sorted(glob.glob(os.path.join(
-                local_log_dir, "*.kvtest_*.summary.json"))):
-            m = compact_summary_re.match(os.path.basename(p))
-            legacy = False
-            if not m:
-                m = legacy_summary_re.match(os.path.basename(p))
-                legacy = bool(m)
-            if not m:
-                continue
-            iid = int(m.group("iid"))
-            nodename = (m.group("node") if legacy else
-                        iid_nodes.get(str(iid), "i{}".format(iid)))
-            try:
-                with open(p, encoding="utf-8") as f:
-                    summary = json.load(f)
-            except (OSError, ValueError) as exc:
-                log("[WARN] kvtest summary {}: {} (skipped)".format(
-                    os.path.basename(p), exc))
-                continue
-            summaries.setdefault(m.group("ds"), []).append(
-                (iid, nodename, summary))
-        # 每实例正式统计（CSV 实例行 + TOTAL 合并输入）：
-        #   controller 模式 -> reduced.json 的 instances 块（job 算出）
-        #   本地/STOP 模式 -> 从本地 samples.csv 流式重算
-        # 两者都由 ls.kvtest_instance_ops_stats 产生且与报表 reduce 同一
-        # 分位口径（hist <= p95 / REQ sketch 尾部）。
-        warm_sec = float(
-            cfg.get("_kvtest_warmup_duration")
-            if cfg.get("_kvtest_warmup_duration") is not None
-            else (cfg.get("warmup_s") or 0))
-        _digest_k = cfg.get("_kvtest_digest_k")
-        _local_samples = {}
-        _samples_re = re.compile(
-            r"^.*i(?P<iid>\d+)_p(?P<port>\d+)\.kvtest_(?P<ds>.+?)"
-            r"\.samples\.csv$")
-        for _sp in sorted(glob.glob(os.path.join(
-                local_log_dir, "*.kvtest_*.samples.csv"))):
-            _m = _samples_re.match(os.path.basename(_sp))
-            if _m:
-                _local_samples[(_m.group("ds"), int(_m.group("iid")))] = _sp
-        _csv_ops = (set(KVTEST_WRITE_OPS) | set(KVTEST_READ_OPS)
-                    | {"notify_rpc", "notify_http", "notify_queue_wait"})
-
-        def instance_ops(ds, iid):
-            red = _kvtest_reduced_doc(local_log_dir, ds)
-            if red is not None:
-                for it in red.get("instances") or []:
-                    try:
-                        if int(it.get("iid", -1)) == int(iid):
-                            return it.get("ops") or None
-                    except (TypeError, ValueError):
-                        continue
-            path = _local_samples.get((str(ds), int(iid)))
-            if not path:
-                return None
-            try:
-                return _logstats_module().kvtest_instance_ops_stats(
-                    path, _csv_ops, warmup_sec=warm_sec or None,
-                    digest_k=_digest_k)
-            except Exception as exc:
-                log("[WARN] kvtest {} i{} instance stats: {}".format(
-                    ds, iid, exc))
-                return None
-
-        def merge_ops(ops_list):
-            """合并多实例同 op 的正式统计（TOTAL 分位输入，同一 policy）。"""
-            hist = {}
-            digests = []
-            for st in ops_list:
-                for b, n in (st.get("hist") or {}).items():
-                    hist[int(b)] = hist.get(int(b), 0) + int(n)
-                if st.get("digest"):
-                    digests.append(st["digest"])
-            if not hist:
-                return None
-            out = {}
-            for q, key in ((0.50, "p50_ms"), (0.90, "p90_ms"),
-                           (0.95, "p95_ms"), (0.99, "p99_ms"),
-                           (0.999, "p999_ms"), (0.9999, "p9999_ms")):
-                v = _logstats_module().unified_pct(
-                    hist, digests or None, q)
-                out[key] = round(v, 4) if v is not None else None
-            return out
-
         for ds in data_size_list(cfg):
-            wall = duration
+            red = reduced.get(ds)
+            if red is None:
+                raise RuntimeError(
+                    "kvtest CSV: no report/{}/reduced.json under {} (the "
+                    "two-stage reduce did not finalize)".format(
+                        ds, local_log_dir))
+            blk = (red.get("sizes") or {}).get(ds) or {}
+            summ = blk.get("role_summaries") or {}
+            insts = [it for it in (red.get("instances") or [])
+                     if str(it.get("role")) in ("writer", "reader")]
             writer_rows, reader_rows = [], []
-            writer_op_stats, reader_op_stats = [], []
-            for iid, nodename, summary in sorted(summaries.get(ds, [])):
-                ops = summary.get("operations") or {}
-                elapsed = float(summary.get("elapsed_seconds", 0) or duration)
-                # C++ elapsed_seconds 是单窗口（含 warmup）；正式时长扣掉
-                # warmup 区，qps/吞吐口径才正确
-                instance_wall = (max(0.0, elapsed - warm_sec)
-                                 if warm_sec > 0 else elapsed)
-                inst_ops = instance_ops(ds, iid) or {}
-                if writer_op in ops:
-                    row = base_row("writer", "i{}".format(iid), nodename, ds)
-                    wst = inst_ops.get(writer_op)
-                    if wst is None:
-                        log("[WARN] kvtest {} i{} {} formal stats unavailable; "
-                            "using summary (includes warmup)".format(
-                                ds, iid, writer_op))
-                        wst = op_stats(summary, writer_op)
-                    else:
-                        writer_op_stats.append(wst)
-                    fill_metrics(row, wst, instance_wall)
-                    notify_operation = (
-                        "notify_rpc" if "notify_rpc" in ops
-                        else "notify_http")
-                    nst = inst_ops.get(notify_operation)
-                    fill_notify(
-                        row,
-                        ({"operations": {notify_operation: nst}}
-                         if nst is not None else summary))
+            def _iid_of(x):
+                v = x.get("iid")
+                return int(v) if v is not None else -1
+
+            for it in sorted(insts, key=lambda x: (
+                    str(x.get("role")), _iid_of(x))):
+                role = str(it.get("role"))
+                iid = _iid_of(it)
+                row = base_row(role, "i{}".format(iid),
+                               str(it.get("node") or ""), ds)
+                fill_metrics(row, it)
+                if role == "writer":
+                    fill_notify(row, it)
                     writer_rows.append(row)
-                if reader_op in ops:
-                    row = base_row("reader", "i{}".format(iid), nodename, ds)
-                    rst = inst_ops.get(reader_op)
-                    if rst is None:
-                        log("[WARN] kvtest {} i{} {} formal stats unavailable; "
-                            "using summary (includes warmup)".format(
-                                ds, iid, reader_op))
-                        rst = op_stats(summary, reader_op)
-                    else:
-                        reader_op_stats.append(rst)
-                    fill_metrics(row, rst, instance_wall)
-                    qst = inst_ops.get("notify_queue_wait")
-                    fill_queue(
-                        row,
-                        ({"operations": {"notify_queue_wait": qst}}
-                         if qst is not None else summary))
-                    # data verification runs on the read path (C++ scalar;
-                    # cannot be split by time -> keeps the warmup region)
+                else:
+                    fill_queue(row, it)
                     row["verify_failures"] = int(
-                        summary.get("verify_failures", 0) or 0)
+                        it.get("verify_failures") or 0)
                     reader_rows.append(row)
-            # grouped like the pipeline CSV: all writers + TOTAL, then all
-            # readers + TOTAL
             rows.extend(writer_rows)
             if writer_rows:
-                row = total_row(
-                    "writer", writer_rows, ds, wall,
-                    merge_ops(writer_op_stats))
+                row = total_row("writer", writer_rows, ds, duration,
+                                summ.get("writer"))
                 for k in ("notify_submitted", "notify_ok", "notify_fail"):
                     row[k] = sum(r.get(k, 0) for r in writer_rows)
                 row["notify_avg_ms"] = weighted_of(
@@ -10279,16 +9782,15 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 rows.append(row)
             rows.extend(reader_rows)
             if reader_rows:
-                row = total_row(
-                    "reader", reader_rows, ds, wall,
-                    merge_ops(reader_op_stats))
+                row = total_row("reader", reader_rows, ds, duration,
+                                summ.get("reader"))
                 row["verify_failures"] = sum(
                     r.get("verify_failures", 0) for r in reader_rows)
                 row["queue_wait_avg_ms"] = weighted_of(
                     reader_rows, "queue_wait_avg_ms", "success")
                 row["queue_wait_max_ms"] = max(
-                    (r.get("queue_wait_max_ms", 0) or 0 for r in reader_rows),
-                    default=0)
+                    (r.get("queue_wait_max_ms", 0) or 0
+                     for r in reader_rows), default=0)
                 rows.append(row)
     else:
         def fill_basic_row(row, agg, op_label):
@@ -10699,9 +10201,40 @@ def rebuild_reports(ts):
         d = os.path.join(logs_root, name)
         if not os.path.isdir(d) or name == "report":
             continue
+        _kv_partials = sorted(glob.glob(os.path.join(
+            d, "report", "*", "partial.json.gz")))
+        _kv_reds = sorted(glob.glob(os.path.join(
+            d, "report", "*", "reduced.json")))
+        if _kv_partials or _kv_reds:
+            # kvtest units rebuild from the two-stage products only: the
+            # orchestrator keeps partial (digests) + reduced (final); no
+            # samples/map input exists locally by design.
+            try:
+                if _kv_partials:
+                    _kvtest_finalize_stage(d)
+                for red in sorted(glob.glob(os.path.join(
+                        d, "report", "*", "reduced.json"))):
+                    with open(red, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    out_d = os.path.dirname(red)
+                    html, _dj = rp.render_scenario(
+                        data, out_d, echarts,
+                        rel_base=os.path.relpath(out_d, ROOT)
+                        .replace(os.sep, "/"))
+                    scenarios.append(dict(
+                        data, unit=os.path.basename(out_d),
+                        report_rel=os.path.relpath(
+                            html, os.path.join(ts_dir, "report")
+                        ).replace(os.sep, "/")))
+                    log("[report] rebuilt {} · {} -> {}".format(
+                        name, os.path.basename(out_d),
+                        os.path.relpath(html, ROOT)))
+            except Exception as exc:
+                log("[WARN] {}: kvtest report rebuild failed: {}".format(
+                    name, exc))
+            continue
         stats = _collect_local_stats(d)
-        _samples = glob.glob(os.path.join(d, "*.kvtest_*.samples.csv"))
-        if not stats and not _samples:
+        if not stats:
             rep = os.path.join(d, "report")
             has_report = os.path.isdir(rep) and any(
                 os.path.isfile(os.path.join(rep, x, "report.html"))
@@ -10713,22 +10246,9 @@ def rebuild_reports(ts):
                     "Reports and data.js remain usable. Use "
                     "--keep-intermediates (or MC_KEEP_INTERMEDIATES=1) when "
                     "running".format(name))
-                continue
-        _have_kvtest_stats = any(
-            os.path.basename(p).endswith(".stats.json") and
-            ".samples.csv." in os.path.basename(p) for p in stats)
-        if _samples and not _have_kvtest_stats:
-            # failed kvtest run: rebuild the map products from the request
-            # samples (the run config is gone; the sidecar supplies the node
-            # mapping + /start epochs, the summary mtime is the last resort)
-            try:
-                _kvtest_map_stats(d, {"_kvtest_start_epochs": {}})
-            except Exception as exc:
-                log("[WARN] {}: kvtest map rebuild failed: {}".format(
-                    name, exc))
-            stats = _collect_local_stats(d)
-        if not stats:
-            log("[WARN] {}: no stats/raw logs locally; skipped".format(name))
+            else:
+                log("[WARN] {}: no stats/raw logs locally; skipped".format(
+                    name))
             continue
         probe = rp.load(stats[:1])
         roles = {(st.get("meta") or {}).get("role") for st in probe}
@@ -10848,19 +10368,11 @@ def rebuild_reports(ts):
                 "unit_threads": u["t"],
                 "params": params,
             }
-            site_sizes = None
-            try:
-                with open(os.path.join(d, "report", "site_sizes.json"),
-                          "r", encoding="utf-8") as f:
-                    site_sizes = json.load(f) or None
-            except (OSError, ValueError):
-                site_sizes = None
             data = rp.reduce_scenario(
                 loaded, meta,
                 monitors=rp.reduce_monitors(d, t0=t0, t1=t1),
                 traces=rp.load(traces_by_unit.get(key, [])),
-                monitor_sites=rp.reduce_monitor_sites(d),
-                site_sizes=site_sizes)
+                monitor_sites=rp.reduce_monitor_sites(d))
             out_d = os.path.join(d, "report", u["name"])
             # 回写修正后的 meta.json：后续重建/打开读到一致的参数
             try:
@@ -10917,12 +10429,19 @@ def _post_process_config(cfg, cfg_name, scenario, ts, ts_dir,
     only this config failed — the report wrappers themselves stay WARN-only,
     exactly like the old inline path."""
     log_dir = os.path.join(ts_dir, "logs", cfg_name)
+    if scenario == "kvtest":
+        # 两阶段 reduce 的第一阶段收尾：partial -> reduced（digest 尾部合并、
+        # 监控注入、logsite）必须在 CSV 之前完成——CSV 只读 reduced。
+        try:
+            _kvtest_finalize_stage(log_dir)
+        except Exception as exc:
+            log("[WARN] kvtest finalize failed (CSV/report rely on "
+                "reduced.json): {}".format(exc))
     rows = write_scenario_csv(log_dir, cfg, ts,
                               cfg.get("__cfg_path__") or "",
                               cluster_snapshot, store_nodes, result_dir=ts_dir)
     if scenario == "kvtest":
-        # map (samples -> per-role stats.json) + reduce, same chain as
-        # pipeline/basic; no extra kwargs (derived inside from cfg)
+        # render only（finalize 已在上面完成，幂等）
         _kvtest_generate_reports(cfg, log_dir, args)
     else:
         _generate_reports(cfg, log_dir, args, **report_kwargs)

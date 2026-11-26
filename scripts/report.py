@@ -307,7 +307,7 @@ def _series_columns(merged, step, edges=None):
     return out
 
 
-def _summary_of(stats):
+def _summary_of(stats, defer_digests=False, pending=None):
     """Cluster summary from merged per-instance globals.
 
     Percentiles follow the single pipeline policy (ls.unified_pct): center
@@ -390,15 +390,22 @@ def _summary_of(stats):
 
     edges = _hist_edges(stats)
 
+    if defer_digests and pending is not None and _digest_items:
+        pending.extend(_digest_items)
+
     def pct(q, key=None):
-        # Single policy (scripts/quantiles.py): center <= p95 from the merged
-        # histogram, tails from the merged REQ sketches; never above the true
-        # maximum.  N/A only when neither source exists.
+        # Single policy: center <= p95 from the merged histogram, tails from
+        # the merged REQ sketches.  defer_digests (controller stage) leaves
+        # tails None and hands the sketches to the orchestrator's finalize —
+        # never a silent histogram tail.
+        if defer_digests and q > ls.QUANTILE_HIST_MAX_Q:
+            return None
         v = ls.unified_pct(hist, _digest_items, q, edges, gmax=gmax)
         return None if v is None else round(v, 4)
 
-    _pct_method = ("hist+digest" if (_digest_items and ls.have_sketch())
-                   else "hist")
+    _pct_method = ("pending" if (defer_digests and _digest_items) else
+                   ("hist+digest" if (_digest_items and ls.have_sketch())
+                    else "hist"))
     return {
         "pct_method": _pct_method, "pct_k": _pct_k,
         "total": total, "ok": ok, "fail": fail,
@@ -442,6 +449,7 @@ def _client_entry(st, role):
         "source": meta.get("source") or "",
         "remote_path": meta.get("remote_path") or "",
         "bytes": meta.get("bytes") or 0,
+        "size_mode": meta.get("size_mode") or "",
         "map_bytes": st.get("_bytes") or 0,
         "total": g.get("key_total") or 0,
         "ok": g.get("key_ok") or 0,
@@ -568,7 +576,7 @@ def _node_ts_epoch(ts):
         return None
 
 
-def reduce_size(stats, meta):
+def reduce_size(stats, meta, defer_digests=False):
     """One data-size block: summary / chart objects (tiered series) / clients."""
     role_stats = {}
     node_stats = {}
@@ -647,7 +655,19 @@ def reduce_size(stats, meta):
             best = n
             excerpt = st["error_excerpt"]
             excerpt_status = st.get("error_excerpt_status")
-    summary = _summary_of(stats)
+    if defer_digests:
+        # 严格：每个实例产物必须携带 digest（pod 内 map 产出）。缺失即报错，
+        # 不允许静默退化为直方图尾部。
+        for st in stats:
+            if not (st.get("digest") or {}).get("global"):
+                raise RuntimeError(
+                    "kvtest reduce: product missing digest (source={}) — "
+                    "pod map requires datasketches".format(
+                        (st.get("meta") or {}).get("source")
+                        or st.get("_path") or "?"))
+    _pend_all, _pend_w, _pend_r = [], [], []
+    summary = _summary_of(stats, defer_digests=defer_digests,
+                          pending=_pend_all)
     _cuts = [float((st.get("meta") or {}).get("warmup_cutoff"))
              for st in stats
              if (st.get("meta") or {}).get("warmup_cutoff") is not None]
@@ -726,7 +746,9 @@ def reduce_size(stats, meta):
     role_summaries = {}
     for role, group in role_stats.items():
         if role in ("writer", "reader"):
-            role_summaries[role] = _summary_of(group)
+            role_summaries[role] = _summary_of(
+                group, defer_digests=defer_digests,
+                pending=(_pend_w if role == "writer" else _pend_r))
     tiers_meta = [{"key": str(s), "label": TIER_LABELS[s], "step": s}
                   for s in offered]
     tiers_meta.append({"key": COUNT_KEY, "label": COUNT_LABEL,
@@ -736,9 +758,13 @@ def reduce_size(stats, meta):
     return {
         "summary": summary,
         "span": round(span, 1),
-        # 统计口径（报告顶部注记 + 前端说明）：hist+digest / hist
+        # 统计口径（报告顶部注记 + 前端说明）：hist+digest / hist / pending
         "pct_method": summary.get("pct_method"),
         "pct_k": summary.get("pct_k"),
+        # 两阶段 reduce：controller 侧把待合并的 digest 交给编排机 finalize
+        "_digest_pending": ({"all": _pend_all, "writer": _pend_w,
+                             "reader": _pend_r}
+                            if defer_digests else None),
         # warmup 结束点（epoch，图表域）：前端在该位置画一条竖线
         "warmup_cutoff": warmup_cutoff,
         "tiers": tiers_meta,
@@ -1202,6 +1228,8 @@ def _volume_block(blk, traces):
                   if (c.get("role") or "") == "reader")
     stats_map = sum(int(c.get("map_bytes") or 0) for c in clients)
     trace_map = int(tm.get("product_bytes") or 0)
+    # dir 口径（kvtest 进程目录 du）：py_bytes 已包含 glog，绝不重复叠加
+    dir_mode = any((c.get("size_mode") == "dir") for c in clients)
     n = max(1, len(clients))
     n_trace = max(1, len(traces or []))
     nodes = len({c.get("node") for c in clients if c.get("node")})
@@ -1229,7 +1257,7 @@ def _volume_block(blk, traces):
             "other_python_bytes": max(0, py_bytes - w_bytes - r_bytes),
             "glog_bytes": glog_raw,
             "ylt_bytes": None,          # 未采集（暂不处理）
-            "total_bytes": py_bytes + glog_raw,
+            "total_bytes": py_bytes if dir_mode else (py_bytes + glog_raw),
         },
         "map": {
             "stats_bytes": stats_map, "trace_bytes": trace_map,
@@ -1278,7 +1306,7 @@ def _engine_of(meta):
 
 
 def reduce_scenario(stats, meta, monitors=None, traces=None,
-                    monitor_sites=None, site_sizes=None):
+                    monitor_sites=None, defer_digests=False, logsite=True):
     """Full scenario report data: stats grouped by data-size (caller passes a
     flat list where possible; the size label is taken from meta["size"] when
     present, else 'all'). `monitors` (from reduce_monitors) is scenario-level
@@ -1290,7 +1318,8 @@ def reduce_scenario(stats, meta, monitors=None, traces=None,
         by_size.setdefault(size, []).append(st)
     sizes = {}
     for size, group in by_size.items():
-        sizes[str(size)] = reduce_size(group, meta)
+        sizes[str(size)] = reduce_size(group, meta,
+                                       defer_digests=defer_digests)
     trace_list = traces or []
     by_size_trace = {}
     for st in trace_list:
@@ -1313,18 +1342,86 @@ def reduce_scenario(stats, meta, monitors=None, traces=None,
                       if str((t.get("meta") or {}).get("size")
                              or meta.get("size") or "all") == size])
     sources, nodes = _sources(stats, trace_list)
-    du_ledger = _site_du_ledger(meta, sources, monitor_sites, site_sizes)
-    for size, blk in sizes.items():
-        if blk.get("volume") is not None and du_ledger:
-            blk["volume"]["site"] = {
-                "nodes": [{"node": n, "pods": v["pods"],
-                           "profiling": v["profiling"], "total": v["total"]}
-                          for n, v in sorted(du_ledger.items())],
-                "total": sum(v["total"] for v in du_ledger.values())}
-    return {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
-            "monitors": monitors or {},
-            "logsite": build_logsite(meta, sources, monitor_sites,
-                                     site_sizes)}
+    out = {"meta": meta, "sizes": sizes, "sources": sources, "nodes": nodes,
+           "monitors": monitors or {}}
+    if defer_digests:
+        # 两阶段 reduce：controller 侧把待合并的 digest（按 size/scope）交给
+        # 编排机 finalize；块内的私有键不外泄。
+        pend = {}
+        k = None
+        for size, blk in sizes.items():
+            p = blk.pop("_digest_pending", None)
+            if p:
+                pend[size] = p
+                k = k or blk.get("pct_k")
+        out["_digest_pending"] = {"k": k, "scopes": pend}
+    else:
+        for blk in sizes.values():
+            blk.pop("_digest_pending", None)
+    if logsite:
+        out["logsite"] = build_logsite(meta, sources, monitor_sites)
+    return out
+
+
+_KVTEST_TAIL_Q = ((0.99, "p99_ms"), (0.999, "p999_ms"),
+                   (0.9999, "p9999_ms"))
+
+
+def finalize_digests(partial, monitors=None, monitor_sites=None,
+                     partial_bytes=None):
+    """Orchestrator stage: merge the deferred REQ sketches, fill the tail
+    percentiles, attach monitors and build the logsite table.
+
+    Strict by design: a missing pending block, an empty digest list for an
+    existing scope, an unavailable library or a failed merge is an error —
+    the controller stage never approximates a tail with the histogram."""
+    if not isinstance(partial, dict):
+        raise RuntimeError("finalize_digests: invalid partial")
+    pending = partial.pop("_digest_pending", None)
+    if not pending:
+        raise RuntimeError(
+            "finalize_digests: partial has no _digest_pending (controller "
+            "partial reduce did not run)")
+    k = pending.get("k")
+    scopes = pending.get("scopes") or {}
+    for size, blk in (partial.get("sizes") or {}).items():
+        sc = scopes.get(str(size)) or {}
+        targets = []
+        if blk.get("summary"):
+            targets.append((blk["summary"], sc.get("all") or [], "all"))
+        rs = blk.get("role_summaries") or {}
+        if rs.get("writer"):
+            targets.append((rs["writer"], sc.get("writer") or [], "writer"))
+        if rs.get("reader"):
+            targets.append((rs["reader"], sc.get("reader") or [], "reader"))
+        for target, items, scope in targets:
+            if not items:
+                raise RuntimeError(
+                    "finalize_digests: no digests for size {} scope {}"
+                    .format(size, scope))
+            mx = target.get("max_ms")
+            for q, key in _KVTEST_TAIL_Q:
+                v = ls.digest_quantile(items, q, k=k)
+                target[key] = round(min(v, mx) if mx is not None else v, 4)
+            target["pct_method"] = "hist+digest"
+            target["pct_k"] = k
+        blk["pct_method"] = "hist+digest"
+        blk["pct_k"] = k
+    if partial_bytes:
+        # 编排机只收 partial.json.gz：数据量账本的「reduce 回传」以它为准
+        for blk in (partial.get("sizes") or {}).values():
+            vol = blk.get("volume")
+            if not vol or vol.get("reduce") is None:
+                continue
+            vol["reduce"]["pulled_bytes"] = int(partial_bytes)
+            raw = int((vol.get("raw") or {}).get("total_bytes") or 0)
+            vol.setdefault("ratio", {})["raw_to_pulled"] = (
+                round(raw / float(partial_bytes), 1) if partial_bytes else None)
+    partial["monitors"] = monitors or {}
+    partial["logsite"] = build_logsite(partial.get("meta") or {},
+                                       partial.get("sources") or [],
+                                       monitor_sites)
+    return partial
 
 
 # ---------------------------------------------------------------------------
@@ -1387,43 +1484,7 @@ def _site_mount_twin(meta):
     return twin, base
 
 
-def _site_du_ledger(meta, sources, monitor_sites, site_sizes):
-    """per-node du 台账：pods / profiling / total（无 du 数据时返回 {}）。
-
-    k8s：pod 目录逐项匹配；ssh 扁平目录（pod 行目录==根目录）用根 total，
-    profiling 作为其子集扣除，避免重复计数。"""
-    twin, base = _site_mount_twin(meta)
-    du_nodes = (site_sizes or {}).get("nodes") or {}
-    if not du_nodes:
-        return {}
-    pod_dirs = {}
-    for src in sources or []:
-        node = str(src.get("node") or "?")
-        pod = str(src.get("pod") or "")
-        rpath = twin(src.get("remote_path") or "")
-        d = (base + ("/" + pod if pod else "")) if base else (
-            os.path.dirname(rpath) if rpath else "")
-        if d:
-            pod_dirs.setdefault(node, set()).add(d.rstrip("/"))
-    mons = monitor_sites or {}
-    out = {}
-    for node, du in du_nodes.items():
-        dirs = du.get("dirs") or {}
-        scopes = sorted(pod_dirs.get(node) or [])
-        pod_bytes = sum(int(dirs.get(d, 0)) for d in scopes)
-        mdir = twin(((mons.get(node) or {}).get("remote_dir")) or "")
-        prof = int(dirs.get(mdir.rstrip("/"), 0)) if mdir else 0
-        root_path = str(du.get("root") or "").rstrip("/")
-        if root_path and scopes and all(d == root_path for d in scopes):
-            total = int(du.get("total") or 0)
-            pod_bytes = max(0, total - prof) if prof else total
-        else:
-            total = pod_bytes + prof
-        out[node] = {"pods": pod_bytes, "profiling": prof, "total": total}
-    return out
-
-
-def build_logsite(meta, sources, monitor_sites=None, site_sizes=None):
+def build_logsite(meta, sources, monitor_sites=None):
     """现场日志表行：每节点一个节点行（聚合）+ 若干 pod 行 + 恰好一个监控行。
 
     - 节点行：files/bytes = 该节点全部已知产物合计；dir = 节点日志根目录
@@ -1435,8 +1496,6 @@ def build_logsite(meta, sources, monitor_sites=None, site_sizes=None):
       落不进的强制以自身 dirname 成行（永不静默丢产物）。"""
     meta = meta or {}
     _twin, base = _site_mount_twin(meta)
-    du_nodes = (site_sizes or {}).get("nodes") or {}
-    du_ledger = _site_du_ledger(meta, sources, monitor_sites, site_sizes)
 
     pods = {}
     extras = {}
@@ -1487,27 +1546,23 @@ def build_logsite(meta, sources, monitor_sites=None, site_sizes=None):
         mon_dir = _twin(site.get("remote_dir") or "")
         if not node_dir and mon_dir:
             node_dir = os.path.dirname(os.path.dirname(mon_dir.rstrip("/")))
-        du = du_nodes.get(node) or {}
-        du_dirs = du.get("dirs") or {}
-        led = du_ledger.get(node)
-        node_bytes = (led["total"] if led else
-                      sum(r["bytes"] for r in items) + site_bytes)
+        # 单一大小口径：kvtest 各进程 meta.bytes = 其现场目录 apparent size；
+        # python 引擎为产物字节合计。不再有 du 台账覆盖。
+        node_bytes = sum(r["bytes"] for r in items) + site_bytes
         rows.append({"tier": "node", "node": node, "role": "", "pod": "",
                      "files": sum(len(r["files"]) for r in items) + site_files,
                      "bytes": node_bytes, "dir": node_dir})
         for r in items:
-            dv = du_dirs.get(str(r["dir"]).rstrip("/"))
             rows.append({"tier": "pod", "node": node, "pod": r["pod"],
                          "role": "、".join(sorted(r["roles"])),
                          "files": len(r["files"]),
-                         "bytes": int(dv) if dv is not None else r["bytes"],
+                         "bytes": r["bytes"],
                          "dir": r["dir"]})
-        mv = du_dirs.get(mon_dir.rstrip("/")) if mon_dir else None
         rows.append({"tier": "monitor", "node": node,
                      "role": MONITOR_ROW_ROLE,
                      "pod": str(site.get("pod") or ""),
                      "files": site_files,
-                     "bytes": int(mv) if mv is not None else site_bytes,
+                     "bytes": site_bytes,
                      "dir": mon_dir})
     return rows
 
@@ -4327,7 +4382,8 @@ function renderVolume(){
   b('原始','writer.log',raw.writer_bytes,'实测（map 前原始文件）');
   b('原始','reader.log',raw.reader_bytes,'实测（map 前原始文件）');
   b('原始','glog（C++ SDK）',raw.glog_bytes,
-    '实测；参与 map-reduce（tracestats → trace.json）');
+    '实测；参与 map-reduce（tracestats → trace.json）；'+
+    'kvtest 下已含在进程目录大小内，合计不重复计入');
   row('原始','ylt（coro_rpc easylog）','未采集',
     '暂不处理，仅占节点磁盘（轮转上限 50MB×3）');
   b('原始','合计',raw.total_bytes,'writer + reader + glog（不含 ylt）',true);
@@ -4337,23 +4393,11 @@ function renderVolume(){
   b('map 后','trace.json · 单实例均值',mp.trace_per_client,
     '阶段秒桶 + 慢点 Top-'+mp.trace_top_n+'（含 L1/L2）');
   b('reduce','回传统计总量',red.pulled_bytes,
-    'stats '+fmtBytes(mp.stats_bytes)+' + trace '+fmtBytes(mp.trace_bytes)+
-    '（原始日志留节点）',true);
+    'partial.json.gz（pod→controller 的 stats '+fmtBytes(mp.stats_bytes)+
+    ' + trace '+fmtBytes(mp.trace_bytes)+' 已在两跳内合并；编排机只收这一个'+
+    '文件；原始日志留节点）',true);
   b('输出','data.js',out.data_js,'全量明细（深查用）');
   b('输出','report.html',out.report_html,'自包含单文件（内嵌当前档位）');
-  const sd=v.site||{}; const sdn=sd.nodes||[];
-  if(sdn.length){
-    sdn.forEach(function(x){
-      const formula=(x.profiling!=null&&x.pods!=null)
-        ?('pod 目录 '+fmtBytes(x.pods)+' + profiling '+fmtBytes(x.profiling)+
-          '（du -sb 实测）')
-        :'现场目录（du -sb 实测，含全部运行时文件）';
-      b('留存',String(x.node),x.total,formula);
-    });
-    b('留存','合计',sd.total,
-      'du -sb 实测（节点侧真实字节；含 .glog.d / summary / exitrc / '+
-      'remove 服务日志等全部现场文件）',true);
-  }
   const rawT=Number(raw.total_bytes)||0;
   const pulled=Number(red.pulled_bytes)||0;
   const repTotal=(Number(out.data_js)||0)+(Number(out.report_html)||0);

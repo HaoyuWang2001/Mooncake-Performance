@@ -105,9 +105,9 @@ basic 根基座 `configs/basic/_configs.json` 存放 20 个正式场景共用字
 | `duration` | 压测时长（秒，可选） | 未配置：跑完 key_count 一遍即结束；配置：循环访问全部 key 直到到达时长（仅 get 家族：get / get_batch / get_into / get_buffer） |
 | `target_qps` | 总限速 QPS（可选）：按该总 QPS 对操作均匀限速（跨 client×thread 均分，绝对时间表自纠偏） | 空/0：计数模式极速连发（现行为）；设置后用于低压时延对比 |
 | `numa_bind` | 客户端 NUMA 绑定：为 true 时每个 client 进程绑定到本节点的一个 NUMA 节点（CPU 亲和，round-robin 轮询分配）。解析优先级：用例/层级显式值 > global.json（默认 true）> 代码缺省 true | `true` |
-| `parallel.fanout_workers` | 并发上限：kubectl exec / HTTP fan-out / 实例配置推送 / 启动 / 退出等待 / 产物整理（flatten+trace） | `16` |
+| `parallel.fanout_workers` | 并发上限：kubectl exec / HTTP fan-out / 实例配置推送 / 启动 / 退出等待 / 产物整理（pod map+trace） | `16` |
 | `parallel.pull_workers` | 产物拉回并发（controller SFTP，受 sshd MaxSessions≈10 约束，勿超过） | `10` |
-| `k8s.reduce_on_controller` | kvtest 产物 pod→controller 单跳（kubectl cp），map+reduce 在 controller 执行，编排机只收 reduced/meta/summary；失败自动回退本地链路 | `true` |
+| `k8s.reduce_on_controller` | kvtest 产物 pod→controller 单跳（kubectl cp），partial reduce 在 controller 执行（仅 stdlib，digest 延后），编排机只收一个 `partial.json.gz` 并 finalize/render；失败即报错（无本地回退） | `true` |
 | `k8s.remove_service` | run 级 remove 服务：测量期预热一个小 remove pod（常驻一个已初始化的 store 客户端），各 remove 阶段走热调用（~2s 而非每次 ~40s 冷启动）；服务不可用自动回退逐阶段 legacy | `true` |
 | `k8s.controller_keep_data` | 保留 controller 侧 per-run 中间产物（默认成功后清理，失败总是保留） | `false` |
 | `k8s_numa_node` | K8s basic 场景显式 NUMA 节点；通过 `numactl --cpunodebind/--membind` 同时绑定 CPU 和内存，未配置时 K8s basic 不绑定 | 未配置 |
@@ -922,21 +922,25 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   `MC_MAP_TIMEOUT`（默认 900s，0=不限）并打印 `[map] … 1.2s` 耗时。
   原始日志留在节点（失败路径、`--pull-raw-logs`，或「`.log` + `.glog` 合计 ≤100MB」的
   小 run 才自动回拉——阈值把 SDK glog 体积算在内，避免把 GB 级 glog 拖回来）。
-- **kvtest（C++ 场景）同样走 map-reduce**：`scripts/logstats.py --kvtest-samples`
-  把每个实例的请求级 `samples.csv`（`elapsed_us` 以测量起点为原点：无 warmup 是
-  `/start`，有 warmup 是 `/arm`，warmup 样本已被 C++ `/reset` 清空）
-  转成与 Python 客户端完全同构的 `<...>.stats.json`——dual 实例按 operation 拆成
-  writer/reader 两份产物；reduce 复用同一套 `report.py`，按 data_size 出
-  `report.html`/`data.js`/`meta.json` 与 run 级 `overview.html`。map 在编排器本地
-  执行（样本本就要拉回做 CSV/点位图），时间桶用显式 epoch，不受宿主时区影响。
-  `--rebuild-report` 在失败 run 只留 `samples.csv` 时会先补跑 map。
-  只存在于 summary 的 reader「值校验失败」与「队列等待均/峰」也被提升进
-  reader 角色概要；节点日志体积取真实 `log+glog` 大小；Ctrl+C 的 STOP
-  路径先发 `/stop` 落盘样本、再收集并出 `early_stop` 报表。
-  每配置的 CSV + 报表 map/reduce 由后台 worker 在场景返回后生成——它们只消费
-  已回拉的本地产物，因此与「本配置收尾 + 下一配置部署」重叠；run 级
-  `overview.html` 在全局收尾前渲染，PNG 点位图与 sweep-end remove / pod /
-  namespace 删除并行。
+- **kvtest（C++ 场景）= 两阶段数据面（map 在 pod，reduce 分两跳）**：
+  ① **pod 内单遍 map**（`scripts/logstats.py --kvtest-map-instance`）：每个**进程**
+  在自己的目录 `<pod>/<role>_i<iid>_p<port>/` 里读一次 `latency_samples.csv`，就地读
+  `summary.json`，写 `stats.json`（直方图/REQ digest/慢点/异常）与 `csvstats.json`
+  （正式窗口逐 op 计数/字节/均值/极值 + summary 的 notify/queue/verify）；`meta.bytes`
+  = 该进程目录 apparent size（写产物前采集）。samples/summary **不传输**，留在节点现场；
+  ② **controller partial reduce**（`scripts/kvtest_partial_reduce.py`，仅 stdlib + staged
+  `report.py`/`logstats.py`）：合并除 digest 外的全部聚合（计数/均值/直方图/时间桶/trace/
+  instances 块），尾部 p99/p999/p9999 置 `null` 并携带 `_digest_pending`（按 scope 去重），
+  输出**一个** `partial.json.gz`；不建 logsite、不注入监控；
+  ③ **编排机 finalize/render**：合并 all/writer/reader 三个 scope 的 digest 回填 9 个尾部
+  值、注入 monitors/monitor_sites、构建「现场日志」表、写 `reduced.json`，再渲染
+  `report.html`/`data.js`/`meta.json` 与 run 级 `overview.html`。CSV **只读** `reduced.json`
+  （instances + role_summaries），与报表同口径。依赖：pod 与编排机需 datasketches
+  （缺失即报错）；controller 零第三方库。**无回退**：gzip/trace/产物缺失、digest 缺失、
+  controller 失败都直接报错（原始日志仍在节点）。Ctrl+C 的 STOP 走同一 map→partial 流程
+  （controller 不可达则 WARN 跳过报表、清理照常），报表标 `early_stop`。
+  `--rebuild-report` 从 `report/<ds>/reduced.json` 重渲染（缺失时可由
+  `partial.json.gz` finalize 补齐；两者都没有才报错）。
 - **形态与引擎解耦**：报表格式由 `meta.scenario`（`basic`|`pipeline`）决定，
   `meta.engine`（`python`|`kvtest`）只做标注（副标题「引擎 …」）；kvtest 场景可在配置里用
   `"report_scenario": "pipeline"|"basic"` 声明形态（缺省 pipeline）。旧产物
@@ -945,14 +949,14 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
 - **中间产物清理（默认开启，成功才清）**：每个配置的所有单元都通过校验
   （`report.html` 非空且完整、`data.js` 非空、单元数与 stats 分组一致）后，删除
   `logs/<配置>/` 下除 `report/`、`profiling/` 外的全部中间产物——`*.stats.json`、
-  `*.trace.json`、回拉的原始 `.log`/`.glog`、kvtest 的 `samples.csv`/`summary.json`/
-  `timeseries.csv`/`kvtest_report_meta.json` 等；python 与 kvtest、basic 与 pipeline
-  一致。run 级 `benchmark_detail.csv`、各配置 `<cfg>.csv`、`overview.html` 与
-  `profiling/`（监控 CSV）**始终保留**。逃生口：`--keep-intermediates`
-  （或 env `MC_KEEP_INTERMEDIATES=1`）保留整个 run；`--pull-raw-logs` / `--png`
-  因用户显式要原始日志而跳过；失败配置、STOP/Ctrl+C、`--no-report` 的 run 一律保留。
-  注意：被清理的成功 run 不能再 `--rebuild-report`（会提示「中间产物已按成功清理」），
-  失败 run 的 `samples.csv`/stats 仍在，可正常补跑。
+  `*.trace.json`、回拉的原始 `.log`/`.glog` 等；kvtest 本就不回拉 samples/summary
+  （除非显式 `--pull-raw-logs`/`--png`），`report/<ds>/partial.json.gz` 与
+  `reduced.json` 作为可重建产物保留。run 级 `benchmark_detail.csv`、各配置
+  `<cfg>.csv`、`overview.html` 与 `profiling/`（监控 CSV）**始终保留**。逃生口：
+  `--keep-intermediates`（或 env `MC_KEEP_INTERMEDIATES=1`）保留整个 run；
+  `--pull-raw-logs` / `--png` 因用户显式要原始日志而跳过；失败配置、STOP/Ctrl+C、
+  `--no-report` 的 run 一律保留。注意：被清理的成功 run 仍可由 reduced 重建报表
+  （`--rebuild-report`），不再需要 samples/stats。
 - **reduce（编排器本地）**：`scripts/report.py` 合并 stats（直方图相加还原集群分位数），
   渲染 `report.html`（自包含、可单文件分享；同目录 `data.js` 提供全量深查）与
   `overview.html`（run 总览）。**`data.js` 必须与 report.html 同目录**：从磁盘双击打开时
@@ -983,20 +987,20 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   `<cfg>.<run>_8MB.dual_<node>_c0_p9301.reader.log`），因此多 data_size 与读写角色
   仍能正确分块。
 - **开关**：`--no-report` 只跳过 HTML 报表（per-unit `report.html` 与 run 级
-  `overview.html`，场景级报表、STOP/失败的部分报表、kvtest 的 map+reduce 一并生效）。
+  `overview.html`，场景级报表、STOP/失败的部分报表、kvtest 的 finalize/render 一并生效）。
   绘图**默认关闭**，显式 `--png` 才生成旧 PNG 图（`plot_latency.py`，含 kvtest 点位图）；
   `--png` 必须与 `--pull-raw-logs` 同开（否则报错），`--pull-raw-logs` 也决定是否把
-  原始客户端日志拉回本地（默认只拉紧凑 `*.stats.json`）。`--keep-intermediates`
+  原始客户端日志拉回本地（kvtest 默认不回拉任何原始/中间产物：pod map 在原地完成，
+  正常路径只回传一个 `partial.json.gz`）。`--keep-intermediates`
   保留全部中间产物。两个独立的监控开关 `--monitor-mem on|off` 与
   `--monitor-urma on|off` 覆盖 `profile.json` 的对应工具；WebUI 运行表单
   总会发送两者（默认关闭），内存紧张的环境可关掉它们避免监控 DaemonSet
   与压测争内存。
   保留报表成功后的全部中间产物。`--dry-run` 仍全部跳过。
-- **现场日志实测大小**：每个配置成功收尾时（profiling 落盘后、pod 销毁前）在节点侧执行
-  `du -sb`（k8s 经存活 client pod `kubectl exec`、ssh 直跑），快照写入
-  `logs/<配置>/report/site_sizes.json`（成功清理保留、重建可复用）；「日志现场」表的
-  pod/监控/节点行与「数据量与优化」的「留存（du 实测）」同源消费，含 .glog.d/summary/
-  exitrc/remove 服务日志等全部运行时文件；失败/STOP 或 du 不可用时回退已知产物合计。
+- **现场日志大小（单一 `meta.bytes` 口径）**：kvtest 每进程 `meta.bytes` = 其目录
+  `<pod>/<role>_i<iid>_p<port>/` 的 apparent size（pod 内 map 开始前 `os.stat` 求和，
+  含样本/glog/产物），pod 行=各进程之和、节点行=各 source 之和+监控产物；python 引擎
+  为已知产物字节合计。**不再有 `du -sb` 快照/`site_sizes.json`/「留存」区块**。
 - **k8s 节点级监控（容器内采样、宿主工具借用）**：每宿主一个 monitor
   DaemonSet（hostPID + nsenter/chroot 借用宿主的 mdcli），产物落在
   `logs/<配置>/profiling/<节点 IP>/`（目录名即报表节点显示名；历史 run 的 pod 名

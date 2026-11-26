@@ -69,6 +69,24 @@ def have_sketch():
     """True when the third-party sketch library is importable right now."""
     return _qt is not None and _qt.available()
 
+def digest_quantile(items, q, k=None):
+    """Merge serialized REQ sketches and query one quantile (strict).
+
+    Used by the orchestrator finalize stage only; the controller defers the
+    tails. Missing library or an empty merge is an ERROR (no fallback)."""
+    if _qt is None or not _qt.available():
+        raise RuntimeError(
+            "digest_quantile: datasketches unavailable (finalize runs on the "
+            "orchestrator and requires the library)")
+    if not items:
+        raise RuntimeError("digest_quantile: empty digest list for q={}"
+                           .format(q))
+    v = _qt.quantile_from(items, q, k=k)
+    if v is None:
+        raise RuntimeError("digest_quantile: sketch merge failed (q={})"
+                           .format(q))
+    return float(v)
+
 
 def unified_pct(hist, digest_items=None, q=0.5, edges=None, gmax=None):
     """One percentile under the single policy.
@@ -289,7 +307,8 @@ def _row_epoch(row):
 def compute_stats(path, top_n=100, context=20, node=None, pod=None,
                   role=None, remote_path=None, size=None, rows_factory=None,
                   summaries=None, source_name=None, extra_meta=None,
-                  warmup_cutoff=None, digest_k=None):
+                  warmup_cutoff=None, digest_k=None,
+                  row_sink=None, op_filter=None):
     """Build one client's stats product (the map stage).
 
     rows_factory: optional callable(path) -> row iterator; defaults to the
@@ -305,6 +324,11 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         slowest/errors). None keeps the legacy single-phase behaviour.
     digest_k: REQ sketch k for the percentile digests (None disables the
         sketch — tails then fall back to histogram interpolation).
+    row_sink: optional callback(row, in_warmup, okrow) invoked for EVERY row
+        (before op filtering/warmup skipping) so a caller can collect a
+        side product in the same single pass (kvtest csvstats).
+    op_filter: when set, only these ops enter this product's aggregates;
+        other ops are delivered to row_sink and skipped (notify ops).
     """
     row_source = rows_factory or iter_rows
     top_n = max(1, int(top_n or 0))   # a 0-capacity heap indexes slowest[0]
@@ -344,8 +368,13 @@ def compute_stats(path, top_n=100, context=20, node=None, pod=None,
         status = row["status"]
         okrow = status == "OK"
         ep = _row_epoch(row)
-        if (warmup_cutoff is not None and ep is not None
-                and ep < float(warmup_cutoff)):
+        in_warmup = (warmup_cutoff is not None and ep is not None
+                     and ep < float(warmup_cutoff))
+        if row_sink is not None:
+            row_sink(row, in_warmup, okrow)
+        if op_filter is not None and op not in op_filter:
+            continue
+        if in_warmup:
             # warmup 区：只进图表时间桶（图上绘制），不进任何正式统计。
             # 失败行交给下方 errors 二次扫描统一入桶，避免重复计数。
             warmup_rows += 1
@@ -828,6 +857,176 @@ def kvtest_instance_ops_stats(path, ops, warmup_sec=None, digest_k=None,
     return out
 
 
+def _kvtest_summary_doc(path):
+    """Parse one C++ summary.json (None when missing/corrupt)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _apply_summary_metrics(stats, summary_doc):
+    """Surface C++ aggregates the request samples cannot carry.
+
+    value-verification failures and the notify queue wait exist only in
+    summary.json (the samples CSV has no such columns)."""
+    if not summary_doc:
+        return
+    try:
+        verify = int(summary_doc.get("verify_failures") or 0)
+    except (TypeError, ValueError):
+        verify = 0
+    if verify:
+        stats["global"]["verify_failures"] = verify
+    qw = (summary_doc.get("operations") or {}).get("notify_queue_wait") or {}
+    try:
+        avg = float(qw.get("avg_ms") or 0.0)
+        mx = float(qw.get("max_ms") or 0.0)
+        n = int(qw.get("total") or qw.get("count") or 0)
+    except (TypeError, ValueError):
+        return
+    if n > 0 and (avg > 0 or mx > 0):
+        stats["global"]["qw_avg_ms"] = round(avg, 6)
+        stats["global"]["qw_max_ms"] = round(mx, 6)
+        stats["global"]["qw_n"] = n
+
+
+def _dir_apparent_bytes(path):
+    """Apparent size of every regular file under ``path`` (du -sb semantics).
+
+    Computed inside the pod before the map writes anything, so it is the raw
+    footprint of THIS process's directory (meta.bytes), never mixing roles.
+    Missing directory -> 0 (the caller passes an explicit instance dir)."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(str(path)):
+            for name in files:
+                try:
+                    total += os.stat(os.path.join(root, name)).st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def kvtest_map_instance(samples, summary_path, role, node=None, pod=None,
+                        size=None, start_epoch=None, warmup_s=None,
+                        digest_k=None, remote_path=None, iid=None,
+                        instance_dir=None, out_stats=None, out_csvstats=None,
+                        top_n=100):
+    """Single-pass in-pod map for ONE kvtest process (split topology).
+
+    Produces BOTH products from one read of latency_samples.csv:
+      * the role stats product (hist/seconds/slowest/outliers/digest), and
+      * the csvstats product (per-op FORMAL counts/avg/min/max for the
+        scenario CSV; no digests — the CSV has only avg/max for notify/queue
+        and instance-level percentiles come from the role product).
+    summary.json is read in place on the same node for wall/verify/queue-wait
+    (never transported). meta.bytes = apparent size of the instance directory
+    captured BEFORE any map output is written. Missing samples/summary is an
+    error — there is no fallback path."""
+    if not os.path.isfile(samples):
+        raise RuntimeError("kvtest map: samples not found: " + str(samples))
+    if not os.path.isfile(summary_path):
+        raise RuntimeError("kvtest map: summary not found: "
+                           + str(summary_path))
+    doc = _kvtest_summary_doc(summary_path)
+    if doc is None:
+        raise RuntimeError("kvtest map: summary unreadable: "
+                           + str(summary_path))
+    role = (role or "").strip().lower()
+    role_ops = KVTEST_WRITE_OPS if role == "writer" else KVTEST_READ_OPS
+    warm = float(warmup_s or 0)
+    cutoff = ((float(start_epoch) + warm)
+              if (start_epoch and warm > 0) else None)
+    pod_bytes = _dir_apparent_bytes(instance_dir) if instance_dir else 0
+    csv_ops = {}
+
+    def _sink(row, in_warmup, okrow):
+        if in_warmup:
+            return                      # 正式窗口口径（与报表严格一致）
+        st = csv_ops.get(row["op"])
+        if st is None:
+            st = csv_ops[row["op"]] = {"total": 0, "success": 0,
+                                       "failure": 0, "bytes": 0,
+                                       "lat_sum": 0.0, "min": None,
+                                       "max": None}
+        st["total"] += 1
+        lat = row.get("lat")
+        if okrow and lat is not None:
+            st["success"] += 1
+            st["bytes"] += int(row.get("bytes") or 0)
+            st["lat_sum"] += lat
+            st["min"] = lat if st["min"] is None else min(st["min"], lat)
+            st["max"] = lat if st["max"] is None else max(st["max"], lat)
+        else:
+            st["failure"] += 1
+
+    payload = kvtest_summary_payload(summary_path, role_ops)
+    summaries = [("summary", payload)] if payload is not None else []
+    stats = compute_stats(
+        samples, top_n=top_n, node=node, pod=pod, role=role,
+        remote_path=remote_path, size=size,
+        rows_factory=lambda p: iter_kvtest_rows(p, start_epoch, None),
+        summaries=summaries, source_name=os.path.basename(samples),
+        digest_k=digest_k, warmup_cutoff=cutoff,
+        op_filter=role_ops, row_sink=_sink,
+        extra_meta={"format": "kvtest_samples", "scenario": "kvtest"})
+    stats["meta"]["samples_bytes"] = os.path.getsize(samples)
+    stats["meta"]["bytes"] = int(pod_bytes)
+    # 单一大小口径：该字节数 = 进程现场目录 apparent size（已含 glog/样本），
+    # 报表的「原始合计」不再叠加 trace 的 glog_bytes。
+    stats["meta"]["size_mode"] = "dir"
+    _apply_summary_metrics(stats, doc)
+    ops_out = {}
+    for op, st in csv_ops.items():
+        ok = st["success"]
+        ops_out[op] = {
+            "total": st["total"], "success": ok,
+            "failure": st["failure"], "bytes": st["bytes"],
+            "avg_ms": round(st["lat_sum"] / ok, 6) if ok else 0.0,
+            "min_ms": round(st["min"], 6) if st["min"] is not None else 0.0,
+            "max_ms": round(st["max"], 6) if st["max"] is not None else 0.0,
+        }
+    try:
+        elapsed = float(doc.get("elapsed_seconds") or 0.0)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    # summary.json 只读一遍：notify/queue 指标只有它带（请求样本里没有），
+    # 随 csvstats 产出一并回传，编排机无需再接触 summary。
+    _sops = doc.get("operations") or {}
+    _nop = ("notify_rpc" if "notify_rpc" in _sops else
+            ("notify_http" if "notify_http" in _sops else None))
+    _nt = (_sops.get(_nop) or {}) if _nop else {}
+    _qw = _sops.get("notify_queue_wait") or {}
+
+    def _num(d, key):
+        try:
+            return float(d.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    csvstats = {"instance_id": iid, "node": node, "pod": pod, "role": role,
+                "size": size, "elapsed_seconds": elapsed,
+                "warmup_s": warm, "meta_bytes": int(pod_bytes),
+                "verify_failures": int(doc.get("verify_failures") or 0),
+                "notify": ({"submitted": int(_nt.get("total") or 0),
+                            "ok": int(_nt.get("success") or 0),
+                            "fail": int(_nt.get("failure") or 0),
+                            "avg_ms": _num(_nt, "avg_ms"),
+                            "max_ms": _num(_nt, "max_ms")}
+                           if _nt else None),
+                "queue": ({"avg_ms": _num(_qw, "avg_ms"),
+                           "max_ms": _num(_qw, "max_ms"),
+                           "n": int(_qw.get("total") or _qw.get("count") or 0)}
+                          if _qw else None),
+                "ops": ops_out}
+    return stats, csvstats
+
+
 def _epoch_to_ts(epoch):
     """Absolute local wall clock as 'YYYY-MM-DD HH:MM:SS.micro' (log format)."""
     whole = int(epoch)
@@ -917,15 +1116,31 @@ def main(argv=None):
         description="Compute compact stats JSON from one client log (map stage)")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--log", help="client log file")
-    src.add_argument("--kvtest-samples",
-                     help="kvtest request-sample CSV (C++ binary map input)")
+    src.add_argument("--kvtest-map-instance", action="store_true",
+                     help="kvtest: single-pass in-pod map over "
+                          "latency_samples.csv (stats + csvstats)")
+    parser.add_argument("--kvtest-samples", default=None,
+                        help="kvtest map: latency_samples.csv path")
     parser.add_argument("--out", default=None,
                         help="output path (default: <input>.stats.json)")
+    parser.add_argument("--out-stats", default=None,
+                        help="kvtest map: stats product output path")
+    parser.add_argument("--out-csvstats", default=None,
+                        help="kvtest map: csvstats product output path")
+    parser.add_argument("--instance-dir", default=None,
+                        help="kvtest map: per-process artifact dir "
+                             "(meta.bytes = its apparent size, captured first)")
+    parser.add_argument("--iid", type=int, default=None,
+                        help="kvtest map: process instance id")
+    parser.add_argument("--warmup-s", type=float, default=None,
+                        help="kvtest map: warmup seconds (rows before the "
+                             "cutoff stay chart-only / are excluded)")
     parser.add_argument("--start-epoch", type=float, default=None,
                         help="kvtest: epoch seconds of the /start trigger "
                              "(origin of elapsed_us)")
     parser.add_argument("--summary", default=None,
-                        help="kvtest: per-instance summary.json (wall/bytes)")
+                        help="kvtest map: per-instance summary.json "
+                             "(read in place for wall/verify/queue-wait)")
     parser.add_argument("--source-name", default=None,
                         help="meta.source override (default: input basename)")
     parser.add_argument("--digest-k", type=int, default=None,
@@ -941,36 +1156,45 @@ def main(argv=None):
     parser.add_argument("--remote-path", default=None)
     parser.add_argument("--size", default=None)
     args = parser.parse_args(argv)
-    if args.kvtest_samples:
-        if args.start_epoch is None:
-            parser.error("--kvtest-samples requires --start-epoch")
-        ops = None
-        if args.role == "writer":
-            ops = KVTEST_WRITE_OPS
-        elif args.role == "reader":
-            ops = KVTEST_READ_OPS
-        summaries = []
-        if args.summary:
-            payload = kvtest_summary_payload(args.summary, ops)
-            if payload is not None:
-                summaries.append(("summary", payload))
-        src_path = args.kvtest_samples
-        stats = compute_stats(
-            src_path, top_n=args.top_n, context=args.context,
-            node=args.node, pod=args.pod, role=args.role,
-            remote_path=args.remote_path, size=args.size,
-            rows_factory=lambda p: iter_kvtest_rows(p, args.start_epoch, ops),
-            summaries=summaries, source_name=args.source_name,
-            digest_k=args.digest_k,
-            extra_meta={"format": "kvtest_samples"})
-    else:
-        src_path = args.log
-        stats = compute_stats(src_path, top_n=args.top_n,
-                              context=args.context, node=args.node,
-                              pod=args.pod, role=args.role,
-                              remote_path=args.remote_path, size=args.size,
-                              source_name=args.source_name,
-                              digest_k=args.digest_k)
+    if args.kvtest_map_instance:
+        missing = [flag for flag, val in (
+            ("--kvtest-samples", args.kvtest_samples),
+            ("--summary", args.summary), ("--role", args.role),
+            ("--instance-dir", args.instance_dir),
+            ("--out-stats", args.out_stats),
+            ("--out-csvstats", args.out_csvstats),
+            ("--start-epoch", args.start_epoch)) if not val]
+        if missing:
+            parser.error("--kvtest-map-instance requires: "
+                         + ", ".join(missing))
+        stats, csvstats = kvtest_map_instance(
+            args.kvtest_samples, args.summary, args.role,
+            node=args.node, pod=args.pod, size=args.size,
+            start_epoch=args.start_epoch, warmup_s=args.warmup_s,
+            digest_k=args.digest_k, remote_path=args.remote_path,
+            iid=args.iid, instance_dir=args.instance_dir,
+            out_stats=args.out_stats, out_csvstats=args.out_csvstats,
+            top_n=args.top_n)
+        for path, doc in ((args.out_stats, stats),
+                          (args.out_csvstats, csvstats)):
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False,
+                          separators=(",", ":"))
+            os.replace(tmp, path)
+        g = stats["global"]
+        print("[logstats] map-instance {} i{} rows={} ok={} fail={} "
+              "p99={:.3f}ms bytes={} -> stats, csvstats".format(
+                  args.role, args.iid, stats["meta"]["rows"], g["ok"],
+                  g["fail"], g["p99_ms"], stats["meta"]["bytes"]))
+        return 0
+    src_path = args.log
+    stats = compute_stats(src_path, top_n=args.top_n,
+                          context=args.context, node=args.node,
+                          pod=args.pod, role=args.role,
+                          remote_path=args.remote_path, size=args.size,
+                          source_name=args.source_name,
+                          digest_k=args.digest_k)
     out = args.out or (src_path + ".stats.json")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

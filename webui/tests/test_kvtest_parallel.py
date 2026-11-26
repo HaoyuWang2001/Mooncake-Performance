@@ -31,7 +31,7 @@ def test_parallel_knob_defaults():
     assert bm._PIPELINE_PARALLEL == 1
 
 
-def test_gzip_remote_files_fallback(monkeypatch):
+def test_gzip_remote_files_is_strict(monkeypatch):
     calls = []
 
     def fake_ssh(ip, node, cmd, **kw):
@@ -41,9 +41,12 @@ def test_gzip_remote_files_fallback(monkeypatch):
     monkeypatch.setattr(bm, "ssh_check_output", fake_ssh)
     monkeypatch.setattr(bm, "get_node",
                         lambda cluster, name: {"ip": "1.2.3.4"})
-    # exec failure -> original paths, never raises
-    out = bm._kvtest_gzip_remote_files(None, "n1", ["/r/a.samples.csv"])
-    assert out == ["/r/a.samples.csv"]
+    # exec failure -> hard error (no uncompressed fallback)
+    try:
+        bm._kvtest_gzip_remote_files(None, "n1", ["/r/a.samples.csv"])
+        raise AssertionError("should raise")
+    except RuntimeError as exc:
+        assert "gzip failed" in str(exc)
     # success -> .gz paths
     monkeypatch.setattr(
         bm, "ssh_check_output",
