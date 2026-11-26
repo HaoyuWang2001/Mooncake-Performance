@@ -5581,8 +5581,9 @@ def _k8s_deployment_pods(cluster, run_label, role):
 # (MONITOR_ARTIFACTS: mem/urma) to the ``_monitor`` pseudo-nodes ONLY, and the
 # in-container tools (spdiag/perf/runqlat/offcputime) to the benchmark pods
 # ONLY. spdiag is per-container (SHM /spdiag_shm_default) and no instrumented
-# process runs in a monitor pod, so it must never target one: `restart` there
-# dies with SIGBUS (rc=135).
+# process runs in a monitor pod, so it must never target one (there `restart`
+# has no initialized SHM to work on). spdiag itself is status-driven:
+# `spdiag status` -> not running => start, is running => restart.
 _K8S_MONITOR_TIMEOUT_S = 60
 
 
