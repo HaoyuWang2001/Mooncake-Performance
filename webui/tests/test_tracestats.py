@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """tracestats（C++ SDK trace 主行）单测——fixtures 严格取自 SDK 日志格式样例。
 
-覆盖当前打点体系（对齐 Mooncake 源码，TE/TENT 双引擎）：
-- 写 put 家族 breakdown[op]：engine[classic] memwrite_* / engine[tent] 四相位
-- 读 get_buffer 的 get_breakdown 行（A/B 分段）、get_into 的 breakdown[get_into]
+覆盖当前打点体系（对齐 Mooncake 源码 docs/yh/log-reference.md §14，统一 breakdown[op]，
+TE/TENT 双引擎）：
+- 读：breakdown[get_buffer]（新字段 query_total_us/buf_alloc_us 归一为 query_us/alloc_us）、
+  get_into、batch_get、batch_get_into（query 三段下钻 / prep_us L1；旧 get_breakdown 仍兼容）
+- 写：put 家族 breakdown[op]：engine[classic] memwrite_* / engine[tent] 四相位；
+  batch_put / batch_put_into；TENT+TCP 诚实零值
+- remove / batchRemove 薄行归「其它」组（remove_rpc_us 仍入字段统计）
 - slice / slice_stats 明细行仅计数；方向 read/write；阶段树加和/残差；
   -1 哨兵；失败早退字段为 0；engine 分布
 """
@@ -247,6 +251,128 @@ def test_time_buckets_and_topn(tmp_path):
     for k in ("local_endpoints_us", "select_replica_us", "read_a_us",
               "read_transfer_window_us", "read_b_us"):
         assert k in st0, (k, st0)
+
+
+# ---- 统一 breakdown[op]（log-reference §14.8/§14.9）：新增接口与字段 ----
+
+READ_UNIFIED = (
+    GLOG + "trace_id[18446744073] breakdown[get_buffer] "
+    "key[bench/obj_000123] status[ok] size[1048576] type[memory_remote] "
+    "replica_count[2] remote_endpoint[10.20.1.9:50051] "
+    "local_endpoint[10.20.1.7:50051] start_time[2026-11-27 10:23:41.882310] "
+    "query_total_us[57] query_route_us[5] query_rpc_us[50] "
+    "query_retry_us[0] query_retry_count[0] select_us[18] "
+    "local_endpoints_us[12] select_replica_us[6] buf_alloc_us[5] "
+    "engine[classic] memread_total_us[189] read_submit_us[8] "
+    "read_queue_us[14] read_urma_us[160] read_teardown_us[7] "
+    "slice_count[2] read_urma_min_us[148] read_urma_avg_us[150] "
+    "read_us[189] read_a_us[58] read_b_us[5] "
+    "read_transfer_window_us[126] read_ab_valid[1] "
+    "read_transfer_count[1] memcpy_us[0] total_us[269]")
+
+BATCH_GET = (
+    GLOG + "trace_id[18446744073] breakdown[batch_get] num_keys[8] "
+    "start_time[2026-11-27 10:23:42.000000] query_us[30] "
+    "query_route_us[4] query_rpc_us[24] query_retry_us[0] prep_us[50] "
+    "read_us[120] total_us[200] batch_get_ops[8] ssd_offload_ops[0] "
+    "success[8] replicas[2] status[ok]")
+
+BATCH_GET_INTO = (
+    GLOG + "trace_id[18446744073] breakdown[batch_get_into] num_keys[6] "
+    "start_time[2026-11-27 10:23:43.000000] query_us[30] "
+    "query_route_us[4] query_rpc_us[24] query_retry_us[0] prep_us[40] "
+    "read_us[130] total_us[200] direct_ops[0] mem_ops[6] nof_ops[0] "
+    "disk_ops[0] ssd_offload_ops[0] success[6] replicas[2] status[ok]")
+
+BATCH_PUT = (
+    GLOG + "trace_id[18446744073] breakdown[batch_put] num_keys[4] "
+    "start_time[2026-11-27 10:23:44.000000] total_us[500] status[ok]")
+
+REMOVE_THIN = (
+    GLOG + "trace_id[18446744073] breakdown[remove] key[bench/obj] "
+    "start_time[2026-11-27 10:23:45.000000] remove_rpc_us[30] "
+    "total_us[30] status[ok]")
+
+BATCH_REMOVE_THIN = (
+    GLOG + "trace_id[18446744073] breakdown[batchRemove] num_keys[3] "
+    "start_time[2026-11-27 10:23:46.000000] remove_rpc_us[40] "
+    "total_us[40] status[ok]")
+
+# TENT + TCP：引擎身份仍是 tent，但 rail 不暴露任务级计时 → 四相位诚实零值
+TENT_TCP_ZERO = (
+    GLOG + "trace_id[18446744073] breakdown[upsert] key[bench/obj] "
+    "status[ok] size[131072] replicas[2] "
+    "start_time[2026-11-27 10:23:47.000000] prep_total_us[52] "
+    "prep_buf_alloc_us[8] prep_memcpy_us[41] prep_split_us[3] "
+    "checksum_us[29] prepare_us[4] query_us[57] put_start_us[0] "
+    "engine[tent] admit_us[0] queue_prep_us[0] wire_span_us[0] "
+    "propagate_us[0] slice_count[0] bytes[0] put_end_us[0] "
+    "finalize_us[60] cache_invalidate_us[2] revoke_us[0] total_us[458]")
+
+
+def test_unified_get_buffer_field_alias_and_tree(tmp_path):
+    """breakdown[get_buffer] 新字段：query_total_us/buf_alloc_us 归一为
+    query_us/alloc_us，query 三段下钻与 A/B 分段保留，残差为 0。"""
+    st = ts.compute_trace_stats(_write(tmp_path, "u.glog", [READ_UNIFIED]))
+    op = st["groups"]["read"]["ops"]["get_buffer"]
+    f = op["fields"]
+    assert op["count"] == 1 and op["ok"] == 1
+    assert f["query_us"]["max"] == 57          # query_total_us → query_us
+    assert f["alloc_us"]["max"] == 5           # buf_alloc_us → alloc_us
+    assert f["select_us"]["max"] == 18 and f["read_us"]["max"] == 189
+    assert f["query_route_us"]["max"] == 5
+    assert f["query_rpc_us"]["max"] == 50
+    assert f["query_retry_us"]["max"] == 0
+    assert f["read_a_us"]["max"] == 58 and f["read_transfer_window_us"]["max"] == 126
+    assert "memread_total_us" in f             # classic 传输段仍入字段统计
+    assert op["residual"]["n"] == 1 and op["residual"]["max"] == 0
+    assert op["engine"] == {"classic": 1}
+
+
+def test_get_into_query_drill_fields(tmp_path):
+    """get_into 的 query 三段下钻（L2）登记且不破坏残差。"""
+    line = (GET_INTO_OK.replace("query_us[40]",
+                                "query_us[40] query_route_us[5] "
+                                "query_rpc_us[30] query_retry_us[0]"))
+    st = ts.compute_trace_stats(_write(tmp_path, "into3.glog", [line]))
+    op = st["groups"]["read"]["ops"]["get_into"]
+    assert op["fields"]["query_route_us"]["max"] == 5
+    assert op["fields"]["query_rpc_us"]["max"] == 30
+    assert op["residual"]["max"] == 0
+
+
+def test_batch_read_interfaces_prep_and_query_drill(tmp_path):
+    st = ts.compute_trace_stats(
+        _write(tmp_path, "batch.glog", [BATCH_GET, BATCH_GET_INTO]))
+    read = st["groups"]["read"]["ops"]
+    for name, prep in (("batch_get", 50), ("batch_get_into", 40)):
+        op = read[name]
+        assert op["count"] == 1
+        assert op["fields"]["prep_us"]["max"] == prep
+        assert op["fields"]["query_route_us"]["max"] == 4
+        assert op["residual"]["n"] == 1 and op["residual"]["max"] == 0
+
+
+def test_batch_put_write_group_and_remove_other(tmp_path):
+    st = ts.compute_trace_stats(
+        _write(tmp_path, "mix2.glog",
+               [BATCH_PUT, REMOVE_THIN, BATCH_REMOVE_THIN]))
+    assert st["groups"]["write"]["ops"]["batch_put"]["count"] == 1
+    other = st["groups"]["other"]["ops"]
+    assert other["remove"]["fields"]["remove_rpc_us"]["max"] == 30
+    assert other["batchRemove"]["fields"]["remove_rpc_us"]["max"] == 40
+    assert "residual" not in other["remove"]   # 其它组不做阶段残差
+
+
+def test_tent_tcp_honest_zero_phases(tmp_path):
+    """TENT + TCP：engine 仍为 tent，四相位 0（诚实零值）；残差吸收真实传输。"""
+    st = ts.compute_trace_stats(_write(tmp_path, "zt.glog", [TENT_TCP_ZERO]))
+    op = st["groups"]["write"]["ops"]["upsert"]
+    assert op["engine"] == {"tent": 1}
+    assert op["fields"]["admit_us"]["max"] == 0
+    assert "memwrite_total_us" not in op["fields"]
+    # 52+29+4+57+60+2 = 204；458 − 204 = 254
+    assert op["residual"]["n"] == 1 and op["residual"]["max"] == 254
 
 
 def test_cli_writes_trace_json(tmp_path):

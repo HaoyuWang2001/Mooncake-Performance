@@ -10,20 +10,28 @@ SDK 把高频 trace 打到 glog（`<glog 前缀> trace_id[...] breakdown[op] k[v
 数值字段按 int/float 解析，`-1` 为"该阶段拿不到时间戳"的哨兵（不参与时延统计，
 仅计 neg）；start_time 为本地日期时间（含空格），转 epoch 用于时间桶。
 
-阶段树（数据自检用，report 按此展示；对齐当前 Mooncake 源码，TE/TENT 双引擎）：
-  读 get_buffer（get_breakdown 行）:
-    total ≈ query + select(local_endpoints+select_replica) + alloc + read
-            (read = read_a + read_transfer_window + read_b)
+阶段树（数据自检用，report 按此展示；对齐 Mooncake 源码统一 breakdown[op] 体系，
+见 Mooncake 仓库 docs/yh/log-reference.md §14；TE/TENT 双引擎）：
+  读 get_buffer（breakdown[get_buffer]；旧 get_breakdown 行仍兼容）:
+    total ≈ query_total + select(local_endpoints+select_replica) + buf_alloc + read
+            (query_total ≈ query_route + query_rpc + query_retry + glue)
+            (read ≈ read_a + read_transfer_window + read_b；classic: read == memread_total)
   读 get_into（breakdown[get_into]）:
     total ≈ query + select(local_endpoints+select_replica) + read
             (read = offload_rpc + transfer_data + release_buffer + read_overhead)
+  读 batch_get / batch_get_into（breakdown[batch_get|batch_get_into]）:
+    total ≈ query + prep(逐 key 选择/分配汇总) + read
+            (query 同样带 query_route/query_rpc/query_retry 下钻)
   写 put/put_from/upsert/upsert_from（breakdown[op]，engine[tent|classic]）:
     total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare
-            + query(upsert) | put_start(put) + <传输段>
-            + put_end(put) | finalize(upsert) + cache_invalidate + revoke
+            + query(upsert，带 query_route/rpc/retry 下钻) | put_start(put)
+            + <传输段> + put_end(put) | finalize(upsert) + cache_invalidate + revoke
     <传输段> classic: memwrite_total(submit+queue+urma+teardown)
              tent:    admit + queue_prep + wire_span + propagate
+  写 batch_put / batch_put_into（breakdown[op]）：put 族字段集（缺省字段跳过）
+  remove / batchRemove：薄行（remove_rpc_us/total_us/status），归「其它」组
   辅助（不参与加和）: slice_count, replicas, bytes, engine 分布
+  字段名归一：query_total_us→query_us、buf_alloc_us→alloc_us（报表树沿用规范名）
 
 采样门控（报表需标注）：主行仅在采样命中或失败时出现；样本数 ≠ 请求总数。
 
@@ -55,20 +63,27 @@ STRING_FIELDS = {"trace_id", "breakdown", "key", "status", "type",
                  "engine"}
 META_FIELDS = {"start_time", "slice_idx", "offset", "bytes"}
 
-READ_OPS = {"get", "get_batch", "get_into", "get_buffer", "batch_get"}
+READ_OPS = {"get", "get_batch", "get_into", "get_buffer", "batch_get",
+            "batch_get_into", "batch_get_buffer", "batch_get_into_buffer"}
 WRITE_OPS = {"put", "put_batch", "put_from", "upsert", "upsert_from",
-             "batch_put"}
+             "batch_put", "batch_put_into", "batch_upsert_from",
+             "batch_put_from"}
+
+# 统一 breakdown[get_buffer] 的字段改名（log-reference §14.5/§14.9）：
+# 报表阶段树沿用既有规范名 query_us/alloc_us，这里做一次等价归一。
+FIELD_ALIASES = {"query_total_us": "query_us", "buf_alloc_us": "alloc_us"}
 
 # 读侧（get_breakdown / breakdown[get_into]）：query+select+alloc+read 四个 L1；
 # select 拆 local_endpoints/select_replica，read 拆 A/B 分段（get_buffer）或
 # offload 三段+overhead（get_into）。
-READ_TOP = ("query_us", "select_us", "alloc_us", "read_us")
+READ_TOP = ("query_us", "select_us", "alloc_us", "prep_us", "read_us")
 # L2 子阶段：慢请求展开明细要回答「慢的一块里哪个子区间慢」——top 条目
 # 除 L1 外一并保留这些字段（与 report.py 的 TREAD/TWRITE 树一致）。
 READ_SUB = ("local_endpoints_us", "select_replica_us",
             "read_a_us", "read_transfer_window_us", "read_b_us",
             "offload_rpc_us", "transfer_data_us", "release_buffer_us",
-            "read_overhead_us")
+            "read_overhead_us",
+            "query_route_us", "query_rpc_us", "query_retry_us")
 # 写侧公共段 + 双引擎传输段：classic 的 memwrite_*（字段名不变）与 TENT 四相位
 # admit/queue_prep/wire_span/propagate 并列；逐行缺省字段跳过，残差各自成立。
 WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
@@ -79,7 +94,8 @@ WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
              "cache_invalidate_us", "revoke_us")
 WRITE_SUB = ("prep_buf_alloc_us", "prep_memcpy_us", "prep_split_us",
              "memwrite_submit_us", "memwrite_queue_us",
-             "memwrite_urma_us", "memwrite_teardown_us")
+             "memwrite_urma_us", "memwrite_teardown_us",
+             "query_route_us", "query_rpc_us", "query_retry_us")
 
 # 段3：阶段曲线（图2）采样字段 = L1 顶层 + total + residual。
 # L2 子阶段（query_route/read_urma/...）不再逐时间采样（体积随字段数线性膨胀，
@@ -191,6 +207,9 @@ def parse_line(line):
         pairs["breakdown"] = "get_buffer"
     elif "breakdown" not in pairs:
         return None
+    for _old, _new in FIELD_ALIASES.items():
+        if _old in pairs and _new not in pairs:
+            pairs[_new] = pairs.pop(_old)
     return pairs
 
 

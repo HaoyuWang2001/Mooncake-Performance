@@ -467,6 +467,17 @@ def test_reduce_trace_block_and_sources(tmp_path):
     assert tr["groups"]["read"]["top"][0]["total_us"] == 269
 
 
+def test_trace_stage_tree_covers_unified_breakdown_fields():
+    """统一 breakdown[op]：读树补 prep_us（batch 接口 L1），读写 query 均带
+    query_route/rpc/retry 下钻（log-reference §14.9）。"""
+    js = rp._APP_JS
+    assert '["prep_us",1,"total_us"]' in js
+    for key in ("query_route_us", "query_rpc_us", "query_retry_us"):
+        assert '["{}",2,"query_us"]'.format(key) in js, key
+    # 两个引擎的写树都在（classic memwrite_* / tent 四相位）
+    assert "memwrite_total_us" in js and '"admit_us"' in js
+
+
 def test_render_trace_section(tmp_path):
     a = _stats(tmp_path, "a.writer", "writer")
     tr = _trace_stats(tmp_path, "c.glog")
