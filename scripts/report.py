@@ -4407,7 +4407,8 @@ function renderErrors(){
 function renderLogSite(){
   const box=document.getElementById('logsite'); if(!box) return;
   box.innerHTML='';
-  const rows=D.logsite||[];
+  const rows=(D.logsite&&D.logsite.length)?D.logsite:
+    (((typeof FULL!=='undefined')&&FULL&&FULL.logsite)||[]);
   if(!rows.length){box.appendChild(el('div','note','无日志产物'));return;}
   const t=el('table','logsite-table');
   const thead=el('thead'); const hr=el('tr');
@@ -6873,6 +6874,7 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     # compact copy for the HTML: only top-K clients carry minute series
     embedded = {"meta": meta, "sizes": {}, "nodes": data.get("nodes") or [],
                 "sources": data.get("sources") or [],
+                "logsite": data.get("logsite") or [],
                 "monitors": compact_monitors(data.get("monitors") or {})}
     for size, z in (data.get("sizes") or {}).items():
         clients = sorted(z.get("clients") or [],

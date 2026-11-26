@@ -1993,6 +1993,25 @@ def test_logsite_out_of_tree_source_gets_own_row(tmp_path):
     assert listed == len(distinct), (listed, distinct)
 
 
+def test_logsite_embedded_copy_has_rows(tmp_path):
+    """回归：logsite 必须同时进入 report.html 的内嵌 __MC_REPORT__ 副本
+    （只加进 data.js 而漏掉内嵌副本时，直接打开会显示「无日志产物」）。"""
+    import re as _re
+    root, ts = "/var/lib/mooncake-bench", "20261126-1200"
+    a = _site_stats(tmp_path, "a.writer", "writer", "10.0.0.1", "pod-a",
+                    root + "/" + ts)
+    data = rp.reduce_scenario(rp.load([a]),
+                              {"config": "cfg", "mode": "pipeline",
+                               "host_log_root": root, "run_id": ts})
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    emb = json.loads(_re.search(
+        r"window\.__MC_REPORT__ = (.*?);</script>", src, _re.S).group(1))
+    assert emb.get("logsite"), emb.keys()
+    tiers = [r["tier"] for r in emb["logsite"]]
+    assert tiers == ["node", "pod", "monitor"], tiers
+
+
 def test_logsite_rows_flattened_and_monitor_states(tmp_path):
     """行 = 节点行（聚合）+ pod 行 + 监控行；节点列只在节点行填。
     监控开着带 pod 名与目录；未开则 pod/属性/路径均为 -。"""
