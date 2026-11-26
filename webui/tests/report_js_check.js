@@ -591,6 +591,17 @@ if (!errs.length) {
       });
       out.overlay_len = opt && opt.series && opt.series.length
         ? opt.series[0].data.length : null;
+      /* 全局统计横线：名字 + 水平线取值（data[0][1]） */
+      out.globals = (opt && opt.series || []).filter(function(ss){
+        return String(ss.name || "").indexOf("全局") === 0;
+      }).map(function(ss){
+        return {name: ss.name,
+                y: (ss.data && ss.data[0] ? ss.data[0][1] : null),
+                x0: (ss.data && ss.data[0] ? ss.data[0][0] : null),
+                x1: (ss.data && ss.data.length
+                     ? ss.data[ss.data.length - 1][0] : null),
+                dash: !!(ss.lineStyle && ss.lineStyle.type === "dashed")};
+      });
     } catch (e) { errs.push("add obj: " + String(e && e.stack || e)); }
   }
 

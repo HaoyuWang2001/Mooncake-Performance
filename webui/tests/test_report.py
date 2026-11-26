@@ -980,9 +980,13 @@ def test_overlay_two_objects_js(tmp_path):
     assert res["errors"] == []
     # 多对象：每个对象一整套指标线（同色），series 名 = 对象名 + 指标
     names = res["overlay_names"] or []
-    objs = {n.split(" ")[0] for n in names}
+    # 全局统计横线（默认 avg/p99/p9999）不是对象：从对象集合中排除
+    globs = [n for n in names if n.startswith("全局")]
+    assert globs, names
+    obj_names = [n for n in names if not n.startswith("全局")]
+    objs = {n.split(" ")[0] for n in obj_names}
     assert len(objs) == 2, names
-    assert len(names) >= 4, names
+    assert len(obj_names) >= 4, names
     assert res["overlay_len"] and res["overlay_len"] > 0
 
 
