@@ -925,6 +925,13 @@ def _kvtest_writer_operation(cfg):
 def _kvtest_reader_operation(cfg):
     return ((cfg.get("reader", {}) or {}).get("operation") or "get_buffer")
 
+
+def _kvtest_record_raw_samples(cfg):
+    value = (cfg.get("kvtest") or {}).get("record_raw_samples", False)
+    if not isinstance(value, bool):
+        raise ValueError("kvtest.record_raw_samples must be a JSON boolean")
+    return value
+
 # runner-script marker for pid liveness probes of kvtest instances (the
 # ledger pid is the run_kvtest.sh bash wrapper; see _PIPELINE_PID_MARKER)
 _KVTEST_PID_MARKER = "run_kvtest.sh"
@@ -4574,6 +4581,9 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
         "notify_read_format": "both",
         "start_paused": True,
         "data_sizes": [ds_label],
+        "record_raw_samples": _kvtest_record_raw_samples(cfg),
+        "report_start_s": (_kvtest_report_window(cfg) or (0, 0))[0],
+        "report_end_s": (_kvtest_report_window(cfg) or (0, 0))[1],
         "metrics_interval_ms": int(kv.get("metrics_interval_ms", 0) or 0),
         "output_dir": entry["_out_dir"],
         "cpu_affinity": entry.get("_cpu_affinity", ""),
@@ -4601,6 +4611,13 @@ def build_kvtest_instance_config(cfg, globals_cfg, cluster_session, plan,
             "replica_num": max(1, int(kv.get("replica_num", 1) or 1)),
         },
     }
+
+
+def _kvtest_spdiag_prefix(prefix, plan, role):
+    """Name each split child before loading the C++ SDK."""
+    if plan.get("split_pod") and role in ("writer", "reader"):
+        return prefix + "env MOONCAKE_SPDIAG_PROGRAM_NAME={} ".format(role)
+    return prefix
 
 
 def _kvtest_health_gate(cluster, entries, timeout_s, what):
@@ -4711,8 +4728,7 @@ def _kvtest_flatten_artifacts(cluster, entry, remote_log_dir, attempts=1,
             last = ssh_check_output(n["ip"], n, command, quiet=True).strip()
         except Exception as exc:
             last = "copy command failed: {}".format(exc)
-        # samples=MISSING is accepted for compatibility with older binaries;
-        # new binaries expose one-request-per-row latency_samples.csv.
+        # Digest binaries deliberately do not emit raw request samples.
         if last.startswith("summary=OK samples="):
             return True, last
         if attempt + 1 < attempts and retry_s:
@@ -4772,6 +4788,11 @@ def _kvtest_window_summary(path, cfg):
     doc = _kvtest_summary_doc(path)
     window = _kvtest_report_window(cfg)
     if window and doc is not None:
+        if doc.get("statistics_format") == "tdigest-v1":
+            selected = doc.get("report_window") or {}
+            if (selected.get("start_s"), selected.get("end_s")) != tuple(window):
+                raise ValueError("digest report window was not collected; rerun with the requested window")
+            return selected
         samples = path[:-len(".summary.json")] + ".samples.csv"
         return _kvtest_window_stats_module().window_summary(samples, doc, *window)
     return doc
@@ -4781,14 +4802,16 @@ def _kvtest_write_report_meta(local_log_dir, cfg, context=None):
     """Keep measurement origin, node mapping and report window with raw data."""
     payload = {
         "format": "kvtest_report_meta",
+        "scenario": cfg.get("scenario"),
+        "work_mode": cfg.get("work_mode"),
         "duration": cfg.get("duration"),
         "report": cfg.get("report", {}),
         "nodes": cfg.get("_kvtest_nodes"),
         "iid_nodes": cfg.get("_kvtest_iid_nodes") or {},
         "iid_pods": cfg.get("_kvtest_iid_pods") or {},
         "start_epochs": cfg.get("_kvtest_start_epochs") or {},
-        "writer_operation": _kvtest_writer_operation(cfg),
-        "reader_operation": _kvtest_reader_operation(cfg),
+        "writer_operation": KVTEST_WRITER_OPS.get(_kvtest_writer_operation(cfg), _kvtest_writer_operation(cfg)),
+        "reader_operation": KVTEST_READER_OPS.get(_kvtest_reader_operation(cfg), _kvtest_reader_operation(cfg)),
     }
     if context:
         payload.update({k: v for k, v in context.items() if v})
@@ -5252,6 +5275,7 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                 if explicit_numa_node is not None:
                     launch_prefix = "env KVTEST_NUMA_NODE={} ".format(
                         explicit_numa_node)
+            launch_prefix = _kvtest_spdiag_prefix(launch_prefix, plan, role)
             entry["_numa_node"] = explicit_numa_node
             inst_cfg = build_kvtest_instance_config(
                 cfg, globals_cfg, cluster_session, plan, entry, role, ds,
@@ -5506,8 +5530,8 @@ def run_kvtest_scenario(cluster, globals_cfg, cfg, ts, args):
                     _files.append("{}/{}.samples.csv".format(
                         remote_log_dir, base))
                 elif not dry:
-                    log("[WARN] kvtest i{} uses an older binary without "
-                        "latency_samples.csv; request-level plot unavailable"
+                    log("kvtest i{} has no raw latency_samples.csv; "
+                        "summary/digest statistics are used; request-level plot unavailable"
                         "".format(entry["iid"]))
                 _groups.append((n, _files,
                                 "kvtest i{}".format(entry["iid"])))
@@ -5627,6 +5651,9 @@ def build_kvtest_basic_instance_config(cfg, globals_cfg, metadata_server,
         "warmup_duration": warmup,
         "start_paused": True,
         "samples_max": int(kv.get("samples_max", 0) or 0),
+        "record_raw_samples": _kvtest_record_raw_samples(cfg),
+        "report_start_s": (_kvtest_report_window(cfg) or (0, 0))[0],
+        "report_end_s": (_kvtest_report_window(cfg) or (0, 0))[1],
         "metrics_interval_ms": int(kv.get("metrics_interval_ms", 0) or 0),
         "output_dir": entry["_out_dir"],
         "cpu_affinity": kv.get("cpu_affinity", ""),
@@ -5965,6 +5992,8 @@ def run_kvtest_basic_scenario(cluster, globals_cfg, cfg, ts, args):
                 os.makedirs(tmp_dir, exist_ok=True)
                 for remote_name, local_suffix in (
                         ("summary.json", ".summary.json"),
+                        *([("latency_samples.csv", ".samples.csv")] if
+                          _kvtest_record_raw_samples(cfg) else []),
                         ("metrics_{}.csv".format(entry["iid"]),
                          ".metrics.csv")):
                     try:
@@ -6033,8 +6062,7 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
     batch = max(1, int(cfg.get("batch_size", 1) or 1))
     warmup = float((cfg.get("warmup", {}) or {}).get("duration", 0) or 0)
     port_base = int((cfg.get("kvtest", {}) or {}).get("port_base", 9401) or 9401)
-    lat_keys = ("avg_ms", "min_ms", "max_ms", "p99_ms", "p999_ms",
-                "p9999_ms")
+    lat_keys = tuple(LATENCY_SUMMARY_COLUMNS)
     rows = []
     for c, t, ds in build_runs(cfg):
         summaries = []
@@ -6047,7 +6075,10 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 continue
             try:
                 with open(path, "r", encoding="utf-8") as fh:
-                    summaries.append(json.load(fh))
+                    document = json.load(fh)
+                if document.get("statistics_format") == "tdigest-v1" and _kvtest_report_window(cfg):
+                    document = _kvtest_window_summary(path, cfg)
+                summaries.append(document)
             except Exception as exc:
                 log("[WARN] kvtest_basic summary {}: {}".format(path, exc))
         if not summaries:
@@ -6110,6 +6141,13 @@ def write_kvtest_basic_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 row[key] = round(weighted[key] / ok, 4) if ok else 0.0
             row["min_ms"] = round(min(mins), 4) if mins else 0.0
             row["max_ms"] = round(max(maxs), 4) if maxs else 0.0
+            from scripts.kvtest_digest import merge_operations
+            merged = merge_operations([
+                (summary.get("operations") or {}).get(op_name, {})
+                for summary in summaries])
+            if merged is not None:
+                for key in LATENCY_SUMMARY_COLUMNS:
+                    row[key] = round(merged.get(key, 0), 4)
             row["throughput_mb_s"] = round(row["throughput_mb_s"], 2)
             row["throughput_gb_s"] = round(row["throughput_gb_s"], 2)
             row["qps"] = round(row["qps"], 2)
@@ -6922,6 +6960,15 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                     else:
                         row[k] = weighted_of(
                             inst_rows, k, weight_key="success")
+            from scripts.kvtest_digest import merge_operations
+            operation = writer_op if role == "writer" else reader_op
+            merged = merge_operations([
+                op_stats(summary, operation)
+                for _iid, _node, summary in summaries.get(ds, [])
+                if operation in (summary.get("operations") or {})])
+            if merged is not None:
+                for k in lat_keys:
+                    row[k] = round(merged.get(k, 0), 4)
             for k in ("qps", "fail_rate", "throughput_mb_s",
                       "throughput_gb_s"):
                 row[k] = round(row[k], 2)
@@ -6963,11 +7010,17 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                 continue
             summaries.setdefault(m.group("ds"), []).append(
                 (iid, nodename, summary))
-        ok_samples = _load_kvtest_ok_samples(
+        digest_only = all(summary.get("statistics_format") == "tdigest-v1"
+                          for group in summaries.values()
+                          for _iid, _node, summary in group)
+        ok_samples = {} if digest_only else _load_kvtest_ok_samples(
             local_log_dir, name, iid_nodes=iid_nodes,
             window=_kvtest_report_window(cfg))
 
         def sample_values(ds, iid, nodename, operation, expected):
+            if any("digest" in op_stats(summary, operation)
+                   for sid, _node, summary in summaries.get(ds, []) if sid == iid):
+                return None
             values = ok_samples.get((ds, iid, nodename, operation), [])
             if len(values) != expected:
                 log("[WARN] kvtest {} i{} {} samples incomplete: {} OK rows, "
@@ -7578,6 +7631,11 @@ def main(args, cfg_paths):
                 if cfg.get("scenario") == "kvtest":
                     _kvtest_generate_window_report(
                         os.path.join(ts_dir, "logs", name), cfg, rows)
+                if cfg.get("scenario") in ("kvtest", "kvtest_basic"):
+                    from scripts.kvtest_distribution_plots import prepare
+                    folder = os.path.join(ts_dir, "logs", name)
+                    _kvtest_write_report_meta(folder, cfg)
+                    prepare(folder, cfg)
                 if cfg.get("scenario") == "pipeline":
                     categories.add("pipeline")
                     # detail keeps only the aggregated writer/reader TOTAL rows
@@ -7682,9 +7740,11 @@ def main(args, cfg_paths):
         has_plot_inputs = bool(
             glob.glob(os.path.join(log_dir, "**", "*.log"), recursive=True)
             or glob.glob(os.path.join(log_dir, "**", "*.samples.csv"),
+                         recursive=True)
+            or glob.glob(os.path.join(log_dir, "**", "kvtest_distributions.json"),
                          recursive=True))
         if not has_plot_inputs:
-            log("[WARN] auto-plot skipped (no *.log or *.samples.csv under "
+            log("[WARN] auto-plot skipped (no logs, samples or digest plot data under "
                 "{})".format(log_dir))
         else:
             plot_script = os.path.join(ROOT, "scripts", "plot_latency.py")

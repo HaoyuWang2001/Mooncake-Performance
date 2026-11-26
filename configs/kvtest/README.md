@@ -1,5 +1,47 @@
 # configs/kvtest — mooncake_kvtest（C++ 原生压测）配置
 
+## t-digest 统计与多 Pod 聚合
+
+默认自动生成每组接口的 Pod Avg/P99/P99.99/Max 对比图、CDF、对数纵轴 CCDF，
+位于 `logs/<配置名>/digest_plots/`。CDF/CCDF 叠加各 Pod 和合并 TOTAL 曲线。
+rank/recall、writer/reader、数据大小与接口分别出图。单接口模式按接口出图。
+绘图需要编排机安装 `pip install matplotlib`；`--no-plot` 关闭全部绘图，但保留统计。
+
+在要运行的场景 JSON 中加入以下开关，可在 digest 之外额外记录所有请求：
+
+```json
+"kvtest": {
+  "record_raw_samples": true
+}
+```
+
+默认是 `false`。原生 C++ JSON 对应顶层 `record_raw_samples`。
+开启后 t-digest 统计和三类分布/对比图继续生成，还会额外产生：
+
+- 每实例 `*.samples.csv`，以及每接口一请求一点的 `*.latency.png` 点线图；
+- `kvtest_raw_statistics.json` 和 `.csv`：原始样本的各 Pod 与 TOTAL 精确统计；
+- `*.raw_stats.json`：各实例点线图对应的精确统计；
+- `kvtest_distributions.json`：独立的 digest 统计/合并结果和出图数据。
+
+原始样本统计包含 min/Avg/P50/P90/P95/P99/P99.9/P99.99/Max 和所有超限次数。
+分位数使用旧版原始样本排序取位次规则；digest 的主 CSV 和分布图保持原统计口径。
+两种统计使用同一报告区间和成功请求口径。开启后内存随请求数增长，长测需预留容量；
+该开关保留全部样本，不受旧 `samples_max` 限制。
+
+新版 kvtest 使用 t-digest 保存各操作的全程时延分布，默认不生成逐请求
+`latency_samples.csv`。需要重新编译部署新版二进制。每个进程的 `summary.json`
+包含质心均值/权重，Performance 合并质心后重算 P50/P90/P95/P99/P99.9/P99.99，
+不会平均各 Pod 的分位数。rank/recall 按场景隔离，场景内按数据大小、writer/reader
+及接口分别聚合；单接口模式按接口聚合，mixed 的读写接口分别计算。
+
+min/avg/max 由精确累计值计算；`>2000us`、`>5000us`、`>6000us`、`>7000us`、
+`>8000us`、`>9000us`、`>10000us`、`>20000us` 是成功请求的精确严格超限次数，
+不是比例。失败与 warmup 不进入时延分布，错误数另行统计。
+
+原有 `report.start_s/end_s` 会在运行前传给 C++，同时采集全程和所选区间两个
+digest。digest 模式只支持全程或运行时指定的区间，事后更换区间会明确报错；
+逐请求时序图需要开启原始记录。已有旧版原始 CSV 仍可用于重算旧报告。
+
 `scenario: "kvtest"` 调用 mooncake-store 仓库 `benchmarks/kvtest` 编译出的
 `mooncake_kvtest` C++ 二进制：Writer→Reader 通知使用 YLT `coro_rpc`，HTTP
 仅保留控制接口；通知队列、Mooncake 调用与指标采集全部留在 C++ 内（无
@@ -160,26 +202,24 @@ writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node
 
 ## 结果
 
-成功运行的最终目录按 Python 模式收敛，只保留每实例 `log`/`glog`、请求级
-PNG，以及 run 级 `<cfg>.csv` 和 `benchmark_detail.csv`。`summary.json` 和
-`samples.csv` 仅作为汇总、作图的临时输入，成功后自动删除；失败或绘图失败时
-保留它们用于排障和重画。注意：
+成功运行保留每实例 `log`/`glog`、含 digest 的 `summary.json`，以及 run 级
+`<cfg>.csv` 和 `benchmark_detail.csv`。逐请求 CSV/PNG 由 `record_raw_samples` 控制。注意：
 kvtest 无 etcd rendezvous；测量窗口从全部实例 `/health` 后的并行 `/start`
 开始。配置 warmup 时，`/start` 先释放 warmup；到时后编排器依次执行
 `/pause`（停 writer 并排空出站通知）、`/drain`（排空 reader 入站队列）、
 `/reset`（清除 warmup metrics/samples）、`/arm`（启动正式计时）和 `/resume`
 （进入正式测量）。每实例 QPS/吞吐使用 summary 中从 arm 后开始计算的实际
 `elapsed_seconds`，不包含跨任务 barrier 等待。
-延迟统计只使用 `status=OK` 的请求；TOTAL 行会先合并全部实例的成功请求样本，
-再重新计算 avg/max/P50/P90/P99/P999/P9999，因此 max 是真正的全局最大值，
-分位数也不是各实例分位数的加权平均。旧二进制没有请求样本时才回退为近似值并
-打印 WARN。
+延迟统计只使用 `status=OK` 的请求；TOTAL 行合并成功请求 digest 后计算分位数，
+精确累加时延总和与成功数计算 avg，并取各实例最大值计算 max。
+旧版逐请求数据仍支持精确合并；仅有旧 summary 时沿用旧近似回退。
 CSV 中 `qps=success/wall_s`，直接表示实测成功 QPS；TOTAL 行汇总所有并发
 实例的成功 QPS。汇总延迟列为 min/avg/P50/P90/P95/P99/P99.9/P99.99/max，
 并记录 `>2000us`、`>5000us`、`>6000us`、`>7000us`、`>8000us`、
 `>9000us`、`>10000us`、`>20000us` 的成功请求数。
 
-kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
+以下逐请求绘图说明适用于旧版原始数据和开启 `record_raw_samples` 的新版。
+旧版 kvtest 在请求热路径中只把 `elapsed_us/operation/latency/status/bytes` 保存到
 内存，`/stop` 后一次性写出 `latency_samples.csv`，不会逐请求刷盘。编排器将其
 拉回为 `*.samples.csv`，`scripts/plot_latency.py` 按 operation 生成一请求一点、
 并按完成时间顺序连接的点线图
@@ -202,12 +242,12 @@ kvtest 实例文件使用紧凑名称
 可用 `--report-start-s 120 --report-end-s 330` 覆盖；rank+recall 入口也支持这两个参数。
 区间相对正式测量开始（不含 warmup），左闭右开，按请求完成时间 `elapsed_us` 归窗。
 流量仍运行完整 duration；QPS/吞吐以区间时长为分母，提前停止则截到实际测量结束。
-读写、通知发送和通知队列等待都从区间样本重算，不使用全程 summary 的延迟/计数。
+新版从运行时单独采集的区间 digest/计数重算读写、通知和队列等待；旧版从区间样本重算。
 没有逐请求时间的校验失败、队列峰值等全程计数无法准确归窗，不继承到区间汇总。
 
 报告输出：`logs/<配置名>/report/report.html` 与 `report/stats.json`，使用同一组 CSV 行，
 不增加 C++ breakdown 日志解析，不引入其他分支的 WebUI 或报告框架。
-`*.samples.csv`、原始 `*.summary.json`、`kvtest_report_meta.json` 成功后也始终保留，
+原始 `*.summary.json`、`kvtest_report_meta.json` 以及旧版已有的 `*.samples.csv` 成功后始终保留，
 不裁剪、不改写原始请求数据。旁挂文件记录统计区间、正式测量起点和实例/节点对应关系。
 短测试在子配置中以 `"report":{"start_s":0,"end_s":null}` 覆盖为全程统计。
 此处的新保留策略取代上文旧的 samples/summary 成功后删除说明。

@@ -921,3 +921,12 @@ def test_write_kvtest_basic_csv_prefers_busy_throughput(tmp_path):
     assert len(rows) == 1
     expected = 2000 / 0.05 / 1024.0 ** 2
     assert rows[0]["throughput_mb_s"] == round(expected, 2)
+
+
+def test_kvtest_spdiag_program_name_is_per_split_process():
+    split = {"split_pod": True}
+    assert bm._kvtest_spdiag_prefix("", split, "writer") == "env MOONCAKE_SPDIAG_PROGRAM_NAME=writer "
+    assert bm._kvtest_spdiag_prefix("env KVTEST_NUMA_NODE=0 ", split, "reader") == "env KVTEST_NUMA_NODE=0 env MOONCAKE_SPDIAG_PROGRAM_NAME=reader "
+    assert bm._kvtest_spdiag_prefix("numactl --membind=0 ", split, "writer").startswith("numactl --membind=0 env ")
+    assert bm._kvtest_spdiag_prefix("", {"split_pod": False}, "writer") == ""
+    assert bm._kvtest_spdiag_prefix("", split, "dual") == ""

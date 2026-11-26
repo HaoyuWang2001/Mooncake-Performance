@@ -15,6 +15,8 @@
 # scenario when a backgrounded instance dies with an error.
 
 set -u
+# Preserve per-process naming across sourced pod defaults.
+SPDIAG_LAUNCH_PROGRAM_NAME=${MOONCAKE_SPDIAG_PROGRAM_NAME:-}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/env.sh"
 
@@ -69,6 +71,10 @@ if command -v ldd >/dev/null 2>&1; then
     echo "$missing_libs" >&2
     exit 1
   fi
+fi
+
+if [ -n "$SPDIAG_LAUNCH_PROGRAM_NAME" ]; then
+  export MOONCAKE_SPDIAG_PROGRAM_NAME="$SPDIAG_LAUNCH_PROGRAM_NAME"
 fi
 
 LAUNCH_CMD=()

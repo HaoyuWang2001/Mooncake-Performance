@@ -464,6 +464,7 @@ def process_kvtest_samples(path, args):
         if name.endswith(KVTEST_SAMPLES_SUFFIX) else os.path.splitext(name)[0]
     out_dir = args.out or os.path.dirname(os.path.abspath(path))
     os.makedirs(out_dir, exist_ok=True)
+    raw_statistics = {}
     for operation in sorted(groups):
         is_queue_wait = _kvtest_is_queue_wait(operation)
         if args.type == "latency" and is_queue_wait:
@@ -482,6 +483,11 @@ def process_kvtest_samples(path, args):
         stat_vals = [v for v, t in zip(vals, times) if report_window is None or
                      (t >= report_window[0] and
                       (report_window[1] is None or t < report_window[1]))]
+        try:
+            from scripts.kvtest_distribution_plots import exact_stats
+        except ModuleNotFoundError:
+            from kvtest_distribution_plots import exact_stats
+        raw_statistics[operation] = exact_stats(stat_vals)
         threshold = args.outlier or max(
             round(percentile(sorted(stat_vals or vals), 0.99) * 10), 1)
         print("[{}] {}: OK={}, failed={}, outlier threshold={}ms".format(
@@ -497,6 +503,9 @@ def process_kvtest_samples(path, args):
             title, file_stem, kind, vals, times, out_dir, threshold,
             "{} OK samples plotted  ERR:{}".format(len(stat_vals), failed),
             time_axis="elapsed", report_window=report_window))
+    with open(os.path.join(out_dir, base + ".raw_stats.json"), "w", encoding="utf-8") as stream:
+        json.dump({"method": "exact-nearest-index", "report_window": report_window,
+                   "operations": raw_statistics}, stream, indent=2)
     return outputs
 
 
@@ -514,7 +523,8 @@ def collect_inputs(path):
     found = []
     for root, _dirs, files in os.walk(path):
         for f in sorted(files):
-            if f.endswith(".log") or f.endswith(KVTEST_SAMPLES_SUFFIX):
+            if (f.endswith(".log") or f.endswith(KVTEST_SAMPLES_SUFFIX)
+                    or f == "kvtest_distributions.json"):
                 found.append(os.path.join(root, f))
     return found
 
@@ -538,9 +548,18 @@ def main(argv=None):
         sys.exit(f"[ERROR] log path not found: {args.log}")
     inputs = collect_inputs(args.log)
     if not inputs:
-        sys.exit(f"[ERROR] no *.log or *.samples.csv under {args.log}")
+        sys.exit(f"[ERROR] no logs, samples CSV or kvtest_distributions.json under {args.log}")
     for path in inputs:
-        if path.endswith(KVTEST_SAMPLES_SUFFIX):
+        if os.path.basename(path) == "kvtest_distributions.json":
+            try:
+                from scripts.kvtest_distribution_plots import render
+            except ModuleNotFoundError:
+                from kvtest_distribution_plots import render
+            with open(path, encoding="utf-8") as stream:
+                data = json.load(stream)
+            for output in render(os.path.dirname(path), data, args.out):
+                print("  -> " + output)
+        elif path.endswith(KVTEST_SAMPLES_SUFFIX):
             process_kvtest_samples(path, args)
         else:
             process_file(path, args)
