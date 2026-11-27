@@ -2316,8 +2316,8 @@
   {
    "id": "C21.V2",
    "module": "report",
-   "desc": "表格分七段：输入（时长/实例数/采样率）→ 行数（总请求行/trace 行 + `行/秒 = 行数 ÷ 时长` 公式）→ 原始（writer.log / reader.log / glog / ylt / 合计）→ map 后（单实例 stats.json / trace.json 均值 + 构成口径：时间桶 ≤8192/档、直方图箱数、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ reduce 回传总量 → 输出（data.js / report.html）→ 对比（原始→回传、原始→报表倍数）",
-   "req": "DR-40",
+   "desc": "表格分层（DR-61 行精简）：输入（时长/实例数/采样率）→ 行数（总请求行/trace 行 + `行/秒 = 行数 ÷ 时长` 公式）→ 原始（仅合计行：dir_mode=各进程目录 apparent size 合计；否则 writer+reader+glog 合计）→ map 后（单实例 stats.json / trace.json 均值 + 构成口径：时间桶 ≤8192/档、直方图箱数、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ reduce 回传总量 → 输出（data.js / report.html）→ 留存（仅合计行）→ 对比（仅 原始→回传 倍数）",
+   "req": "DR-40/DR-61",
    "unit": [
     "test_volume_card_estimates"
    ],
@@ -2326,8 +2326,8 @@
   {
    "id": "C21.V3",
    "module": "report",
-   "desc": "**ylt（coro_rpc easylog）不采集/不处理**：只出现在「原始」行并标注「未采集/暂不处理（仅占节点磁盘，轮转 50MB×3）」，**绝不进入 map 回传或 reduce 统计**",
-   "req": "DR-40",
+   "desc": "**ylt（coro_rpc easylog）不采集/不处理**：不出现在表格行（原始分文件行已删，DR-61），不计入原始合计，**绝不进入 map 回传或 reduce 统计**；「未采集/暂不处理」说明仅在卡顶小注（#volumeNote）",
+   "req": "DR-40/DR-61",
    "unit": [
     "test_volume_card_estimates"
    ],
@@ -2336,7 +2336,7 @@
   {
    "id": "C21.V4",
    "module": "report",
-   "desc": "**glog 参与 map-reduce**：原始 glog 字节取 trace meta.bytes（实测），回传取 trace.json 文件大小（实测）；卡内必须注明该关系",
+   "desc": "**glog 参与 map-reduce**：原始 glog 字节取 trace meta.bytes（实测），回传取 trace.json 文件大小（实测）；关系在卡顶小注说明（dir 模式下 glog 已含在目录合计内、不叠加）",
    "req": "DR-40",
    "unit": [
     "test_volume_card_estimates"
@@ -2354,10 +2354,20 @@
    "e2e": []
   },
   {
+   "id": "C21.D3",
+   "module": "report",
+   "desc": "旧产物 dir_mode 回填：DR-61 前的 partial/reduced 台账无 raw.dir_mode；render_scenario 入口按 size 块 clients 的 size_mode 回填（kvtest dir→True、python→False），--rebuild-report 重建旧 run 时合计行口径文字不落错分支",
+   "req": "DR-61",
+   "unit": [
+    "test_volume_dir_mode_backfill_for_old_products"
+   ],
+   "e2e": []
+  },
+  {
    "id": "C21.D2",
    "module": "report",
-   "desc": "对比口径：`原始合计 ÷ 回传总量` 与 `原始合计 ÷ (data.js + report.html)`；0910 实测约 500MB → 5MB（≈100×）→ 报表 14MB",
-   "req": "",
+   "desc": "对比口径（DR-61）：仅 `原始合计 ÷ 回传总量`（原始→报表行已删）；0910 实测约 500MB → 5MB（≈100×）",
+   "req": "DR-61",
    "unit": [
     "test_volume_card_estimates"
    ],
@@ -2376,7 +2386,7 @@
   {
    "id": "C21.B2",
    "module": "report",
-   "desc": "曾把 ylt 误当 map 输入/回传量 → 行级文案与统计口径必须分离（ylt 只有原始行）",
+   "desc": "曾把 ylt 误当 map 输入/回传量 → 统计口径必须分离（ylt 不进表格行、不计入原始合计，只在卡顶小注说明）",
    "req": "",
    "unit": [
     "test_volume_card_estimates"
@@ -2476,8 +2486,8 @@
   {
    "id": "C20.V9",
    "module": "report",
-   "desc": "数据量与优化卡的「reduce 回传」= `partial.json.gz` 一个文件（pod→controller 的 stats+trace 已在两跳内合并；原始日志留节点）；kvtest 的「原始」合计按进程目录口径计（glog 已含，不重复叠加）；「留存（map 侧目录实测，场景级）」区块：每节点一行（进程目录合计 + profiling）+ 合计",
-   "req": "R-VOL-2/DR-57",
+   "desc": "数据量与优化卡的「reduce 回传」= `partial.json.gz` 一个文件（编排机只接收这一个文件；原始日志留节点）；kvtest 的「原始」合计按进程目录口径计（glog 已含，不重复叠加）；「留存」区块仅合计行（进程目录含 .glog.d / summary / exitrc / remove 服务日志等全部现场文件 + profiling 目录）——每节点行已删（DR-61），data.js 台账字段不变",
+   "req": "R-VOL-2/DR-57/DR-61",
    "unit": [
     "test_finalize_merges_digests_and_builds_logsite",
     "test_csv_is_built_from_reduced_only",
