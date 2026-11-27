@@ -117,10 +117,10 @@ def main(argv=None):
                     q * 100, e if e is not None else float("nan"),
                     m if m is not None else float("nan")))
             print("  k={:<3} build={:.1f}s ({:.0f}k/s) merge={:.2f}s "
-                  "ser={}B rse={:.4f}".format(
+                  "ser={}B rse(p50)={:.4f}".format(
                       k, build_s, n / build_s / 1000.0, merge_s,
                       len(qs.serialize(sk) or ""),
-                      qs.relative_error(sk) or -1.0))
+                      qs.relative_error(sk, 0.5) or -1.0))
             print("       err(single/merged): " + " ".join(cols))
     return 0
 

@@ -129,12 +129,21 @@ def quantile_from(items, q, k=None):
     return quantile(merge(items, k=k), q)
 
 
-def relative_error(sketch):
-    """The sketch's own relative standard-error estimate (REQ get_RSE)."""
+def relative_error(sketch, q=0.999):
+    """A priori rank RSE at normalized rank ``q`` (one standard deviation).
+
+    datasketches 5.x exposes ``get_RSE`` only as a *static* helper
+    ``get_RSE(k, rank, is_hra, n)`` — and released 5.x builds return the
+    rank lower bound there instead of the error. Derive the quantity from
+    the public rank-bound API instead: upper bound - rank at 1 std dev.
+    Returns 0.0 for exact-mode sketches and None when unavailable.
+    """
     if sketch is None:
         return None
     try:
-        return float(sketch.get_RSE())
+        q = float(q)
+        v = float(sketch.get_rank_upper_bound(q, 1)) - q
+        return v if v > 0 else 0.0
     except Exception:
         return None
 

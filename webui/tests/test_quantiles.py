@@ -51,8 +51,8 @@ class _FakeSketch:
         sk.v = [float(x) for x in doc["v"]]
         return sk
 
-    def get_RSE(self):
-        return 0.0
+    def get_rank_upper_bound(self, q, num_std_dev):
+        return float(q) + 0.01
 
 
 class _FakeDS:
@@ -87,6 +87,20 @@ def test_wrapper_degrades_without_library(monkeypatch):
     assert qt.make(24) is None
     assert qt.quantile_from(["x"], 0.99) is None
     assert qt.is_tail(0.99) and not qt.is_tail(0.50)
+
+
+def test_relative_error_from_rank_bound(fake_lib):
+    sk = qt.make(24)
+    # fake: upper bound = q + 0.01 -> RSE 0.01 regardless of rank
+    assert qt.relative_error(sk, 0.50) == pytest.approx(0.01)
+    assert qt.relative_error(sk, 0.99) == pytest.approx(0.01)
+    assert qt.relative_error(None) is None
+
+
+def test_relative_error_degrades_without_rank_bound():
+    class _Bare:
+        pass
+    assert qt.relative_error(_Bare(), 0.5) is None
 
 
 def test_unified_pct_routing(fake_lib):
@@ -234,3 +248,5 @@ def test_real_library_roundtrip():
     assert b64
     q = qt.quantile_from([b64], 0.999)
     assert 985.0 <= q <= 1000.0
+    rse = qt.relative_error(sk, 0.5)
+    assert rse is not None and 0.0 < rse < 0.05

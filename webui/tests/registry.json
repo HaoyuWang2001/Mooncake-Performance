@@ -2905,7 +2905,9 @@
    "desc": "验证真实 datasketches 库序列化往返",
    "req": "",
    "unit": [
-    "test_real_library_roundtrip"
+    "test_real_library_roundtrip",
+    "test_relative_error_from_rank_bound",
+    "test_relative_error_degrades_without_rank_bound"
    ],
    "e2e": []
   },
@@ -7069,6 +7071,20 @@
    "e2e": [
     "check_csv_headers"
    ]
+  },
+  {
+   "id": "E-433",
+   "module": "webui",
+   "desc": "k8s 实例模板镜像 TAG 覆盖写入冻结快照",
+   "req": "",
+   "unit": [
+    "test_apply_image_tag_empty_is_noop",
+    "test_apply_image_tag_overrides_base_with_new_tag",
+    "test_apply_image_tag_rank_recall_patches_both",
+    "test_apply_image_tag_rejects_slash",
+    "test_apply_image_tag_ssh_mode_is_noop"
+   ],
+   "e2e": []
   }
  ]
 }
