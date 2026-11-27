@@ -274,6 +274,7 @@ def test_finalize_merges_digests_and_builds_logsite(tmp_path, fake_sketch):
     assert sum(r["bytes"] for r in pods) > 0
     vol = data["sizes"]["8MB"]["volume"]
     assert vol["reduce"]["pulled_bytes"] == os.path.getsize(partial)
+    assert vol["raw"]["dir_mode"] is True               # 目录口径（DR-61）
 
 
 def test_finalize_is_idempotent(tmp_path, fake_sketch):

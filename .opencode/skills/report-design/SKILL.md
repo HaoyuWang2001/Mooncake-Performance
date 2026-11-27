@@ -448,13 +448,14 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 ### C21 数据量与优化（volume）
 
 - C21.V1 独立卡「数据量与优化」，位于 **节点监控之后、页脚之前**
-- C21.V2 表格分七段：输入（时长/实例数/采样率）→ 行数（总请求行/trace 行 + `行/秒 = 行数 ÷ 时长` 公式）→ 原始（writer.log / reader.log / glog / ylt / 合计）→ map 后（单实例 stats.json / trace.json 均值 + 构成口径：时间桶 ≤8192/档、直方图箱数、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ reduce 回传总量 → 输出（data.js / report.html）→ 对比（原始→回传、原始→报表倍数）
-- C21.V3 **ylt（coro_rpc easylog）不采集/不处理**：只出现在「原始」行并标注「未采集/暂不处理（仅占节点磁盘，轮转 50MB×3）」，**绝不进入 map 回传或 reduce 统计**
-- C21.V4 **glog 参与 map-reduce**：原始 glog 字节取 trace meta.bytes（实测），回传取 trace.json 文件大小（实测）；卡内必须注明该关系
+- C21.V2 表格分层（DR-61 行精简）：输入（时长/实例数/采样率）→ 行数（总请求行/trace 行 + `行/秒 = 行数 ÷ 时长` 公式）→ **原始（仅合计行**：`dir_mode` 为真 = 各进程目录 apparent size 合计；否则 = writer + reader + glog 合计**）** → map 后（单实例 stats.json / trace.json 均值 + 构成口径：时间桶 ≤8192/档、直方图箱数、慢点 Top-N、异常/离群清单上限、trace 阶段秒桶）→ reduce 回传总量 → 输出（data.js / report.html）→ **留存（仅合计行）** → 对比（**仅 原始→回传** 倍数；原始→报表行已删）
+- C21.V3 **ylt（coro_rpc easylog）不采集/不处理**：不出现在表格行（原始分文件行已删，DR-61），不计入原始合计，**绝不进入 map 回传或 reduce 统计**；「未采集/暂不处理」说明仅在卡顶小注（#volumeNote）
+- C21.V4 **glog 参与 map-reduce**：原始 glog 字节取 trace meta.bytes（实测），回传取 trace.json 文件大小（实测）；关系在卡顶小注说明（dir 模式下 glog 已含在目录合计内、不叠加）
 - C21.D1 数值来源：原始 = stats/trace meta.bytes；map 产物 = 文件大小（load 时记 `_bytes`）；输出 = data.js 精确（数值迭代收敛）、report.html 两遍渲染实测
-- C21.D2 对比口径：`原始合计 ÷ 回传总量` 与 `原始合计 ÷ (data.js + report.html)`；0910 实测约 500MB → 5MB（≈100×）→ 报表 14MB
+- C21.D3 **旧产物 dir_mode 回填**：DR-61 前的 partial/reduced 台账无 `raw.dir_mode`；`render_scenario` 入口按 size 块 clients 的 `size_mode` 回填（kvtest dir→True、python→False），`--rebuild-report` 重建旧 run 时合计行口径文字不落错分支
+- C21.D2 对比口径（DR-61）：**仅 `原始合计 ÷ 回传总量`**（原始→报表行已删）；0910 实测约 500MB → 5MB（≈100×）
 - C21.B1 旧产物无 volume 块 → 卡内降级说明（用 --rebuild-report 重生成），不隐藏
-- C21.B2 曾把 ylt 误当 map 输入/回传量 → 行级文案与统计口径必须分离（ylt 只有原始行）
+- C21.B2 曾把 ylt 误当 map 输入/回传量 → 统计口径必须分离（ylt 不进表格行、不计入原始合计，只在卡顶小注说明）
 ### C20 跨切面（排版 / 数据口径 / 工程约束）
 
 - C20.V1 全站字号 ≥12px（无微字幕）
@@ -466,7 +467,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C20.V7 body 卡片层级完整（`div` 闭合平衡）
 - C20.V8 **控件风格统一**：新控件必须复用既有形态（`.toolbar` 行 / `.tl-label` 标签 / `.objtree-strip` 树条 / `.tree-*` 树行 / 既有按钮）；**禁止引入新的容器底色或描边风格**；多栏布局只允许无样式 grid（先例 `.stage-split`/`.trace-cols`）
 - C20.D1 正确性口径：总计=同桶按请求数加权平均、max 取最大、直方图全量合并、离群剔除口径
-- C20.V9 数据量与优化卡的「reduce 回传」= `partial.json.gz` 一个文件（pod→controller 的 stats+trace 已在两跳内合并；原始日志留节点）；kvtest 的「原始」合计按进程目录口径计（glog 已含，不重复叠加）；「留存（map 侧目录实测，场景级）」区块：每节点一行（进程目录合计 + profiling）+ 合计
+- C20.V9 数据量与优化卡的「reduce 回传」= `partial.json.gz` 一个文件（编排机只接收这一个文件；原始日志留节点）；kvtest 的「原始」合计按进程目录口径计（glog 已含，不重复叠加）；「留存」区块**仅合计行**（进程目录含 .glog.d / summary / exitrc / remove 服务日志等全部现场文件 + profiling 目录）——每节点行已删（DR-61），data.js 台账字段不变
 - C20.D2 跨节点时间戳：当前用绝对秒 + 节点时区归一；相对秒 + 编排机参考钟为欠账
 - C20.D3 data.js 规模与嵌入预算（对象/档位/行预算）
 - C20.I1 单区块异常隔离（`safe()`），其余区块正常渲染

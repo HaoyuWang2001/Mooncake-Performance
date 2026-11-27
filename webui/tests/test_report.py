@@ -3463,8 +3463,8 @@ def test_qps_single_object_bars_unchanged(tmp_path):
 
 
 def test_volume_card_estimates(tmp_path):
-    """数据量与优化卡：输入/行数速率/原始分文件（ylt 未采集）/单实例 map 后/
-    reduce 回传/输出大小/优化倍数；data.js 大小与实测一致。"""
+    """数据量与优化卡：输入/行数速率/原始合计（分文件行已删，DR-61）/
+    单实例 map 后/reduce 回传/输出大小/优化倍数；data.js 大小与实测一致。"""
     import os as _os
     import re as _re
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
@@ -3484,6 +3484,7 @@ def test_volume_card_estimates(tmp_path):
     assert v["raw"]["writer_bytes"] > 0 and v["raw"]["reader_bytes"] > 0
     assert v["raw"]["glog_bytes"] > 0
     assert v["raw"]["ylt_bytes"] is None            # 未采集
+    assert v["raw"]["dir_mode"] is False            # python 引擎：文件口径
     assert v["map"]["stats_bytes"] > 0 and v["map"]["trace_bytes"] > 0
     assert v["reduce"]["pulled_bytes"] == (
         v["map"]["stats_bytes"] + v["map"]["trace_bytes"])
@@ -3502,6 +3503,7 @@ def test_volume_card_estimates(tmp_path):
     raw = 700655 + 3019512 + 61265549
     pulled = 75513 + 112024 + 461545
     assert vv["raw"]["total_bytes"] == raw, vv["raw"]
+    assert vv["raw"]["dir_mode"] is False
     assert vv["reduce"]["pulled_bytes"] == pulled
     assert vv["ratio"]["raw_to_pulled"] == round(raw / pulled, 1)
     assert vv["ratio"]["raw_to_pulled"] > 50, vv["ratio"]
@@ -3522,11 +3524,39 @@ def test_volume_card_estimates(tmp_path):
         return
     assert res["errors"] == []
     vt = res.get("volume_text") or ""
-    assert "原始" in vt and "glog" in vt and "ylt" in vt, vt
-    assert "未采集" in vt and "暂不处理" in vt, vt
+    assert "原始" in vt and "glog" in vt, vt
+    assert "writer.log" not in vt and "ylt" not in vt, vt
+    assert "报表" not in vt and "原始 → 回传" in vt, vt
+    assert "partial.json.gz" in vt and "编排机只接收这一个文件" in vt, vt
     assert "map 后" in vt and "stats.json" in vt and "trace.json" in vt, vt
     assert "回传统计总量" in vt, vt
     assert "行/s" in vt, vt
+
+
+def test_volume_dir_mode_backfill_for_old_products(tmp_path):
+    """DR-61 兼容：旧产物 volume.raw 无 dir_mode（DR-61 前在 controller 侧
+    算出），render_scenario 按块内 clients 的 size_mode 回填——重建旧 run 时
+    「原始合计」的口径文字不落错分支（kvtest=目录口径 / python=文件口径）。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"})
+    z = list(data["sizes"].values())[0]
+    del z["volume"]["raw"]["dir_mode"]          # 模拟旧台账
+    z["clients"][0]["size_mode"] = "dir"        # 模拟 kvtest 目录口径
+    html, dj = rp.render_scenario(data, str(tmp_path / "o"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    assert "各进程目录 apparent size 合计" in src, "dir 口径文案未渲染"
+    full = json.loads(re.search(
+        r"window\.__MC_FULL__\s*=\s*(\{.*\})\s*;?\s*$",
+        open(dj, encoding="utf-8").read().strip(), re.S).group(1))
+    zz = list(full["sizes"].values())[0]
+    assert zz["volume"]["raw"]["dir_mode"] is True
+
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    data2 = rp.reduce_scenario(rp.load([b]), {"config": "cfg"})
+    z2 = list(data2["sizes"].values())[0]
+    del z2["volume"]["raw"]["dir_mode"]          # python 引擎：无 size_mode
+    rp._volume_dir_mode_compat(data2)
+    assert z2["volume"]["raw"]["dir_mode"] is False
 
 
 def test_endlabel_focus_single_object(tmp_path):

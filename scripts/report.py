@@ -1220,7 +1220,9 @@ def _volume_block(blk, traces):
     glog **参与 map-reduce**（tracestats → trace.json）；ylt（coro_rpc
     easylog）当前**不采集/不处理**，只作为“原始数据”存在，绝不进入 map 或
     reduce 统计（V-7/DR-40）。原始 glog 字节来自 map 产物 meta.bytes（实测），
-    map 产物字节来自文件大小（实测）。"""
+    map 产物字节来自文件大小（实测）。raw.dir_mode 标记 kvtest 目录口径
+    （合计 = 各进程目录 apparent size，glog 已含），渲染层据此选合计行口径
+    文字（DR-61）。"""
     sm = blk.get("summary") or {}
     tr = blk.get("trace") or {}
     tm = tr.get("meta") or {}
@@ -1269,6 +1271,7 @@ def _volume_block(blk, traces):
             "glog_bytes": glog_raw,
             "ylt_bytes": None,          # 未采集（暂不处理）
             "total_bytes": py_bytes if dir_mode else (py_bytes + glog_raw),
+            "dir_mode": dir_mode,       # kvtest：目录口径（glog 已含）
         },
         "map": {
             "stats_bytes": stats_map, "trace_bytes": trace_map,
@@ -4489,49 +4492,30 @@ function renderVolume(){
     '行/秒 ≈ 总请求 ÷ 时长 = '+fmtNum(rt.rows_per_s)+' 行/s');
   row('行数','trace 行',fmtNum(inp.trace_lines),
     '行/秒 ≈ trace 行 ÷ 时长 = '+fmtNum(rt.trace_rows_per_s)+' 行/s');
-  b('原始','writer.log',raw.writer_bytes,'实测（map 前原始文件）');
-  b('原始','reader.log',raw.reader_bytes,'实测（map 前原始文件）');
-  b('原始','glog（C++ SDK）',raw.glog_bytes,
-    '实测；参与 map-reduce（tracestats → trace.json）；'+
-    'kvtest 下已含在进程目录大小内，合计不重复计入');
-  row('原始','ylt（coro_rpc easylog）','未采集',
-    '暂不处理，仅占节点磁盘（轮转上限 50MB×3）');
-  b('原始','合计',raw.total_bytes,'writer + reader + glog（不含 ylt）',true);
+  b('原始','合计',raw.total_bytes,
+    raw.dir_mode?'实测（各进程目录 apparent size 合计）'
+                :'实测（writer + reader + glog 合计）',true);
   b('map 后','stats.json · 单实例均值',mp.stats_per_client,
     '时间桶 ≤ '+fmtNum(mp.bucket_cap)+'/档 + 直方图 '+mp.hist_bins+
     ' 箱 + 慢点 Top-'+mp.top_n+' + 异常/离群清单 ≤'+mp.list_cap+'/实例');
   b('map 后','trace.json · 单实例均值',mp.trace_per_client,
     '阶段秒桶 + 慢点 Top-'+mp.trace_top_n+'（含 L1/L2）');
   b('reduce','回传统计总量',red.pulled_bytes,
-    'partial.json.gz（pod→controller 的 stats '+fmtBytes(mp.stats_bytes)+
-    ' + trace '+fmtBytes(mp.trace_bytes)+' 已在两跳内合并；编排机只收这一个'+
-    '文件；原始日志留节点）',true);
+    'partial.json.gz（编排机只接收这一个文件；原始日志留节点）',true);
   b('输出','data.js',out.data_js,'全量明细（深查用）');
   b('输出','report.html',out.report_html,'自包含单文件（内嵌当前档位）');
-  const sd=v.site||{}; const sdn=sd.nodes||[];
-  if(sdn.length){
-    sdn.forEach(function(x){
-      const formula=(x.profiling!=null&&x.pods!=null)
-        ?('进程目录 '+fmtBytes(x.pods)+' + profiling '+fmtBytes(x.profiling)+
-          '（map 侧目录实测）')
-        :'现场目录（map 侧实测，含全部运行时文件）';
-      b('留存',String(x.node),x.total,formula);
-    });
+  const sd=v.site||{};
+  if(sd.total!=null){
     b('留存','合计',sd.total,
-      '节点侧留存实测（进程目录含 .glog.d / summary / exitrc / '+
-      'remove 服务日志等全部现场文件）',true);
+      '节点侧留存实测合计（进程目录含 .glog.d / summary / exitrc / '+
+      'remove 服务日志等全部现场文件 + profiling 目录）',true);
   }
   const rawT=Number(raw.total_bytes)||0;
   const pulled=Number(red.pulled_bytes)||0;
-  const repTotal=(Number(out.data_js)||0)+(Number(out.report_html)||0);
   if(pulled) row('对比','原始 → 回传',
     (rawT/pulled).toFixed(1)+'×',
     fmtBytes(rawT)+' ÷ '+fmtBytes(pulled)+
     '：map 只回传统计产物，原始日志留在节点',true);
-  if(repTotal) row('对比','原始 → 报表',
-    (rawT/repTotal).toFixed(1)+'×',
-    fmtBytes(rawT)+' ÷ ('+fmtBytes(out.data_js)+' + '+
-    fmtBytes(out.report_html)+')',true);
   t.appendChild(tb);
   const wrapx=el('div','wrapx'); wrapx.appendChild(t); box.appendChild(wrapx);
 }
@@ -7481,11 +7465,26 @@ _BODY_PIPELINE = "<!-- tpl:pipeline -->\n" + "".join([
 
 
 
+def _volume_dir_mode_compat(data):
+    """DR-61 兼容：旧产物（DR-61 前的 partial/reduced）的 volume.raw 没有
+    dir_mode（当时在 controller 侧算出）。render_scenario 按 size 块 clients
+    的 size_mode 回填，--rebuild-report 重建旧 run 时「原始合计」行的口径
+    文字才不会落到 python 分支。新 run 的 volume 自带该标志，直接跳过。"""
+    for blk in (data.get("sizes") or {}).values():
+        raw = (blk.get("volume") or {}).get("raw")
+        if raw is None or "dir_mode" in raw:
+            continue
+        raw["dir_mode"] = any(
+            (c.get("size_mode") or "") == "dir"
+            for c in (blk.get("clients") or []))
+
+
 def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
-                     rel_base=None):
+                    rel_base=None):
     """Write report.html (self-contained) + data.js (full per-client data)."""
     os.makedirs(out_dir, exist_ok=True)
     meta = data.get("meta") or {}
+    _volume_dir_mode_compat(data)
     size_keys = list((data.get("sizes") or {}).keys())
     # compact copy for the HTML: only top-K clients carry minute series
     embedded = {"meta": meta, "sizes": {}, "nodes": data.get("nodes") or [],
