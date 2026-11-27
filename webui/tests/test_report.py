@@ -4116,6 +4116,153 @@ def test_b05_theme_manual_toggle(tmp_path):
     assert r3["theme_dark"] is True, r3["theme_dark"]
 
 
+def _mon_full():
+    """C18.V8/V9 测试数据：2 节点 × (2 NUMA + available)、2 节点各 2 进程、
+    URMA 2 节点各 1 端口。"""
+    return {
+        "mem_host": [
+            {"node": "n1", "t": [1000, 1001],
+             "columns": ["n0_used_mb", "n1_used_mb", "mem_available_mb"],
+             "series": {"n0_used_mb": [10.0, 20.0], "n1_used_mb": [5.0, 8.0],
+                        "mem_available_mb": [500.0, 480.0]}},
+            {"node": "n2", "t": [1000, 1001],
+             "columns": ["n0_used_mb", "mem_available_mb"],
+             "series": {"n0_used_mb": [30.0, 40.0],
+                        "mem_available_mb": [700.0, 690.0]}},
+        ],
+        "mem_proc": [
+            {"node": "n1", "pid": 11, "comm": "cli", "t": [1000, 1001],
+             "rss_mb": [10.0, 20.0], "pss_mb": [9.0, 18.0],
+             "rss_growth_mb": 10.0, "rss_growth_pct": 100.0,
+             "leak_suspect": False},
+            {"node": "n1", "pid": 12, "comm": "cli", "t": [1000, 1001],
+             "rss_mb": [30.0, 31.0], "pss_mb": [28.0, 29.0],
+             "rss_growth_mb": 1.0, "rss_growth_pct": 3.3,
+             "leak_suspect": False},
+            {"node": "n2", "pid": 21, "comm": "cli", "t": [1000, 1001],
+             "rss_mb": [50.0, 55.0], "pss_mb": [48.0, 52.0],
+             "rss_growth_mb": 5.0, "rss_growth_pct": 10.0,
+             "leak_suspect": False},
+        ],
+        "urma": [
+            {"node": "n1", "ubpu": 0, "port": 1, "t": [1000, 1001],
+             "rx": [1.0, 2.0], "tx": [0.5, 1.0],
+             "rx_avg": 1.5, "rx_max": 2.0, "tx_avg": 0.75, "tx_max": 1.0},
+            {"node": "n2", "ubpu": 0, "port": 1, "t": [1000, 1001],
+             "rx": [3.0, 4.0], "tx": [1.5, 2.0],
+             "rx_avg": 3.5, "rx_max": 4.0, "tx_avg": 1.75, "tx_max": 2.0},
+        ],
+        "summary": {
+            "peak_mem_mb": {"n1": 28, "n2": 40},
+            "worst_proc": {"label": "n1/11 cli", "growth_mb": 10.0,
+                           "growth_pct": 100.0, "leak_suspect": False},
+            "proc_growth": [{"label": "n1/11 cli", "growth_mb": 10.0,
+                             "growth_pct": 100.0, "leak_suspect": False}],
+            "peak_urma": {"label": "n2 ubpu=0 port=1", "value": 4.0},
+        },
+    }
+
+
+def test_b07_monitor_tree_controls_and_legends(tmp_path):
+    """C18.V8 [新增]：三树控件 + 固定图例 + 默认序列。
+    mem 树=节点（求和线）/NUMA 分列；proc 树=节点仅分组不可选、进程勾选；
+    urma 树=仅节点；图例 selectedMode:false 只说明颜色。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    # mem 树：节点行 + NUMA 展开（默认收起）+ toggle 按钮
+    mem_tree = res["mem_tree"]
+    assert "row:n1" in mem_tree, mem_tree
+    assert "btn:清空节点" in mem_tree or "btn:全选节点" in mem_tree, mem_tree
+    assert not any(t.startswith("row:NUMA") for t in mem_tree), mem_tree
+    # mem 图默认 = 每节点一条 used 求和线（可用量默认关）
+    names = [s["name"] for s in res["mem_series"]]
+    assert names == ["n1 used", "n2 used"], names
+    # 求和口径：n1 = n0 + n1 列相加
+    n1 = res["mem_series"][0]
+    assert n1["n"] == 2
+    # proc 树：节点为分组头（无 row: 前缀）、进程行默认展开
+    proc_tree = res["proc_tree"]
+    assert "head:n1" in proc_tree, proc_tree
+    assert "row:cli 11" in proc_tree, proc_tree
+    assert "btn:清空进程" in proc_tree or "btn:全选进程" in proc_tree, proc_tree
+    # proc 图默认 = 全部进程（不再截断前 8）
+    pnames = sorted(s["name"] for s in res["proc_series"])
+    assert pnames == ["cli 11 @n1", "cli 12 @n1", "cli 21 @n2"], pnames
+    # urma 树：仅节点行
+    urma_tree = res["urma_tree"]
+    assert "row:n1" in urma_tree and "row:n2" in urma_tree, urma_tree
+    # urma 图 = 每节点 RX 实线 + TX 虚线
+    us = res["urma_series"]
+    assert len(us) == 4, us
+    assert sum(1 for s in us if s["dash"]) == 2, us
+    # 图例固定不可点（同主图 C5.V4）
+    assert res["mem_legend"]["selectedMode"] is False, res["mem_legend"]
+    assert res["urma_legend"]["selectedMode"] is False, res["urma_legend"]
+    # 空态默认隐藏
+    assert res["mem_empty"] == "none"
+    assert res["proc_empty"] == "none"
+    assert res["urma_empty"] == "none"
+
+
+def test_b08_monitor_tree_click_filters(tmp_path):
+    """C18.V8 [新增]：勾选即时过滤。取消 n1 节点 → mem/proc/urma 序列
+    只剩 n2；节点色 = 色系固定（跨选择稳定）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    # 记录默认色（用于跨选择稳定断言）
+    r0 = _js_check(tmp_path, data)
+    if r0 is None:
+        return
+    n2_color = [s["color"] for s in r0["mem_series"] if s["name"] == "n2 used"][0]
+    res = _js_check(tmp_path, data, "--mon-click", "memTree::n1")
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    names = [s["name"] for s in res["mem_series_after"]]
+    assert names == ["n2 used"], names
+    # 取消后 n2 的颜色不变（色系按节点名固定，不按序号）
+    n2_after = [s["color"] for s in res["mem_series_after"]][0]
+    assert n2_after == n2_color, (n2_after, n2_color)
+    # URMA 树点 n1 → 只剩 n2 的 RX/TX
+    res2 = _js_check(tmp_path, data, "--mon-click", "urmaTree::n1")
+    if res2 is None:
+        return
+    assert res2["errors"] == [], res2["errors"]
+    unames = [s["name"] for s in res2["urma_series_after"]]
+    assert unames == ["n2 ubpu=0 port=1 RX", "n2 ubpu=0 port=1 TX"], unames
+    # proc 树点进程行 → 该进程消失
+    res3 = _js_check(tmp_path, data, "--mon-click", "procTree::cli 11")
+    if res3 is None:
+        return
+    assert res3["errors"] == [], res3["errors"]
+    pnames = sorted(s["name"] for s in res3["proc_series_after"])
+    assert pnames == ["cli 12 @n1", "cli 21 @n2"], pnames
+
+
+def test_b09_monitor_partial_missing_groups(tmp_path):
+    """C18.V9 [新增]：部分缺失三元组（标题+树+图+空态）整组隐藏。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    mons = _mon_full()
+    mons["urma"] = []
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, monitors=mons)
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    assert res["mon_title_suffix"] == "（内存）", res["mon_title_suffix"]
+    assert res["urma_title_display"] == "none", res["urma_title_display"]
+    assert res["urma_series"] is None, res["urma_series"]
+    # mem/proc 正常
+    assert res["mem_title_display"] != "none"
+    assert [s["name"] for s in res["mem_series"]] == ["n1 used", "n2 used"]
+
+
 def test_b06_monitor_card_partial_missing(tmp_path):
     """R-MON-4 v0.5 分支 [新增]：只有 mem 无 urma => 不留 URMA 空占位：
     标题去掉对应分句、urmachart 不渲染或隐藏，且图注同步。"""

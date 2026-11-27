@@ -420,18 +420,21 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C17.B1 日志路径曾在渲染侧改写/给出 pod 内视角（ssh 后 cd 不进）—— 路径必须由产物生成时写入节点侧真实路径
 ### C18 节点监控（内存 / URMA）
 
-- C18.V1 三图：宿主内存（mem.host）/ 进程 RSS（mem.proc）/ URMA 端口流量（urma.flits）；标题后缀
-- C18.V2 部分缺失分支：URMA 无数据不留空占位、标题与图注同步
-- C18.V3 进程 RSS 增幅排序、疑似泄露标记
+- C18.V1 三图：宿主内存（mem.host）/ 进程 RSS（mem.proc）/ URMA 端口流量（urma.flits）；标题后缀；每图三元组 = h3 标题（`宿主内存`/`进程 RSS`/`URMA 端口流量监控`）+ `.objtree-strip mon-strip` 树条 + 图 + `empty-tip` 空态
+- C18.V2 部分缺失分支：三元组整组隐藏（标题/树/图/空态同组同显隐），不留空占位、标题与图注同步
+- C18.V3 进程 RSS 增幅排序、疑似泄露标记（增幅条形图挪入「进程 RSS」区块内）
 - C18.V4 无监控数据整卡隐藏（仅限完全没有 profiling 产物）
 - C18.V5 产物目录 = 节点 IP（k8s 宿主 IP / ssh 管理 IP；显示名冲突回退原名）
 - C18.V6 有产物无可用序列 → 占位卡列出原因（URMA 失败原文 / CSV 无数据行 / 时间窗无交叠），不静默消失
+- C18.V8 三树控件（复用 `.tree-row/.tree-check/button.mini` 既有组件）：**mem 树** = 节点行（勾选 = 该节点 used 求和实线）+ caret 展开分 NUMA 行（勾选 = 分列线）+「用量/可用量」指标开关（lat-sel-btns 同风格；用量默认开且不可关、可用量默认关 = 勾选节点时多一条同色虚线；available 仅节点级）；**proc 树** = 节点行纯分组头（无 checkbox，仅 caret 展开，默认展开、节点名着节点色）+ 进程行勾选（不再 slice(0,8) 截断）；**urma 树** = 仅节点行。三树均允许空选（不回填）→ 图区 empty-tip；toggle 按钮未全选显示「全选*」、全选变「清空*」；选择状态会话内保留，size 切换重置
+- C18.V9 配色与图例：节点色 = `monNodeHue`（与主图 `nodeHue` 同一调色板按节点名排序固定分配，跨选择稳定）；NUMA/进程 = 同系色阶 `monShade`（同 instanceColor 算法）；图例 `type:'scroll'`、**`selectedMode:false` 固定不可点**（显隐只由树勾选控制，与主图「叠加只走对象树」同构）；URMA RX 实线 / TX 同系虚线；进程序列名 `comm pid @node`
 - C18.D1 监控时间窗与主图对齐（reduce 按 t0/t1 切片）
 - C18.D2 URMA 计数器回绕/重置不产生尖峰
 - C18.D3 产物下采样有界（compact_monitors；notes 透传）
 - C18.D4 kvtest 采样注入编排器时钟基准 EPOCH_BASE（时间戳=基准+节点流逝）；窗口裁空回退全量+注记；python 保持节点绝对时间
 - C18.D5 URMA slot 以 mdcli 报错的 available slot id 为准（配置仅提示），自动切换并记录 probe
 - C18.I1 图表 tooltip 同构（悬浮指针 / 点击开框）
+- C18.I2 树勾选即时重渲染对应图（monRenderCharts，不触发整页 renderAll）；主题切换重渲监控树（配色随 token 翻转，选择保留）
 - C18.B1 监控卡在页脚之后（曾被追加到 body 末尾）
 ### C19 overview.html（run 总览）
 
