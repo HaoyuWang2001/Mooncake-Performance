@@ -2118,6 +2118,17 @@
    "e2e": []
   },
   {
+   "id": "C18.V7",
+   "module": "profiling",
+   "desc": "collect 逐文件行 console 折叠为一条结构化汇总（files/nodes/分组计数，计数不均退化为逐文件），benchmark.log 全量；失败 [WARN] 不折叠",
+   "req": "R-MON-1",
+   "unit": [
+    "test_collect_console_fold_one_summary_line",
+    "test_collect_failure_warn_stays_on_console"
+   ],
+   "e2e": []
+  },
+  {
    "id": "C18.D1",
    "module": "report",
    "desc": "监控时间窗与主图对齐（reduce 按 t0/t1 切片）",
@@ -7083,6 +7094,21 @@
     "test_apply_image_tag_rank_recall_patches_both",
     "test_apply_image_tag_rejects_slash",
     "test_apply_image_tag_ssh_mode_is_noop"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "E-434",
+   "module": "utils",
+   "desc": "多节点相似日志聚合：console 折叠（log_agg/flush_agg/flush_agg_all），benchmark.log 逐行全量，错误行立即完整上屏",
+   "req": "",
+   "unit": [
+    "test_log_agg_folds_console_keeps_full_log",
+    "test_log_agg_error_lines_escalate_immediately",
+    "test_flush_agg_custom_summary_and_idempotent",
+    "test_flush_agg_all_drains_every_group",
+    "test_log_agg_verbose_shows_raw_stream",
+    "test_flush_agg_pure_error_group_prints_nothing"
    ],
    "e2e": []
   },

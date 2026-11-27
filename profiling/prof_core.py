@@ -8,7 +8,9 @@
                          marker 记录预期 cmdline，reap 防误杀按 marker 校验）
   stop_and_collect()     场景结束：SIGINT 停采样（perf 优雅落盘）->
                          spdiag show -> scp 收集至 outputs/<ts>/profiling/
-                         <节点>/ -> 清台账
+                         <节点>/ -> 清台账。逐文件 collected 行走 log_agg：
+                         console 折叠为一条结构化汇总，benchmark.log 全量
+                         保留，失败 [WARN] 立即完整上屏
   extract_outliers()     RESULT 行 > threshold 的异常值清单（时刻/key/时延）
   slice_window()         异常时刻 ±window 的文本数据源切片（按行内
                          HH:MM:SS 时间戳过滤；perf.data 建议真机用
@@ -28,7 +30,8 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils import get_node, log, scp_pull, scp_push, ssh_check_output  # noqa: E402
+from utils import (flush_agg, get_node, log, log_agg, scp_pull,  # noqa: E402
+                   scp_push, ssh_check_output)
 
 try:
     import spdiag_tree as spdiag_tree_mod
@@ -224,7 +227,8 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
                 else:
                     present = _run(ip, n, "command -v {} >/dev/null 2>&1 && echo OK || echo MISSING".format(probe))
                 if present != "OK":
-                    log("[profile] {} unavailable on {} -> skipped".format(tool, node_name))
+                    log_agg("profile.avail", "[profile] {} unavailable on {} -> skipped".format(
+                        tool, node_name))
                     continue
                 if tcfg.get("sudo"):
                     # privilege probe: without NOPASSWD the tool would die
@@ -341,6 +345,9 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
                 log("[WARN] [profile] start {} on {}: {}".format(tool, node_name, exc))
         if started:
             session["tools"][node_name] = started
+    # fold the per-node "unavailable -> skipped" lines (console only;
+    # benchmark.log keeps each one)
+    flush_agg("profile.avail")
     if not session["tools"]:
         return None
     log("[profile] started: {}".format(
@@ -418,6 +425,46 @@ def _spdiag_show_file(remote_out_dir, session, node):
         log_dir, pod, session.get("cfg", ""))
 
 
+def _collect_summary(results):
+    """One console line summarizing stop_and_collect pulls from the per-node
+    results [(node_name, ok_files, fail_count), ...].
+
+    monitor artifacts group per tool (mem.* / urma.*), everything else lists
+    per file with its node count; uneven counts inside a tool (a file failed
+    on one node) degrade to the explicit per-file form. Returns None for an
+    empty result list (caller falls back to the generic fold)."""
+    if not results:
+        return None
+    total = sum(len(files) for _n, files, _f in results)
+    nodes = len(results)
+    fails = sum(f for _n, _files, f in results)
+    counts = {}
+    for _node, files, _f in results:
+        for fname in files:
+            counts[fname] = counts.get(fname, 0) + 1
+    parts = []
+    for tool, tool_files in MONITOR_ARTIFACTS.items():
+        got = [counts.get(f, 0) for f in tool_files]
+        if not any(got):
+            continue
+        if min(got) == max(got):
+            parts.append("{}.*×{}".format(tool, got[0]))
+        else:
+            parts.append("{}.*: {}".format(tool, ", ".join(
+                "{}×{}".format(f, c) for f, c in zip(tool_files, got) if c)))
+    known = set()
+    for fl in MONITOR_ARTIFACTS.values():
+        known.update(fl)
+    for fname in sorted(f for f in counts if f not in known):
+        parts.append("{}×{}".format(fname, counts[fname]))
+    msg = "[profile] collected {} files from {} node{}: {}".format(
+        total, nodes, "" if nodes == 1 else "s", ", ".join(parts))
+    if fails:
+        msg += "; {} collect error{} (see [WARN] above)".format(
+            fails, "" if fails == 1 else "s")
+    return msg
+
+
 def stop_and_collect(cluster, session, local_prof_dir):
     """Stop sampling, dump spdiag, collect artifacts. Never raises."""
     if not session:
@@ -449,6 +496,8 @@ def stop_and_collect(cluster, session, local_prof_dir):
         dir_names[node_name] = disp
 
     def _one(item):
+        """Collect one target; returns (node_name, ok_files, fail_count) so
+        the caller can fold the per-file console lines into one summary."""
         node_name, tools = item
         n = get_node(cluster, node_name)
         ip = n["ip"]
@@ -508,12 +557,20 @@ def stop_and_collect(cluster, session, local_prof_dir):
             collected.append(MONITOR_CONFIG_FILE)
         node_local = os.path.join(local_prof_dir, dir_names[node_name])
         os.makedirs(node_local, exist_ok=True)
+        ok_files = []
+        fails = 0
         for fname in collected:
             try:
                 scp_pull(ip, n, remote_paths.get(fname)
                          or "{}/{}".format(remote_out, fname), node_local)
-                log("[profile] collected {}/{}".format(node_name, fname))
+                ok_files.append(fname)
+                # multi-node folding: benchmark.log keeps every line; the
+                # console gets one summary at flush_agg below. Failures use
+                # log() (NOT folded) so a broken pull stays fully visible.
+                log_agg("profile.collect", "[profile] collected {}/{}".format(
+                    node_name, fname))
             except Exception as exc:
+                fails += 1
                 log("[WARN] [profile] collect {}/{}: {}".format(node_name, fname, exc))
         # text-tree generation from the collected spdiag table: every
         # interface tree under configs/_spdiag_trees/ whose root point
@@ -523,17 +580,29 @@ def stop_and_collect(cluster, session, local_prof_dir):
                 for tree_file in spdiag_tree_mod.generate_trees(
                         os.path.join(node_local, "spdiag.show.txt"),
                         SPDIAG_TREES_DIR, node_local, node_name):
-                    log("[profile] spdiag tree {}/{}".format(node_name, tree_file))
+                    log_agg("profile.tree", "[profile] spdiag tree {}/{}".format(
+                        node_name, tree_file))
             except Exception as exc:
                 log("[WARN] [profile] spdiag tree on {}: {}".format(node_name, exc))
         bm.state_remove([{"ip": ip, "pid": p} for p in tools.values() if p])
+        return (node_name, ok_files, fails)
 
     from concurrent.futures import ThreadPoolExecutor
+    results = []
     try:
         with ThreadPoolExecutor(max_workers=max(1, min(8, len(items)))) as pool:
-            list(pool.map(_one, items))
+            results = list(pool.map(_one, items))
     except Exception as exc:
         log("[WARN] [profile] stop_and_collect: {}".format(exc))
+    # fold the per-file console lines into one structured summary (N nodes x
+    # M files would otherwise bury the rest of the console output). A summary
+    # build failure degrades to the generic "(+N similar)" fold, never raises.
+    try:
+        summary = _collect_summary(results)
+    except Exception:
+        summary = None
+    flush_agg("profile.collect", summary)
+    flush_agg("profile.tree")
 
 
 # --------------------------------------------------------------------------
