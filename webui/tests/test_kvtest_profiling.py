@@ -48,17 +48,28 @@ def test_spdiag_restart_and_show_are_collected_per_pod(monkeypatch, tmp_path):
                       os.path.join(str(tmp_path), "bench-pod"))]
 
 
-def test_service_discovery_all_endpoints_without_mutating_workers(monkeypatch):
+def test_service_discovery_by_namespace_and_role_without_mutating_workers(monkeypatch):
     cluster = {"_controller": {}, "nodes": {"bench": {"ip": "1"}}}
     calls = []
 
     def run(controller, args, check=False):
         import json
         calls.append(args)
-        pods = ["master-0"] if args[4] == "mc-master" else ["store-0", "store-1"]
-        return json.dumps({"subsets": [{"addresses": [
-            {"ip": "10.0.0.1", "targetRef": {"kind": "Pod", "name": pod}}
-            for pod in pods]}]}), 0
+        assert args[2:5] == ["get", "pods", "-l"]
+        pods = ["master-0"] if args[5] == "role=master" else ["store-0", "store-1"]
+        items = [{"metadata": {"name": pod}, "status": {
+            "podIP": "10.0.0.1", "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}]}}
+            for pod in pods]
+        # Pending, unready and terminating pods must not be selected.
+        items += [
+            {"metadata": {"name": "pending"}, "status": {"phase": "Pending"}},
+            {"metadata": {"name": "unready"}, "status": {
+                "phase": "Running", "podIP": "10.0.0.2"}},
+            {"metadata": {"name": "terminating", "deletionTimestamp": "now"},
+             "status": {"phase": "Running", "podIP": "10.0.0.3",
+                        "conditions": [{"type": "Ready", "status": "True"}]}}]
+        return json.dumps({"items": items}), 0
 
     monkeypatch.setattr(bm, "controller_run", run)
     nodes = bm._spdiag_service_nodes(
@@ -68,7 +79,29 @@ def test_service_discovery_all_endpoints_without_mutating_workers(monkeypatch):
     assert {n["_pod"] for n in nodes.values()} == {"master-0", "store-0", "store-1"}
     assert all(n["_ns"] == "prod" for n in nodes.values())
     assert set(cluster["nodes"]) == {"bench"}
-    assert calls[1][4] == "mooncake-store"
+    assert calls[1][5] == "role=store"
+    # etcd mode has no RPC master_addr; discover from the metrics Service DNS.
+    etcd_nodes = bm._spdiag_service_nodes(
+        cluster, {"master_type": "etcd", "master_addr": "",
+                  "master_metrics_url": "http://mc-master.prod.svc.cluster.local:17702/metrics"},
+        {"tools": {"spdiag": {"enabled": True}}})
+    assert set(etcd_nodes) == set(nodes)
+    # Explicit namespace works even when no master DNS is configured.
+    explicit_nodes = bm._spdiag_service_nodes(
+        cluster, {}, {"tools": {"spdiag": {"enabled": True, "namespace": "rank-prod"}}})
+    assert len(explicit_nodes) == 3
+    assert all(n["_ns"] == "rank-prod" for n in explicit_nodes.values())
+    # rank+recall children each read their own global.json and share one profile.
+    profile = {"tools": {"spdiag": {"enabled": True}}}
+    for namespace in ("mooncake-rank", "mooncake-recall"):
+        targets = bm._spdiag_service_nodes(
+            cluster, {"master_type": "etcd", "master_addr": "",
+                      "master_metrics_url":
+                          "http://mooncake-master.{}.svc.cluster.local:17702/metrics".format(namespace)},
+            profile)
+        assert len(targets) == 3
+        assert all(n["_ns"] == namespace for n in targets.values())
+    assert "namespace" not in profile["tools"]["spdiag"]
 
 
 def test_service_only_spdiag_is_collected_without_worker_registration(monkeypatch, tmp_path):

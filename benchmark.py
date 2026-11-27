@@ -3123,46 +3123,53 @@ def _spdiag_service_nodes(cluster, globals_cfg, matrix):
             log("[WARN] [profile] master SSH node not resolved; configure "
                 "tools.spdiag.service_nodes with cluster node names")
         return result
-    addr = str(globals_cfg.get("master_addr") or "")
-    host = urllib.parse.urlsplit(addr if "://" in addr else "//" + addr).hostname
-    svc, ns = _svc_ns_from_host(host)
-    services = cfg.get("services")
-    if services is None:
-        if not svc:
-            log("[WARN] [profile] master Service DNS unavailable; configure "
-                "tools.spdiag.services with Service DNS names")
-            return result
-        services = ["{}.{}".format(svc, ns), "mooncake-store.{}".format(ns)]
-    for service in services:
+    namespace = cfg.get("namespace")
+    if not namespace:
+        # Preserve automatic namespace discovery for existing profiles.
+        for addr in (globals_cfg.get("master_addr"), _master_metrics_url(globals_cfg)):
+            addr = str(addr or "")
+            host = urllib.parse.urlsplit(addr if "://" in addr else "//" + addr).hostname
+            _, namespace = _svc_ns_from_host(host)
+            if namespace:
+                break
+    if not namespace:
+        log("[WARN] [profile] service namespace unavailable; configure "
+            "tools.spdiag.namespace (the master/store namespace)")
+        return result
+    selectors = cfg.get("pod_selectors", {"master": "role=master", "store": "role=store"})
+    for role, selector in selectors.items():
         try:
-            service_name, namespace = _svc_ns_from_host(service)
-            if not service_name:
-                raise ValueError("expected <service>.<namespace>: {}".format(service))
+            if not selector:
+                raise ValueError("empty Pod selector")
             out, rc = controller_run(
-                controller, ["-n", namespace, "get", "endpoints", service_name,
+                controller, ["-n", namespace, "get", "pods", "-l", selector,
                              "-o", "json"], check=False)
             if rc != 0:
                 raise RuntimeError(out.strip()[:300])
             found = False
-            for subset in json.loads(out).get("subsets", []):
-                for address in subset.get("addresses", []):
-                    ref = address.get("targetRef") or {}
-                    if ref.get("kind") != "Pod" or not ref.get("name"):
-                        continue
-                    pod = ref["name"]
-                    key = "service-{}-{}".format(namespace, pod)
-                    result[key] = {
-                        "kind": "k8s-pod", "_pod": pod, "_ns": namespace,
-                        "_ctx": controller.get("_ctx", ""),
-                        "_controller": controller,
-                        "_controller_workspace": (cluster.get("k8s") or {}).get(
-                            "controller_workspace", ""),
-                        "ip": address["ip"], "fabric_ip": address["ip"]}
-                    found = True
+            for item in json.loads(out).get("items", []):
+                metadata = item.get("metadata") or {}
+                status = item.get("status") or {}
+                ready = any(c.get("type") == "Ready" and c.get("status") == "True"
+                            for c in status.get("conditions", []))
+                if (metadata.get("deletionTimestamp") or status.get("phase") != "Running"
+                        or not ready or not status.get("podIP")):
+                    continue
+                pod = metadata["name"]
+                key = "service-{}-{}".format(namespace, pod)
+                result[key] = {
+                    "kind": "k8s-pod", "_pod": pod, "_ns": namespace,
+                    "_ctx": controller.get("_ctx", ""),
+                    "_controller": controller,
+                    "_controller_workspace": (cluster.get("k8s") or {}).get(
+                        "controller_workspace", ""),
+                    "ip": status["podIP"], "fabric_ip": status["podIP"]}
+                log("[profile] spdiag target {}: {}/{}".format(role, namespace, pod))
+                found = True
             if not found:
-                raise RuntimeError("no ready Pod endpoints")
+                raise RuntimeError("no Running/Ready Pods matching {}".format(selector))
         except Exception as exc:
-            log("[WARN] [profile] spdiag Service {}: {}".format(service, exc))
+            log("[WARN] [profile] spdiag {} Pods in {}: {}".format(role, namespace, exc))
     return result
 
 

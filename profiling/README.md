@@ -23,10 +23,14 @@ python profiling/profiling.py --trace outputs/<ts> [--at HH:MM:SS.micro] [--thre
 `spdiag restart`，结束时 `spdiag show` 并拉取结果（额外服务端只运行 spdiag）。
 basic、pipeline、kvtest 均支持；kvtest_basic 尚未接入 profiling 生命周期。
 
-- K8s：从 `global.master_addr` 的 Service DNS 推导 master Service 和 namespace，
-  并查找同 namespace 的 `mooncake-store` Service；遍历 Endpoints 中全部 ready Pod。
-  服务名不同时，在 profile 中配置
-  `tools.spdiag.services: ["my-master.prod", "my-store.prod"]`。
+- K8s：按 namespace + Pod 标签发现服务端，不依赖 Service Endpoints。
+  profile 中用 `tools.spdiag.namespace` 显式指定服务端 namespace（如 `mooncake-rank`）；
+  未指定时从 `global.master_addr`、`global.master_metrics_url` 的 Service DNS 推导。
+  rank+recall 模式中两个子进程分别读取 `--rank-global` / `--recall-global`，
+  各自推导服务端 namespace；共用 profile 只需开启 spdiag，无需填写 namespace。
+  默认查询 `role=master` 和 `role=store`，只选择未删除的 Running/Ready Pod。
+  标签不同时可配置 `tools.spdiag.pod_selectors`，例如
+  `{"master": "app=mooncake-master", "store": "app=mooncake-store"}`。
   结果位于 `logs/<配置名>/profiling/service-<namespace>-<Pod名>/spdiag.show.txt`。
 - SSH：使用 `global.mooncake_store_nodes`，并将 `global.master_addr` 的 host 与
   cluster 节点的 `ip` / `fabric_ip` 匹配。也可用 profile 的
