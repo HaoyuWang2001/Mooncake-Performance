@@ -3165,9 +3165,12 @@ def test_qps_bars_follow_object_colors(tmp_path):
 
 
 def test_skill_rulebook_integrity():
-    """规则册完整性：ID 唯一/格式合法、引用的测试真实存在、覆盖率汇总与实际一致。"""
-    import re as _re
+    """规则册 = 纯设计规范（测试映射已迁 registry.json）：
+    C-* 条目唯一且格式合法；不得再内联测试引用；每条 C-* 必须登记进 registry。"""
+    import json as _json
+    import os as _os
     import pathlib as _pl
+    import re as _re
     skill = (_pl.Path(__file__).resolve().parents[2]
              / ".opencode/skills/report-design/SKILL.md").read_text(
         encoding="utf-8")
@@ -3182,38 +3185,15 @@ def test_skill_rulebook_integrity():
         sorted({i for i in ids if ids.count(i) > 1}))
     for i in ids:
         assert _re.fullmatch(r"C\d{1,2}\.[VIDB]\d{1,2}", i), i
-    names = set()
-    for p in _pl.Path(__file__).parent.glob("test_*.py"):
-        names |= set(_re.findall(r"^def (test_[a-z0-9_]+)\(",
-                                 p.read_text(encoding="utf-8"), _re.M))
-    refs = set()
-    for _, line in entries:
-        for m in _re.finditer(r"〔([^〕]*)〕", line):
-            refs |= set(_re.findall(r"test_[a-z0-9_]+", m.group(1)))
-    missing = sorted(r for r in refs if r not in names)
-    assert not missing, "规则册引用了不存在的测试: {}".format(missing)
-
-    def status(line):
-        if "〔✗" in line:
-            return "none"
-        if "〔◐" in line:
-            return "part"
-        if "〔n/a" in line:
-            return "na"
-        if _re.search(r"〔[^〕]*test_[a-z0-9_]+", line):
-            return "ok"
-        return "none"
-
-    counts = {"ok": 0, "part": 0, "none": 0, "na": 0}
-    for _, line in entries:
-        counts[status(line)] += 1
-    m = _re.search(r"覆盖率（自动校验）\**：共 (\d+) 条 · ✓(\d+) · ◐(\d+) · "
-                   r"✗(\d+) · n/a(\d+)", skill)
-    assert m, "缺少覆盖率汇总行"
-    got = tuple(int(x) for x in m.groups())
-    want = (len(entries), counts["ok"], counts["part"], counts["none"],
-            counts["na"])
-    assert got == want, "覆盖率汇总与实际不一致: {} != {}".format(got, want)
+    # 测试映射已迁至 registry：规则册不得内联测试引用
+    assert "〔test_" not in body, "规则册不应再内联测试引用（映射在 registry.json）"
+    reg = _json.load(open(_os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__)))),
+        "webui", "tests", "registry.json"), encoding="utf-8"))
+    reg_ids = {r["id"] for r in reg.get("rules") or []}
+    missing = [i for i in ids if i not in reg_ids]
+    assert not missing, "规则册条目未登记进 registry: {}".format(missing)
 
 
 def test_reset_view_restores_zoom(tmp_path):

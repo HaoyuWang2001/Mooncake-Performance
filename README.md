@@ -1210,6 +1210,21 @@ run 级异常值台账 `outputs/<ts>/profiling/outliers.json` 与时间窗切片
   为可折叠/缩放的树状图（nested=包含盒、phase 横向按 order、nodata 半透明、残差 chip）
 - 手动重生成：`python profiling/spdiag_tree.py --spdiag spdiag.show.txt --tree configs/_spdiag_trees/get_buffer.json [-o out.txt]`
 
+### 10.5 测试体系（registry 驱动）
+
+测试与规则**一一对应**，规则登记处为机器可读的 `webui/tests/registry.json`
+（每条：一句话 desc / 模块 / 关联单元测试 / E2E 检查）。双向强制由
+`webui/tests/test_registry.py` 负责：规则引用的测试必须存在、**每个测试必须归属某条规则**（孤儿红灯）。
+
+- **模块选择**：conftest 按 registry 给每个测试打模块 marker（report /
+  benchmark / kvtest / webui / profiling / utils），`pytest -m <模块>` 只跑相关子集。
+- **改动定位**：`python3 scripts/test_scope.py --since <ref>` 按改动文件→模块→测试清单输出；
+  每批默认只跑这个范围。
+- **触发策略**：单元层默认跑模块相关子集；**E2E**（重资源，见 `webui/tests/e2e/`）默认不跑，
+  批次触及 E2E 登记行为时**询问用户**；全量单测仅用户主动要求排查时执行（见
+  `~/.config/opencode/skills/where-it-all-began/` 的测试触发策略）。
+- **沉淀**：真实事故修复后回写 registry 一条规则（必要时附 E2E 检查），防止同类回归靠人脑回忆。
+
 ## 11. 注意事项与待验证项
 
 - API 语义以 `mooncake_api.md` 为准：`put` 为 create-only（key 存在时 no-op 不覆盖），因此 put
