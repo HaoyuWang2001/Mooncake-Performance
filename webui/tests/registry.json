@@ -2129,6 +2129,38 @@
    "e2e": []
   },
   {
+   "id": "C18.V8",
+   "module": "report",
+   "desc": "三树控件 + 固定图例：mem=节点（NUMA 求和行）/展开分 NUMA + 用量/可用量开关；proc=节点仅分组（不可选）下分进程勾选；urma=仅节点；图例 selectedMode:false 只说明颜色；配色=主图节点色系/同系色阶同源",
+   "req": "R-MON-1",
+   "unit": [
+    "test_b07_monitor_tree_controls_and_legends",
+    "test_b08_monitor_tree_click_filters"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C18.V9",
+   "module": "report",
+   "desc": "部分缺失三元组（标题+树+图+空态）整组隐藏：缺 mem_host/proc/urma 分别隐藏对应组；空选显示 empty-tip 不回填；proc 截断 slice(0,8) 已删除（选择权在树）",
+   "req": "R-MON-1/4",
+   "unit": [
+    "test_b09_monitor_partial_missing_groups",
+    "test_b06_monitor_card_partial_missing"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C18.I2",
+   "module": "report",
+   "desc": "树勾选即时重渲染对应图（不触发整页 renderAll）；主题切换重渲监控树（配色随 token 翻换、选择保留）；size 切换重置监控选择",
+   "req": "R-MON-1",
+   "unit": [
+    "test_b08_monitor_tree_click_filters"
+   ],
+   "e2e": []
+  },
+  {
    "id": "C18.D1",
    "module": "report",
    "desc": "监控时间窗与主图对齐（reduce 按 t0/t1 切片）",
