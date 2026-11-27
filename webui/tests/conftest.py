@@ -112,26 +112,35 @@ def fake_sketch(monkeypatch):
     yield FakeSketch()
 
 def pytest_collection_modifyitems(config, items):
-    """按 registry.json 给每个测试打模块 marker（改哪测哪）。
+    """① E2E 门控：仅当 CLI -m 显式含 e2e 才收集（默认不跑重测试）；
+    ② 按 registry.json 给每个测试打模块 marker（改哪测哪）。
 
     registry 是唯一规则源：test -> module 的映射来自各规则的 unit 列表。
     未登记的测试保持无 marker（test_registry 的孤儿检查会红灯）。"""
     import json as _json
     import os as _os
+    expr = str(config.getoption("markexpr") or "")
+    want_e2e = "e2e" in expr
     reg_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
                              "registry.json")
     try:
         with open(reg_path, "r", encoding="utf-8") as f:
             reg = _json.load(f)
     except (OSError, ValueError):
-        return
+        reg = None
     mod_of = {}
-    for rule in reg.get("rules") or []:
-        for t in rule.get("unit") or []:
-            mod_of.setdefault(t, rule.get("module"))
+    if reg:
+        for rule in reg.get("rules") or []:
+            for t in rule.get("unit") or []:
+                mod_of.setdefault(t, rule.get("module"))
+    keep = []
     for item in items:
+        if "e2e" in item.keywords and not want_e2e:
+            continue                       # E2E 默认不收集
         name = item.name.split("[")[0]
         mod = mod_of.get(name)
         if mod:
             item.add_marker(getattr(_pytest.mark, mod))
+        keep.append(item)
+    items[:] = keep
 

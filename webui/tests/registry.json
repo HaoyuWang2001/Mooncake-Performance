@@ -6969,6 +6969,106 @@
     "test_ensure_utf8_stdio_leaves_tty"
    ],
    "e2e": []
+  },
+  {
+   "id": "E-423",
+   "module": "kvtest",
+   "desc": "E2E：30s kvtest run 成功且 SUMMARY all OK（无 [ERROR]）",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_run_ok"
+   ]
+  },
+  {
+   "id": "E-424",
+   "module": "kvtest",
+   "desc": "E2E：产物齐备（report/data.js/meta/reduced + 两 CSV）",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_artifacts_present"
+   ]
+  },
+  {
+   "id": "E-425",
+   "module": "report",
+   "desc": "E2E：日志现场表进入 report.html 内嵌副本",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_logsite_embedded"
+   ]
+  },
+  {
+   "id": "E-426",
+   "module": "report",
+   "desc": "E2E：trace 解析无错误且读 get_buffer/写 upsert 分组",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_trace_parsed"
+   ]
+  },
+  {
+   "id": "E-427",
+   "module": "report",
+   "desc": "E2E：每个 op 的 engine 分布非空（classic/tent 可见）",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_trace_engine"
+   ]
+  },
+  {
+   "id": "E-428",
+   "module": "report",
+   "desc": "E2E：读侧残差 ≤ 5%·total（字段错配即爆）",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_trace_read_residual"
+   ]
+  },
+  {
+   "id": "E-429",
+   "module": "benchmark",
+   "desc": "E2E：logsite pod 大小 ≈ 节点 du -sb（±15%，软链双计即爆）",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_logsite_matches_node_du"
+   ]
+  },
+  {
+   "id": "E-430",
+   "module": "report",
+   "desc": "E2E：logsite 行序 [node,pod,monitor] 且目录=host_root/run_id",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_logsite_structure"
+   ]
+  },
+  {
+   "id": "E-431",
+   "module": "report",
+   "desc": "E2E：V-7「留存」区块存在且 site 台账非空",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_volume_retention"
+   ]
+  },
+  {
+   "id": "E-432",
+   "module": "kvtest",
+   "desc": "E2E：两份 CSV 表头精确匹配 KVTEST/PIPELINE 契约",
+   "req": "",
+   "unit": [],
+   "e2e": [
+    "check_csv_headers"
+   ]
   }
  ]
 }
