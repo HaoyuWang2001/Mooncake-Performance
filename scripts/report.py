@@ -794,6 +794,7 @@ def _sources(stats, traces=None):
                     "source": meta.get("source") or "",
                     "remote_path": meta.get("remote_path") or "",
                     "bytes": int(meta.get("bytes") or 0),
+                    "size_mode": meta.get("size_mode") or "",
                     "kind": "log"})
     for st in traces or []:
         meta = st.get("meta") or {}
@@ -1370,6 +1371,7 @@ def reduce_scenario(stats, meta, monitors=None, traces=None,
             blk.pop("_digest_pending", None)
     if logsite:
         out["logsite"] = build_logsite(meta, sources, monitor_sites)
+        attach_site_volume(out, meta, sources, monitor_sites)
     return out
 
 
@@ -1431,6 +1433,8 @@ def finalize_digests(partial, monitors=None, monitor_sites=None,
     partial["logsite"] = build_logsite(partial.get("meta") or {},
                                        partial.get("sources") or [],
                                        monitor_sites)
+    attach_site_volume(partial, partial.get("meta") or {},
+                       partial.get("sources") or [], monitor_sites)
     return partial
 
 
@@ -1494,6 +1498,98 @@ def _site_mount_twin(meta):
     return twin, base
 
 
+def _site_sources(meta, sources):
+    """Normalize sources for the 现场日志 table (dir-mode aware).
+
+    kvtest map products carry ``size_mode="dir"``: their ``bytes`` is the
+    retained footprint of that PROCESS directory (map side, lstat). Such an
+    entry represents the whole dir, so:
+      - it becomes ONE synthetic entry keyed by the dir (never by the shared
+        source name ``latency_samples.csv`` — writer/reader would collide);
+      - other entries nested inside a counted dir (its glog.d trace products)
+        are dropped from size accounting to avoid double counting.
+    Non-dir (python/file) entries pass through unchanged."""
+    _twin, _base = _site_mount_twin(meta)
+    dirs = {}
+    dir_prefix = {}
+    files = []
+    for src in sources or []:
+        node = str(src.get("node") or "?")
+        pod = str(src.get("pod") or "")
+        path = _twin(src.get("remote_path") or "")
+        if str(src.get("size_mode") or "") == "dir" and path:
+            d = os.path.dirname(path) or path
+            key = (node, d)
+            ent = dirs.get(key)
+            if ent is None:
+                ent = dirs[key] = {"node": node, "pod": pod, "roles": set(),
+                                   "source": d, "remote_path": d,
+                                   "bytes": int(src.get("bytes") or 0),
+                                   "kind": "dir", "size_mode": "dir"}
+            if src.get("role"):
+                ent["roles"].add(str(src["role"]))
+            dir_prefix.setdefault(node, set()).add(d.rstrip("/") + "/")
+            continue
+        if path and any(path.startswith(pref)
+                        for pref in dir_prefix.get(node, ())):
+            continue
+        files.append(src)
+    out = []
+    for ent in dirs.values():
+        ent = dict(ent)
+        ent["role"] = "、".join(sorted(ent.pop("roles")))
+        out.append(ent)
+    # nested skip must consider ALL dirs regardless of source order
+    kept = []
+    for src in files:
+        node = str(src.get("node") or "?")
+        path = _twin(src.get("remote_path") or "")
+        if path and any(path.startswith(pref)
+                        for pref in dir_prefix.get(node, ())):
+            continue
+        kept.append(src)
+    out.extend(kept)
+    return out
+
+
+def _site_bytes_ledger(meta, sources, monitor_sites=None):
+    """Per-node retained bytes: process dirs/files + monitor profiling dir."""
+    ents = _site_sources(meta, sources)
+    pods = {}
+    for src in ents:
+        node = str(src.get("node") or "?")
+        key = str(src.get("remote_path") or src.get("source") or "")
+        per = pods.setdefault(node, {})
+        if key and key not in per:
+            per[key] = int(src.get("bytes") or 0)
+    ledger = {}
+    for node, per in pods.items():
+        ledger[node] = {"pods": sum(per.values()), "profiling": 0,
+                        "total": sum(per.values())}
+    for node, site in (monitor_sites or {}).items():
+        b = int((site or {}).get("bytes") or 0)
+        led = ledger.setdefault(node, {"pods": 0, "profiling": 0,
+                                       "total": 0})
+        led["profiling"] = b
+        led["total"] = led["pods"] + b
+    return ledger
+
+
+def attach_site_volume(out, meta, sources, monitor_sites=None):
+    """Attach the per-node「留存」ledger to the V-7 数据量与优化卡（场景级）。"""
+    ledger = _site_bytes_ledger(meta, sources, monitor_sites)
+    if not ledger:
+        return
+    site = {"nodes": [{"node": n, "pods": v["pods"],
+                       "profiling": v["profiling"], "total": v["total"]}
+                      for n, v in sorted(ledger.items())],
+            "total": sum(v["total"] for v in ledger.values())}
+    for blk in (out.get("sizes") or {}).values():
+        vol = blk.get("volume")
+        if vol is not None:
+            vol["site"] = site
+
+
 def build_logsite(meta, sources, monitor_sites=None):
     """现场日志表行：每节点一个节点行（聚合）+ 若干 pod 行 + 恰好一个监控行。
 
@@ -1509,11 +1605,11 @@ def build_logsite(meta, sources, monitor_sites=None):
 
     pods = {}
     extras = {}
-    for src in sources or []:
+    for src in _site_sources(meta, sources):
         node = str(src.get("node") or "?")
         pod = str(src.get("pod") or "")
         rpath = _twin(src.get("remote_path") or "")
-        name = str(src.get("source") or "")
+        name = str(src.get("remote_path") or src.get("source") or "")
         row_dir = (base + ("/" + pod if pod else "")) if base else (
             os.path.dirname(rpath) if rpath else "")
         inside = (not row_dir) or (not rpath) or (
@@ -4410,6 +4506,19 @@ function renderVolume(){
     '文件；原始日志留节点）',true);
   b('输出','data.js',out.data_js,'全量明细（深查用）');
   b('输出','report.html',out.report_html,'自包含单文件（内嵌当前档位）');
+  const sd=v.site||{}; const sdn=sd.nodes||[];
+  if(sdn.length){
+    sdn.forEach(function(x){
+      const formula=(x.profiling!=null&&x.pods!=null)
+        ?('进程目录 '+fmtBytes(x.pods)+' + profiling '+fmtBytes(x.profiling)+
+          '（map 侧目录实测）')
+        :'现场目录（map 侧实测，含全部运行时文件）';
+      b('留存',String(x.node),x.total,formula);
+    });
+    b('留存','合计',sd.total,
+      '节点侧留存实测（进程目录含 .glog.d / summary / exitrc / '+
+      'remove 服务日志等全部现场文件）',true);
+  }
   const rawT=Number(raw.total_bytes)||0;
   const pulled=Number(red.pulled_bytes)||0;
   const repTotal=(Number(out.data_js)||0)+(Number(out.report_html)||0);

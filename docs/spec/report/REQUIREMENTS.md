@@ -160,7 +160,7 @@ report.py（本组件：reduce + render，纯标准库）
   - **监控行**（每节点恰好一行，位于该节点 pod 行之后）：角色「监控」；开启监控时 pod 列填监控 pod 名、日志属性 = 大小、日志路径 = 节点侧 profiling 目录；**未开启时 pod/日志属性/日志路径均为 `-`**（行仍保留）；
   - **整表逐行 nowrap + 全表水平滑动**；节点行加粗；
   - **结构性不变量**：任何产物（stats/glog/监控 CSV 等）必须落在表中某行的日志路径之下；落不进规范目录的产物强制以自身目录成行（**永不静默丢产物**；属结构性 bug 时必须显式暴露）；
-  - **大小口径（单一口径）**：kvtest 每进程 `meta.bytes` = 其现场目录 `<pod>/<role>_i<iid>_p<port>/` 的 apparent size（pod 内 map 开始前 `os.stat` 求和，含样本/glog/产物；不以外部 du）；python 引擎为已知产物字节合计。pod 行 = 同 pod 各进程之和，节点行 = 该节点各 source 之和 + 监控产物；节点行「x 个子项」仍为已知产物去重计数；不再有 `du -sb` 快照/`site_sizes.json`；
+  - **大小口径（单一口径）**：kvtest 每进程 `meta.bytes` = 其现场目录 `<pod>/<role>_i<iid>_p<port>/` 的 apparent size（pod 内 map 开始前 `os.lstat` 求和，含样本/glog/产物；**不得跟随符号链接**——glog_compat 在 `.glog.d/` 留 `<prog>.INFO` 软链，`os.stat` 会把每段 glog 计两次、目录大小虚高 ~2×）；python 引擎为已知产物字节合计。**pod 行按 `remote_path`（进程目录/文件路径）维度去重**（writer/reader 的 `source` 同名 `latency_samples.csv` 不得折叠），**嵌套在已计目录内的产物（glog trace 等）不再叠加字节**；节点行 = 该节点各条目之和 + 监控产物；节点行「x 个子项」= 进程目录数 + 未嵌套文件数；不再有 `du -sb` 快照/`site_sizes.json`；
   - 已删除：客户端实例树（总数/成功/失败/客户端列、对慢点追踪的贡献列、writer 在前排序）、节点汇总表、登录命令/查看列、其它产物索引、data.js 降级提示；性能指标（avg/p50/p99…）不在本卡展示。
 - **R-INST-3** `[已固化·DR-19·DR-29·DR-50]` 现场日志表**全部只读**（无点击交互、不叠加曲线、无折叠）；「节点与登录现场」小节及其节点汇总/登录命令/非客户端产物索引已删除，内容由 R-INST-1 单表承载。
 - **R-INST-4** `[已固化·DR-46]` **节点身份 = 节点 IP**：k8s 场景取 `pod.status.hostIP`（宿主节点 IP），ssh 场景取节点管理 IP；同一宿主上的多个 client pod 在**节点级合并**为一个节点（对象树/实例节点列/错误归属/来源表/监控标签一致）；pod 名保留在 `meta.pod` 与客户端名中（明细不丢）。取不到 IP 或 ssh 配置出现重复 IP 时回退原节点名；历史产物（IP 未记录）沿用 pod 名/节点名。
@@ -192,7 +192,7 @@ report.py（本组件：reduce + render，纯标准库）
 ### K. 数据量与优化（VOL）
 
 - **R-VOL-1** `[已固化·DR-40]` 报表含**独立卡「数据量与优化」**，位于节点监控之后、页脚之前。
-- **R-VOL-2** `[已固化·DR-40·DR-54 修订]` 卡内按层级给出：输入（时长/实例数/采样率）→ 行数与**每秒新增行数**（公式：行数 ÷ 时长）→ **原始数据量分文件**（writer.log / reader.log / glog / ylt / 合计；kvtest 为进程目录口径，glog 已含在目录大小内、不重复计）→ **单实例 map 后**（stats.json / csvstats.json / trace.json 均值，注明构成）→ **reduce 回传统计总量**（= `partial.json.gz` 一个文件；pod→controller 的 stats+trace 两跳内合并）→ 输出（data.js / report.html）→ **原始 vs 体系优化倍数**（原始÷回传、原始÷报表）。不再渲染「留存（du 实测）」区块。
+- **R-VOL-2** `[已固化·DR-40·DR-54 修订]` 卡内按层级给出：输入（时长/实例数/采样率）→ 行数与**每秒新增行数**（公式：行数 ÷ 时长）→ **原始数据量分文件**（writer.log / reader.log / glog / ylt / 合计；kvtest 为进程目录口径，glog 已含在目录大小内、不重复计）→ **单实例 map 后**（stats.json / csvstats.json / trace.json 均值，注明构成）→ **reduce 回传统计总量**（= `partial.json.gz` 一个文件；pod→controller 的 stats+trace 两跳内合并）→ 输出（data.js / report.html）→ **留存（map 侧目录实测，场景级）**（每节点一行：进程目录合计 + profiling 目录；合计行；口径见 R-INST-1，含 `.glog.d`/summary/exitrc/remove 日志等全部现场文件）→ **原始 vs 体系优化倍数**（原始÷回传、原始÷报表）。
 - **R-VOL-3** `[已固化·DR-40]` **glog 参与 map-reduce**（原始 glog 字节实测，产物 trace.json 实测）；**ylt（coro_rpc easylog）暂不处理**——只作为原始数据出现并标注「未采集/暂不处理」，**不得进入 map 回传或 reduce 统计**。
 - **R-VOL-4** `[已固化·DR-40·DR-54 修订]` 数据以实测为准：原始=各进程目录 apparent size（kvtest，见 R-INST-1）/stats meta.bytes（python 引擎）、map 产物=文件大小、回传=partial.json.gz 实际大小、输出=实际写盘大小（data.js 精确、report.html 两遍渲染实测）；不再有 du 快照。
 
@@ -306,6 +306,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-51（**被 DR-54 取代**） | 2026-11-26 | 现场日志大小改为节点侧 **du -sb 实测**（用户需求：不再依赖 map/pull 源头记录的已知产物字节，避免遗漏 .glog.d/summary/exitrc/remove 服务日志等运行时文件）：成功收尾时（profiling 落盘后、pod 销毁前）每宿主一次 du 快照（k8s=kubectl exec 进存活 client pod / ssh=远端直跑），pod 内路径换算为节点侧真实路径，写入 `logs/<cfg>/report/site_sizes.json`（report/ 内：成功清理保留、rebuild 可复用）；失败/STOP 不采集并回退旧口径；现场日志表 pod/监控/节点行与 V-7「数据量与优化」新增「留存（du 实测，场景级）」同源消费 | 用户需求 |
 | DR-53 | 2026-11-26 | **受控近似分位口径（单一管线）**（用户需求）：引入 Apache DataSketches REQ sketch（尾部聚焦）作为尾部分位来源——count/avg/min/max/count 精确；**p50/p90/p95 = 合并直方图插值**（us-v1 桶，误差≈桶宽，实测 p50≈0.1%/p95≈1.4%）；**p99/p999/p9999 = 合并 REQ sketch**（k 可配 `quantiles.req_k`，默认 24；实测尾部 ≤0.6%）；**退役**精确原始样本池化与 map 侧 5M 精确窗口（map/reduce 内存均降为 O(1)，口径不随规模切换）；sketch 在 map 阶段按 op/产物生成（warmup 区不插入），reduce 按 scope 合并；库缺失时优雅降级为直方图并如实标注；报表顶部与 size 块标注 `pct_method`（hist+digest / hist）；controller 数据面在 reduced.json 增发 per-instance 正式统计块（instances），CSV 实例行与 TOTAL 行消费同源 helper，与报表严格同口径 | 用户需求 |
 | DR-52 | 2026-11-26 | 端到端时延图新增**全局统计横线**（用户需求）：六条水平参考线 avg/p50/p95/p99/p999/p9999 取当前角色（pipeline writer/reader；basic 无 role_summaries 不画）的正式窗口 `role_summaries` 值，**图表生成时即确定、不随所选 pod/node/实例变化**；同指标同色 + 虚线 + 沉于分桶曲线下方、无端点标签；图例为「时延曲线选择」后的「全局横线」按钮组（默认仅 avg/p99/p9999 可见），tooltip 按可见性追加全局行；**仅端到端图绘制**——分级时延曲线不绘制（同构原则的显式例外） | 用户需求 |
+| DR-57 | 2026-11-27 | **map 侧现场大小记账修正（用户需求）**：① `_dir_apparent_bytes` 改 `os.lstat`——glog_compat 的 `<prog>.INFO` 软链曾使 `os.stat` 把每段 glog 计两次（实测进程目录虚高 ~2×：5.66/6.15MB vs 真实 2.88/3.16MB）；② 报表按 `remote_path`（进程目录/文件）维度去重（writer/reader 的 `source` 同为 `latency_samples.csv` 会被错误折叠），嵌套在已计目录内的 glog trace 不再叠加字节；③ V-7「数据量与优化」恢复「留存（map 侧目录实测，场景级）」行（每节点 pods + profiling + 合计） | 用户需求 |
 | DR-56 | 2026-11-27 | **端点解析同步 Mooncake 统一 `breakdown[op]` 体系**（用户需求；依据 `docs/yh/log-reference.md` §14）：`get_buffer` 主行由 `get_breakdown` 改为 `breakdown[get_buffer]`（旧行保留兼容），新增字段 `query_total_us/buf_alloc_us` 归一为报表树规范名 `query_us/alloc_us`；读接口补 `batch_get_into`、`prep_us`（batch L1）与 query 三段下钻（route/rpc/retry）；写接口补 `batch_put/batch_put_into` 与 query 三段下钻；`remove/batchRemove` 薄行归「其它」组；TENT+TCP 的诚实零四相位按 `engine[tent]` 解析（不误判 classic、残差吸收传输）；成功状态 `status[ok]`，`read_ok` 仅旧产物兼容 | 用户需求 |
 
 ---

@@ -2038,6 +2038,63 @@ def test_logsite_single_table_and_removed_sections(tmp_path):
         assert bad not in src, bad
 
 
+def _site_kvtest_sources(pod="pod-a"):
+    base = "/var/lib/mb/ts"
+    return base, [
+        {"node": "10.0.0.1", "pod": pod, "role": "writer",
+         "source": "latency_samples.csv",
+         "remote_path": "/workspace/mp/logs/ts/{}/writer_i0_p9101/x.stats.json.gz"
+                        .format(pod),
+         "bytes": 1000, "kind": "log", "size_mode": "dir"},
+        {"node": "10.0.0.1", "pod": pod, "role": "reader",
+         "source": "latency_samples.csv",
+         "remote_path": "/workspace/mp/logs/ts/{}/reader_i1_p9201/y.stats.json.gz"
+                        .format(pod),
+         "bytes": 2000, "kind": "log", "size_mode": "dir"},
+        # 嵌套在已计目录内的 glog trace：只用于 trace，不计入大小
+        {"node": "10.0.0.1", "pod": pod, "role": "writer",
+         "source": "writer.INFO",
+         "remote_path": base + "/" + pod + "/writer_i0_p9101/x.glog.d/INFO",
+         "bytes": 900, "kind": "glog"},
+    ]
+
+
+def test_logsite_dir_mode_dedupes_by_remote_path(tmp_path):
+    """kvtest 目录口径：两个角色同 source 名不能被折叠；嵌套 glog 不重复计数。"""
+    base, sources = _site_kvtest_sources()
+    meta = {"config": "cfg", "mode": "pipeline",
+            "host_log_root": "/var/lib/mb", "run_id": "ts",
+            "remote_log_dir": "/workspace/mp/logs/ts"}
+    mons = {"10.0.0.1": {"pod": "mc-mon", "remote_dir": base + "/profiling/cfg",
+                         "files": 2, "bytes": 300}}
+    rows = rp.build_logsite(meta, sources, mons)
+    pod = [r for r in rows if r["tier"] == "pod"][0]
+    assert pod["bytes"] == 3000                 # 1000 + 2000（glog 900 不叠加）
+    assert pod["files"] == 2                    # 两个进程目录
+    assert pod["role"] == "reader、writer"
+    node = [r for r in rows if r["tier"] == "node"][0]
+    assert node["bytes"] == 3300                # + profiling 300
+    mon = [r for r in rows if r["tier"] == "monitor"][0]
+    assert mon["bytes"] == 300 and mon["pod"] == "mc-mon"
+
+
+def test_attach_site_volume_rows(tmp_path):
+    """V-7 数据量与优化：留存（map 侧目录实测）行，pods + profiling 拆分。"""
+    base, sources = _site_kvtest_sources()
+    meta = {"config": "cfg", "mode": "pipeline",
+            "host_log_root": "/var/lib/mb", "run_id": "ts",
+            "remote_log_dir": "/workspace/mp/logs/ts"}
+    mons = {"10.0.0.1": {"pod": "mc-mon", "remote_dir": base + "/profiling/cfg",
+                         "files": 2, "bytes": 300}}
+    out = {"sizes": {"8MB": {"volume": {}}}}
+    rp.attach_site_volume(out, meta, sources, mons)
+    site = out["sizes"]["8MB"]["volume"]["site"]
+    assert site["total"] == 3300
+    assert site["nodes"][0]["pods"] == 3000
+    assert site["nodes"][0]["profiling"] == 300
+    assert "留存" in rp._APP_JS
+
+
 def test_logsite_out_of_tree_source_gets_own_row(tmp_path):
     """结构性不变量：remote_path 落在规范目录外时，该产物以自身目录成行，
     绝不静默丢失（所有产物都能在表内找到路径）。"""

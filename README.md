@@ -998,9 +998,11 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   与压测争内存。
   保留报表成功后的全部中间产物。`--dry-run` 仍全部跳过。
 - **现场日志大小（单一 `meta.bytes` 口径）**：kvtest 每进程 `meta.bytes` = 其目录
-  `<pod>/<role>_i<iid>_p<port>/` 的 apparent size（pod 内 map 开始前 `os.stat` 求和，
-  含样本/glog/产物），pod 行=各进程之和、节点行=各 source 之和+监控产物；python 引擎
-  为已知产物字节合计。**不再有 `du -sb` 快照/`site_sizes.json`/「留存」区块**。
+  `<pod>/<role>_i<iid>_p<port>/` 的 apparent size（pod 内 map 开始前 **`os.lstat`** 求和，
+  含样本/glog/产物；不得跟随 `.glog.d/` 的 `<prog>.INFO` 软链，否则每段 glog 双计、目录虚高 ~2×），
+  pod 行按 `remote_path`（进程目录）去重、嵌套 glog trace 不叠加，节点行=各条目之和+监控产物；
+  python 引擎为已知产物字节合计。「数据量与优化」恢复「留存（map 侧目录实测）」区块
+  （每节点 pods + profiling + 合计）。不再有 `du -sb` 快照/`site_sizes.json`。
 - **k8s 节点级监控（容器内采样、宿主工具借用）**：每宿主一个 monitor
   DaemonSet（hostPID + nsenter/chroot 借用宿主的 mdcli），产物落在
   `logs/<配置>/profiling/<节点 IP>/`（目录名即报表节点显示名；历史 run 的 pod 名

@@ -894,17 +894,20 @@ def _apply_summary_metrics(stats, summary_doc):
 
 
 def _dir_apparent_bytes(path):
-    """Apparent size of every regular file under ``path`` (du -sb semantics).
+    """Apparent size of every entry under ``path`` (du -sb semantics).
 
     Computed inside the pod before the map writes anything, so it is the raw
     footprint of THIS process's directory (meta.bytes), never mixing roles.
-    Missing directory -> 0 (the caller passes an explicit instance dir)."""
+    Uses lstat on purpose: glog_compat leaves convenience symlinks in
+    ``<base>.glog.d/`` (``<prog>.INFO`` → the rotated segment). Following them
+    with stat() counted every segment twice (~2× the real footprint); du -sb
+    counts the link itself. Missing directory -> 0."""
     total = 0
     try:
         for root, _dirs, files in os.walk(str(path)):
             for name in files:
                 try:
-                    total += os.stat(os.path.join(root, name)).st_size
+                    total += os.lstat(os.path.join(root, name)).st_size
                 except OSError:
                     continue
     except OSError:

@@ -319,3 +319,18 @@ def test_no_outlier_detection_for_small_samples(tmp_path):
     st = ls.compute_stats(_write(tmp_path, lines))
     assert st["meta"]["outlier_threshold_ms"] is None
     assert st["outliers"] == []
+
+
+def test_dir_apparent_bytes_ignores_symlink_targets(tmp_path):
+    """glog_compat 的 <prog>.INFO 软链不能被 stat 跟随（否则双计 ~2×）。"""
+    import os
+    d = tmp_path / "proc"
+    d.mkdir()
+    seg = d / "seg.INFO"
+    seg.write_bytes(b"x" * 1000)
+    link = d / "prog.INFO"
+    link.symlink_to("seg.INFO")
+    expect = seg.stat().st_size + link.lstat().st_size
+    got = ls._dir_apparent_bytes(str(d))
+    assert got == expect, got
+    assert got < seg.stat().st_size * 2
