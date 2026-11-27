@@ -144,6 +144,85 @@ def test_spdiag_show_uses_per_pod_cfg_dir(tmp_path, monkeypatch):
         "/pw/logs/ts/profiling/cfg1/spdiag.show.txt")
 
 
+def test_collect_console_fold_one_summary_line(tmp_path, capsys, monkeypatch):
+    """通用聚合规则落到 profile collect：console 只有 1 条结构化汇总
+    （mem.*×N, monitor.config.json×N），零逐文件 collected 行；
+    benchmark.log 保留全部原始行 + 汇总行。"""
+    import utils
+    nodes = {"n1": {"ip": "10.0.0.1"}, "n2": {"ip": "10.0.0.2"}}
+    pulled = _patch_collect(monkeypatch, nodes)
+    logf = tmp_path / "benchmark.log"
+    utils.set_detail_log(str(logf))
+    try:
+        session = {"tools": {"n1": {"mem": "11"}, "n2": {"mem": "22"}},
+                   "matrix_tools": {"mem": {}}, "remote_out_dir": "/remote/out"}
+        prof_core.stop_and_collect({"nodes": nodes}, session, str(tmp_path))
+        assert pulled == {"10.0.0.1", "10.0.0.2"}
+        out = capsys.readouterr().out
+        # one summary line, zero per-file lines
+        collect_lines = [l for l in out.splitlines() if "] collected" in l]
+        per_file = [l for l in out.splitlines()
+                    if "collected n" in l and "files from" not in l]
+        assert len(collect_lines) == 1, out
+        assert not per_file, out
+        import re
+        assert re.search(r"\[profile\] collected 8 files from 2 nodes: "
+                         r"mem\.\*×2, monitor\.config\.json×2", out), out
+        # benchmark.log keeps all 8 raw lines verbatim + the summary digest
+        text = logf.read_text(encoding="utf-8")
+        for node in ("n1", "n2"):
+            for f in ("mem.host.csv", "mem.proc.csv", "mem.err.log",
+                      "monitor.config.json"):
+                assert "collected {}/{}".format(node, f) in text, \
+                    "benchmark.log lost a raw line: {}/{}".format(node, f)
+        assert "collected 8 files from 2 nodes" in text
+    finally:
+        utils.close_detail_log()
+
+
+def test_collect_failure_warn_stays_on_console(tmp_path, capsys, monkeypatch):
+    """单个文件拉取失败：[WARN] 完整立即上屏（绝不折叠），汇总行退化为
+    逐文件计数并带错误计数。"""
+    import utils
+    nodes = {"n1": {"ip": "10.0.0.1"}, "n2": {"ip": "10.0.0.2"}}
+
+    def fake_pull(ip, node, remote, local_dir, dry_run=False):
+        fname = os.path.basename(remote)
+        if ip == "10.0.0.2" and fname == "mem.proc.csv":
+            raise RuntimeError("scp size mismatch")
+        pulled.add(os.path.basename(local_dir))
+
+    pulled = set()
+    monkeypatch.setattr(prof_core, "_run", lambda *a, **k: "")
+    monkeypatch.setattr(prof_core, "_wait_pid_gone", lambda *a, **k: None)
+    monkeypatch.setattr(prof_core, "_wait_artifact_stable",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(prof_core, "scp_pull", fake_pull)
+    monkeypatch.setattr(prof_core, "get_node", lambda c, name: nodes[name])
+    import benchmark as bm
+    monkeypatch.setattr(bm, "state_remove", lambda *a, **k: None)
+    logf = tmp_path / "benchmark.log"
+    utils.set_detail_log(str(logf))
+    try:
+        session = {"tools": {"n1": {"mem": "11"}, "n2": {"mem": "22"}},
+                   "matrix_tools": {"mem": {}}, "remote_out_dir": "/remote/out"}
+        prof_core.stop_and_collect({"nodes": nodes}, session, str(tmp_path))
+        out = capsys.readouterr().out
+        assert "[WARN] [profile] collect n2/mem.proc.csv: scp size mismatch" in out
+        import re
+        m = re.search(r"\[profile\] collected 7 files from 2 nodes: "
+                      r"mem\.\*: (.+), monitor\.config\.json×2"
+                      r"; 1 collect error \(see \[WARN\] above\)", out)
+        assert m, out
+        assert "mem.host.csv×2, mem.proc.csv×1, mem.err.log×2" == m.group(1)
+        # the failed line is in benchmark.log too (with its WARN twin)
+        text = logf.read_text(encoding="utf-8")
+        assert "collected n2/mem.proc.csv" not in text  # failed pull: no raw line
+        assert "[WARN] [profile] collect n2/mem.proc.csv" in text
+    finally:
+        utils.close_detail_log()
+
+
 def test_start_profiling_injects_epoch_base(monkeypatch, tmp_path):
     """kvtest 传入 epoch_base 时启动命令带 EPOCH_BASE；python 不传则不带。"""
     import benchmark as bm

@@ -43,9 +43,10 @@ from utils import (StopRequested, _drain_chan, _ssh_client, _ssh_drop,
                    controller_put,
                    controller_remove,
                    controller_run, controller_stream, ensure_utf8_stdio,
-                   get_node, is_k8s_node,
+                   flush_agg, get_node, is_k8s_node,
                    kubectl_exec_line, kubectl_prefix, load_json, log,
-                   log_detail, log_phase, parse_data_size, percentile,
+                   log_agg, log_detail, log_phase, parse_data_size,
+                   percentile,
                    close_detail_log, request_stop, run_ssh, scp_pull,
                    scp_push, set_detail_log, set_stop_file, set_verbose,
                    ssh_check_output, stop_requested, verbose_enabled)
@@ -9007,8 +9008,11 @@ def cleanup_cluster(cluster, globals_cfg, dry_run=False):
     remote_dir = globals_cfg["remote_dir"]
     for node_name in sorted(cluster.get("nodes", {})):
         n = get_node(cluster, node_name)
-        log("cleanup {} : {}".format(node_name, remote_dir))
+        # multi-node folding: console gets one fold line after the loop,
+        # benchmark.log keeps every per-node cleanup line
+        log_agg("cleanup.nodes", "cleanup {} : {}".format(node_name, remote_dir))
         run_ssh(n["ip"], n, "rm -rf {}".format(remote_dir), dry_run=dry_run)
+    flush_agg("cleanup.nodes")
 
 # --------------------------------------------------------------------------
 # metrics aggregation

@@ -15,6 +15,7 @@ Node transports (cluster.json `kind` field, default "ssh"):
                any transport call. Pod IPs are written into node["ip"] so
                peers/fabric/dedup logic is transport-agnostic.
 """
+import atexit
 import json
 import os
 import posixpath
@@ -67,6 +68,9 @@ def ensure_utf8_stdio():
 # --- dual-sink logging: console summary + full benchmark.log --------------
 # log()        console (summary) AND the full log file
 # log_detail() the full log file ALWAYS; console only when verbose
+# log_agg()    multi-node similar lines: full log file ALWAYS (verbatim);
+#              console only the folded flush_agg() summary — error lines
+#              ([WARN]/[ERROR]/[FAIL]) bypass folding and print immediately
 # The full file lives at outputs/<ts>/benchmark.log and receives every
 # per-pod/per-command line, so the WebUI console stays short while every
 # detail remains locatable on disk.
@@ -109,16 +113,23 @@ def _detail_write(msg):
                 pass
 
 
-def log(msg):
+def _emit(msg, console):
+    """One timestamped [benchmark] line: file always, console when asked.
+    Must be called WITHOUT _LOG_LOCK held (it takes the lock itself)."""
     line = "[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg)
     with _LOG_LOCK:
-        print(line, flush=True)
+        if console:
+            print(line, flush=True)
         if _DETAIL_FH is not None:
             try:
                 _DETAIL_FH.write(line + "\n")
                 _DETAIL_FH.flush()
             except Exception:
                 pass
+
+
+def log(msg):
+    _emit(msg, console=True)
 
 
 # --- verbose logging (CLI --verbose / env MC_BENCH_VERBOSE / WebUI toggle) ---
@@ -136,18 +147,76 @@ def verbose_enabled():
 
 def log_detail(msg):
     """Full-detail line: always to benchmark.log, console only when verbose."""
-    if not _VERBOSE:
-        _detail_write(msg)
-        return
-    line = "[{}] [benchmark] {}".format(time.strftime("%H:%M:%S"), msg)
+    _emit(msg, console=_VERBOSE)
+
+
+# --- multi-node log folding: console aggregates, benchmark.log keeps all --
+# 通用规则（多节点相似日志）：逐节点/逐文件的成功行在 console 折叠为一
+# 条汇总（log_agg -> flush_agg），benchmark.log 永远逐行全量保留；错误行
+# （[WARN]/[ERROR]/[FAIL] 前缀或 error=True）绝不折叠，立即完整上屏。
+_AGG = {}
+
+
+def _agg_is_error(msg):
+    s = str(msg).lstrip()
+    return s.startswith(("[WARN]", "[ERROR]", "[FAIL]"))
+
+
+def log_agg(key, msg, error=False):
+    """Fold one similar multi-node line into aggregation group ``key``.
+
+    benchmark.log always receives the line verbatim. The console sees it
+    immediately only when it is an error (never folded) or in verbose mode
+    (verbose = raw stream); otherwise the group stays buffered until
+    flush_agg() prints its single summary line. Thread-safe: the group
+    state and the file write share _LOG_LOCK."""
+    escalated = bool(error) or _agg_is_error(msg)
     with _LOG_LOCK:
-        print(line, flush=True)
-        if _DETAIL_FH is not None:
-            try:
-                _DETAIL_FH.write(line + "\n")
-                _DETAIL_FH.flush()
-            except Exception:
-                pass
+        st = _AGG.setdefault(key, {"count": 0, "errors": 0, "first": None})
+        st["count"] += 1
+        if escalated:
+            st["errors"] += 1
+        elif st["first"] is None:
+            st["first"] = str(msg)
+    _emit(msg, console=escalated or _VERBOSE)
+
+
+def flush_agg(key, summary=None):
+    """Emit the single folded console line for group ``key`` and drop it.
+
+    With ``summary`` the console gets exactly that line (and benchmark.log
+    records it as a digest marker); without it the group's first line plus
+    "(+N similar; see benchmark.log)". Errors were already printed verbatim
+    when they arrived, so a group made ONLY of error lines prints nothing
+    here. Returns the popped stats dict {count, errors, first} (None/empty
+    when the group did not exist); a second flush is a no-op."""
+    with _LOG_LOCK:
+        st = _AGG.pop(key, None)
+    if not st or st.get("count", 0) == 0:
+        return st
+    first = st.get("first")
+    if summary is None:
+        if first is None:
+            return st  # every line was an error and is already on the console
+        summary = first
+        if st["count"] > 1:
+            summary += " (+{} similar; see benchmark.log)".format(st["count"] - 1)
+        if st.get("errors"):
+            summary += " [{} error line(s) printed above]".format(st["errors"])
+    log(summary)
+    return st
+
+
+def flush_agg_all():
+    """Flush every open aggregation group (atexit safety net: an owner that
+    forgot to flush still gets its one console line — never silence)."""
+    with _LOG_LOCK:
+        keys = list(_AGG)
+    for key in keys:
+        flush_agg(key)
+
+
+atexit.register(flush_agg_all)
 
 
 # --- cooperative stop (WebUI stop file / Ctrl+C signals) -------------------
