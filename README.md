@@ -801,7 +801,8 @@ python benchmark.py --k8s -f configs/basic/put.json
 
 - 集群中 mooncake_master、mooncake_store 已手动启动；
 - 编排机安装 Python 依赖：`pip install -r requirements.txt`（**paramiko**——SSH 传输纯 Python
-  实现，密码/密钥登录，无需外部 ssh/scp/sshpass 二进制，Windows 原生可用）；节点缺省走密钥
+  实现，密码/密钥登录，无需外部 ssh/scp/sshpass 二进制，Windows 原生可用；**datasketches**——
+  尾部 p99/p999/p9999 的 REQ sketch，pod 镜像也需安装）；节点缺省走密钥
   登录（`ssh_key` 空 = 默认密钥 + ssh-agent），配 `passwd` 字段走密码登录（每节点独立，明文
   存于 cluster.json，已 gitignored）；
 - **k8s 预运行脚本**：`k8s-deployment/scripts/k8s-prerun.sh` 会在 benchmark
