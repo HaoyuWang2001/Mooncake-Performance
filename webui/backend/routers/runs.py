@@ -200,6 +200,17 @@ def _active_run_for_ts(ts):
     return None
 
 
+def _has_local_products(ts_dir):
+    """True when the run (or any of its combined rank+recall children) has a
+    logs directory with rebuildable local artifacts."""
+    if os.path.isdir(os.path.join(ts_dir, "logs")):
+        return True
+    for name in os.listdir(ts_dir):
+        if os.path.isdir(os.path.join(ts_dir, name, "logs")):
+            return True
+    return False
+
+
 def _build_rebuild_argv(body):
     """Validate {ts} and return the argv for benchmark.py --rebuild-report."""
     ts = (body.get("ts") or "").strip()
@@ -208,7 +219,9 @@ def _build_rebuild_argv(body):
     ts_dir = os.path.join(OUTPUTS_DIR, ts)
     if not os.path.isdir(ts_dir):
         raise ApiError(404, "no such run: {}".format(ts))
-    if not os.path.isdir(os.path.join(ts_dir, "logs")):
+    if not _has_local_products(ts_dir):
+        # combined rank+recall parents keep their logs/ in the child run
+        # dirs (rank/, recall/) — those rebuild too
         raise ApiError(400, "{} has no logs directory; nothing to "
                             "rebuild".format(ts))
     rid = _active_run_for_ts(ts)

@@ -941,7 +941,9 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   controller 失败都直接报错（原始日志仍在节点）。Ctrl+C 的 STOP 走同一 map→partial 流程
   （controller 不可达则 WARN 跳过报表、清理照常），报表标 `early_stop`。
   `--rebuild-report` 从 `report/<ds>/reduced.json` 重渲染（缺失时可由
-  `partial.json.gz` finalize 补齐；两者都没有才报错）。
+  `partial.json.gz` finalize 补齐；两者都没有才报错），并按 `report/cfg.json`→
+  实例快照→仓库配置的优先级发现生效配置，重算该配置的 `<cfg>.csv` 与 run 级
+  `benchmark_detail.csv`（重算不出行的配置读回既有 CSV，不覆盖）。
 - **形态与引擎解耦**：报表格式由 `meta.scenario`（`basic`|`pipeline`）决定，
   `meta.engine`（`python`|`kvtest`）只做标注（副标题「引擎 …」）；kvtest 场景可在配置里用
   `"report_scenario": "pipeline"|"basic"` 声明形态（缺省 pipeline）。旧产物
@@ -981,9 +983,17 @@ pod/namespace 删除后日志仍在节点盘上；CLEAN-UP **不自动删除**�
   `/stop` 让 C++ 落盘样本再收集，报表标注 `early_stop`）。done/failed 走远端 map；stopped 在清理
   前回拉原始日志、本地重算（不再静默无产物）。三种路径的报表都标注「提前停止/异常」。
 - **重建**：`benchmark.py --rebuild-report <ts>`（传时间戳目录名，**不要**带 `outputs/`
-  前缀）仅用本地 stats/原始日志重建报表，覆盖「run 正常结束但报表阶段失败」；远端重建
-  需重新 map，暂未自动实现。成功 run 的中间产物已按默认策略清理，重建会提示
-  「中间产物已按成功清理，无法重建」；需要保留时用 `--keep-intermediates` 重跑。
+  前缀）仅用本地 stats/原始日志（kvtest 为 `partial.json.gz`/`reduced.json`）重建报表，
+  覆盖「run 正常结束但报表阶段失败」；远端重建需重新 map，暂未自动实现。重建同时
+  **重算 CSV**：按 `logs/<cfg>/report/cfg.json`（run 时持久化的生效配置，含继承与
+  运行期键）→ 实例快照 `snapshot/files/**/<cfg>.json` → 仓库 `configs/` 同名配置的
+  优先级发现配置，走与 run 时相同的 `write_scenario_csv` 重算各 `<cfg>.csv` 并重组
+  run 级 `benchmark_detail.csv`；重算不出行的配置读回既有 CSV 原样合并（空结果不
+  覆盖成功 run 的 CSV），cluster 配置无法发现时仅拓扑列降级、不报错；CSV 失败
+  WARN + rc=1，报表仍重建（与 run 时「CSV 失败算 run 失败」同源）。rank+recall
+  组合父目录（自身无 `logs/`）递归重建每个子 run 并从子 `overview_units.json`
+  重渲染父总览。成功 run 的 python 引擎侧 stats 已清理，无 reduced/CSV 可用时重建
+  会报「no local stats or raw logs found」；需要保留时用 `--keep-intermediates` 重跑。
   本地重算会从文件名/目录回填 `size/role/node`（如
   `<cfg>.<run>_8MB.dual_<node>_c0_p9301.reader.log`），因此多 data_size 与读写角色
   仍能正确分块。

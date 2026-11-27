@@ -17,6 +17,7 @@ Contract covered here:
      whole run is kept behind --keep-intermediates / MC_KEEP_INTERMEDIATES=1,
      --pull-raw-logs / --png, --no-report, or any failed config.
 """
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -114,6 +115,28 @@ def test_post_process_kvtest_uses_map_reduce_chain(tmp_path, monkeypatch):
     assert rows == [{"instance": "TOTAL"}]
     assert calls == ["csv", ("kvtest-report",
                              os.path.join(str(tmp_path), "logs", "x"))]
+
+
+def test_post_process_persists_effective_cfg(tmp_path, monkeypatch):
+    """run 时把生效配置（继承已解析 + 运行期键）持久化到
+    logs/<cfg>/report/cfg.json：--rebuild-report 的 CSV 重建与 run 时
+    严格同源；report/ 不被成功清理，产物长期可重建。"""
+    monkeypatch.setattr(
+        bm, "write_scenario_csv", lambda *a, **k: [{"instance": "TOTAL"}])
+    monkeypatch.setattr(bm, "_generate_reports", lambda *a, **k: [])
+    cfg = {"__cfg_path__": "configs/pipeline/demo/x.json",
+           "scenario": "pipeline", "protocol": "ub", "duration": 30,
+           "_writer_count": 3, "_key_space": {"8MB": 4096}}
+    bm._post_process_config(
+        cfg, "x", "pipeline", "ts", str(tmp_path), {"nodes": {}}, [],
+        {}, SimpleNamespace(_matrix=None))
+    path = os.path.join(str(tmp_path), "logs", "x", "report", "cfg.json")
+    with open(path, encoding="utf-8") as f:
+        saved = json.load(f)
+    assert saved["scenario"] == "pipeline"
+    assert saved["_writer_count"] == 3 and saved["_key_space"] == {
+        "8MB": 4096}
+    assert "__cfg_path__" not in saved
 
 
 # --------------------------------------------------------------- STOP path

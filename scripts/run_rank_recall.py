@@ -167,83 +167,13 @@ def _child_env(work_mode):
     return env
 
 
-def _load_child_units(child_dir):
-    """Slim per-unit index written by benchmark.py beside the child overview."""
-    path = os.path.join(child_dir, "report", "overview_units.json")
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def _render_parent_overview(parent_dir):
     """One combined overview.html over both children.
 
-    Merges the children's overview_units.json, re-anchors every unit report
-    link to the parent report/ dir and renders the regular overview template:
-    one card per config (rank + recall), each with direct links to that
-    side's report.html files. WARN-only: never fails the run."""
-    rank = _load_child_units(os.path.join(parent_dir, "rank"))
-    recall = _load_child_units(os.path.join(parent_dir, "recall"))
-    if not rank and not recall:
-        print("[parallel] 未找到子报表索引（overview_units.json），"
-              "跳过总览生成", flush=True)
-        return None
-    for role, data in (("rank", rank), ("recall", recall)):
-        if not data:
-            print("[parallel] {} 侧没有报表产物（失败或 --no-report），"
-                  "总览仅包含另一侧".format(role), flush=True)
-    ov_dir = os.path.join(parent_dir, "report")
-    scenarios = []
-    for data in (rank, recall):
-        for unit in (data or {}).get("units") or []:
-            sc = dict(unit.get("sc") or {})
-            html_path = unit.get("report_html") or ""
-            sc["report_rel"] = (os.path.relpath(html_path, ov_dir)
-                                .replace(os.sep, "/")) if html_path else ""
-            sc["unit"] = unit.get("unit") or sc.get("unit") or ""
-            scenarios.append(sc)
-    if not scenarios:
-        return None
-    by_node = {}
-    for sc in scenarios:
-        for n in sc.get("nodes") or []:
-            e = by_node.setdefault(n.get("node"), {"node": n.get("node"),
-                                                   "pods": 0, "bytes": 0})
-            e["pods"] += n.get("pods") or 0
-            e["bytes"] += n.get("bytes") or 0
-    started = next((str((sc.get("meta") or {}).get("started"))
-                    for sc in scenarios
-                    if (sc.get("meta") or {}).get("started")),
-                   time.strftime("%Y-%m-%d %H:%M:%S"))
-    run_meta = {
-        "run": os.path.basename(parent_dir.rstrip(os.sep)) or parent_dir,
-        "mode": "rank+recall",
-        "started": started,
-        "nodes": sorted(by_node.values(),
-                        key=lambda x: -(x.get("bytes") or 0)),
-    }
-    # 现场索引：两侧的 namespace / 日志根天然不同（rank 与 recall 各一套
-    # namespace），并列展示而不是取其一。
-    for key in ("host_log_root", "remote_log_dir", "run_id", "k8s_namespace"):
-        vals = []
-        for sc in scenarios:
-            v = (sc.get("meta") or {}).get(key)
-            if v and str(v) not in vals:
-                vals.append(str(v))
-        if vals:
-            run_meta[key] = " / ".join(vals)
-    rp = bm._report_module()
-    ov = rp.render_overview(
-        run_meta, scenarios, ov_dir,
-        rel_base=os.path.relpath(ov_dir, bm.ROOT).replace(os.sep, "/"))
-    print("[parallel] overview -> {}".format(
-        os.path.relpath(ov, bm.ROOT)), flush=True)
-    return ov
+    Thin forwarder: the implementation lives in benchmark.py
+    (_render_combined_overview) so --rebuild-report re-renders exactly the
+    same parent overview from the children's overview_units.json."""
+    return bm._render_combined_overview(parent_dir)
 
 
 def parse_args(argv=None):

@@ -237,6 +237,38 @@ def test_rebuild_reports_local(tmp_path, monkeypatch):
     assert bm.rebuild_reports("nope") == 2
 
 
+def test_rebuild_combined_parent_rebuilds_children(tmp_path, monkeypatch):
+    """--rebuild-report 传组合 rank+recall 父目录：逐子 run 重建
+    （rank 侧产物/CSV/总览），父总览从子 overview_units.json 重渲染；
+    无任何产物的子 run 只 WARN，不把整体重建打成失败。"""
+    monkeypatch.setattr(bm, "RESULTS_DIR", str(tmp_path))
+    parent = tmp_path / "20261125-1614-rank-recall"
+    logs = parent / "rank" / "logs" / "rank_smoke"
+    logs.mkdir(parents=True)
+    raw = logs / "rank_smoke.benchmark_c1_t1_8MB.dual_n1_c0_p9301.writer.log"
+    raw.write_text("".join(
+        "RESULT\t2026-11-25 16:15:{:02d}.{:06d}\tpipeline_write\tk{}\t1.0\tOK\t4\n"
+        .format(10 + i // 10, i % 10, i) for i in range(30)), encoding="utf-8")
+    (parent / "recall" / "logs").mkdir(parents=True)   # recall 侧：无产物
+    rc = bm.rebuild_reports("20261125-1614-rank-recall")
+    assert rc == 0
+    assert (logs / "report" / "8MB" / "report.html").is_file()
+    # 子 run 自己的总览 + 单元索引（父总览的输入）
+    assert (parent / "rank" / "report" / "overview.html").is_file()
+    units = json.loads(
+        (parent / "rank" / "report" / "overview_units.json")
+        .read_text(encoding="utf-8"))
+    assert units["units"] and units["units"][0]["report_html"].endswith(
+        "report.html")
+    # 子 CSV + 子 detail
+    assert (parent / "rank" / "rank_smoke.csv").is_file()
+    assert (parent / "rank" / "benchmark_detail.csv").is_file()
+    # 父总览重渲染（rank_smoke 卡片）
+    ov = (parent / "report" / "overview.html").read_text(encoding="utf-8")
+    assert "rank_smoke" in ov
+    assert "../rank/logs/rank_smoke/report/8MB/report.html" in ov
+
+
 def test_summary_three_sections_and_params(tmp_path):
     """段1：性能统计（含第三行 总数/成功/失败/失败率/QPS）+ 参数配置；
     「信息展示」子区已删除；无返回链接。"""

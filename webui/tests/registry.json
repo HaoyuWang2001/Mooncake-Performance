@@ -7095,6 +7095,31 @@
     "test_results_file_tree_hierarchical"
    ],
    "e2e": []
+  },
+  {
+   "id": "E-436",
+   "module": "benchmark",
+   "desc": "--rebuild-report 补 CSV：run 时把生效配置（继承已解析+运行期键）持久化到 logs/<cfg>/report/cfg.json；重建按 cfg.json→实例快照→仓库配置的优先级发现配置并回填运行期键，用 write_scenario_csv 重算 per-config CSV 与 benchmark_detail.csv；无法重算的配置读回既有 CSV（空结果不覆盖）；cluster 不可发现时拓扑列降级",
+   "req": "R-PARAM-2/R-SRC-3",
+   "unit": [
+    "test_post_process_persists_effective_cfg",
+    "test_rebuild_regenerates_csv_and_detail",
+    "test_rebuild_keeps_runtime_csv_without_cfg",
+    "test_rebuild_loads_cfg_from_instance_snapshot"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "E-437",
+   "module": "benchmark",
+   "desc": "--rebuild-report 容器感知：rank+recall 组合父目录（自身无 logs/）逐子 run 重建并补写子 overview_units.json，父总览从子索引重渲染（与 run 结束同一实现）；无任何产物的子 run 仅 WARN 不判整体失败；WebUI 重建端点放行「子目录有 logs」的父目录、无子 logs 仍 400",
+   "req": "",
+   "unit": [
+    "test_rebuild_combined_parent_rebuilds_children",
+    "test_rebuild_accepts_combined_parent",
+    "test_rebuild_rejects_combined_parent_without_child_logs"
+   ],
+   "e2e": []
   }
  ]
 }

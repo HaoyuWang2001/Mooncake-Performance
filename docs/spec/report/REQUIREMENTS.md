@@ -97,7 +97,7 @@ report.py（本组件：reduce + render，纯标准库）
 ### D. 参数配置（PARAM）
 
 - **R-PARAM-1** `[已固化·DR-13]` 参数配置区显示本次 run 的参数与运行上下文（场景/协议/工作模式/采集与预热时长/操作/key_count/目标 QPS/节点数/配置文件名等），空值省略；**信息展示已给出的值不重复**（数据大小、客户端数、线程数、客户端总数、采集时长、开始时间均由渲染层过滤）。
-- **R-PARAM-2** `[已固化]` 上述参数在生成时持久化到 report 同目录 meta.json；`--rebuild-report` 优先从 meta.json 恢复；历史 run 无 meta.json 时按文件名与 stats 角色降级推断。
+- **R-PARAM-2** `[已固化·DR-59 修订]` 上述参数在生成时持久化到 report 同目录 meta.json；`--rebuild-report` 优先从 meta.json 恢复；历史 run 无 meta.json 时按文件名与 stats 角色降级推断。生效配置（继承解析结果+运行期键）另持久化为 `logs/<cfg>/report/cfg.json`，`--rebuild-report` 的 CSV 重算以它与 run 时严格同源（发现链：cfg.json → 实例快照 → 仓库配置，见 DR-59）。
 
 ### E. 端到端时延曲线（LAT）
 
@@ -310,6 +310,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-52 | 2026-11-26 | 端到端时延图新增**全局统计横线**（用户需求）：六条水平参考线 avg/p50/p95/p99/p999/p9999 取当前角色（pipeline writer/reader；basic 无 role_summaries 不画）的正式窗口 `role_summaries` 值，**图表生成时即确定、不随所选 pod/node/实例变化**；同指标同色 + 虚线 + 沉于分桶曲线下方、无端点标签；图例为「时延曲线选择」后的「全局横线」按钮组（默认仅 avg/p99/p9999 可见），tooltip 按可见性追加全局行；**仅端到端图绘制**——分级时延曲线不绘制（同构原则的显式例外） | 用户需求 |
 | DR-57 | 2026-11-27 | **map 侧现场大小记账修正（用户需求）**：① `_dir_apparent_bytes` 改 `os.lstat`——glog_compat 的 `<prog>.INFO` 软链曾使 `os.stat` 把每段 glog 计两次（实测进程目录虚高 ~2×：5.66/6.15MB vs 真实 2.88/3.16MB）；② 报表按 `remote_path`（进程目录/文件）维度去重（writer/reader 的 `source` 同为 `latency_samples.csv` 会被错误折叠），嵌套在已计目录内的 glog trace 不再叠加字节；③ V-7「数据量与优化」恢复「留存（map 侧目录实测，场景级）」行（每节点 pods + profiling + 合计） | 用户需求 |
 | DR-56 | 2026-11-27 | **端点解析同步 Mooncake 统一 `breakdown[op]` 体系**（用户需求；依据 `docs/yh/log-reference.md` §14）：`get_buffer` 主行由 `get_breakdown` 改为 `breakdown[get_buffer]`（旧行保留兼容），新增字段 `query_total_us/buf_alloc_us` 归一为报表树规范名 `query_us/alloc_us`；读接口补 `batch_get_into`、`prep_us`（batch L1）与 query 三段下钻（route/rpc/retry）；写接口补 `batch_put/batch_put_into` 与 query 三段下钻；`remove/batchRemove` 薄行归「其它」组；TENT+TCP 的诚实零四相位按 `engine[tent]` 解析（不误判 classic、残差吸收传输）；成功状态 `status[ok]`，`read_ok` 仅旧产物兼容 | 用户需求 |
+| DR-59 | 2026-11-27 | **--rebuild-report 补齐 CSV 与组合 run（用户需求）**：① run 时把生效配置（继承解析结果+运行期键）持久化到 `logs/<cfg>/report/cfg.json`（`report/` 永不清理，随报表长期可重建）；② 重建按 cfg.json → 实例快照 `snapshot/files/**/<cfg>.json` → 仓库 `configs/` 同名配置的优先级发现配置，运行期键（实例数/warmup）从 `reduced.json` meta 回填，走与 run 时同一 `write_scenario_csv` 重算 `<cfg>.csv` 与 run 级 `benchmark_detail.csv`（无法重算的配置读回既有 CSV 合并、空结果不覆盖成功 run 的存量）；③ cluster/global 按 unit meta 记录的文件名在快照/仓库中发现，找不到仅拓扑列降级不报错；④ CSV 失败 = WARN + rc=1（报表仍重建），与 run 时「CSV 失败算 run 失败」同源；⑤ rank+recall 组合父目录递归重建每个子 run（子 run 补写 `overview_units.json`）并重渲染父总览（与 run 结束同一实现，`run_rank_recall` 转发）；⑥ WebUI 重建端点放行「子目录有 logs」的组合父目录（无子 logs 仍 400）；`parse_arguments` 对 `--rebuild-report` 跳过 cluster/global/profile 存在性校验（纯本地操作） | 用户需求 |
 
 ---
 

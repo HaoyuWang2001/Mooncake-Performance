@@ -196,6 +196,25 @@ def test_rebuild_refuses_run_still_writing(outputs, monkeypatch):
     assert exc.value.code == 409
 
 
+def test_rebuild_accepts_combined_parent(outputs):
+    """rank+recall 组合 run：父目录自身无 logs/、子 run 目录有 →
+    放行重建（rebuild 会在 benchmark.py 侧逐子 run 处理）。"""
+    (outputs / "20261125-1614-rank-recall" / "rank" / "logs").mkdir(
+        parents=True)
+    argv = runs_router._build_rebuild_argv(
+        {"ts": "20261125-1614-rank-recall"})
+    assert argv[-2:] == ["--rebuild-report", "20261125-1614-rank-recall"]
+
+
+def test_rebuild_rejects_combined_parent_without_child_logs(outputs):
+    """组合样式的父目录但子目录也没有 logs/：与普通空 run 一样 400。"""
+    (outputs / "20261125-1614-empty").mkdir()
+    (outputs / "20261125-1614-empty" / "rank").mkdir(parents=True)
+    with pytest.raises(ApiError) as exc:
+        runs_router._build_rebuild_argv({"ts": "20261125-1614-empty"})
+    assert exc.value.code == 400
+
+
 # --------------------------------------------------- WebUI 参数转发
 
 def test_webui_forwards_plot_and_report_flags():

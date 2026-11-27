@@ -127,15 +127,21 @@ selector 语义：`dirs` + `files` 至少一项非空；**dirs 先执行、files
   `webui/data/runs/<id>.state` 台账（Rank+Recall 子任务为 `<id>.state.rank|recall`）
 
 ### POST /api/runs/rebuild-report
-用**本地**已有产物重建某次 run 的 HTML 报表（等价 `benchmark.py --rebuild-report <ts>`），
-用于「run 正常结束但报表阶段失败」或报表被 `--no-report` / `no_plot` 跳过后补出：
+用**本地**已有产物重建某次 run 的 HTML 报表与 CSV（等价 `benchmark.py --rebuild-report <ts>`），
+用于「run 正常结束但报表/CSV 阶段失败」或报表被 `--no-report` / `no_plot` 跳过后补出：
 ```json
 {"ts": "20261112-1804"}   // outputs/ 下的时间戳目录名，不带 outputs/ 前缀
 ```
-- 只读本地 `logs/<cfg>/` 下的 `*.stats.json` / `*.log` / kvtest `samples.csv`，不访问集群；
-- 产出 `report/<size>/report.html`(+`data.js`/`meta.json`) 与 run 级 `report/overview.html`；
+- 只读本地 `logs/<cfg>/` 下的 `*.stats.json` / `*.log` / kvtest `partial.json.gz`+`reduced.json`，
+  不访问集群；
+- 产出 `report/<size>/report.html`(+`data.js`/`meta.json`)、run 级 `report/overview.html`，
+  并按 `report/cfg.json` → 实例快照 → 仓库配置的优先级发现生效配置，重算各
+  `<cfg>.csv` 与 run 级 `benchmark_detail.csv`（重算不出行的配置读回既有 CSV）；
+- rank+recall 组合 run 传**父**时间戳目录（其 `logs/` 在子 run 目录里）：逐子 run
+  重建后重渲染父总览；
 - 以普通 run 形式执行，日志/rc 进「历史运行」；
-- 404 无该 run；400 无 `logs/`；409 该 run 仍由活跃 run 写入或 scheduler 执行中；
+- 404 无该 run；400 该 run（及组合 run 的所有子目录）无 `logs/`；409 该 run 仍由
+  活跃 run 写入或 scheduler 执行中；
 - → `{"run":{"id":"r...","status":"running",...}}`。
 
 ### POST /api/cleanup
