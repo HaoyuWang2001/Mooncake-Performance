@@ -165,11 +165,14 @@ writer/reader 的 NUMA 节点。runner 使用 `numactl` 的 `--cpunodebind=<node
 ## 结果
 
 成功运行保留最终产物：**HTML 报表（map-reduce 产物，见下节）**、run 级
-`<cfg>.csv` 和 `benchmark_detail.csv`、`profiling/`（监控 CSV）。**中间产物默认在
-报表校验通过后清理**（与 python 引擎、basic/pipeline 形态一致）：`samples.csv` /
-`summary.json` / `timeseries.csv` / `*.stats.json` / `kvtest_report_meta.json`
+`<cfg>.csv` 和 `benchmark_detail.csv`、`profiling/`（监控 CSV），以及 `report/` 下
+的可重建产物 `partial.json.gz` / `reduced.json` 和 `report/cfg.json`（run 时持久化
+的生效配置快照，含继承解析结果与运行期键）。**中间产物默认在报表校验通过后清理**
+（与 python 引擎、basic/pipeline 形态一致）：`samples.csv` /
+`summary.json` / `timeseries.csv` / `*.stats.json`
 以及回拉的原始 log/glog 都会删除；需要保留现场时用 `--keep-intermediates`
-（或 env `MC_KEEP_INTERMEDIATES=1`）。清理后该 run 不能再 `--rebuild-report`；
+（或 env `MC_KEEP_INTERMEDIATES=1`）。清理后的成功 run 仍可 `--rebuild-report`
+（报表从 `reduced.json` 重渲染、CSV 按 `report/cfg.json` 重算，见下节）；
 失败/STOP 的 run 不清理，`samples.csv` 仍在，可补跑 map。失败 run 不再自动拉取原始日志：编排器只打印
 失败场景/阶段/异常、全量 pod 列表（`get pods -o wide`）和每个 pod 一行原始日志目录
 （k8s: `<host_log_root>/<run_id>/<pod>/`，ssh: `remote_log_dir`），原始 log/glog/exitrc
@@ -228,14 +231,19 @@ scenario 仅兼容旧页面；kvtest-pipeline 与 Python pipeline 同构，kvtes
    pipeline 为 writer/reader 角色单选 + 总计 + 角色化节点（同一节点每角色仅一行）、
    角色概要、QPS/时延曲线、客户端/节点对象树、错误分布、慢请求 Top-N、异常窗口；
    basic 为单「总览」、无角色分组；若 `.glog` 含 SDK trace 还会出现 C++ 全链路卡片。
-3. **重建**：`python benchmark.py --rebuild-report <ts>`。成功 run 的中间产物已按
-   默认策略清理，重建会提示「中间产物已按成功清理，无法重建」（报表与 data.js 仍可用）；
-   失败 run 保留了
-   `samples.csv` 时，会自动先补跑 map 再重建报表。运行期会把
-   `iid→节点/节点数/每个 size 的测量起点 epoch`写进
-   `logs/<cfg>/kvtest_report_meta.json`（旁挂文件，成功后也保留），重建据此
-   恢复真实节点名与精确时间轴；该文件缺失时才回退为
-   `summary.json` 的 mtime 减去 `elapsed_seconds` 估算。
+3. **重建**：`python benchmark.py --rebuild-report <ts>`（WebUI 结果页的「重建报表」
+   按钮同一入口）。报表从 `report/<ds>/reduced.json` 重渲染，缺失时先由
+   `partial.json.gz` 在本地 finalize 补齐（两者都没有才报错；不需要远端重跑
+   map）。CSV 重算：按 `logs/<cfg>/report/cfg.json`（run 时持久化的生效配置）→
+   实例快照 `snapshot/files/**/<cfg>.json`（cfg.json 持久化之前的旧 run）→ 仓库
+   `configs/` 同名配置的优先级发现配置，运行期键（实例数、warmup 秒数等）从
+   `reduced.json` 的 meta 回填，然后走与 run 时完全相同的 `write_scenario_csv`
+   重算 `<cfg>.csv` 与 run 级 `benchmark_detail.csv`；重算不出行的配置读回既有
+   CSV 原样合并（不覆盖）。节点名、每个 size 的测量起点 epoch 以及
+   cluster/global 配置文件名都冻结在 `reduced.json` 的 meta 里，重建据此恢复
+   真实节点名、精确时间轴与集群拓扑（cluster 上下文按 meta 文件名在实例快照/
+   仓库 `configs/` 中查找，找不到时拓扑列降级、不报错）。失败/STOP 的 run 本就
+   保留全部产物（含 `partial.json.gz`），同样可重建。
 
 报表参数卡沿用 pipeline 字段（场景/协议/工作模式/QPS/notify/操作/节点数/客户端
 总数/KV 配置名等），并标记「运行模式 = kvtest」。注意：

@@ -406,6 +406,95 @@ def test_rebuild_errors_without_products_or_report(tmp_path, monkeypatch):
     assert bm.rebuild_reports("20260101-0002") == 1
 
 
+def _move_fixture_into_run(tmp_path, fake_sketch, ts):
+    """_csv_env 产物搬进 outputs/<ts>/logs/kvtest_demo/ 的 run 布局。"""
+    d, cfg = _csv_env(tmp_path, fake_sketch)
+    ts_dir = os.path.join(d, ts)
+    os.makedirs(os.path.join(ts_dir, "logs"))
+    src = os.path.join(d, "report")
+    if os.path.isdir(src):
+        import shutil
+        shutil.move(src, os.path.join(ts_dir, "logs", "kvtest_demo",
+                                      "report"))
+    return d, ts_dir, {k: v for k, v in cfg.items()
+                       if not str(k).startswith("__")}
+
+
+def test_rebuild_regenerates_csv_and_detail(tmp_path, fake_sketch,
+                                            monkeypatch):
+    """rebuild 补齐 run 时失败的 CSV：report/cfg.json（run 时持久化的
+    生效配置）让 write_scenario_csv 以与 run 相同的输入重算
+    kvtest_demo.csv 与 benchmark_detail.csv。"""
+    d, ts_dir, persist = _move_fixture_into_run(
+        tmp_path, fake_sketch, "20260101-0001")
+    with open(os.path.join(ts_dir, "logs", "kvtest_demo", "report",
+                           "cfg.json"), "w", encoding="utf-8") as f:
+        json.dump(persist, f, ensure_ascii=False)
+    monkeypatch.setattr(bm, "RESULTS_DIR", d)
+    assert bm.rebuild_reports("20260101-0001") == 0
+    with open(os.path.join(ts_dir, "kvtest_demo.csv"), newline="",
+              encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert {r["role"] for r in rows} == {"writer", "reader"}
+    totals = [r for r in rows if r["instance"] == "TOTAL"]
+    assert len(totals) == 2
+    w = [r for r in totals if r["role"] == "writer"][0]
+    assert w["total"] == "5" and w["total_bytes"] == str(5 * 8388608)
+    with open(os.path.join(ts_dir, "benchmark_detail.csv"), newline="",
+              encoding="utf-8") as f:
+        detail = list(csv.DictReader(f))
+    assert [r["instance"] for r in detail] == ["TOTAL", "TOTAL"]
+    assert {r["role"] for r in detail} == {"writer", "reader"}
+
+
+def test_rebuild_keeps_runtime_csv_without_cfg(tmp_path, fake_sketch,
+                                               monkeypatch):
+    """无 report/cfg.json 且快照/仓库找不到配置：per-config CSV 保持
+    原样不清空，detail 从既有 CSV 读回组装。"""
+    d, ts_dir, _persist = _move_fixture_into_run(
+        tmp_path, fake_sketch, "20260101-0003")
+    with open(os.path.join(ts_dir, "kvtest_demo.csv"), "w", newline="",
+              encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=bm.KVTEST_CSV_HEADER)
+        w.writeheader()
+        row = {k: "" for k in bm.KVTEST_CSV_HEADER}
+        row.update({"config_name": "kvtest_demo", "scenario": "kvtest",
+                    "role": "writer", "instance": "TOTAL",
+                    "data_size": "8MB", "total": "5", "success": "5",
+                    "fail": "0"})
+        w.writerow(row)
+    monkeypatch.setattr(bm, "RESULTS_DIR", d)
+    assert bm.rebuild_reports("20260101-0003") == 0
+    with open(os.path.join(ts_dir, "kvtest_demo.csv"), newline="",
+              encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1 and rows[0]["total"] == "5"
+    with open(os.path.join(ts_dir, "benchmark_detail.csv"), newline="",
+              encoding="utf-8") as f:
+        detail = list(csv.DictReader(f))
+    assert [r["instance"] for r in detail] == ["TOTAL"]
+
+
+def test_rebuild_loads_cfg_from_instance_snapshot(tmp_path, fake_sketch,
+                                                  monkeypatch):
+    """无 report/cfg.json 的历史 run（cfg.json 持久化之前）：实例快照里
+    冻结的配置作为 CSV 重建的来源。"""
+    d, ts_dir, persist = _move_fixture_into_run(
+        tmp_path, fake_sketch, "20260101-0004")
+    snap = os.path.join(ts_dir, "snapshot", "files", "configs", "kvtest",
+                        "smoke")
+    os.makedirs(snap)
+    with open(os.path.join(snap, "kvtest_demo.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(persist, f, ensure_ascii=False)
+    monkeypatch.setattr(bm, "RESULTS_DIR", d)
+    assert bm.rebuild_reports("20260101-0004") == 0
+    with open(os.path.join(ts_dir, "kvtest_demo.csv"), newline="",
+              encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert {r["role"] for r in rows} == {"writer", "reader"}
+
+
 # ---------------------------------------------------------------------- STOP
 
 def test_stop_collect_partial_reuses_map_and_partial_reduce(monkeypatch,

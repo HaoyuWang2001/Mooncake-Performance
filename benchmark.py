@@ -308,6 +308,38 @@ def collapse_config_name(rows):
     return out
 
 
+def _write_detail_csv(ts_dir, categories, all_rows):
+    """Run-level benchmark_detail.csv assembly (main and --rebuild-report
+    share it): pick the header from the scenario categories, keep only the
+    writer/reader TOTAL rows for pipeline/kvtest, collapse repeated
+    config_name cells. Returns the written path."""
+    if categories == {"pipeline"}:
+        detail_header = PIPELINE_CSV_HEADER
+        detail_rows = collapse_config_name(all_rows)
+    elif categories == {"kvtest"}:
+        detail_header = KVTEST_CSV_HEADER
+        detail_rows = collapse_config_name(all_rows)
+    elif categories == {"basic"}:
+        detail_header = BASIC_CSV_HEADER
+        detail_rows = list(all_rows)
+    else:
+        # mixed / empty (rebuild may see a subset): ordered union of headers
+        detail_header = [c for c in BASIC_CSV_HEADER]
+        for extra in (PIPELINE_CSV_HEADER, KVTEST_CSV_HEADER):
+            for c in extra:
+                if c not in detail_header:
+                    detail_header.append(c)
+        detail_rows = list(all_rows)
+    detail_csv = os.path.join(ts_dir, "benchmark_detail.csv")
+    with open(detail_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=detail_header)
+        writer.writeheader()
+        for row in detail_rows:
+            writer.writerow(row)
+    log("detail -> {}".format(detail_csv))
+    return detail_csv
+
+
 # --------------------------------------------------------------------------
 # domain planning
 # --------------------------------------------------------------------------
@@ -3676,23 +3708,27 @@ def _write_overview_units(ov_dir, run_name, accs):
         log_detail("[report] overview_units.json write failed: {}".format(exc))
 
 
-def _render_run_overview(ts_dir, mode=""):
+def _render_run_overview(ts_dir, mode="", accs=None):
     """Render the run-level overview.html from the scenarios accumulated so
-    far (also used by the STOP path). WARN-only, never raises outward."""
-    if not _REPORT_ACC:
+    far (also used by the STOP path and --rebuild-report via ``accs``).
+    WARN-only, never raises outward."""
+    if accs is None:
+        if not _REPORT_ACC:
+            return None
+        # snapshot: a STOP can race a background post-processing unit that is
+        # still appending to the accumulator
+        accs = list(_REPORT_ACC)
+    if not accs:
         return None
     rp = _report_module()
     ov_dir = os.path.join(ts_dir, "report")
     scenarios = []
-    # snapshot: a STOP can race a background post-processing unit that is
-    # still appending to the accumulator
-    _accs = list(_REPORT_ACC)
-    for acc in _accs:
+    for acc in accs:
         rel = os.path.relpath(acc["report_html"], ov_dir)
         sc = dict(acc["data"], report_rel=rel.replace(os.sep, "/"))
         sc["unit"] = acc.get("unit") or ""
         scenarios.append(sc)
-    _write_overview_units(ov_dir, os.path.basename(ts_dir), _accs)
+    _write_overview_units(ov_dir, os.path.basename(ts_dir), accs)
     by_node = {}
     for sc in scenarios:
         for n in sc.get("nodes") or []:
@@ -3717,6 +3753,104 @@ def _render_run_overview(ts_dir, mode=""):
     return rp.render_overview(run_meta, scenarios, ov_dir,
                                rel_base=os.path.relpath(
                                    ov_dir, ROOT).replace(os.sep, "/"))
+
+
+def _combined_run_children(ts_dir):
+    """Child run directories of a combined (rank+recall) parent: every
+    direct subdirectory carrying its own logs/ (the rank/ and recall/ dirs
+    of the rank-recall layout). Empty for plain single runs."""
+    if not os.path.isdir(ts_dir):
+        return []
+    out = []
+    for name in sorted(os.listdir(ts_dir)):
+        if os.path.isdir(os.path.join(ts_dir, name, "logs")):
+            out.append(os.path.join(ts_dir, name))
+    return out
+
+
+def _load_overview_units(child_dir):
+    """Slim per-unit index written beside the child run's overview (input of
+    the combined parent overview)."""
+    path = os.path.join(child_dir, "report", "overview_units.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _render_combined_overview(parent_dir):
+    """One combined overview.html over every child run of a rank+recall-style
+    parent.
+
+    Merges the children's overview_units.json, re-anchors every unit report
+    link to the parent report/ dir and renders the regular overview template:
+    one card per config (rank + recall), each with direct links to that
+    side's report.html files. WARN-only: never fails the caller. Shared by
+    scripts/run_rank_recall.py (run end) and --rebuild-report (container
+    parent rebuild)."""
+    loaded = []
+    for child in _combined_run_children(parent_dir):
+        data = _load_overview_units(child)
+        if data:
+            loaded.append((os.path.basename(child), data))
+        else:
+            log("[parallel] {} 侧没有报表产物（失败或 --no-report），"
+                "总览仅包含另一侧".format(os.path.basename(child)))
+    if not loaded:
+        log("[parallel] 未找到子报表索引（overview_units.json），"
+            "跳过总览生成")
+        return None
+    ov_dir = os.path.join(parent_dir, "report")
+    scenarios = []
+    for _role, data in loaded:
+        for unit in (data or {}).get("units") or []:
+            sc = dict(unit.get("sc") or {})
+            html_path = unit.get("report_html") or ""
+            sc["report_rel"] = (os.path.relpath(html_path, ov_dir)
+                                .replace(os.sep, "/")) if html_path else ""
+            sc["unit"] = unit.get("unit") or sc.get("unit") or ""
+            scenarios.append(sc)
+    if not scenarios:
+        return None
+    by_node = {}
+    for sc in scenarios:
+        for n in sc.get("nodes") or []:
+            e = by_node.setdefault(n.get("node"), {"node": n.get("node"),
+                                                    "pods": 0, "bytes": 0})
+            e["pods"] += n.get("pods") or 0
+            e["bytes"] += n.get("bytes") or 0
+    started = next((str((sc.get("meta") or {}).get("started"))
+                    for sc in scenarios
+                    if (sc.get("meta") or {}).get("started")),
+                   time.strftime("%Y-%m-%d %H:%M:%S"))
+    run_meta = {
+        "run": os.path.basename(parent_dir.rstrip(os.sep)) or parent_dir,
+        "mode": "rank+recall",
+        "started": started,
+        "nodes": sorted(by_node.values(),
+                        key=lambda x: -(x.get("bytes") or 0)),
+    }
+    # 现场索引：两侧的 namespace / 日志根天然不同（rank 与 recall 各一套
+    # namespace），并列展示而不是取其一。
+    for key in ("host_log_root", "remote_log_dir", "run_id", "k8s_namespace"):
+        vals = []
+        for sc in scenarios:
+            v = (sc.get("meta") or {}).get(key)
+            if v and str(v) not in vals:
+                vals.append(str(v))
+        if vals:
+            run_meta[key] = " / ".join(vals)
+    rp = _report_module()
+    ov = rp.render_overview(
+        run_meta, scenarios, ov_dir,
+        rel_base=os.path.relpath(ov_dir, ROOT).replace(os.sep, "/"))
+    log("[parallel] overview -> {}".format(
+        os.path.relpath(ov, ROOT)))
+    return ov
 
 
 def _stop_reports():
@@ -9310,6 +9444,10 @@ def write_scenario_csv(local_log_dir, cfg, ts, cfg_path, cluster=None,
                        mooncake_store_nodes=None, result_dir=None):
     """拓扑判定（IP 匹配）：节点的 cluster.json `ip` 出现在
     mooncake_store_nodes 各节点的 `ip` 集合中即 local_node。"""
+    # cluster=None (--rebuild-report without a discoverable cluster config):
+    # topology is informational only — degrade instead of failing loudly
+    if cluster is None:
+        mooncake_store_nodes = []
     store_ips = resolve_store_node_ips(
         cluster or {}, mooncake_store_nodes or [])
 
@@ -10084,8 +10222,12 @@ def parse_arguments(argv=None):
                              "from its timestamp directory name (e.g. "
                              "20261110-1308, NOT outputs/<ts>): merges the "
                              "local stats and/or raw logs and re-renders "
-                             "report.html + overview.html (remote map is NOT "
-                             "re-run; pull raw logs first if stats are absent)")
+                             "report.html + overview.html, and regenerates "
+                             "the per-config CSVs + benchmark_detail.csv "
+                             "from the same local products (remote map is "
+                             "NOT re-run; pull raw logs first if stats are "
+                             "absent). Combined rank+recall parents rebuild "
+                             "every child run and the parent overview")
     parser.add_argument("--protocol", default=None, choices=["tcp", "rdma", "ub"],
                         help="override protocol (tcp/rdma/ub); highest priority, "
                              "overrides the JSON config value")
@@ -10109,11 +10251,18 @@ def parse_arguments(argv=None):
         args.global_cfg = os.path.join(args.mode_dir, "global.json")
     standalone_cleanup = bool(
         args.clean_up and not (args.config or args.config_dir))
-    if args.profile is None and not standalone_cleanup:
+    if args.profile is None and not standalone_cleanup \
+            and not args.rebuild_report:
         args.profile = os.path.join(args.mode_dir, "profile.json")
-    required = [("cluster", args.cluster), ("global", args.global_cfg)]
-    if args.profile is not None or not standalone_cleanup:
-        required.append(("profile", args.profile))
+    if args.rebuild_report:
+        # --rebuild-report is purely local: cluster/global/profile existence
+        # is irrelevant (the CSV cluster context is discovered from the
+        # run's own products/snapshot; CLI paths are only a last resort)
+        required = []
+    else:
+        required = [("cluster", args.cluster), ("global", args.global_cfg)]
+        if args.profile is not None or not standalone_cleanup:
+            required.append(("profile", args.profile))
     for name, path in required:
         if not os.path.exists(path):
             example = os.path.join(args.mode_dir, name + ".example.json")
@@ -10193,24 +10342,335 @@ def _profile_outliers(matrix, ts_dir, cfg_name):
             f.write("\n".join(lines) + "\n")
 
 
-def rebuild_reports(ts):
+def _snapshot_cfg_roots(ts_dir):
+    """Instance-snapshot files roots for a (possibly nested child) run: its
+    own snapshot/ and — for a rank+recall child — the shared parent's."""
+    here = os.path.abspath(ts_dir.rstrip(os.sep))
+    roots = [os.path.join(here, "snapshot", "files")]
+    parent = os.path.dirname(here)
+    if parent != here:
+        roots.append(os.path.join(parent, "snapshot", "files"))
+    return roots
+
+
+def _find_named_file(basename, roots):
+    """First file with the exact basename under the given roots (walks
+    everything, including _-prefixed dirs: cluster/global configs live in
+    configs/_k8s, configs/_ssh). None when not found."""
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in sorted(files):
+                if fn == basename:
+                    return os.path.join(dirpath, fn)
+    return None
+
+
+def _rebuild_load_cfg(ts_dir, log_dir, name):
+    """Effective scenario config for one rebuilt config dir.
+
+    Priority: report/cfg.json persisted by the run (authoritative — carries
+    the runtime keys like _writer_count/_kvtest_key_pool) -> the instance
+    snapshot archived under the run -> a repo config matching the basename
+    (WARN: the file may have drifted since the run). Returns (cfg, source)
+    with cfg=None when nothing usable was found."""
+    path = os.path.join(log_dir, "report", "cfg.json")
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict) and cfg.get("scenario"):
+                return cfg, "report/cfg.json"
+        except (OSError, ValueError):
+            pass
+        log("[WARN] {}: {} is unreadable; falling back to the snapshot/"
+            "repo config".format(name, os.path.relpath(path, ROOT)))
+    want = name + ".json"
+    for files_root in _snapshot_cfg_roots(ts_dir):
+        configs_root = os.path.join(files_root, "configs")
+        for found in collect_config_files(configs_root):
+            if os.path.basename(found) != want:
+                continue
+            try:
+                cfg = load_scenario_config(found, configs_root=configs_root)
+            except (RuntimeError, OSError, ValueError) as exc:
+                log("[WARN] {}: snapshot config {} failed: {}".format(
+                    name, found, exc))
+                continue
+            return cfg, "instance snapshot"
+    for found in collect_config_files(CONFIGS_DIR):
+        if os.path.basename(found) != want:
+            continue
+        try:
+            cfg = load_scenario_config(found)
+        except (RuntimeError, OSError, ValueError) as exc:
+            log("[WARN] {}: repo config {} failed: {}".format(
+                name, found, exc))
+            continue
+        log("[WARN] {}: using the current repo config ({}); its values may "
+            "have drifted since the run".format(name, found))
+        return cfg, "repo config"
+    return None, ""
+
+
+def _backfill_runtime_keys(cfg, log_dir):
+    """Recover runtime-only keys for a snapshot/repo-sourced config from the
+    reduced.json products: the real per-role process counts and the resolved
+    warmup window. Existing keys are never overwritten."""
+    for red in sorted(glob.glob(os.path.join(
+            log_dir, "report", "*", "reduced.json"))):
+        try:
+            with open(red, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        insts = data.get("instances") or []
+        if insts:
+            writers = sum(1 for it in insts
+                          if str(it.get("role")) == "writer")
+            readers = sum(1 for it in insts
+                          if str(it.get("role")) == "reader")
+            if writers:
+                cfg.setdefault("_writer_count", writers)
+            if readers:
+                cfg.setdefault("_reader_count", readers)
+        warm = (data.get("meta") or {}).get("warmup_s")
+        if warm is not None:
+            cfg.setdefault("_kvtest_warmup_duration", float(warm))
+        return
+
+
+def _rebuild_cluster_context(ts_dir, log_dir, args=None):
+    """(cluster, store_nodes, mode) for a rebuilt CSV.
+
+    The cluster/global configs are discovered by the basenames recorded in
+    the unit meta products (instance snapshot first, repo configs second,
+    the CLI args last). Degrades to (None, [], "") — the CSV then shows node
+    names instead of management IPs and a blank topology column, but the
+    metric columns stay complete."""
+    names = {}
+    meta_paths = [os.path.join(log_dir, "report", "meta.json")]
+    meta_paths.extend(sorted(glob.glob(
+        os.path.join(log_dir, "report", "*", "meta.json"))))
+    for meta_path in meta_paths:
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+        except (OSError, ValueError):
+            continue
+        for key in ("cluster_cfg", "global_cfg"):
+            if meta.get(key) and not names.get(key):
+                names[key] = os.path.basename(str(meta[key]))
+        if names.get("cluster_cfg") and names.get("global_cfg"):
+            break
+    roots = _snapshot_cfg_roots(ts_dir) + [CONFIGS_DIR]
+    cluster = None
+    cluster_path = None
+    if names.get("cluster_cfg"):
+        cluster_path = _find_named_file(names["cluster_cfg"], roots)
+        if cluster_path:
+            try:
+                cluster = load_json(cluster_path)
+            except (OSError, ValueError):
+                cluster = None
+    globals_cfg = None
+    if names.get("global_cfg"):
+        gpath = _find_named_file(names["global_cfg"], roots)
+        if gpath:
+            try:
+                globals_cfg = load_json(gpath)
+            except (OSError, ValueError):
+                globals_cfg = None
+    if args is not None:
+        if cluster is None:
+            path = getattr(args, "cluster", None)
+            if path and os.path.isfile(path):
+                try:
+                    cluster = load_json(path)
+                    cluster_path = path
+                except (OSError, ValueError):
+                    cluster = None
+        if globals_cfg is None:
+            path = getattr(args, "global_cfg", None)
+            if path and os.path.isfile(path):
+                try:
+                    globals_cfg = load_json(path)
+                except (OSError, ValueError):
+                    globals_cfg = None
+    mode = ""
+    if cluster_path:
+        parts = os.path.normpath(os.path.abspath(cluster_path)).split(os.sep)
+        if "_k8s" in parts:
+            mode = "k8s"
+        elif "_ssh" in parts:
+            mode = "ssh"
+    elif args is not None:
+        mode = getattr(args, "mode", "") or ""
+    store_nodes = []
+    if mode != "k8s" and globals_cfg:
+        store_nodes = globals_cfg.get("mooncake_store_nodes", []) or []
+    return cluster, store_nodes, mode
+
+
+def _rebuild_config_csv(name, log_dir, ts_dir, cfg, cluster, store_nodes):
+    """Rewrite one config's per-config CSV via the very same
+    write_scenario_csv the run used. Returns (rows, scenario).
+
+    A rebuild that reproduces no rows (e.g. the python-engine raw logs were
+    cleaned after a successful run) restores the run-time CSV instead of
+    clobbering it and returns (None, None). Any product problem (missing
+    reduced.json, missing digest tails) raises — the caller mirrors the
+    run-time "CSV failure fails the run" contract."""
+    out_csv = os.path.join(ts_dir, "{}.csv".format(name))
+    backup = None
+    if os.path.isfile(out_csv):
+        try:
+            with open(out_csv, "rb") as f:
+                backup = f.read()
+        except OSError:
+            backup = None
+    rows = write_scenario_csv(log_dir, cfg, os.path.basename(ts_dir),
+                              os.path.join(log_dir, name + ".json"),
+                              cluster, store_nodes, result_dir=ts_dir)
+    if not rows and backup:
+        with open(out_csv, "wb") as f:
+            f.write(backup)
+        log("[WARN] {}: the rebuilt CSV has no rows; kept the existing {}"
+            .format(name, os.path.relpath(out_csv, ROOT)))
+        return None, None
+    log("[report] rebuilt {} CSV -> {}".format(
+        name, os.path.relpath(out_csv, ROOT)))
+    return rows, cfg.get("scenario")
+
+
+def _rebuild_csv_unit(name, log_dir, ts_dir, args=None):
+    """One config's CSV regeneration: config discovery -> runtime-key
+    backfill -> cluster context -> write_scenario_csv.
+
+    Returns (rows, scenario, mode): rows is None when skipped (no config
+    found) or when the existing run-time CSV was kept; raises when
+    regeneration started but failed."""
+    cfg, src = _rebuild_load_cfg(ts_dir, log_dir, name)
+    if cfg is None:
+        log("[WARN] {}: no effective config found (report/cfg.json, "
+            "instance snapshot, repo configs); CSV not rebuilt".format(name))
+        return None, None, ""
+    if src != "report/cfg.json":
+        # snapshot/repo configs cannot know the runtime-resolved keys
+        _backfill_runtime_keys(cfg, log_dir)
+    cluster, store_nodes, mode = _rebuild_cluster_context(ts_dir, log_dir, args)
+    rows, scenario = _rebuild_config_csv(name, log_dir, ts_dir, cfg,
+                                         cluster, store_nodes)
+    return rows, scenario, mode
+
+
+def _infer_csv_scenario(fields):
+    """Scenario category of an existing per-config CSV, from its header."""
+    if "key_pool_size" in fields:
+        return "kvtest"
+    if "notify_pipeline" in fields or "traffic_mode" in fields:
+        return "pipeline"
+    if "num_clients" in fields:
+        return "basic"
+    return ""
+
+
+def _read_back_csv_rows(ts_dir, name):
+    """Rows + scenario category read back from an existing per-config CSV
+    (the run wrote it; this rebuild could not regenerate it — cleaned
+    intermediates, no discoverable config)."""
+    path = os.path.join(ts_dir, "{}.csv".format(name))
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = [dict(r) for r in reader]
+            fields = reader.fieldnames or []
+    except (OSError, ValueError) as exc:
+        log("[WARN] read back {}: {}".format(path, exc))
+        return None, None
+    return rows, _infer_csv_scenario(fields)
+
+
+def rebuild_reports(ts, args=None):
     """--rebuild-report: regenerate the reports for an existing run purely
-    from LOCAL artifacts (pulled stats and/or raw logs). Covers the
+    from LOCAL artifacts (pulled stats and/or raw logs, kvtest partial/
+    reduced products and the per-config CSVs built from them). Covers the
     "run finished but report generation failed" case without touching the
-    remote side. Returns the process exit code."""
+    remote side. A combined rank+recall parent (whose logs/ only exist in
+    the child run dirs) recurses into every child and re-renders the parent
+    overview afterwards. Returns the process exit code."""
     ts_dir = os.path.join(RESULTS_DIR, ts)
-    logs_root = os.path.join(ts_dir, "logs")
-    if not os.path.isdir(logs_root):
+    if not os.path.isdir(os.path.join(ts_dir, "logs")):
+        children = _combined_run_children(ts_dir)
+        if children:
+            rc = 0
+            produced_any = False
+            for child in children:
+                crc, produced = _rebuild_single_run(child, args)
+                produced_any = produced_any or produced
+                if crc and not produced:
+                    # a child with nothing local at all (failed before any
+                    # product): WARN, never fails the whole parent rebuild
+                    log("[WARN] {}: no local products; child skipped".format(
+                        os.path.basename(child)))
+                else:
+                    rc = crc or rc
+            if not produced_any:
+                log("[ERROR] rebuild: no local products under any child of "
+                    "{}".format(os.path.relpath(ts_dir, ROOT)))
+                rc = 1
+            try:
+                ov = _render_combined_overview(ts_dir)
+                if ov:
+                    log("[report] overview -> {}".format(
+                        os.path.relpath(ov, ROOT)))
+            except Exception as exc:
+                log("[WARN] combined overview rebuild failed: {}".format(exc))
+            return rc
         log("[ERROR] no logs directory under {}".format(
             os.path.relpath(ts_dir, ROOT)))
         return 2
+    return _rebuild_single_run(ts_dir, args)[0]
+
+
+def _rebuild_single_run(ts_dir, args=None):
+    """Rebuild one run directory: reports + CSVs + run-level overview.
+
+    Purely local: no remote map/reduce is re-run, only the orchestrator-side
+    stages (kvtest finalize/render, python-engine reduce/render, CSV
+    aggregation) over the artifacts already on this machine."""
+    logs_root = os.path.join(ts_dir, "logs")
     rp = _report_module()
     echarts = os.path.join(ROOT, "webui", "web", "vendor", "echarts.min.js")
-    scenarios = []
+    accs = []            # [{data, report_html, unit}] — overview input
+    config_names = []    # every config dir visited (CSV read-back scope)
+    csv_units = {}       # name -> (rows, scenario) regenerated this pass
+    csv_failures = []
+    overview_mode = ""
+
+    def _csv_step(cfg_name, log_dir):
+        """One config's CSV regeneration with WARN/failure tracking."""
+        nonlocal overview_mode
+        try:
+            rows, scenario, mode = _rebuild_csv_unit(
+                cfg_name, log_dir, ts_dir, args)
+        except Exception as exc:
+            log("[WARN] {}: CSV rebuild failed: {}".format(cfg_name, exc))
+            csv_failures.append(cfg_name)
+            return
+        if rows is not None:
+            csv_units[cfg_name] = (rows, scenario)
+        if mode and not overview_mode:
+            overview_mode = mode
+
     for name in sorted(os.listdir(logs_root)):
         d = os.path.join(logs_root, name)
         if not os.path.isdir(d) or name == "report":
             continue
+        config_names.append(name)
         _kv_partials = sorted(glob.glob(os.path.join(
             d, "report", "*", "partial.json.gz")))
         _kv_reds = sorted(glob.glob(os.path.join(
@@ -10231,17 +10691,17 @@ def rebuild_reports(ts):
                         data, out_d, echarts,
                         rel_base=os.path.relpath(out_d, ROOT)
                         .replace(os.sep, "/"))
-                    scenarios.append(dict(
-                        data, unit=os.path.basename(out_d),
-                        report_rel=os.path.relpath(
-                            html, os.path.join(ts_dir, "report")
-                        ).replace(os.sep, "/")))
+                    accs.append({"data": data, "report_html": html,
+                                 "unit": os.path.basename(out_d)})
                     log("[report] rebuilt {} · {} -> {}".format(
                         name, os.path.basename(out_d),
                         os.path.relpath(html, ROOT)))
             except Exception as exc:
                 log("[WARN] {}: kvtest report rebuild failed: {}".format(
                     name, exc))
+            # CSV needs reduced.json (finalize above); even a render failure
+            # leaves it on disk, so regeneration is attempted regardless
+            _csv_step(name, d)
             continue
         stats = _collect_local_stats(d)
         if not stats:
@@ -10397,33 +10857,74 @@ def rebuild_reports(ts):
                 rel_base=os.path.relpath(out_d, ROOT).replace(os.sep, "/"))
             log("[report] rebuilt {} · {} -> {}".format(
                 name, u["label"], os.path.relpath(html, ROOT)))
-            scenarios.append(dict(
-                data, unit=u["label"],
-                report_rel=os.path.relpath(
-                    html, os.path.join(ts_dir, "report")
-                ).replace(os.sep, "/")))
+            accs.append({"data": data, "report_html": html,
+                         "unit": u["label"]})
 
-    if not scenarios:
+        # CSV for the python engine too (stats/raw logs still local for
+        # failed/STOPped runs; a cleaned successful run keeps its run-time
+        # CSV via the read-back path in the assembly below)
+        _csv_step(name, d)
+
+    # --- run-level CSV assembly: rows regenerated this pass + the run-time
+    # CSVs this pass could not regenerate (read back verbatim) ---
+    all_rows = []
+    categories = set()
+    for name in config_names:
+        rows, scenario = csv_units.get(name) or (None, None)
+        if rows is None:
+            rows, scenario = _read_back_csv_rows(ts_dir, name)
+        if not rows:
+            continue
+        if scenario in ("pipeline", "kvtest"):
+            categories.add(scenario)
+            # detail keeps only the aggregated writer/reader TOTAL rows
+            all_rows.extend([r for r in rows
+                             if r.get("instance") == "TOTAL"])
+        else:
+            categories.add(scenario or "basic")
+            all_rows.extend(rows)
+    if all_rows:
+        _write_detail_csv(ts_dir, categories, all_rows)
+    else:
+        log("[report] detail CSV unchanged (no rows regenerated or read "
+            "back)")
+    if not accs and not csv_units and not all_rows:
         log("[ERROR] rebuild: no local stats or raw logs found under {} — "
             "re-run with --pull-raw-logs, use --rebuild-report on the "
             "originating machine, or keep the intermediates next time with "
             "--keep-intermediates".format(os.path.relpath(logs_root, ROOT)))
-        return 1
-    by_node = {}
-    for sc in scenarios:
-        for n in sc.get("nodes") or []:
-            e = by_node.setdefault(n.get("node"), {"node": n.get("node"),
-                                                   "pods": 0, "bytes": 0})
-            e["pods"] += n.get("pods") or 0
-            e["bytes"] += n.get("bytes") or 0
-    ov_d = os.path.join(ts_dir, "report")
-    ov = rp.render_overview({
-        "run": ts, "mode": "", "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "nodes": sorted(by_node.values(), key=lambda x: -(x.get("bytes") or 0)),
-    }, scenarios, ov_d, rel_base=os.path.relpath(
-        ov_d, ROOT).replace(os.sep, "/"))
-    log("[report] overview -> {}".format(os.path.relpath(ov, ROOT)))
-    return 0
+        return 1, False
+    # --- run-level overview from the units rebuilt this pass (also refreshes
+    # overview_units.json — the combined-parent overview input) ---
+    try:
+        ov = _render_run_overview(ts_dir, overview_mode, accs=accs)
+        if ov:
+            log("[report] overview -> {}".format(os.path.relpath(ov, ROOT)))
+    except Exception as exc:
+        log("[WARN] overview report failed: {}".format(exc))
+    if csv_failures:
+        log("SUMMARY: rebuild done but CSV failed for: {}".format(
+            ", ".join(csv_failures)))
+        return 1, True
+    return 0, True
+
+
+def _persist_effective_cfg(cfg, log_dir):
+    """Persist the effective scenario config (inheritance resolved + runtime
+    keys like _writer_count/_kvtest_key_pool) under logs/<cfg>/report/cfg.json
+    so --rebuild-report can regenerate the CSVs from exactly the config the
+    run-time CSV used. report/ is never removed by the intermediate cleanup,
+    so the product survives successful runs. WARN-only."""
+    try:
+        rep = os.path.join(log_dir, "report")
+        os.makedirs(rep, exist_ok=True)
+        data = {k: v for k, v in (cfg or {}).items()
+                if not str(k).startswith("__")}
+        with open(os.path.join(rep, "cfg.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except (OSError, TypeError, ValueError) as exc:
+        log("[WARN] effective config persist failed for {}: {}".format(
+            os.path.basename(log_dir.rstrip(os.sep)), exc))
 
 
 def _post_process_config(cfg, cfg_name, scenario, ts, ts_dir,
@@ -10439,6 +10940,10 @@ def _post_process_config(cfg, cfg_name, scenario, ts, ts_dir,
     only this config failed — the report wrappers themselves stay WARN-only,
     exactly like the old inline path."""
     log_dir = os.path.join(ts_dir, "logs", cfg_name)
+    # persist BEFORE any CSV/report step: a run whose finalize/CSV fails here
+    # (e.g. datasketches missing) must leave the config behind so
+    # --rebuild-report can regenerate both once fixed
+    _persist_effective_cfg(cfg, log_dir)
     if scenario == "kvtest":
         # 两阶段 reduce 的第一阶段收尾：partial -> reduced（digest 尾部合并、
         # 监控注入、logsite）必须在 CSV 之前完成——CSV 只读 reduced。
@@ -10468,7 +10973,7 @@ def _post_process_config(cfg, cfg_name, scenario, ts, ts_dir,
 
 def main(args, cfg_paths):
     if getattr(args, "rebuild_report", None):
-        sys.exit(rebuild_reports(args.rebuild_report))
+        sys.exit(rebuild_reports(args.rebuild_report, args))
     stop_file = args.stop_file or os.environ.get("BENCH_STOP_FILE")
     if stop_file:
         args.stop_file = stop_file
@@ -10682,30 +11187,7 @@ def main(args, cfg_paths):
     # --- run-level assembly (local, fast) — done BEFORE the global teardown
     # so the detail CSV / overview are available immediately and the PNG plots
     # (also purely local) can run in parallel with the cluster teardown.
-    if categories == {"pipeline"}:
-        detail_header = PIPELINE_CSV_HEADER
-        detail_rows = collapse_config_name(all_rows)
-    elif categories == {"kvtest"}:
-        detail_header = KVTEST_CSV_HEADER
-        detail_rows = collapse_config_name(all_rows)
-    elif categories == {"basic"}:
-        detail_header = BASIC_CSV_HEADER
-        detail_rows = all_rows
-    else:
-        # mixed (not reachable through normal CLI): ordered union of headers
-        detail_header = [c for c in BASIC_CSV_HEADER]
-        for extra in (PIPELINE_CSV_HEADER, KVTEST_CSV_HEADER):
-            for c in extra:
-                if c not in detail_header:
-                    detail_header.append(c)
-        detail_rows = all_rows
-    detail_csv = os.path.join(ts_dir, "benchmark_detail.csv")
-    with open(detail_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=detail_header)
-        writer.writeheader()
-        for row in detail_rows:
-            writer.writerow(row)
-    log("detail -> {}".format(detail_csv))
+    _write_detail_csv(ts_dir, categories, all_rows)
     if failed_scenarios:
         log("SUMMARY: {} scenarios OK, {} FAILED: {}".format(
             len(cfg_paths) - len(failed_scenarios), len(failed_scenarios),
