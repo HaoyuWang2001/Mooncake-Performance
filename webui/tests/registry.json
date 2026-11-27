@@ -7085,6 +7085,16 @@
     "test_apply_image_tag_ssh_mode_is_noop"
    ],
    "e2e": []
+  },
+  {
+   "id": "E-435",
+   "module": "webui",
+   "desc": "结果框文件下拉改为层级目录树，节点带类型标记",
+   "req": "",
+   "unit": [
+    "test_results_file_tree_hierarchical"
+   ],
+   "e2e": []
   }
  ]
 }

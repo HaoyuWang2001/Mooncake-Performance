@@ -134,6 +134,23 @@ def test_missing_file_falls_back_to_detail_csv():
     assert "已自动展示 benchmark_detail.csv" in src
 
 
+def test_results_file_tree_hierarchical():
+    """结果框文件下拉：层级目录树（替代平铺的类型分组列表）。"""
+    results = open(os.path.join(JS_DIR, "views", "results-view.js"),
+                   encoding="utf-8").read()
+    assert "function _fileTree(" in results
+    assert '<el-tree-select v-model="pane.file"' in results
+    assert 'node-key="path"' in results
+    assert ":props=\"{ label: 'path', children: 'children' }\"" in results
+    assert 'class="pft-node"' in results
+    assert 'class="pft-type"' in results
+    assert "el-option-group" not in results      # 类型分组平铺列表已移除
+    assert "_groupedFiles" not in results
+    css = open(os.path.join(os.path.dirname(JS_DIR), "style.css"),
+               encoding="utf-8").read()
+    assert ".pft-node" in css and ".pane-file-popper" in css
+
+
 def test_reports_in_results_and_instance_detail():
     """HTML 报表：结果页「报表」分组 + 新标签打开；实例详情「查看报表」。"""
     results = open(os.path.join(JS_DIR, "views", "results-view.js"),

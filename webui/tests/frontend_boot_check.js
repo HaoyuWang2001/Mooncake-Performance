@@ -230,5 +230,52 @@ try {
   console.error("[FAIL] _perfShouldFetchLog: " + e.message);
 }
 
+// 回归：结果框文件下拉 -> 层级目录树（目录优先、计数、文件类型标记、memo）
+try {
+  const tree = vm.runInContext(`(function () {
+    return _fileTree([
+      "b.log",
+      "report/2026/report.html",
+      "report/2026/data.js",
+      "logs/node2/client.log",
+      "logs/node1/client.log",
+      "benchmark_detail.csv",
+    ]);
+  })()`, ctx);
+  const names = tree.map(n => n.name);
+  if (JSON.stringify(names) !== JSON.stringify(
+        ["logs", "report", "b.log", "benchmark_detail.csv"])) {
+    failed = true;
+    console.error("[FAIL] _fileTree top order: " + JSON.stringify(names));
+  }
+  const logs = tree[0];
+  if (!logs.isDir || logs.count !== 2 || logs.children.length !== 2 ||
+      logs.children[0].name !== "node1" || logs.children[0].count !== 1) {
+    failed = true;
+    console.error("[FAIL] _fileTree dir count/order: " + JSON.stringify(logs));
+  }
+  const csv = tree.find(n => n.name === "benchmark_detail.csv");
+  if (!csv || csv.isDir || csv.path !== "benchmark_detail.csv" || csv.g !== "csv") {
+    failed = true;
+    console.error("[FAIL] _fileTree file leaf: " + JSON.stringify(csv));
+  }
+  const log = tree[0].children[0].children[0];
+  if (log.g !== "日志" || log.path !== "logs/node1/client.log") {
+    failed = true;
+    console.error("[FAIL] _fileTree file type/path: " + JSON.stringify(log));
+  }
+  const memo = vm.runInContext(`(function () {
+    const files = ["a/x.log", "a/y.log"];
+    return _fileTree(files) === _fileTree(files);
+  })()`, ctx);
+  if (!memo) {
+    failed = true;
+    console.error("[FAIL] _fileTree memo by files reference");
+  }
+} catch (e) {
+  failed = true;
+  console.error("[FAIL] _fileTree: " + e.message);
+}
+
 if (failed) process.exit(1);
 console.log("FRONTEND_BOOT_OK (" + registered.map(([n]) => n).join(", ") + ")");

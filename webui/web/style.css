@@ -577,6 +577,18 @@ html, body, #app {
 .pane-empty { display: flex; align-items: center; justify-content: center; }
 .pane-tools { margin-left: auto; display: inline-flex; align-items: center; }
 
+/* ---- 结果框文件下拉：层级目录树（长名截断、类型标记、深树可滚动） ---- */
+.pft-node {
+  display: inline-flex; align-items: center; gap: var(--mc-space-1);
+  max-width: 100%; overflow: hidden;
+}
+.pft-node.dir .pft-name { font-weight: 500; }
+.pft-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pft-count, .pft-type {
+  flex: none; color: var(--el-text-color-secondary); font-size: 12px;
+}
+.pane-file-popper .el-select-dropdown__wrap { max-height: 60vh; }
+
 /* ---- 悬浮操作条（运行日志页） ---- */
 .float-bar {
   position: sticky; top: 8px; z-index: 60;

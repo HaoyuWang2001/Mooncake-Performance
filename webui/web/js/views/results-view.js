@@ -27,14 +27,43 @@ function _kindOf(pane) {
   return "txt";
 }
 
-function _groupedFiles(pane) {
-  const groups = {};
-  for (const f of pane.files) {
-    const g = _fileGroup(f);
-    (groups[g] = groups[g] || []).push(f);
+/* 平铺相对路径 -> 层级目录树（文件下拉用）：目录在前、文件在后，各自按名排序。
+   目录节点带 count（子孙文件数）；文件叶子带 g（类型标记）。以 files 数组
+   引用为键做 memo —— _loadFiles 每次整体替换数组，缓存随之失效，避免轮询
+   触发的重渲染反复建树。 */
+const _fileTreeCache = new WeakMap();
+function _fileTree(files) {
+  const src = Array.isArray(files) ? files : [];
+  if (_fileTreeCache.has(src)) return _fileTreeCache.get(src);
+  const root = { children: [] };
+  for (const f of src) {
+    const rel = String(f);
+    const parts = rel.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const path = parts.slice(0, i + 1).join("/");
+      let dir = node.children.find(c => c.isDir && c.path === path);
+      if (!dir) {
+        dir = { name: parts[i], path: path, isDir: true, count: 0, children: [] };
+        node.children.push(dir);
+      }
+      node = dir;
+    }
+    node.children.push({ name: parts[parts.length - 1], path: rel, isDir: false,
+                         g: _fileGroup(rel), children: [] });
   }
-  const order = ["csv", "报表", "图片", "spdiag树", "profiling", "日志", "json", "其他"];
-  return order.filter(g => groups[g]).map(g => ({ label: g, opts: groups[g] }));
+  (function finish(node) {
+    node.children.sort((a, b) => a.isDir === b.isDir
+      ? a.name.localeCompare(b.name) : (a.isDir ? -1 : 1));
+    let n = 0;
+    for (const c of node.children) {
+      if (c.isDir) { c.count = finish(c); n += c.count; } else n += 1;
+    }
+    return n;
+  })(root);
+  const tree = root.children;
+  _fileTreeCache.set(src, tree);
+  return tree;
 }
 
 function _treeShortcut(pane) {
@@ -202,13 +231,19 @@ const ResPane = {
                  style="width: 190px" @change="loadFiles(pane, true)">
         <el-option v-for="r in runs" :key="r.ts" :label="r.ts" :value="r.ts"></el-option>
       </el-select>
-      <el-select v-model="pane.file" filterable placeholder="选择文件" size="small"
-                 style="flex: 1; min-width: 300px">
-        <el-option-group v-for="g in groupedFiles(pane)" :key="g.label"
-                         :label="g.label + ' (' + g.opts.length + ')'">
-          <el-option v-for="o in g.opts" :key="o" :label="o" :value="o"></el-option>
-        </el-option-group>
-      </el-select>
+      <el-tree-select v-model="pane.file" :data="fileTree(pane)" node-key="path"
+                      :props="{ label: 'path', children: 'children' }"
+                      filterable placeholder="选择文件" size="small"
+                      style="flex: 1; min-width: 300px"
+                      popper-class="pane-file-popper">
+        <template #default="{ data }">
+          <span class="pft-node" :class="{ dir: data.isDir }" :title="data.path">
+            <span class="pft-name">{{ data.name }}</span>
+            <span v-if="data.isDir" class="pft-count">({{ data.count }})</span>
+            <span v-else class="pft-type">{{ data.g }}</span>
+          </span>
+        </template>
+      </el-tree-select>
       <el-radio-group v-if="kindOf(pane) === 'tree'" v-model="pane.rawView" size="small">
         <el-radio-button :value="false">树状图</el-radio-button>
         <el-radio-button :value="true">源文件</el-radio-button>
@@ -338,7 +373,8 @@ const ResPane = {
       return { width: (pane.imgScale * 100) + "%", height: "auto", transform: t };
     }
     const dragging = Vue.ref(false);
-    return { setAuto, kindOf: _kindOf, groupedFiles: _groupedFiles, treeShortcut: _treeShortcut,
+    return { setAuto, kindOf: _kindOf, fileTree: p => _fileTree(p.files),
+             treeShortcut: _treeShortcut,
              csvColWidth: _csvColWidth, csvIsNumeric: _csvIsNumeric,
              loadFiles: _loadFiles, toggleWrap, imgStep, imgFit, imgDragStart, dragging, imgStyle,
              loadMore: _loadMore, fmtBytes: _fmtBytes,
