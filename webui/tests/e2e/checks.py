@@ -160,3 +160,33 @@ def check_csv_headers(art):
     for p in (art.detail_csv, art.cfg_csv):
         h = _csv_header(p)
         assert h in (bm.KVTEST_CSV_HEADER, bm.PIPELINE_CSV_HEADER), h[:8]
+
+
+def check_client_objects(art):
+    """实例对象身份唯一（49772ea 撞键回归）：每个 size 块的 client 对象
+    数 == clients 列表长度（防对象被同名键覆盖丢失）且 ≥1，对象键集合与
+    clients 一一对应（client:+name）；client 对象总数 == instances 条数；
+    pipeline（kvtest 双角色）下 reader 角色的 client 对象 ≥1（默认 reader
+    视图下实例可见的前提）。"""
+    d = _data(art)
+    with open(art.reduced_json, encoding="utf-8") as f:
+        red = json.load(f)
+    n_inst = len(red.get("instances") or [])
+    total = readers = 0
+    for size, blk in (d.get("sizes") or {}).items():
+        clients = blk.get("clients") or []
+        cobjs = {k: v for k, v in (blk.get("objects") or {}).items()
+                 if (v or {}).get("kind") == "client"}
+        names = {"client:" + c["name"] for c in clients}
+        assert clients and cobjs, size
+        assert len(cobjs) == len(clients), (size, len(cobjs), len(clients))
+        assert len(names) == len(clients), (size, sorted(names))
+        assert set(cobjs) == names, (size, sorted(cobjs), sorted(names))
+        total += len(cobjs)
+        readers += sum(1 for v in cobjs.values() if v.get("role") == "reader")
+    assert total == n_inst, (total, n_inst)
+    meta = d.get("meta") or {}
+    is_pipeline = ((meta.get("scenario") or meta.get("mode")) in
+                   ("pipeline", "kvtest")) or meta.get("engine") == "kvtest"
+    if is_pipeline:
+        assert readers >= 1, "无 reader 角色实例对象（默认 reader 视图看不到实例）"

@@ -339,6 +339,10 @@ def test_kvtest_pod_map_runs_in_process_dir(monkeypatch):
     assert "--warmup-s 2.0" in commands[0]
     assert "--digest-k 24" in commands[0]
     assert "--out-stats /pod/writer_i3_p9101/case.stats.json" in commands[0]
+    # 旧命名契约：source-name = <base>.<role>.samples.csv（base = _log_base
+    # 的 basename）。basename(samples) 各进程同名（latency_samples.csv），
+    # reduce 的 client 对象会撞键丢实例（49772ea 回归）。
+    assert "--source-name case.writer.samples.csv" in commands[0]
     # strict: a missing product is an error (no fallback map)
     monkeypatch.setattr(bm, "ssh_check_output",
                         lambda *a, **k: "MISSING")

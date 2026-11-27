@@ -7255,6 +7255,12 @@ def _kvtest_pod_map(cluster, entry, remote_scripts, globals_cfg,
     out_csv = pbase + ".csvstats.json"
     remote_path = pbase + ".stats.json.gz"
     script = posixpath.join(remote_scripts, "logstats.py")
+    # 旧命名契约（49772ea 重构前，与 2026-11-26 前历史报告可比）：
+    # meta.source = <base>.<role>.samples.csv（base = _log_base 的
+    # basename，即 _kvtest_artifact_base 的返回值）。basename(samples)
+    # 在所有进程都叫 latency_samples.csv —— reduce 的 client 对象会
+    # 撞键丢失实例，绝不能再用。
+    source_name = "{}.{}.samples.csv".format(os.path.basename(pbase), role)
     # k8s: the pod image carries python3 (datasketches installed there).
     # ssh: the same venv the python-engine map uses (datasketches installed
     # in it); fall back to python3 when no venv is configured.
@@ -7268,7 +7274,8 @@ def _kvtest_pod_map(cluster, entry, remote_scripts, globals_cfg,
            "--summary {su} --role {role} --size {ds} --iid {iid} "
            "--instance-dir {d} --start-epoch {start} "
            "--out-stats {os} --out-csvstats {oc} "
-           "--node {node} --pod {pod} --remote-path {rp}").format(
+           "--node {node} --pod {pod} --remote-path {rp} "
+           "--source-name {sn}").format(
                py=shlex.quote(py), sc=shlex.quote(script),
                sa=shlex.quote(samples),
                su=shlex.quote(summary), role=shlex.quote(role),
@@ -7277,7 +7284,8 @@ def _kvtest_pod_map(cluster, entry, remote_scripts, globals_cfg,
                oc=shlex.quote(out_csv),
                node=shlex.quote(_node_display(cluster, n, entry["node"])),
                pod=shlex.quote((n or {}).get("_pod") or ""),
-               rp=shlex.quote(remote_path))
+               rp=shlex.quote(remote_path),
+               sn=shlex.quote(source_name))
     if warmup_s:
         cmd += " --warmup-s {}".format(float(warmup_s))
     if digest_k:

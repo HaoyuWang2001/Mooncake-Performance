@@ -7188,6 +7188,18 @@
     "test_rebuild_rejects_combined_parent_without_child_logs"
    ],
    "e2e": []
+  },
+  {
+   "id": "E-438",
+   "module": "kvtest",
+   "desc": "E2E：实例对象身份唯一——client 对象数等于 instances 数，无撞键",
+   "req": "",
+   "unit": [
+    "test_client_identity_survives_duplicate_sources"
+   ],
+   "e2e": [
+    "check_client_objects"
+   ]
   }
  ]
 }

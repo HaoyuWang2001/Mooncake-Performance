@@ -99,9 +99,20 @@ def _write_instance(d, iid, role, lats, ds="8MB", warm_rows=0, verify=0,
     return inst_dir, base, samples, summary
 
 
-def _map(d, iid, role, lats, ds="8MB", warm_rows=0, verify=0, qw=None):
+def _map(d, iid, role, lats, ds="8MB", warm_rows=0, verify=0, qw=None,
+         source_name=None, samples_name=None):
+    """Map one process. samples_name: rename the samples CSV to the k8s
+    on-site name ("latency_samples.csv", identical across ALL processes —
+    the incident shape where an omitted source_name collides every
+    instance). source_name: pass through to kvtest_map_instance (None = the
+    basename(samples) fallback)."""
     inst_dir, base, samples, summary = _write_instance(
         d, iid, role, lats, ds=ds, warm_rows=warm_rows, verify=verify, qw=qw)
+    if samples_name:
+        import shutil
+        same = os.path.join(inst_dir, samples_name)
+        shutil.copy(samples, same)
+        samples = same
     pod = "pod-{}".format(iid)
     node_path = ("/var/lib/mooncake-bench/20260101-0001/{}/{}_{}_p{}/"
                  "{}.stats.json.gz".format(pod, role, iid, 9100 + iid, base))
@@ -109,7 +120,7 @@ def _map(d, iid, role, lats, ds="8MB", warm_rows=0, verify=0, qw=None):
         samples, summary, role, node="10.0.0.{}".format(iid + 1),
         pod=pod, size=ds, start_epoch=START,
         warmup_s=WARM, digest_k=24, remote_path=node_path, iid=iid,
-        instance_dir=inst_dir)
+        instance_dir=inst_dir, source_name=source_name)
     paths = {}
     for key, doc, name in (("stats", stats, ".stats.json"),
                            ("csvstats", csvstats, ".csvstats.json")):
@@ -315,6 +326,59 @@ def test_finalize_stage_and_render_write_html(tmp_path, fake_sketch):
     html = open(written[0], encoding="utf-8").read()
     assert "kvtest" in html or "场景" in html
     assert bm._REPORT_ACC and bm._REPORT_ACC[-1]["unit"] == "8MB"
+
+
+def test_client_identity_survives_duplicate_sources(tmp_path, fake_sketch):
+    """事故（49772ea 回归）：map 未传 source_name 时所有进程 meta.source
+    都是 latency_samples.csv，reduce_size 的 objects["client:<name>"] 撞键，
+    10 个实例只剩 1 个对象（幸存 writer），pipeline 默认 reader 视图下端到
+    端时延的对象树里看不到实例。防御：同名组按 remote_path 剥 stats 后缀
+    重建 <base>.<role> 唯一名（=历史报告的实例命名）。"""
+    d = str(tmp_path)
+    prods = [_map(d, 0, "writer", [1.0, 2.0],
+                  samples_name="latency_samples.csv"),
+             _map(d, 1, "reader", [3.0, 4.0],
+                  samples_name="latency_samples.csv")]
+    for p in prods:            # 事故形态：两个进程 meta.source 同名
+        with open(p["stats"], encoding="utf-8") as f:
+            assert json.load(f)["meta"]["source"] == "latency_samples.csv"
+    _partial(d, prods)
+    bm._kvtest_finalize_stage(d)
+    bm._kvtest_render_stage(_cfg(), d, _args())
+    with open(os.path.join(d, "report", "8MB", "reduced.json"),
+              encoding="utf-8") as f:
+        z = json.load(f)["sizes"]["8MB"]
+    # 对象树：每个实例一个 client 对象，键唯一，无撞键幸存者
+    cobjs = {k: v for k, v in z["objects"].items()
+             if (v or {}).get("kind") == "client"}
+    want = {"case.i0_p9100.kvtest_8MB.writer",
+            "case.i1_p9101.kvtest_8MB.reader"}
+    assert "client:latency_samples.csv" not in z["objects"]
+    assert len(cobjs) == 2 == len(z["clients"])
+    assert set(cobjs) == {"client:" + c["name"] for c in z["clients"]}
+    assert {o["label"] for o in cobjs.values()} == want
+    assert {c["name"] for c in z["clients"]} == want
+    # slowest 行的 client 字段与对象名同源
+    assert z["slowest"] and all(r["client"] in want for r in z["slowest"])
+    # 渲染出的 data.js 同样保留两个实例对象
+    dj = open(os.path.join(d, "report", "8MB", "data.js"),
+              encoding="utf-8").read()
+    assert "case.i0_p9100.kvtest_8MB.writer" in dj
+    assert "client:latency_samples.csv" not in dj
+    # 正常路径：显式传旧格式 source_name —— meta.source 保持传入值，
+    # _client_name 剥 .samples.csv 尾即最终对象名（无重名，dedupe 不介入）
+    d2 = os.path.join(str(tmp_path), "named")
+    base = "case.i0_p9100.kvtest_8MB"
+    p2 = _map(d2, 0, "writer", [1.0],
+              source_name="{}.writer.samples.csv".format(base))
+    with open(p2["stats"], encoding="utf-8") as f:
+        st = json.load(f)
+    assert st["meta"]["source"] == "{}.writer.samples.csv".format(base)
+    z2 = rp.reduce_size([st], {"config": "kvtest_demo",
+                               "scenario": "kvtest"})
+    assert [k for k, v in z2["objects"].items()
+            if v.get("kind") == "client"] == ["client:" + base + ".writer"]
+    assert z2["clients"][0]["name"] == base + ".writer"
 
 
 # ----------------------------------------------------------------------- CSV
