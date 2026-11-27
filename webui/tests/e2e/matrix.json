@@ -1,0 +1,4 @@
+[
+  {"name": "kvtest_pipeline_dual_30s",
+   "config": "configs/local/kvtest_pipeline_dual_30s.json"}
+]
