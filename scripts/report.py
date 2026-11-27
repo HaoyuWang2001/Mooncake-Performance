@@ -72,6 +72,63 @@ def _client_name(source):
         ".log", "").replace(".samples.csv", "")
 
 
+def _instance_base_from_remote_path(remote_path):
+    """Historical instance base from a map product's remote_path: basename
+    minus the .stats.json[.gz] product suffix (kv70..i0_p9301.kvtest_8KB.
+    stats.json.gz -> kv70..i0_p9301.kvtest_8KB), then any .samples.csv tail
+    (does not occur for kvtest products; stripped defensively)."""
+    name = os.path.basename(str(remote_path or ""))
+    for suf in (".stats.json.gz", ".stats.json"):
+        if name.endswith(suf):
+            name = name[: -len(suf)]
+            break
+    if name.endswith(".samples.csv"):
+        name = name[: -len(".samples.csv")]
+    return name
+
+
+def _dedupe_client_names(stats):
+    """Collision-free display names for one size block, in stats order.
+
+    First pass is the plain _client_name(meta.source) — identical to the
+    historical behaviour when every product has a unique source. When
+    SEVERAL products share one name (the 49772ea regression: every pod's
+    map wrote meta.source = basename(samples) = "latency_samples.csv", so
+    reduce_size's objects["client:<name>"] collapsed all instances into one
+    object and the pipeline default reader view showed none), each member
+    of the duplicate group is renamed from meta.remote_path:
+    _instance_base_from_remote_path (the historical instance base) plus
+    ".{role}" -> "<base>.<role>", the naming pre-2026-11-26 reports used.
+    remote_path missing or still ambiguous falls back to "{pod}.{role}",
+    then to the list index "client{i}". Blocks without duplicates keep
+    today's names byte-for-byte."""
+    names = [_client_name((st.get("meta") or {}).get("source"))
+             for st in stats]
+    groups = {}
+    for i, name in enumerate(names):
+        groups.setdefault(name, []).append(i)
+    used = {name for name, idxs in groups.items() if len(idxs) == 1}
+    for _name, idxs in groups.items():
+        if len(idxs) == 1:
+            continue          # 唯一名：保持现状（不改变任何既有期望值）
+        for i in idxs:
+            m = stats[i].get("meta") or {}
+            role = str(m.get("role") or "")
+            cands = []
+            base = _instance_base_from_remote_path(m.get("remote_path"))
+            if base:
+                cands.append("{}.{}".format(base, role) if role else base)
+            if m.get("pod") and role:
+                cands.append("{}.{}".format(m.get("pod"), role))
+            cands.append("client{}".format(i))
+            for cand in cands:
+                if cand not in used:
+                    names[i] = cand
+                    used.add(cand)
+                    break
+    return names
+
+
 def _row_ts_epoch(row):
     """Absolute epoch of a listed request: the map may already know it.
 
@@ -438,11 +495,15 @@ def _summary_of(stats, defer_digests=False, pending=None):
     }
 
 
-def _client_entry(st, role):
+def _client_entry(st, role, name=None):
+    """One clients-table row. name: pre-computed display name (the reduce
+    passes the deduped list so the table, objects and slowest rows agree);
+    None falls back to _client_name(meta.source)."""
     g = st.get("global") or {}
     meta = st.get("meta") or {}
     return {
-        "name": _client_name(meta.get("source")),
+        "name": (name if name is not None
+                 else _client_name(meta.get("source"))),
         "node": meta.get("node") or "",
         "pod": meta.get("pod") or "",
         "role": role,
@@ -578,23 +639,26 @@ def _node_ts_epoch(ts):
 
 def reduce_size(stats, meta, defer_digests=False):
     """One data-size block: summary / chart objects (tiered series) / clients."""
+    # 撞键防御（49772ea 回归）：显示名先算一次并去重，clients 表、
+    # objects 键与 slowest 行三处必须同源（否则同名组只剩一个对象）。
+    names = _dedupe_client_names(stats)
     role_stats = {}
     node_stats = {}
     for st in stats:
         role_stats.setdefault(_role_of(st), []).append(st)
         node_stats.setdefault((st.get("meta") or {}).get("node") or "?",
                               []).append(st)
-    clients = [_client_entry(st, _role_of(st)) for st in stats]
+    clients = [_client_entry(st, _role_of(st), name=n)
+               for st, n in zip(stats, names)]
     errors = {}
     for st in stats:
         for k, n in (st.get("errors") or {}).items():
             errors[k] = errors.get(k, 0) + int(n)
     slowest = []
-    for st in stats:
+    for st, _client in zip(stats, names):
         _m = st.get("meta") or {}
         _node = _m.get("node") or ""
         _role = _m.get("role") or ""
-        _client = _client_name(_m.get("source"))
         for row in (st.get("slowest") or []):
             row = dict(row)
             row["node"] = _node

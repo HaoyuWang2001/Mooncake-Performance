@@ -919,7 +919,7 @@ def kvtest_map_instance(samples, summary_path, role, node=None, pod=None,
                         size=None, start_epoch=None, warmup_s=None,
                         digest_k=None, remote_path=None, iid=None,
                         instance_dir=None, out_stats=None, out_csvstats=None,
-                        top_n=100):
+                        source_name=None, top_n=100):
     """Single-pass in-pod map for ONE kvtest process (split topology).
 
     Produces BOTH products from one read of latency_samples.csv:
@@ -930,7 +930,12 @@ def kvtest_map_instance(samples, summary_path, role, node=None, pod=None,
     summary.json is read in place on the same node for wall/verify/queue-wait
     (never transported). meta.bytes = apparent size of the instance directory
     captured BEFORE any map output is written. Missing samples/summary is an
-    error — there is no fallback path."""
+    error — there is no fallback path.
+    source_name: meta.source override. The orchestrator's map command passes
+    the historical instance name "<base>.<role>.samples.csv" (basename
+    differs per process); the raw basename(samples) is identical across ALL
+    processes ("latency_samples.csv") and would collide the reduce-side
+    client objects, so it is only a fallback for ad-hoc calls."""
     if not os.path.isfile(samples):
         raise RuntimeError("kvtest map: samples not found: " + str(samples))
     if not os.path.isfile(summary_path):
@@ -974,7 +979,8 @@ def kvtest_map_instance(samples, summary_path, role, node=None, pod=None,
         samples, top_n=top_n, node=node, pod=pod, role=role,
         remote_path=remote_path, size=size,
         rows_factory=lambda p: iter_kvtest_rows(p, start_epoch, None),
-        summaries=summaries, source_name=os.path.basename(samples),
+        summaries=summaries,
+        source_name=source_name or os.path.basename(samples),
         digest_k=digest_k, warmup_cutoff=cutoff,
         op_filter=role_ops, row_sink=_sink,
         extra_meta={"format": "kvtest_samples", "scenario": "kvtest"})
@@ -1177,7 +1183,7 @@ def main(argv=None):
             digest_k=args.digest_k, remote_path=args.remote_path,
             iid=args.iid, instance_dir=args.instance_dir,
             out_stats=args.out_stats, out_csvstats=args.out_csvstats,
-            top_n=args.top_n)
+            source_name=args.source_name, top_n=args.top_n)
         for path, doc in ((args.out_stats, stats),
                           (args.out_csvstats, csvstats)):
             tmp = path + ".tmp"
