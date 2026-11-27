@@ -213,9 +213,12 @@ const PerfView = {
           <span class="rb-sel-note">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
         </div>
       </template>
-      <div v-if="mode === 'k8s' && launchMode === 'single'" class="rb-row">
-        <span class="rb-label">image</span>
-        <span :title="clusterImage" class="rb-image">{{ clusterImage || "-" }}</span>
+      <div v-if="mode === 'k8s'" class="rb-row">
+        <span class="rb-label">镜像 TAG(覆盖)</span>
+        <el-input v-model="flags.imageTag" size="small" style="width: 240px"
+                  :placeholder="clusterImage ? clusterImage.split(':').pop() : '沿用 cluster.json 的 TAG'"
+                  :title="clusterImage"></el-input>
+        <span class="rb-sel-note">只填 TAG；镜像名沿用 cluster.json（最终镜像 = 镜像名:TAG）</span>
       </div>
       <div class="rb-params" v-loading="paramLoading">
         <div class="rb-params-title">启动参数（选中配置的解析值，供核对）</div>
@@ -454,6 +457,7 @@ const PerfView = {
     const cfgLoading = Vue.ref(false);
     const flags = Vue.reactive(Object.assign(
       { dryRun: false, noWarmup: false, noReport: false, png: false,
+        imageTag: "",
         pullRawLogs: false, keepIntermediates: false,
         monitorMem: false, monitorUrma: false,
         verbose: false, protocol: "", cluster: "",
@@ -809,7 +813,8 @@ const PerfView = {
                rank_cluster: flags.rankCluster,
                rank_global: flags.rankGlobal,
                recall_cluster: flags.recallCluster,
-               recall_global: flags.recallGlobal };
+               recall_global: flags.recallGlobal,
+               image_tag: flags.imageTag || null };
     }
 
     async function loadInstances() {

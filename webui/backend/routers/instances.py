@@ -80,12 +80,61 @@ def api_instance_create(handler, query):
         raise ApiError(400, str(exc))
     except OSError as exc:
         raise ApiError(500, "创建配置快照失败: {}".format(exc))
+    # 镜像 TAG 覆盖：写进实例快照的 cluster 配置 k8s.image（镜像名取自原值，仅换 TAG）
+    _apply_image_tag_override(snap, request,
+                              (request.get("flags") or {}).get("image_tag"))
     try:
         inst = instances.create(request, name, iid=iid, snapshot=snap)
     except Exception:
         shutil.rmtree(inst_snapshot.snapshot_dir(iid), ignore_errors=True)
         raise
     return {"instance": _summary(inst)}
+
+
+def _apply_image_tag_override(snap, request, tag):
+    """把实例快照里各 cluster 配置的 k8s.image 仅替换为 <原镜像名>:<tag>。
+
+    镜像名取自快照内现有 k8s.image（用户只填 TAG），因此不改 benchmark.py。
+    仅 k8s 模式生效；tag 为空则跳过（沿用 cluster 原值）。
+    """
+    if not tag:
+        return
+    flags = request.get("flags") or {}
+    if (flags.get("mode") or "ssh") != "k8s":
+        return
+    if not isinstance(tag, str) or not tag.strip() or "/" in tag or " " in tag:
+        raise ApiError(400, "镜像 TAG 覆盖只能填 TAG（不含 / 或空格）：{}".format(tag))
+    tag = tag.strip()
+    root = snap.get("configs_root") or ""
+    if not root:
+        return
+    root = root if os.path.isabs(root) else os.path.join(ROOT, root)
+    for key in ("cluster", "rank_cluster", "recall_cluster"):
+        rel = flags.get(key)
+        if not rel:
+            continue
+        parts = rel.split("/")
+        if parts and parts[0] == "configs":
+            parts = parts[1:]
+        path = os.path.join(root, *parts)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        k8s = cfg.get("k8s")
+        if not isinstance(k8s, dict):
+            continue
+        existing = k8s.get("image") or ""
+        base = existing.rsplit(":", 1)[0] if ":" in existing else existing
+        k8s["image"] = base + ":" + tag
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+        except OSError:
+            continue
 
 
 SNAPSHOT_GROUP_ORDER = ["部署配置", "场景配置", "继承碎片", "k8s 模板",
