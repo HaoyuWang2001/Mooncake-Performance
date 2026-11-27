@@ -210,15 +210,13 @@ const PerfView = {
             <el-option v-for="m in modeCandidates.profile" :key="m.path || m"
                        :label="m.path || m" :value="m.path || m"></el-option>
           </el-select>
-          <span class="rb-sel-note">所选配置会按继承后的 work_mode 自动分到两个并行任务</span>
         </div>
       </template>
       <div v-if="mode === 'k8s'" class="rb-row">
-        <span class="rb-label">镜像 TAG(覆盖)</span>
+        <span class="rb-label">镜像TAG</span>
         <el-input v-model="flags.imageTag" size="small" style="width: 240px"
                   :placeholder="clusterImage ? clusterImage.split(':').pop() : '沿用 cluster.json 的 TAG'"
                   :title="clusterImage"></el-input>
-        <span class="rb-sel-note">只填 TAG；镜像名沿用 cluster.json（最终镜像 = 镜像名:TAG）</span>
       </div>
       <div class="rb-params" v-loading="paramLoading">
         <div class="rb-params-title">启动参数（选中配置的解析值，供核对）</div>
