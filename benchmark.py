@@ -3531,15 +3531,31 @@ def _unit_groups(paths, mode):
 
 
 def _stats_window(loaded):
-    """(t0, t1) epoch seconds covering these stats, or (None, None)."""
-    t0 = t1 = None
+    """(t0, t1, warmup_cutoff) epoch seconds covering these stats.
+
+    warmup_cutoff = earliest stat's warmup boundary (None when the data has
+    no warmup phase). t0 is the report time origin; the monitor series are
+    rebased onto it by reduce_monitors()."""
+    t0 = t1 = cutoff = None
     for st in loaded or []:
         m = st.get("meta") or {}
         if m.get("ts_from") is not None:
             t0 = m["ts_from"] if t0 is None else min(t0, m["ts_from"])
         if m.get("ts_to") is not None:
             t1 = m["ts_to"] if t1 is None else max(t1, m["ts_to"])
-    return t0, t1
+        if m.get("warmup_cutoff") is not None:
+            cutoff = (float(m["warmup_cutoff"]) if cutoff is None
+                      else min(cutoff, float(m["warmup_cutoff"])))
+    return t0, t1, cutoff
+
+
+def _data_warmup_cutoff(data):
+    """Earliest warmup_cutoff carried by a reduced/partial scenario block."""
+    vals = []
+    for blk in (data.get("sizes") or {}).values():
+        if blk.get("warmup_cutoff") is not None:
+            vals.append(float(blk["warmup_cutoff"]))
+    return min(vals) if vals else None
 
 
 def _override_param(params, label, value):
@@ -3579,7 +3595,7 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
         loaded = rp.load(u["paths"])
         if not loaded:
             continue
-        t0, t1 = _stats_window(loaded)
+        t0, t1, wcut = _stats_window(loaded)
         # P1-B：页头「测试开始于」取数据中最早的采样时刻（节点的绝对时间），
         # 而不是报表生成时刻（旧实现写入 time.strftime 的构建墙钟）
         _started = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0))
@@ -3610,7 +3626,8 @@ def _generate_report_units(cfg, local_log_dir, args, early_stop=False,
         meta["params"] = _build_report_params(cfg, meta, nodes=nodes)
         data = rp.reduce_scenario(
             loaded, meta,
-            monitors=rp.reduce_monitors(local_log_dir, t0=t0, t1=t1),
+            monitors=rp.reduce_monitors(local_log_dir, t0=t0, t1=t1,
+                                        warmup_cutoff=wcut),
             traces=rp.load(traces_by_unit.get(key, [])),
             monitor_sites=rp.reduce_monitor_sites(local_log_dir))
         out_dir = os.path.join(local_log_dir, "report", u["name"])
@@ -7796,7 +7813,9 @@ def _kvtest_finalize_stage(local_log_dir, early_stop=False):
             meta["early_stop"] = True
         t0 = meta.get("ts_from")
         t1 = meta.get("ts_to")
-        monitors = rp.reduce_monitors(local_log_dir, t0=t0, t1=t1)
+        wcut = _data_warmup_cutoff(data)
+        monitors = rp.reduce_monitors(local_log_dir, t0=t0, t1=t1,
+                                      warmup_cutoff=wcut)
         sites = rp.reduce_monitor_sites(local_log_dir)
         data = rp.finalize_digests(
             data, monitors, sites, partial_bytes=os.path.getsize(partial))
@@ -10941,7 +10960,7 @@ def _rebuild_single_run(ts_dir, args=None):
             loaded = rp.load(u["paths"])
             if not loaded:
                 continue
-            t0, t1 = _stats_window(loaded)
+            t0, t1, wcut = _stats_window(loaded)
             # 单元级 meta.json（新布局）优先，旧合并 meta 兜底
             usaved = {}
             try:
@@ -11026,7 +11045,8 @@ def _rebuild_single_run(ts_dir, args=None):
             }
             data = rp.reduce_scenario(
                 loaded, meta,
-                monitors=rp.reduce_monitors(d, t0=t0, t1=t1),
+                monitors=rp.reduce_monitors(d, t0=t0, t1=t1,
+                                            warmup_cutoff=wcut),
                 traces=rp.load(traces_by_unit.get(key, [])),
                 monitor_sites=rp.reduce_monitor_sites(d))
             out_d = os.path.join(d, "report", u["name"])

@@ -428,10 +428,11 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C18.V4 无监控数据整卡隐藏（仅限完全没有 profiling 产物）
 - C18.V5 产物目录 = 节点 IP（k8s 宿主 IP / ssh 管理 IP；显示名冲突回退原名）
 - C18.V6 有产物无可用序列 → 占位卡列出原因（URMA 失败原文 / CSV 无数据行 / 时间窗无交叠），不静默消失
-- C18.V8 三树控件（复用 `.tree-row/.tree-check/button.mini` 既有组件）：**三棵树顶栏三键与端到端曲线严格同构**——全选节点 / 全选实例 / 全部清空（已全选则变「清空*」；树缺少的维度保留按钮置灰 + tooltip：进程树节点仅分组、URMA 无实例），`_monTopBtns` 统一生成。**mem 树** = 节点行（勾选 = 该节点 used 求和实线）+ caret 展开分 NUMA 行（勾选 = 分列线）+「用量/可用量」指标开关（lat-sel-btns 同风格；**两者均可关**，默认用量开、可用量关；available 仅节点级虚线；全关显示指标空态）；**proc 树** = 节点行纯分组头（无 checkbox，仅 caret 展开，默认展开、节点名着节点色）+ 进程行勾选（不再 slice(0,8) 截断）；**urma 树** = 仅节点行。mem/proc 每个节点行带该节点子项（NUMA / 进程）的「全选 / 清空」mini，只作用于本节点。三树均允许空选（不回填）→ 图区 empty-tip；选择状态会话内保留，size 切换重置。三树统一由 `renderMonTree` + `treeNodeGroup`/`treeRow` 渲染（与主图/慢点捕捉同一模板），禁止再写私有行/分组头
+- C18.V8 三树控件（复用 `.tree-row/.tree-check/button.mini` 既有组件）：**三棵树顶栏三键与端到端曲线严格同构**——全选节点 / 全选实例 / 全部清空（已全选则变「清空*」；树缺少的维度保留按钮置灰 + tooltip：进程树节点仅分组、URMA 无实例），`_monTopBtns` 统一生成。**mem 树** = 节点行（勾选 = 该节点 used 求和实线）+ caret 展开分 NUMA 行（勾选 = 分列线）+「用量/可用量」指标开关（lat-sel-btns 同风格；**两者均可关**，默认用量开、可用量关；available 仅节点级虚线；全关显示指标空态）；**proc 树** = 节点行纯分组头（无 checkbox，仅 caret 展开，默认展开、节点名着节点色）+ 进程行勾选（不再 slice(0,8) 截断）；**urma 树** = 节点 → DIE(ubpu) → 端口 三级（见 C18.V13）。mem/proc 每个节点行带该节点子项（NUMA / 进程）的「全选 / 清空」mini，只作用于本节点。三树均允许空选（不回填）→ 图区 empty-tip；选择状态会话内保留，size 切换重置。三树统一由 `renderMonTree` + `treeNodeGroup`/`treeRow` 渲染（与主图/慢点捕捉同一模板），禁止再写私有行/分组头
 - C18.V9 配色与图例：节点色 = `monNodeHue`（与主图 `nodeHue` 同一调色板按节点名排序固定分配，跨选择稳定）；NUMA/进程 = 同系色阶 `monShade`（同 instanceColor 算法）；图例 `type:'scroll'`、**`selectedMode:false` 固定不可点**（显隐只由树勾选控制，与主图「叠加只走对象树」同构）；URMA RX 实线 / TX 同系虚线；进程序列名 `comm pid @node`
 - C18.V11 监控摘要只保留「进程 RSS 增幅正负条」：已删除逐节点峰值内存 / `RSS 最大增幅` / `端口峰值带宽` 三处 KV 行；data.js summary 与 overview 摘要行不变（DR-63）
-- C18.D1 监控时间窗与主图对齐（reduce 按 t0/t1 切片）
+- C18.V13 URMA 三级列表：节点 → DIE（= `ubpu`，UI 显示 DIE）→ 端口 三级均可勾选，标准控件逻辑（父子不联动）——节点/DIE 曲线 = 其端口 RX/TX 求和，端口 = 单端口；节点行 mini 只操作直接子项 DIE、DIE 行 mini 只操作其端口；顶栏 全选节点 / 全选实例（端口叶子）/ 全部清空（允许空图 + empty-tip）。URMA 图下固定平均流量表（节点 / DIE / 端口 / RX 平均 / TX 平均），不随树勾选过滤；平均=warmup 结束→任务结束逐采样点算术平均（`rx_avg_formal`/`tx_avg_formal`，无 warmup 回退 t0）
+- C18.D1 监控时间基准统一：`reduce_monitors` 返回 `t = 采样时刻 - 任务开始 t0`（并带 `time_relative/time_origin`），三图 x 轴刻度 `T+mm:ss`、tooltip 显示相对时间 + 墙钟；`_parse_urma` 先差分再按窗口裁剪并保留窗口前一条样本，首点不晚一拍
 - C18.D2 URMA 计数器回绕/重置不产生尖峰
 - C18.D3 产物下采样有界（compact_monitors；notes 透传）
 - C18.D4 kvtest 采样注入编排器时钟基准 EPOCH_BASE（时间戳=基准+节点流逝）；窗口裁空回退全量+注记；python 保持节点绝对时间

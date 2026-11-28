@@ -2141,7 +2141,7 @@
   {
    "id": "C18.V8",
    "module": "report",
-   "desc": "三树控件 + 固定图例：mem=节点（NUMA 求和行）/展开分 NUMA + 用量/可用量开关（用量亦可关）；proc=节点仅分组（不可选）下分进程勾选；urma=仅节点；三树顶栏三键与端到端曲线严格同构（全选节点/全选实例/全部清空，缺失维度置灰），每节点行带该节点子项的全选/清空 mini；图例 selectedMode:false 只说明颜色；配色=主图节点色系/同系色阶同源",
+   "desc": "三树控件 + 固定图例：mem=节点（NUMA 求和行）/展开分 NUMA + 用量/可用量开关（用量亦可关）；proc=节点仅分组（不可选）下分进程勾选；urma=节点→DIE→端口三级（见 C18.V13）；三树顶栏三键与端到端曲线严格同构（全选节点/全选实例/全部清空，缺失维度置灰），每节点行带该节点子项的全选/清空 mini；图例 selectedMode:false 只说明颜色；配色=主图节点色系/同系色阶同源",
    "req": "R-MON-1",
    "unit": [
     "test_b07_monitor_tree_controls_and_legends",
@@ -2187,6 +2187,19 @@
    "req": "R-MON-1",
    "unit": [
     "test_b11_mem_metric_optional_and_row_minis"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C18.V13",
+   "module": "report",
+   "desc": "URMA 树节点→DIE(ubpu)→端口三级可勾选（标准控件逻辑：父子不联动）；节点/DIE 曲线=其端口 RX/TX 求和，端口=单端口；节点行 mini 只操作直接子项 DIE，DIE 行 mini 只操作其端口；顶栏全选节点/全选实例(=端口叶子)/全部清空；图下固定平均流量表（节点/DIE/端口/RX 平均/TX 平均）不随树勾选过滤",
+   "req": "R-MON-1",
+   "unit": [
+    "test_c18v13_urma_three_level_controls",
+    "test_b07_monitor_tree_controls_and_legends",
+    "test_reduce_monitors_urma_relative_and_formal_avg",
+    "test_reduce_monitors_window_slice"
    ],
    "e2e": []
   },

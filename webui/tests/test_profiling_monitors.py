@@ -366,12 +366,47 @@ def test_reduce_monitors_window_slice(tmp_path):
     assert h["series"]["n1_used_mb"] == [250.0]
     procs = {p["pid"]: p for p in mon["mem_proc"]}
     assert procs[111]["rss_growth_mb"] == 0.0      # 只剩一个采样点
-    assert mon["urma"] == []                        # 单样本算不出速率 -> 无曲线
+    # URMA 先差分再按窗口裁剪：窗口前一条样本用于算出窗口内首点，
+    # 因此单样本窗口仍能得到锚在 t0 的速率点（不再晚一拍而丢曲线）。
+    assert len(mon["urma"]) == 1
+    u = mon["urma"][0]
+    assert u["t"] == [0.0] and u["rx"][0] == 1.0 and u["tx"][0] == 0.5
+    assert mon["time_relative"] is True and mon["time_origin"] == 1001.0
+    assert h["t"] == [0.0]                          # 宿主内存同样相对 t0
     # peak_mem = 各节点 used_mb 之和的峰值（窗口内只剩 150+250）
     assert mon["summary"]["peak_mem_mb"]["n1"] == 400.0
     # 无窗口 = 原行为
     full = rp.reduce_monitors(str(log_dir))
     assert full["mem_host"][0]["series"]["n0_used_mb"] == [100.0, 150.0]
+
+
+def test_reduce_monitors_urma_relative_and_formal_avg(tmp_path):
+    """时间统一：URMA t = 采样时刻 - t0；差分用窗口前一条样本，首点只晚
+    一个采样拍；rx_avg_formal/tx_avg_formal 只统计 warmup 结束→任务结束。"""
+    root = tmp_path / "logs" / "cfg" / "profiling" / "n1"
+    root.mkdir(parents=True)
+    (root / "monitor.config.json").write_text(
+        json.dumps({"urma": {"bytes_per_flit": 20}}), encoding="utf-8")
+    F = 53687091                       # 20B/flit → 每秒 1 GiB
+    rows = ["ts_ns,ubpu,port,rx_flits,tx_flits"]
+    acc = 0
+    rows.append("1000000000000,0,1,0,0")
+    for i, rate in enumerate((1, 2, 3, 4), start=1):
+        acc += rate * F
+        rows.append("{},0,1,{},{}".format(
+            1000000000000 + i * 1000000000, acc, acc // 2))
+    (root / "urma.flits.csv").write_text("\n".join(rows) + "\n",
+                                         encoding="utf-8")
+    mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"),
+                             t0=1000.5, t1=1004.0, warmup_cutoff=1002.5)
+    u = mon["urma"][0]
+    # 窗口前一条样本 (1000) 参与差分 → 1001 的首点被保留
+    assert u["t"] == [0.5, 1.5, 2.5, 3.5], u["t"]
+    assert u["rx"] == [1.0, 2.0, 3.0, 4.0], u["rx"]
+    assert u["rx_avg"] == 2.5
+    # formal 窗口从 warmup 结束 (1002.5) 起 → 只剩 rate 3、4
+    assert u["rx_avg_formal"] == 3.5, u["rx_avg_formal"]
+    assert u["tx_avg_formal"] == 1.75, u["tx_avg_formal"]
 
 
 def test_reduce_monitor_sites_reads_config_and_sizes(tmp_path):
