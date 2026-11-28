@@ -1,0 +1,23 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "remove",
+  "group": "other",
+  "line": {
+    "markers": ["breakdown[remove]"],
+    "legacy": {
+      "marker": "remove_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "key", "force", "start_time", "status", "trace_id"
+  ],
+  "stages": [
+    {"field": "remove_rpc_us", "label": "remove_rpc", "chart": true}
+  ],
+  "invariants": [
+    "remove 为薄行：remove_rpc_us ≡ total_us（同值两报）"
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "upsert",
+  "group": "write",
+  "line": {
+    "markers": ["breakdown[upsert]"],
+    "legacy": {
+      "marker": "upsert_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "key", "size", "replicas", "start_time", "status", "trace_id",
+    "engine", "slice_count", "memwrite_urma_min_us", "memwrite_urma_avg_us",
+    "bytes"
+  ],
+  "stages": [
+    {
+      "field": "prep_total_us", "label": "prep", "chart": true,
+      "children": [
+        {"field": "prep_buf_alloc_us"},
+        {"field": "prep_memcpy_us"},
+        {"field": "prep_split_us"}
+      ]
+    },
+    {"field": "checksum_us", "label": "checksum", "chart": true},
+    {"field": "prepare_us", "label": "prepare", "chart": true},
+    {
+      "field": "query_us", "label": "query", "chart": true,
+      "children": [
+        {"field": "query_route_us", "label": "route"},
+        {"field": "query_rpc_us", "label": "rpc"},
+        {"field": "query_retry_us", "label": "retry"}
+      ]
+    },
+    {
+      "switch": "engine",
+      "label": "传输段",
+      "cases": {
+        "classic": [
+          {
+            "field": "memwrite_total_us", "label": "memwrite", "chart": true,
+            "children": [
+              {"field": "memwrite_submit_us"},
+              {"field": "memwrite_queue_us"},
+              {"field": "memwrite_urma_us"},
+              {"field": "memwrite_teardown_us"}
+            ]
+          }
+        ],
+        "tent": [
+          {"field": "admit_us", "label": "admit", "chart": true},
+          {"field": "queue_prep_us", "label": "queue_prep", "chart": true},
+          {"field": "wire_span_us", "label": "wire_span", "chart": true},
+          {"field": "propagate_us", "label": "propagate", "chart": true}
+        ]
+      }
+    },
+    {"field": "finalize_us", "label": "finalize", "chart": true},
+    {"field": "cache_invalidate_us", "label": "cache_inval", "chart": true},
+    {"field": "revoke_us", "label": "revoke", "chart": true}
+  ],
+  "invariants": [
+    "total_us ≈ prep_total_us + checksum_us + prepare_us + query_us + <传输段> + finalize_us + cache_invalidate_us + revoke_us",
+    "prep_total_us = prep_buf_alloc_us + prep_memcpy_us + prep_split_us",
+    "query_us ≈ query_route_us + query_rpc_us + query_retry_us + glue（UpsertStart RPC）",
+    "<传输段> classic: memwrite_total_us = memwrite_submit + memwrite_queue + memwrite_urma + memwrite_teardown",
+    "<传输段> tent: admit_us + queue_prep_us + wire_span_us + propagate_us ≈ transfer 总跨度",
+    "upsert 不发射 put_start/put_end（put 专属，恒 0 故不列）",
+    "TENT+TCP 时四相位为诚实零值，残差吸收传输"
+  ]
+}

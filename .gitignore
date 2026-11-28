@@ -14,6 +14,7 @@ configs/*
 !configs/pipeline
 !configs/kvtest
 !configs/_spdiag_trees
+!configs/_trace_trees
 !configs/_ssh
 !configs/_k8s
 

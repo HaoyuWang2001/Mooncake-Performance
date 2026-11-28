@@ -1,0 +1,13 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "put_from",
+  "extends": "put",
+  "line": {
+    "markers": ["breakdown[put_from]"],
+    "legacy": {
+      "marker": "put_from_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "batch_get",
+  "group": "read",
+  "line": {
+    "markers": ["breakdown[batch_get]"],
+    "legacy": {
+      "marker": "batch_get_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "num_keys", "batch_get_ops", "ssd_offload_ops", "success", "replicas",
+    "start_time", "trace_id", "engine", "slice_count"
+  ],
+  "stages": [
+    {
+      "field": "query_us", "label": "query", "chart": true,
+      "children": [
+        {"field": "query_route_us", "label": "route"},
+        {"field": "query_rpc_us", "label": "rpc"},
+        {"field": "query_retry_us", "label": "retry"}
+      ]
+    },
+    {"field": "prep_us", "label": "prep", "chart": true},
+    {"field": "read_us", "label": "read", "chart": true}
+  ],
+  "invariants": [
+    "total_us = query_us + prep_us + read_us（batch 口径：t0→t_query→t_prep→end，恒等）",
+    "query_us ≈ query_route_us + query_rpc_us + query_retry_us + glue"
+  ]
+}

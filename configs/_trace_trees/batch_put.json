@@ -1,0 +1,25 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "batch_put",
+  "group": "write",
+  "line": {
+    "markers": ["breakdown[batch_put]"],
+    "legacy": {
+      "marker": "batch_put_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "num_keys", "size", "success", "start_time", "status", "trace_id"
+  ],
+  "stages": [
+    {"field": "prep_us", "label": "prep", "chart": true},
+    {"field": "write_us", "label": "write", "chart": true}
+  ],
+  "invariants": [
+    "total_us = prep_us + write_us（batch 口径：t0→t_prep→end，恒等）",
+    "batch_put 为薄行：无逐请求 put 族字段（prep/checksum/...），残差应为 0"
+  ]
+}

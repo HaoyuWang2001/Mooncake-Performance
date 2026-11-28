@@ -1,0 +1,25 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "batch_put_into",
+  "group": "write",
+  "line": {
+    "markers": ["breakdown[batch_put_into]"],
+    "legacy": {
+      "marker": "batch_put_into_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "num_keys", "size", "success", "start_time", "status", "trace_id"
+  ],
+  "stages": [
+    {"field": "prep_us", "label": "prep", "chart": true},
+    {"field": "write_us", "label": "write", "chart": true}
+  ],
+  "invariants": [
+    "total_us = prep_us + write_us（batch 口径，恒等）",
+    "batch_put_into 为薄行，残差应为 0"
+  ]
+}

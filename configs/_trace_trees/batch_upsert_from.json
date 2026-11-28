@@ -1,0 +1,25 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "batch_upsert_from",
+  "group": "write",
+  "line": {
+    "markers": ["breakdown[batch_upsert_from]"],
+    "legacy": {
+      "marker": "batch_upsert_from_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "num_keys", "size", "success", "start_time", "status", "trace_id",
+    "engine", "slice_count"
+  ],
+  "stages": [
+    {"field": "prep_us", "label": "prep", "chart": true},
+    {"field": "write_us", "label": "write", "chart": true}
+  ],
+  "invariants": [
+    "breakdown[batch_upsert_from] 为 batch 薄行：total_us = prep_us + write_us"
+  ]
+}
