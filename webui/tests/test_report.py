@@ -419,10 +419,20 @@ def test_trace_embed_trim_budget_and_coarsen(tmp_path):
     assert "role:read" in trimmed["objects"]   # 总计始终嵌入
     assert trimmed["embed_objects"] < full_total
     assert trimmed["object_total"] == full_total
-    # 抽稀后 ftier 提高（1s -> k 秒），总样本数保持
-    key = [k for k in trimmed["objects"] if k.startswith("node:")][0]
-    g = list(trimmed["objects"][key]["groups"])[0]
-    op = list(trimmed["objects"][key]["groups"][g]["ops"])[0]
+    # 结构行全量内嵌：超预算对象降级为骨架（无 groups、标 trimmed），
+    # 否则 data.js 缺失时 trace 对象树只剩预算内的节点/实例
+    assert set(trimmed["objects"]) == set(tr["objects"])
+    skel = [k for k, v in trimmed["objects"].items() if v.get("trimmed")]
+    assert skel
+    for k in skel:
+        o = trimmed["objects"][k]
+        assert "groups" not in o
+        assert o.get("kind") in ("node", "client")
+    # 抽稀后 ftier 提高（1s -> k 秒），总样本数保持（预算放开，只看抽稀）
+    kept = rp._trim_trace_embed(tr, max_points=1, budget=10 ** 9)
+    key = [k for k in kept["objects"] if k.startswith("node:")][0]
+    g = list(kept["objects"][key]["groups"])[0]
+    op = list(kept["objects"][key]["groups"][g]["ops"])[0]
     assert op
     # 全量数据未被裁剪污染（data.js 用原始 tr）
     raws = [len(op2.get("fminutes", {}).get("total_us", []))
@@ -430,7 +440,7 @@ def test_trace_embed_trim_budget_and_coarsen(tmp_path):
             for g2 in t["groups"].values()
             for op2 in g2["ops"].values()]
     trims = [len(op2.get("fminutes", {}).get("total_us", []))
-             for t in trimmed["objects"].values()
+             for t in trimmed["objects"].values() if not t.get("trimmed")
              for g2 in t["groups"].values()
              for op2 in g2["ops"].values()]
     assert max(raws) >= max(trims)

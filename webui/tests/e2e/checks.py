@@ -194,9 +194,10 @@ def check_client_objects(art):
 
 def check_embed_skeleton_complete(art):
     """内嵌骨架完整性（20261128 报表残缺回归）：report.html 的内嵌副本
-    必须覆盖 data.js 的全部 node/client/role 结构行，且每个 client 的
-    node+role 与同名节点对象一致。曲线 tiers 可裁剪，结构行不可丢——
-    否则 data.js 未加载时树会退化成「节点有统计、实例只剩 Top-K」。"""
+    必须覆盖 data.js 的全部 node/client/role 结构行（端到端对象树与
+    分级时延曲线 trace 对象树同款），且每个 client 的 node+role 与同名
+    节点对象一致。曲线可裁剪，结构行不可丢——否则 data.js 未加载时树
+    会退化成「节点有统计、实例只剩 Top-K」。"""
     emb = _embedded(art)
     d = _data(art)
     for size, blk in (d.get("sizes") or {}).items():
@@ -209,12 +210,40 @@ def check_embed_skeleton_complete(art):
         assert not missing, (size, sorted(missing)[:5])
         nodes = {((v or {}).get("node"), (v or {}).get("role"))
                  for v in fo.values() if (v or {}).get("kind") == "node"}
+        node_names = {n for n, _ in nodes}
+        pipe = any(r for _, r in nodes)   # pipeline: 节点按角色分键
         for k, v in fo.items():
             if (v or {}).get("kind") != "client":
                 continue
             ev = eo.get(k) or {}
             assert ev.get("node") == v.get("node"), (size, k)
             assert ev.get("role") == v.get("role"), (size, k)
-            assert (v.get("node"), v.get("role")) in nodes, (size, k)
+            if pipe:
+                assert (v.get("node"), v.get("role")) in nodes, (size, k)
+            else:
+                assert v.get("node") in node_names, (size, k)
             if not ev.get("tiers"):
                 assert ev.get("trimmed"), (size, k)   # 无曲线须显式标裁剪
+    # 分级时延曲线（trace）同款：内嵌 trace.objects 覆盖全部结构行；
+    # 超预算对象必须是带 trimmed 的骨架（无 groups），曲线留 data.js。
+    for size, blk in (d.get("sizes") or {}).items():
+        ft = (blk.get("trace") or {}).get("objects") or {}
+        if not ft:
+            continue
+        et = (((emb.get("sizes") or {}).get(size) or {})
+              .get("trace") or {}).get("objects") or {}
+        want = {k for k, v in ft.items()
+                if (v or {}).get("kind") in ("node", "client", "role")}
+        missing = want - set(et)
+        assert not missing, (size, "trace", sorted(missing)[:5])
+        nodes = {((v or {}).get("node"), (v or {}).get("role"))
+                 for v in ft.values() if (v or {}).get("kind") == "node"}
+        for k, v in ft.items():
+            if (v or {}).get("kind") != "client":
+                continue
+            ev = et.get(k) or {}
+            assert ev.get("node") == v.get("node"), (size, k)
+            assert ev.get("role") == v.get("role"), (size, k)
+            assert (v.get("node"), v.get("role")) in nodes, (size, k)
+            if not ev.get("groups"):
+                assert ev.get("trimmed"), (size, k)

@@ -1149,7 +1149,8 @@ def _copy_trace_obj(obj):
 def _trim_trace_embed(tr, max_points=TRACE_EMBED_POINTS,
                       budget=TRACE_EMBED_ROWS):
     """HTML 内嵌裁剪：总计对象全嵌；节点/实例抽稀到 max_points 并按行预算
-    裁剪（超出的对象只留在 data.js，前端在 Full 模式合并）。"""
+    裁剪。超预算对象的曲线只留 data.js，但仍内嵌结构骨架（kind/label/
+    node/role/count + trimmed），保证 data.js 缺失时对象树不残缺。"""
     objs = tr.get("objects") or {}
     order = sorted(objs, key=lambda k: (
         0 if objs[k].get("kind") == "role" else
@@ -1181,12 +1182,20 @@ def _trim_trace_embed(tr, max_points=TRACE_EMBED_POINTS,
                     if k_once > 1:
                         op["ftier"] = int(op.get("ftier") or 1) * k_once
             if used + rows > budget:
+                # 曲线留 data.js，但结构行必须内嵌：否则 data.js 未加载时
+                # trace 对象树只剩预算内的节点/实例（与端到端曲线同病）。
+                skel = {f: objs[k].get(f)
+                        for f in ("kind", "label", "node", "role", "count")
+                        if f in objs[k]}
+                skel["trimmed"] = True
+                out[k] = skel
                 continue
             used += rows
         out[k] = c
     new = dict(tr)
     new["objects"] = out
-    new["embed_objects"] = len(out)
+    new["embed_objects"] = sum(1 for o in out.values()
+                               if not o.get("trimmed"))
     new["object_total"] = len(objs)
     return new
 
