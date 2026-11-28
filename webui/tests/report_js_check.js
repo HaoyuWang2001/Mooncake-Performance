@@ -1920,7 +1920,27 @@ if (useReal && !errs.length) {
   }
   const svgDir = process.env.VC_SVGDIR || null;
   const real = { total: realCharts.length, ok: 0, fail: 0, fails: [] };
+  out.real_geom = {};
   realCharts.forEach((rc) => {
+    try {
+      const lg = rc.chart.getModel().getComponent("legend");
+      const view = lg && rc.chart.getViewOfComponentModel(lg);
+      const gr = rc.chart.getModel().getComponent("grid");
+      const gridRect = gr && gr.coordinateSystem && gr.coordinateSystem.getRect();
+      if (view && view.group && gridRect) {
+        const r = view.group.getBoundingRect();
+        out.real_geom[rc.id] = {
+          legend_top: view.group.y + r.y,
+          legend_bottom: view.group.y + r.y + r.height,
+          legend_left: view.group.x + r.x,
+          legend_right: view.group.x + r.x + r.width,
+          grid_top: gridRect.y, grid_left: gridRect.x,
+          grid_right: gridRect.x + gridRect.width
+        };
+      }
+    } catch (e) {
+      errs.push("real geom " + rc.id + ": " + String(e && e.message || e));
+    }
     try {
       const svg = rc.chart.renderToSVGString();
       if (svgDir) {

@@ -434,7 +434,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C18.V8 三树控件（复用 `.tree-row/.tree-check/button.mini` 既有组件）：**三棵树顶栏三键与端到端曲线严格同构**——全选节点 / 全选实例 / 全部清空（已全选则变「清空*」；树缺少的维度保留按钮置灰 + tooltip：进程树节点仅分组、URMA 无实例），`_monTopBtns` 统一生成。**mem 树** = 节点行（勾选 = 该节点 used 求和实线）+ caret 展开分 NUMA 行（勾选 = 分列线）+「用量/可用量」指标开关（lat-sel-btns 同风格；**两者均可关**，默认用量开、可用量关；available 仅节点级虚线；全关显示指标空态）；**proc 树** = 节点行纯分组头（无 checkbox，仅 caret 展开，默认展开；**不得单独染节点色/加粗**，与标准 `.tree-row` 一致）+ 进程行勾选（不再 slice(0,8) 截断；默认只勾 `mem.proc_pattern` 前缀进程，comm 截断 15 字符，缺省 `mooncake_kvtest`，无命中回退全选；空选不显示「未勾选进程」文案）；**urma 树** = 节点 → DIE(ubpu) → 端口 三级（见 C18.V13）。mem/proc 每个节点行带该节点子项（NUMA / 进程）的「全选 / 清空」mini，只作用于本节点。三树均允许空选（不回填）→ 图区 empty-tip；选择状态会话内保留，size 切换重置。三树统一由 `renderMonTree` + `treeNodeGroup`/`treeRow` 渲染（与主图/慢点捕捉同一模板），禁止再写私有行/分组头
 - C18.V9 配色与图例：节点色 = `monNodeHue`（与主图 `nodeHue` 同一调色板按节点名排序固定分配，跨选择稳定）；NUMA/进程 = 同系色阶 `monShade`（同 instanceColor 算法）；图例 `type:'scroll'`、**`selectedMode:false` 固定不可点**（显隐只由树勾选控制，与主图「叠加只走对象树」同构）；URMA RX 实线 / TX 同系虚线；进程序列名 `comm pid @node`
 - C18.V11 监控摘要只保留「进程 RSS 增幅正负条」：已删除逐节点峰值内存 / `RSS 最大增幅` / `端口峰值带宽` 三处 KV 行；data.js summary 与 overview 摘要行不变（DR-63）
-- C18.V13 URMA 三级列表：节点 → DIE（= `ubpu`，UI 显示 DIE）→ 端口 三级均可勾选，标准控件逻辑（父子不联动）——节点/DIE 曲线 = 其端口 RX/TX 求和，端口 = 单端口；节点行 mini 只操作直接子项 DIE、DIE 行 mini 只操作其端口；顶栏 全选节点 / 全选实例（端口叶子）/ 全部清空（允许空图 + empty-tip）。URMA 图下固定平均流量表（节点 / DIE / 端口 / RX 平均 / TX 平均），不随树勾选过滤；平均=warmup 结束→任务结束逐采样点算术平均（`rx_avg_formal`/`tx_avg_formal`，无 warmup 回退 t0）
+- C18.V13 URMA 三级列表：节点 → DIE（= `ubpu`，UI 显示 DIE）→ 端口 三级均可勾选，标准控件逻辑（父子不联动）——节点/DIE 曲线 = 其端口 RX/TX 求和，端口 = 单端口；节点行 mini 只操作直接子项 DIE、DIE 行 mini 只操作其端口；顶栏 全选节点 / 全选实例（端口叶子）/ 全部清空（允许空图 + empty-tip）。**首次进入默认全部折叠**（只显示节点行，DIE/端口点 caret 展开；状态会话内保留）。URMA 图下固定平均流量表（节点 / DIE / 端口 / RX 平均 / TX 平均），不随树勾选过滤；平均=warmup 结束→任务结束逐采样点算术平均（`rx_avg_formal`/`tx_avg_formal`，无 warmup 回退 t0）
 - C18.D1 监控时间基准统一：`reduce_monitors` 返回 `t = 采样时刻 - 任务开始 t0`（并带 `time_relative/time_origin/time_span`），三图 x 轴共用 `[0, time_span]` 任务窗口（首个采样偏晚也从 T+0 起算），刻度 `T+mm:ss`、tooltip 显示相对时间 + 墙钟；`_parse_urma` 先差分再按窗口裁剪并保留窗口前一条样本，首点不晚一拍；URMA 采样时刻按 `urma.interval_s`（默认 1s）量化到相对 t0 的桶并同桶平均，各节点 x 值一致（竖线可命中全部序列）
 - C18.V14 统一图表框架首批使用者：监控三图走 `lfChartFrame`（见 C22）；RSS 增长 TOP-10 在图下方并带标题；进程默认只勾 `mem.proc_pattern` 前缀（comm 15 字符，缺省 `mooncake_kvtest`，无命中回退全选），空选不显示「未勾选进程」文案
 - C18.D2 URMA 计数器回绕/重置不产生尖峰
@@ -499,7 +499,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 ### C22 统一图表框架（所有图）
 
 - C22.V1 **唯一入口 `lfChartFrame`**：新图/改图必须走模板，禁止再单独手写 legend / xAxis / yAxis / dataZoom；模板同时负责实例复用、空态、grid 与图例边界。
-- C22.V2 **图距**：图与上方控件垂直间距统一；图例顶部留白由 `grid.top` 保证，任何图例都不得被容器上沿截断。
+- C22.V2 **图距**：图与上方控件垂直间距统一；图例顶部留白由 `legend.top`（≥8px）+ `grid.top`（≥64px）共同保证，任何图例都不得被容器上沿截断。验收读 ECharts **实际图例矩形**（`legendBottom ≤ gridTop−2`、`legendTop ≥ 2`），不得只比对配置值。
 - C22.V3 **图例边界**：`legend.left/right` 必须等于 `grid.left/right`（宽度不越过 y 轴标签区），`type:'scroll'`、`selectedMode:false`。
 - C22.V4 **tooltip 时间人类可读**：相对时间 `T+mm:ss` + 墙钟 `YYYY-MM-DD HH:MM:SS`；绝不出现 epoch 浮点数。
 - C22.V5 **缩放控件（原生）**：x 轴底部 `slider` + `inside`（滚轮缩放/拖拽平移）；y 轴右侧竖向 `slider` + `inside`（上下平移）；不新增自绘缩放轨。

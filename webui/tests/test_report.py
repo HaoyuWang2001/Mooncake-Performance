@@ -1423,6 +1423,15 @@ def test_real_echarts_render_smoke(tmp_path):
     real = res.get("real") or {}
     assert real.get("fail") == 0, real
     assert real.get("ok", 0) >= 7, real
+    # 图例真实几何：字形不被画布上沿裁切，且底边不与绘图区重叠
+    geom = res.get("real_geom") or {}
+    for cid in ("memchart", "procchart", "urmachart"):
+        g = geom.get(cid)
+        assert g, (cid, geom)
+        assert g["legend_top"] >= 2, (cid, g)
+        assert g["legend_bottom"] <= g["grid_top"] - 2, (cid, g)
+        assert g["legend_left"] >= g["grid_left"] - 1, (cid, g)
+        assert g["legend_right"] <= g["grid_right"] + 1, (cid, g)
     # F14 标注线：xAxis 必须是非空 label 字符串
     assert res.get("hist_marks") == 4, res.get("hist_marks")
     xs = res.get("hist_mark_x") or []
@@ -4479,16 +4488,16 @@ def test_b07_monitor_tree_controls_and_legends(tmp_path):
     # proc 图默认 = 全部进程（不再截断前 8）
     pnames = sorted(s["name"] for s in res["proc_series"])
     assert pnames == ["cli 11 @n1", "cli 12 @n1", "cli 21 @n2"], pnames
-    # urma 树：节点 → DIE → 端口三级可勾选，默认全展开
+    # urma 树：节点 → DIE → 端口三级可勾选；默认全部折叠（只显示节点行）
     urma_tree = res["urma_tree"]
-    for row in ("row:n1", "row:n2", "row:DIE 0", "row:DIE 1",
-                "row:端口 1", "row:端口 2"):
+    for row in ("row:n1", "row:n2"):
         assert row in urma_tree, (row, urma_tree)
+    for row in ("row:DIE 0", "row:DIE 1", "row:端口 1", "row:端口 2"):
+        assert row not in urma_tree, (row, urma_tree)
     for btn in ("btn:清空节点", "btn:全选实例", "btn:全部清空"):
         assert btn in urma_tree, (btn, urma_tree)
-    # 节点/DIE 行各带一对 mini 全选/清空：n1(2) + DIE0(2) + DIE1(2)
-    # + n2(2) + DIE0(2) = 10
-    assert res["mon_row_minis"]["urma"] == 10, res["mon_row_minis"]
+    # 默认折叠：只有两个节点行各带一对 mini 全选/清空
+    assert res["mon_row_minis"]["urma"] == 4, res["mon_row_minis"]
     # urma 图默认 = 每个节点一条 RX 求和实线 + TX 虚线（父子不联动）
     us = res["urma_series"]
     assert [s["name"] for s in us] == ["n1 RX", "n1 TX", "n2 RX", "n2 TX"], us
@@ -4586,16 +4595,37 @@ def test_b10_monitor_tree_caret_expand_collapse(tmp_path):
     # n2 未动，仍展开
     assert "row:cli 21" in proc_after, proc_after
     assert res2["mon_counts_after_caret"]["proc"].get("head:n1") == 1
-    # URMA 节点默认展开，点 caret 收起该节点的 DIE/端口行
+    # URMA 默认全部折叠；点节点 caret 展开出现该节点的 DIE 行
     res3 = _js_check(tmp_path, data, "--mon-caret", "urmaTree::n1")
     if res3 is None:
         return
     assert res3["errors"] == [], res3["errors"]
     urma_after = res3["mon_tree_after_caret"]["urma"]
     assert "row:n1" in urma_after, urma_after
-    # n1 的 DIE1（独有）消失；n2 的 DIE0 仍在（n1 收起不影响 n2）
-    assert "row:DIE 1" not in urma_after, urma_after
+    assert "row:DIE 1" in urma_after, urma_after
     assert "row:DIE 0" in urma_after, urma_after
+    # DIE 行仍默认折叠：端口行不出现；n2 节点也未展开
+    assert "row:端口 1" not in urma_after, urma_after
+    assert "row:端口 2" not in urma_after, urma_after
+
+
+def test_c18v15_urma_tree_default_collapsed(tmp_path):
+    """C18.V15：URMA 端口树首次进入默认全部折叠——只显示节点行，
+    DIE/端口行需手动展开（选择状态仍会话内保留）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    counts = res["mon_counts"]["urma"]
+    assert counts.get("row:n1") == 1 and counts.get("row:n2") == 1, counts
+    assert not [k for k in counts if k.startswith("row:DIE")], counts
+    assert not [k for k in counts if k.startswith("row:端口")], counts
+    # 节点级曲线仍默认按节点求和（折叠不影响默认选择）
+    names = [s["name"] for s in res["urma_series"]]
+    assert names == ["n1 RX", "n1 TX", "n2 RX", "n2 TX"], names
 
 
 def test_c18_monitor_trees_share_one_template():

@@ -403,6 +403,7 @@ def test_reduce_monitors_urma_relative_and_formal_avg(tmp_path):
     # 窗口前一条样本 (1000) 参与差分 → 1001 的首点被保留；采样时刻量化到
     # 1s 桶（相对 t0），各节点共享同一组 x 值。
     assert u["t"] == [0.0, 1.0, 2.0, 3.0], u["t"]
+    assert all(float(x).is_integer() for x in u["t"]), u["t"]
     assert u["rx"] == [1.0, 2.0, 3.0, 4.0], u["rx"]
     assert u["rx_avg"] == 2.5
     # formal 窗口从 warmup 结束 (1002.5) 起 → 只剩 rate 3、4
@@ -433,6 +434,9 @@ def test_reduce_monitors_urma_bucket_aligns_nodes(tmp_path):
     mon = rp.reduce_monitors(str(logs), t0=1000000000.0, t1=1000000004.0)
     ts = {u["node"]: u["t"] for u in mon["urma"]}
     assert ts["n1"] == ts["n2"] == [1.0, 2.0, 3.0], ts
+    # 默认 1s 桶：相对横坐标必须是整秒（前端 ×1000 为整毫秒）
+    for seq in ts.values():
+        assert all(float(x).is_integer() for x in seq), seq
 
 
 def test_proc_growth_excludes_wrapper_shells(tmp_path):

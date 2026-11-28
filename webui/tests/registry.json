@@ -7400,9 +7400,23 @@
     "test_c18v14_monitor_chart_frame_and_sliders",
     "test_c18v14_proc_default_prefix_and_no_empty_hint",
     "test_c18v14_growth_below_chart_with_title",
+    "test_c18v15_urma_tree_default_collapsed",
+    "test_real_echarts_render_smoke",
     "test_reduce_monitors_urma_bucket_aligns_nodes",
     "test_compact_monitors_keeps_config_for_proc_prefix",
     "test_proc_growth_excludes_wrapper_shells"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C18.V15",
+   "module": "report",
+   "desc": "URMA 端口树首次进入默认全部折叠：仅显示节点行，DIE(ubpu)/端口需点 caret 展开，展开状态会话内保留；节点级默认求和曲线与勾选不受折叠影响",
+   "req": "R-MON-8",
+   "unit": [
+    "test_c18v15_urma_tree_default_collapsed",
+    "test_b07_monitor_tree_controls_and_legends",
+    "test_b10_monitor_tree_caret_expand_collapse"
    ],
    "e2e": []
   },
@@ -7412,7 +7426,8 @@
    "desc": "**统一图表框架 lfChartFrame**：新增/改造任何图必须走该入口（图例/坐标轴/缩放控件唯一来源）；图距统一、图例边界=grid 不越过 y 轴、tooltip 时间人类可读、x 底部 slider+inside、y 右侧 slider+inside，禁止自绘缩放轨",
    "req": "R-CHART-2",
    "unit": [
-    "test_c18v14_monitor_chart_frame_and_sliders"
+    "test_c18v14_monitor_chart_frame_and_sliders",
+    "test_real_echarts_render_smoke"
    ],
    "e2e": []
   }

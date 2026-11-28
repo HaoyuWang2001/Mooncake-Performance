@@ -2948,13 +2948,13 @@ function axisCommon(){
      · y 轴：右侧原生竖向 slider + inside 拖拽平移；
      · tooltip 时间统一由调用方经 lfTooltipTime 输出人类可读文本。
    监控三图（mem/proc/urma）是该模板的首批使用者。 */
-const LF_FRAME={left:72,right:64,top:56,bottom:64};
+const LF_FRAME={left:88,right:64,top:64,bottom:64};
 function lfChartFrame(cfg){
   cfg=cfg||{};
   const grid=Object.assign({},LF_FRAME,cfg.grid||{});
-  const legend=Object.assign({show:true,type:'scroll',top:4,
+  const legend=Object.assign({show:true,type:'scroll',top:8,
     left:grid.left,right:grid.right,icon:'roundRect',
-    itemWidth:14,itemHeight:3,itemGap:14,selectedMode:false,
+    itemWidth:14,itemHeight:4,itemGap:14,selectedMode:false,
     textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}},
     cfg.legend||{});
   const zoomCfg={filterMode:'none'};
@@ -5321,7 +5321,6 @@ function _monChart(id, series, yname, domain){
   const M=D.monitors||{}; const rel=!!M.time_relative;
   /* 统一图表模板：图例不越过 y 轴、x/y 原生缩放滑块、时间 tooltip 人类可读 */
   const o=lfChartFrame({
-    grid:{left:88,right:64,top:56,bottom:64},
     tooltip:lfTooltip({formatter:function(ps){
       if(!ps||!ps.length) return '';
       const p0=ps[0];
@@ -5678,7 +5677,7 @@ function renderUrmaTree(box){
     kids.forEach(function(u){(dieMap[u.ubpu]=dieMap[u.ubpu]||[]).push(u);});
     const dieKeys=Object.keys(dieMap).sort(function(a,b){return a-b;});
     const dieKeyList=dieKeys.map(function(b){return n+'/'+b;});
-    const nodeOpen=monUrmaOpen['n:'+n]!==false;
+    const nodeOpen=monUrmaOpen['n:'+n]===true;
     const nodeCaret=el('button','tree-caret',nodeOpen?'▾':'▸');
     nodeCaret.title=nodeOpen?'收起该节点的 DIE':'展开该节点的 DIE';
     nodeCaret.onclick=function(){monUrmaOpen['n:'+n]=!nodeOpen;
@@ -5689,7 +5688,7 @@ function renderUrmaTree(box){
         return a.port-c.port;});
       const portKeyList=ports.map(function(u){
         return u.node+'/'+u.ubpu+'/'+u.port;});
-      const dieOpen=monUrmaOpen['d:'+dk]!==false;
+      const dieOpen=monUrmaOpen['d:'+dk]===true;
       const dieCaret=el('button','tree-caret',dieOpen?'▾':'▸');
       dieCaret.title=dieOpen?'收起该 DIE 的端口':'展开该 DIE 的端口';
       dieCaret.onclick=function(){monUrmaOpen['d:'+dk]=!dieOpen;
