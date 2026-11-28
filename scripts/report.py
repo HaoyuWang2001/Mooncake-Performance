@@ -2167,6 +2167,9 @@ font:14px/1.62 'Inter','SF Pro Text',system-ui,'Segoe UI','PingFang SC',
 h1{font-size:19px;font-weight:700;letter-spacing:-.02em;margin:0 0 3px}
 h2{font-size:16.5px;font-weight:700;letter-spacing:-.02em;margin:0 0 2px}
 .sub{color:var(--mut);font-size:13px;margin-bottom:14px}
+.data-notice{display:none;margin:0 0 14px;padding:10px 14px;
+border:1px solid var(--hero);border-radius:12px;color:var(--hero);
+font-size:12.5px;line-height:1.6}
 .card{background:var(--paper);border:1px solid var(--grid);border-radius:24px;padding:26px 26px 20px;
 margin:0}
 .card + .card,.wrap > .card:not(:first-child){margin-top:14px}
@@ -4948,6 +4951,7 @@ function renderObjTree(){
     const nodeName=String((m.all[k]&&m.all[k].node)||k.replace(/^node:/,''));
     const kids=m.byNode[nodeName]||[];
     const open=!!treeOpen[k];
+    const ndTrim=!!(m.all[k]&&m.all[k].trimmed);
     let caret=null;
     if(kids.length){
       caret=el('button','tree-caret',open?'▾':'▸');
@@ -4959,10 +4963,13 @@ function renderObjTree(){
       minis:kids.length?[
         miniBtn('全选',kids,'选中该节点下的全部实例',true),
         miniBtn('清空',kids,'取消该节点下的全部实例',false)]:[],
-      note:kids.length?(kids.length+' 实例'):''}));
+      note:kids.length?(kids.length+' 实例'+(ndTrim?' · 曲线见 data.js':''))
+        :(ndTrim?'曲线见 data.js':'')}));
     if(open&&kids.length){
       kids.forEach(function(ck){
-        list.appendChild(treeRow(ck,objLabel(ck),2));
+        const cTrim=!!(m.all[ck]&&m.all[ck].trimmed);
+        list.appendChild(treeRow(ck,objLabel(ck),2,
+          {note:cTrim?'曲线见 data.js':''}));
       });
     }
   });
@@ -5466,6 +5473,7 @@ function mount(){
   const rb=document.getElementById('resetBtn');
   if(rb) rb.onclick=function(){resetViews();};
   renderAll(); safe('monitors',renderMonitors);
+  renderDataNotice();
   safe('chart-interactions',function(){
     bindInteract(chart,MAIN_GRID);
     linkZoom(chart,qpsChart);
@@ -7211,7 +7219,23 @@ window.__MC_FOCUS=function(){
   return {main:!!(chart&&chart.__mcDimActive),
     stage:!!(tChart&&tChart.__mcDimActive)};
 };
-window.__MC_FULL_READY__=function(){renderAll();};
+/* data.js 缺失时顶部提示：对象树仍完整（骨架全嵌），但曲线不可用。
+   WebUI 经 /api/file 异步补加载 data.js；file:// 直开靠 script onerror。 */
+function renderDataNotice(){
+  const n=document.getElementById('dataNotice'); if(!n) return;
+  /* WebUI 下 data.js 靠适配器异步补加载：加载中不提示（避免闪烁），
+     失败由适配器置 __mcDataFailed 后再提示；file:// 直开靠 script onerror。 */
+  const miss=!window.__MC_FULL__&&
+    (window.__mcDataFailed||
+     (window.__mcDataMissing&&!window.__mcAsyncLoad));
+  if(!miss){n.style.display='none';n.textContent='';return;}
+  n.style.display='';
+  n.textContent='数据文件 data.js 未加载：实例曲线不可用，下方对象树仅显示'+
+    '结构（节点与实例仍成对完整）。请确认 data.js 与 report.html 在同一'+
+    '目录，且通过完整报表目录打开。';
+}
+window.__MC_DATA_NOTICE__=renderDataNotice;
+window.__MC_FULL_READY__=function(){renderDataNotice();renderAll();};
 document.addEventListener('DOMContentLoaded',mount);
 """
 
@@ -7242,12 +7266,20 @@ _PAGE_ADAPTER_JS = """
   });
   if(window.__MC_DATA_REL__&&!window.__MC_FULL__){
     var u=api(window.__MC_DATA_REL__);
+    window.__mcAsyncLoad=1;
     fetch(u).then(function(r){return r.ok?r.text():null;})
       .then(function(t){
-        if(!t) return;
+        if(!t){
+          window.__mcDataFailed=1;
+          window.__MC_DATA_NOTICE__&&window.__MC_DATA_NOTICE__();
+          return;
+        }
         (0,eval)(t);
         window.__MC_FULL_READY__&&window.__MC_FULL_READY__();
-      }).catch(function(){});
+      }).catch(function(){
+        window.__mcDataFailed=1;
+        window.__MC_DATA_NOTICE__&&window.__MC_DATA_NOTICE__();
+      });
   }
 })();
 """
@@ -7285,6 +7317,7 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
   aria-pressed="false" title="当前：自动（跟随系统），点击切换"><span
   class="theme-icon">◑</span></button>
 <div class="sub">{subtitle}</div>
+<div class="data-notice" id="dataNotice"></div>
 {body}
 </div>
 <script>{echarts}</script>
@@ -7590,6 +7623,20 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
             _take(k)
         for c in keep:
             _take("client:" + c["name"])
+        # 骨架补全：节点/实例/角色结构行必须全量内嵌，只有 tiers（曲线）
+        # 按 Top-K/预算裁剪。否则 data.js 未加载时，树会退化成「节点有
+        # 统计值、下面却只剩 Top-K 实例」的残缺形态，写/读实例还会漏。
+        # 骨架只带 label/kind/node/role/p99_ms(+trimmed)，曲线仍由
+        # data.js 提供，前端对 trimmed 行标注「曲线见 data.js」。
+        for key, o in objs.items():
+            if key in emb_objs:
+                continue
+            skel = {"label": o.get("label"), "kind": o.get("kind"),
+                    "trimmed": True}
+            for k in ("node", "role", "bytes", "p99_ms"):
+                if k in o:
+                    skel[k] = o[k]
+            emb_objs[key] = skel
         slim["objects"] = emb_objs
         slim["object_total"] = len(objs)
         embedded["sizes"][size] = slim

@@ -1064,6 +1064,47 @@ def test_objects_and_budget_trimming(tmp_path):
     assert emb["object_total"] == len(z["objects"])
 
 
+def test_embed_skeleton_keeps_all_clients_without_datajs(tmp_path):
+    """回归（20261128 报表残缺）：data.js 未加载时对象树不能退化成
+    「节点有统计、实例只剩 Top-K」。内嵌副本必须覆盖 data.js 的全部
+    node/client/role 结构行，且实例的 node/role 与节点对象一一配对；
+    只有 tiers（曲线）按 Top-K/预算裁剪，其余行标 trimmed。"""
+    paths = []
+    for i in range(30):
+        role = "writer" if i % 2 == 0 else "reader"
+        paths.append(_stats(tmp_path, "c%02d.%s" % (i, role), role,
+                            node="n%d" % (i % 3)))
+    data = rp.reduce_scenario(rp.load(paths),
+                              {"config": "c", "mode": "pipeline"})
+    z = data["sizes"]["8MB"]
+    html, _dj = rp.render_scenario(data, str(tmp_path / "r"), ECHARTS, topk=5)
+    src = open(html, encoding="utf-8").read()
+    assert 'id="dataNotice"' in src and "__mcDataFailed" in src
+    emb = json.loads(re.search(
+        r"window\.__MC_REPORT__ = (.*?);</script>",
+        open(html, encoding="utf-8").read(), re.S).group(1))["sizes"]["8MB"]
+    eo, fo = emb["objects"], z["objects"]
+    want = {k for k, v in fo.items()
+            if v.get("kind") in ("node", "client", "role")}
+    assert want and want <= set(eo)
+    # 节点+角色口径：实例行必须带自己的 role/node，且对应节点对象存在，
+    # 写/读实例不混到裸节点下
+    nodes = {(v.get("node"), v.get("role")) for v in fo.values()
+             if v.get("kind") == "node"}
+    clients = [k for k, v in fo.items() if v.get("kind") == "client"]
+    assert len(clients) == 30
+    for k in clients:
+        v = fo[k]
+        assert eo[k].get("node") == v.get("node")
+        assert eo[k].get("role") == v.get("role")
+        assert (v.get("node"), v.get("role")) in nodes
+    # 曲线仍按 Top-K 裁剪；其余实例是 trimmed 骨架
+    with_tiers = [k for k in clients if eo[k].get("tiers")]
+    assert len(with_tiers) == 5
+    assert all(eo[k].get("trimmed") for k in clients if k not in with_tiers)
+    assert all("tiers" not in eo[k] for k in clients if k not in with_tiers)
+
+
 def test_overlay_two_objects_js(tmp_path):
     """对象多选叠加：同一指标两条曲线，客户端自动落到自适应档。"""
     a = _stats(tmp_path, "a.writer", "writer", node="n1")
