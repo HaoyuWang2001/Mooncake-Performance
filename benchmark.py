@@ -2635,6 +2635,25 @@ def _configmap_name(run_label):
     return "mc-bench-" + re.sub(r"[^a-z0-9-]", "-", run_label.lower())
 
 
+def _trace_tree_payload():
+    """map 侧 pod 平铺脚本清单里的 trace 阶段树负载。
+
+    tracestats.py 在 pod 内 import trace_trees（树是其 schema 依赖），
+    树必须随脚本一起下发：configmap 键不允许子目录，故 configs/
+    _trace_trees/*.json 平铺进 scripts/（loader 以 _schema.json 标记
+    识别该平铺布局）。目录缺失直接 RuntimeError——漏发必然导致
+    pod 内 map 全部失败（trace 产物缺失 -> 场景 FAIL）。"""
+    tree_dir = os.path.join(os.path.dirname(SCRIPTS_DIR),
+                            "configs", "_trace_trees")
+    if not os.path.isdir(tree_dir):
+        raise RuntimeError("trace tree dir missing: %s" % tree_dir)
+    files = [("trace_trees.py", SCRIPTS_DIR)]
+    for fname in sorted(os.listdir(tree_dir)):
+        if fname.endswith(".json"):
+            files.append((fname, tree_dir))
+    return tree_dir, files
+
+
 def ensure_configmap(cluster, scenario_params, cluster_session,
                     ts, cfg_name, dry_run):
     """k8s: stage scripts on the controller and create one ConfigMap per
@@ -2664,6 +2683,8 @@ def ensure_configmap(cluster, scenario_params, cluster_session,
                  ("tracestats.py", SCRIPTS_DIR),
                  ("remove_service.py", SCRIPTS_DIR),
                  ("env.sh", None)]
+        # trace 阶段树随脚本平铺下发（pod 内 map 依赖，见 _trace_tree_payload）
+        files.extend(_trace_tree_payload()[1])
         mooncake_env = os.path.join(SCRIPTS_DIR, "env.mooncake.sh")
         if os.path.exists(mooncake_env):
             files.append(("env.mooncake.sh", SCRIPTS_DIR))
@@ -2739,6 +2760,9 @@ def deploy_scripts(cluster, involved_nodes, scenario_params, cluster_session,
                       os.path.join(SCRIPTS_DIR, "logstats.py"),
                       os.path.join(SCRIPTS_DIR, "quantiles.py"),
                       os.path.join(SCRIPTS_DIR, "tracestats.py")]
+        # trace 阶段树随脚本平铺下发（节点侧 map 依赖，同 k8s 模式）
+        for _fname, _src in _trace_tree_payload()[1]:
+            push_files.append(os.path.join(_src, _fname))
         if os.path.exists(mooncake_env_path):
             push_files.append(mooncake_env_path)
         scp_push(n["ip"], n, push_files, remote_scripts, dry_run=dry_run)

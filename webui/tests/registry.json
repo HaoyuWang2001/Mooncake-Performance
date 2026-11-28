@@ -4121,10 +4121,11 @@
   {
    "id": "E-138",
    "module": "benchmark",
-   "desc": "验证 trace map 用进程基目录且 glog 严格",
+   "desc": "验证 trace map 用进程基目录且 glog 严格；trace_trees.py + configs/_trace_trees/*.json 随脚本平铺下发（漏发 = pod 内 import 失败 → 全部 map 挂）",
    "req": "",
    "unit": [
-    "test_remote_trace_map_uses_process_base_and_strict_glog"
+    "test_remote_trace_map_uses_process_base_and_strict_glog",
+    "test_map_pod_payload_carries_trace_trees"
    ],
    "e2e": []
   },
@@ -7326,7 +7327,7 @@
   {
    "id": "C11.V9",
    "module": "report",
-   "desc": "**树 = 单一事实源 configs/_trace_trees/<op>.json（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」不是独立树，breakdown[get] 经 get_buffer.legacy_ops 归一）；目录缺失或校验失败（schema 版本 / 重复字段 / 引用父缺失 / views 子带 chart）一律 TreeError 硬失败，不静默回退；extends 仅支持单层（put_from/upsert_from 继承）；stage_rows_of 扁平行 L1 父 = total_us，residual 由 loader 统一追加为渲染行、不进 chart L1 元组（map 侧残差走独立通道）",
+   "desc": "**树 = 单一事实源 configs/_trace_trees/<op>.json（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」不是独立树，breakdown[get] 经 get_buffer.legacy_ops 归一）；目录缺失或校验失败（schema 版本 / 重复字段 / 引用父缺失 / views 子带 chart）一律 TreeError 硬失败，不静默回退；extends 仅支持单层（put_from/upsert_from 继承）；stage_rows_of 扁平行 L1 父 = total_us，residual 由 loader 统一追加为渲染行、不进 chart L1 元组（map 侧残差走独立通道）；树随脚本平铺下发至 pod/节点（benchmark _trace_tree_payload：configmap 键无子目录，loader 以 _schema.json 标记识别平铺布局，源仓库布局优先）。",
    "req": "R-TRACE-14",
    "unit": [
     "test_all_trees_load_and_validate",
@@ -7334,7 +7335,10 @@
     "test_missing_dir_is_hard_failure",
     "test_bad_tree_raises",
     "test_stage_rows_shape",
-    "test_l1_set_matches_tree_per_op"
+    "test_l1_set_matches_tree_per_op",
+    "test_tree_dir_prefers_repo_layout",
+    "test_tree_dir_flat_pod_layout",
+    "test_tree_dir_missing_keeps_hard_failure"
    ],
    "e2e": [
     "check_trace_unknown_ops"

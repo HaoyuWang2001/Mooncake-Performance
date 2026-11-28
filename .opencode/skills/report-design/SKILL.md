@@ -344,7 +344,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C11.B1 写/读分组曾只作用于部分子图（慢点追踪未跟随）
 - C11.V8 SDK 元信息行展示 **engine 分布**（`engine classic×N / tent×M`；reduce 必须合并 per-op `engine` 计数，否则合并阶段丢失）
 - C11.V7 **统一 `breakdown[op]` 行匹配（树驱动）**（docs/yh/log-reference.md §14；树 = configs/_trace_trees/<op>.json）：行匹配按 op 树注册表（marker → op）；字段名 = 日志原生名（`query_total_us`/`buf_alloc_us`，不再归一改名）；旧 `get_breakdown` 行按 legacy 别名**单向**映射（`query_us → query_total_us`、`alloc_us → buf_alloc_us`；旧 op 名 get/get_batch 归一到 get_buffer）；未知 op 归「其它」组并计 `meta.unknown_ops`（字段探测仅兜底）；remove/batchRemove 薄行归「其它」；树 meta_fields（slice_count/*_min_us 等）不进时延字段统计；TENT+TCP 四相位诚实零值按 engine 标注（不误判 classic）
-- C11.V9 **树 = 单一事实源 `configs/_trace_trees/<op>.json`（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」非独立树，`breakdown[get]` 经 legacy_ops 归一）；`scripts/trace_trees.py` 唯一读取入口，目录缺失或校验失败一律 TreeError 硬失败（不静默回退）；extends 仅单层（put_from/upsert_from 继承）；`stage_rows_of` 扁平行 `[field,level,parent,view]`（L1 父 = total_us；residual 由 loader 统一追加为渲染行、不进 chart L1 元组）
+- C11.V9 **树 = 单一事实源 `configs/_trace_trees/<op>.json`（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」非独立树，`breakdown[get]` 经 legacy_ops 归一）；`scripts/trace_trees.py` 唯一读取入口，目录缺失或校验失败一律 TreeError 硬失败（不静默回退）；extends 仅单层（put_from/upsert_from 继承）；`stage_rows_of` 扁平行 `[field,level,parent,view]`（L1 父 = total_us；residual 由 loader 统一追加为渲染行、不进 chart L1 元组）；树随脚本平铺下发至 pod/节点（configmap 键无子目录，loader 以 `_schema.json` 标记识别平铺布局，源仓库布局优先）
 ### C12 SDK 全链路 · 对象树
 
 - C12.V1 树 = 总计（当前读写组全实例聚合）+ 节点与实例；**无角色行**（角色在顶部）；位于分级时延曲线控台**左栏**

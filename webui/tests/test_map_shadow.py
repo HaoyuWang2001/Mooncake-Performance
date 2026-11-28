@@ -138,6 +138,23 @@ def test_small_run_threshold_counts_glog(monkeypatch, tmp_path):
     assert len(calls) == 2 and "/r/b.log" in calls[1]   # 3MB -> 连 raw 一起拉
 
 
+def test_map_pod_payload_carries_trace_trees():
+    """map 侧 pod 平铺脚本清单必须带 trace_trees.py 与全部树 JSON：
+    tracestats 在 pod 内 import trace_trees（树是其 schema 依赖），
+    漏发 = 每个 pod 的 trace map 全部失败（事故 20261128-1331：import
+    Traceback → no trace product → 场景 FAIL）。"""
+    tree_dir, files = bm._trace_tree_payload()
+    names = [f for f, _ in files]
+    assert "trace_trees.py" in names
+    assert "_schema.json" in names            # 平铺布局标记
+    for op in ("get_buffer", "get_into", "put", "upsert", "remove",
+               "batch_put"):
+        assert op + ".json" in names, op
+    for fname, src in files:                  # 清单引用的文件必须真实存在
+        assert os.path.isfile(os.path.join(src, fname)), (fname, src)
+    assert tree_dir.endswith(os.path.join("configs", "_trace_trees"))
+
+
 def test_map_timeout_env_and_passthrough(monkeypatch):
     """map 超时可配（MC_MAP_TIMEOUT），并真正传给 ssh/exec。"""
     monkeypatch.delenv("MC_MAP_TIMEOUT", raising=False)

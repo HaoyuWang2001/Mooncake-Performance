@@ -13,7 +13,30 @@ import json
 import os
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-TREE_DIR = os.path.join(os.path.dirname(_HERE), "configs", "_trace_trees")
+
+
+def _tree_dir_candidates(scripts_dir):
+    """树目录候选（按优先级）：
+    1. 源仓库布局 <root>/configs/_trace_trees（scripts/ 的同级目录）；
+    2. 平铺布局 scripts/ 本身 —— benchmark 经 configmap/ssh 把树与脚本
+       平铺下发到 pod（configmap 键不允许子目录），以 _schema.json 作
+       平铺标记（loader 本就跳过 ``_`` 前缀文件，不会把它当树加载）。"""
+    root = os.path.dirname(os.path.abspath(scripts_dir))
+    return [os.path.join(root, "configs", "_trace_trees"),
+            os.path.abspath(scripts_dir)]
+
+
+def _resolve_tree_dir(scripts_dir=None):
+    """选第一个带 _schema.json 的候选；都没有则返回首选路径，
+    交由 load_trace_trees 硬失败（缺失不静默）。"""
+    scripts_dir = os.path.abspath(scripts_dir or _HERE)
+    for cand in _tree_dir_candidates(scripts_dir):
+        if os.path.isfile(os.path.join(cand, "_schema.json")):
+            return cand
+    return _tree_dir_candidates(scripts_dir)[0]
+
+
+TREE_DIR = _resolve_tree_dir()
 
 # 全局成功状态（各 op 树可用 ok_statuses 追加自身变体，如 read_ok）
 GLOBAL_OK_STATUSES = frozenset({"ok"})

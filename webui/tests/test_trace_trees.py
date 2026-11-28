@@ -9,6 +9,8 @@ import json
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
@@ -313,3 +315,40 @@ def test_fields_stats_skip_tree_meta_fields(tmp_path):
     assert "memwrite_urma_min_us" not in f
     assert "memwrite_urma_avg_us" not in f
     assert "checksum_us" in f
+
+
+def test_tree_dir_prefers_repo_layout():
+    """树目录解析：源仓库布局（scripts/ 同级的 configs/_trace_trees）优先。"""
+    d = tt._resolve_tree_dir()
+    assert d == os.path.join(ROOT, "configs", "_trace_trees")
+    assert os.path.isfile(os.path.join(d, "_schema.json"))
+
+
+def test_tree_dir_flat_pod_layout(tmp_path):
+    """pod 平铺布局：树与脚本同目录（configmap 键不允许子目录），
+    _schema.json 作平铺标记；标记文件本身不被当树加载（loader 跳过
+    ``_`` 前缀）。"""
+    scripts = tmp_path / "mp" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "_schema.json").write_text("{}", encoding="utf-8")
+    tree = {"schema": "mp-trace-tree/1", "op": "t_flat", "group": "other",
+            "total_field": "total_us",
+            "line": {"markers": ["breakdown[t_flat]"]},
+            "stages": [{"field": "a_us", "chart": True}]}
+    (scripts / "t_flat.json").write_text(json.dumps(tree), encoding="utf-8")
+    d = tt._resolve_tree_dir(str(scripts))
+    assert d == str(scripts)
+    trees = tt.load_trace_trees(d)
+    assert "t_flat" in trees
+    assert "_schema" not in trees
+
+
+def test_tree_dir_missing_keeps_hard_failure(tmp_path):
+    """两个候选目录都没有 _schema.json：返回首选路径（源仓库布局），
+    load 阶段硬失败，不静默回退。"""
+    scripts = tmp_path / "mp" / "scripts"
+    scripts.mkdir(parents=True)
+    d = tt._resolve_tree_dir(str(scripts))
+    assert d == str(tmp_path / "mp" / "configs" / "_trace_trees")
+    with pytest.raises(tt.TreeError, match="not found"):
+        tt.load_trace_trees(d)
