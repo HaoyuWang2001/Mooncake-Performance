@@ -1172,7 +1172,8 @@ def main(argv=None):
             ("--instance-dir", args.instance_dir),
             ("--out-stats", args.out_stats),
             ("--out-csvstats", args.out_csvstats),
-            ("--start-epoch", args.start_epoch)) if not val]
+            ("--start-epoch", args.start_epoch))
+            if val is None or val == ""]
         if missing:
             parser.error("--kvtest-map-instance requires: "
                          + ", ".join(missing))
