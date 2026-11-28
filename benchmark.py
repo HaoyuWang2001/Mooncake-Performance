@@ -2326,7 +2326,14 @@ _K8S_FATAL_WAITING = {
 _K8S_FATAL_EVENTS = {
     "FailedScheduling", "ErrImageNeverPull", "ErrImagePull",
     "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError",
-    "CreateContainerError", "FailedCreatePodSandBox", "FailedMount",
+    "CreateContainerError", "FailedCreatePodSandBox",
+    # NOTE: FailedMount is deliberately NOT fatal. Mount failures are retried
+    # by kubelet and are usually transient (e.g. 16 replicas mounting a
+    # ConfigMap created seconds earlier -> "failed to sync configmap cache:
+    # timed out"). Treating them as fatal aborted a healthy rollout
+    # (kvtest_rank_smoke 20261128-1023: all 16 pods 1/1 Running 1s after the
+    # false failure). A genuinely stuck mount leaves the pod in
+    # ContainerCreating and is caught by the timeout path with full evidence.
 }
 
 

@@ -451,6 +451,39 @@ def test_wait_k8s_deployment_ready_fails_fast_on_events_only(monkeypatch):
         assert "ErrImageNeverPull" in str(exc)
 
 
+def test_wait_k8s_deployment_ready_ignores_transient_failedmount(monkeypatch):
+    """事故回归（20261128-1023 kvtest_rank_smoke）：FailedMount 是 kubelet
+    会重试的瞬时警告——16 副本挂载几秒前刚创建的 ConfigMap 时报
+    "failed to sync configmap cache: timed out"，随后即恢复。部署未满员 +
+    事件流含 FailedMount 时不得快判失败；下一轮满员后应正常返回。
+    （当时误报 1 秒后 16/16 全部 Running。）"""
+    c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
+         "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
+                 "controller_workspace": "/cw", "pod_workspace": "/pw"}}
+    polls = {"n": 0}
+
+    def fake(controller, args, check=True, timeout=None):
+        a = " ".join(str(x) for x in args)
+        if "availableReplicas" in a:
+            polls["n"] += 1
+            return ("14" if polls["n"] == 1 else "16"), 0
+        if "spec.replicas" in a:
+            return "16", 0
+        if a.startswith("-n mc-test get pods"):
+            return "mc-p0 Running \\nmc-p1 ContainerCreating \\n", 0
+        if "get events" in a:
+            return ("4s Warning FailedMount pod/mc-p0 MountVolume.SetUp failed"
+                    " for volume scripts: failed to sync configmap cache:"
+                    " timed out waiting for the condition\\n"
+                    "4s Normal Started pod/mc-p0 Started container benchmark\\n"), 0
+        return "", 0
+
+    monkeypatch.setattr(bm, "controller_run", fake)
+    monkeypatch.setattr(bm, "_k8s_deployment_diag", lambda *a, **k: None)
+    bm.wait_k8s_deployment_ready(c, "d", "run1", timeout=30, poll=0)
+    assert polls["n"] >= 2, "must survive the FailedMount poll and re-poll"
+
+
 def test_wait_k8s_deployment_ready_timeout_dumps_evidence(monkeypatch):
     c = {"_controller": {"ip": "127.0.0.1", "_ctx": ""},
          "k8s": {"namespace": "mc-test", "image": "i", "template": "t",
