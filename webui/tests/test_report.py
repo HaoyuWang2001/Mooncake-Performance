@@ -4621,6 +4621,91 @@ def test_c18v13_urma_three_level_controls(tmp_path):
     assert r3["urma_stats_after_top"] == 3
 
 
+def test_c18v14_monitor_chart_frame_and_sliders(tmp_path):
+    """C22/C18.V14 [新增]：监控三图走统一图表模板——图例左右边界与 grid
+    一致（不越过 y 轴）、顶部留白不被截断；x/y 各有 inside + slider 缩放
+    控件；tooltip 时间为人类可读（相对时间 + 墙钟）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    mons = {
+        "time_relative": True, "time_origin": 1000.0, "time_span": 120.0,
+        "config": {"mem": {"proc_pattern": "mooncake_kvtest"}},
+        "mem_host": [{"node": "n1", "t": [5.0, 10.0],
+                      "columns": ["n0_used_mb"],
+                      "series": {"n0_used_mb": [10.0, 20.0]}}],
+        "mem_proc": [{"node": "n1", "pid": 11, "comm": "mooncake_kvtest",
+                      "t": [30.0, 40.0], "rss_mb": [5.0, 6.0],
+                      "pss_mb": [4.0, 5.0], "rss_growth_mb": 1.0,
+                      "rss_growth_pct": 20.0, "leak_suspect": False}],
+        "urma": [{"node": "n1", "ubpu": 0, "port": 1, "t": [7.0, 15.0],
+                  "rx": [1.0, 2.0], "tx": [0.5, 1.0],
+                  "rx_avg": 1.5, "rx_max": 2.0,
+                  "tx_avg": 0.75, "tx_max": 1.0,
+                  "rx_avg_formal": 1.5, "tx_avg_formal": 0.75}],
+        "summary": {},
+    }
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, monitors=mons)
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    for cid in ("memchart", "procchart", "urmachart"):
+        f = res["mon_frame"][cid]
+        assert f is not None, cid
+        assert f["legend_left"] == f["grid_left"], (cid, f)
+        assert f["legend_right"] == f["grid_right"], (cid, f)
+        assert f["grid_top"] >= 48, (cid, f)
+        kinds = [(z["axis"], z["type"]) for z in f["zoom"]]
+        assert ("x", "inside") in kinds and ("x", "slider") in kinds, kinds
+        assert ("y", "inside") in kinds and ("y", "slider") in kinds, kinds
+        assert f["x_label"] and f["x_label"].startswith("T+"), f
+        assert f["tip"] and "T+" in f["tip"], f
+        assert re.search(r"\d{2}:\d{2}:\d{2}", f["tip"]), f
+
+
+def test_c18v14_proc_default_prefix_and_no_empty_hint(tmp_path):
+    """C18.V14：进程图默认只勾选 mem.proc_pattern 前缀（comm 截断 15 字符），
+    其余进程留在树中；未勾选时不再显示「未勾选进程：…」。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    base = {"node": "n1", "t": [1000, 1001], "rss_mb": [1.0, 2.0],
+            "pss_mb": [1.0, 2.0], "rss_growth_mb": 1.0,
+            "rss_growth_pct": 100.0, "leak_suspect": False}
+    mons = {
+        "config": {"mem": {"proc_pattern": "mooncake_benchmark_client"}},
+        "mem_proc": [dict(base, pid=1, comm="mooncake_benchma"),
+                     dict(base, pid=2, comm="bash"),
+                     dict(base, pid=3, comm="pgrep")],
+        "summary": {},
+    }
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, monitors=mons)
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    assert res["proc_names"] == ["mooncake_benchma 1 @n1"], res["proc_names"]
+    # 进程树仍保留全部进程（可手动勾选）
+    assert "row:bash 2" in res["proc_tree"], res["proc_tree"]
+    # 空选不显示文案
+    res2 = _js_check(tmp_path, data, "--mon-mini", "procTree::n1::清空")
+    if res2 is None:
+        return
+    assert "未勾选进程" not in (res2.get("proc_empty_text_after_mini") or "")
+
+
+def test_c18v14_growth_below_chart_with_title(tmp_path):
+    """C18.V14：RSS 增长 TOP-10 位于进程图下方并带标题；进程节点行不再
+    单独染节点色/加粗（与标准树控件一致）。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    html, _dj = rp.render_scenario(data, str(tmp_path / "report"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    ic, ig, g = (src.index('id="procchart"'), src.index('id="growthTitle"'),
+                 src.index('id="growth"'))
+    assert ic < ig < g
+    assert "RSS 增长 TOP-10" in src
+    assert "color:monNodeHue(n),weight:'600'" not in src
+
+
 def test_c18v13_monitor_charts_shared_time_origin(tmp_path):
     """C18.V13 [新增]：三张监控图共用 [0, time_span] 任务窗口——即使某图
     首个采样晚于任务开始（如进程延迟拉起），x 轴仍从 T+0 起算并与其它图

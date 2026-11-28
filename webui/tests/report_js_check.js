@@ -643,8 +643,45 @@ if (!errs.length) {
     const x = (o && o.xAxis) || {};
     out.mon_xaxis[id] = {min: x.min, max: x.max};
   });
+  /* 统一图表模板（C22）：legend 边界/顶部留白、x/y 原生缩放滑块、
+     tooltip 时间人类可读 */
+  out.mon_frame = {};
+  ["memchart", "procchart", "urmachart"].forEach(function(id) {
+    const a = charts[id] || [];
+    const o = a.length ? a[a.length - 1] : null;
+    if (!o) { out.mon_frame[id] = null; return; }
+    const lg = o.legend || {}, gd = o.grid || {};
+    const dz = (o.dataZoom || []).map(function(d) {
+      return {type: d.type,
+              axis: (d.xAxisIndex != null ? "x" : "y")};
+    });
+    let xlabel = null, tip = null;
+    try {
+      if (o.xAxis && o.xAxis.axisLabel &&
+          typeof o.xAxis.axisLabel.formatter === "function") {
+        xlabel = String(o.xAxis.axisLabel.formatter(65000));
+      }
+      if (o.tooltip && typeof o.tooltip.formatter === "function") {
+        tip = String(o.tooltip.formatter([{
+          axisValue: 65000, marker: "●", seriesName: "s1",
+          data: [65000, 1.5], value: 1.5
+        }]));
+      }
+    } catch (e) {
+      errs.push("mon frame " + id + ": " + String(e && e.stack || e));
+    }
+    out.mon_frame[id] = {
+      legend_left: lg.left, legend_right: lg.right, legend_top: lg.top,
+      grid_left: gd.left, grid_right: gd.right, grid_top: gd.top,
+      zoom: dz, x_label: xlabel, tip: tip
+    };
+  });
+  out.proc_names = (out.proc_series || []).map(function(s){return s.name;});
+  out.growth_title_display = getEl("growthTitle")
+    ? String(getEl("growthTitle").style.display || "") : null;
   out.mem_empty = getEl("memEmpty") ? String(getEl("memEmpty").style.display || "") : null;
   out.proc_empty = getEl("procEmpty") ? String(getEl("procEmpty").style.display || "") : null;
+  out.proc_empty_text = getEl("procEmpty") ? String(getEl("procEmpty").textContent || "") : null;
   out.urma_empty = getEl("urmaEmpty") ? String(getEl("urmaEmpty").style.display || "") : null;
   out.mem_title_display = getEl("memHostTitle") ? String(getEl("memHostTitle").style.display || "") : null;
   out.urma_title_display = getEl("urmaTitle") ? String(getEl("urmaTitle").style.display || "") : null;
@@ -821,6 +858,8 @@ if (!errs.length) {
                              urma: monSeries("urmachart")};
       out.mon_counts_after_mini = {mem: monCounts("memTree"),
         proc: monCounts("procTree"), urma: monCounts("urmaTree")};
+      out.proc_empty_text_after_mini = getEl("procEmpty")
+        ? String(getEl("procEmpty").textContent || "") : null;
     } catch (e) {
       errs.push("mon mini: " + String(e && e.stack || e));
     }

@@ -181,6 +181,12 @@ report.py（本组件：reduce + render，纯标准库）
 - **R-MON-3** `[已固化]` URMA 计数器差分遇负增量（计数器回绕/复位归零）时标记 resync 并跳过紧随的一拍，不产生假尖峰。
 - **R-MON-4** `[已固化·v0.5 修订·DR-23·DR-49]` 无 profiling 产物时整卡隐藏；部分缺失（如仅有 mem 无 urma）时只显示有数据的图，卡片标题与图注同步去掉对应分句，不留下空图占位或对不存在内容的说明；此时若有失败原因（如 URMA slot 探测失败），以原因注记形式展示，不静默。
 - **R-MON-5** `[已固化·DR-49]` **监控时间基准与 URMA slot 探测**：kvtest 采样器启动时注入编排器时钟基准 `EPOCH_BASE`，采样时间戳 = `EPOCH_BASE + 节点时钟流逝`（编排器时钟域，与 kvtest stats 的 `/start` 时间窗同域，不受节点/编排机时钟偏差影响）；python 引擎保持节点绝对时间（其 stats 为节点钟域）。若时间窗与采样仍无交叠（旧产物/异常时钟），reduce 回退全量采样并注记「疑似时钟偏差」，绝不因裁空丢图。URMA `slot` 以 `mdcli` 报错中的 `available slot id` 为准（配置值仅作首选提示），自动切换并记录 probe 日志。
+- **R-MON-6** `[已固化·DR-68]` 进程 RSS：**RSS 增长 TOP-10 正负条位于进程图下方**并带标题「RSS 增长 TOP-10」；进程节点行仅分组、**无 checkbox**（节点级求和/平均语义有歧义），视觉与标准 `.tree-row` 一致（不单独染节点色/加粗），保留节点内「全选/清空」mini；首次进入**默认只勾选** `mem.proc_pattern` 前缀进程（内核 `comm` 截断 15 字符），配置缺失回退 `mooncake_kvtest`、一个未命中回退全选；其余进程仍在树中可手动勾选；未勾选时**不显示「未勾选进程：…」文案**（空图即可）。
+- **R-MON-7** `[已固化·DR-68]` URMA 采样默认 1s 一次（`urma.interval_s` 可配）；速率点时间**量化到采样周期**（相对任务开始 t0 的桶）并对同桶样本取平均，使各节点共享同一组 x 值——hover 竖线可同时命中所有序列，不再“一条竖线只对应一个节点”。
+- **R-CHART-1** `[已固化·DR-68]` **统一图表框架**：新增/改造任何图必须走 `lfChartFrame` 模板（图 / 图例 / x 轴控件 / y 轴控件唯一入口），禁止再单独拼 legend/axis/dataZoom。
+- **R-CHART-2** `[已固化·DR-68]` **图距与图例边界**：图与上方控件的垂直间距统一（`#memchart/#procchart/#urmachart` 统一 `margin-top`），图例顶部留白由 `grid.top` 保证、不被容器上沿截断；图例左右边界 = `grid.left`/`grid.right`，宽度不越过 y 轴标签区。
+- **R-CHART-3** `[已固化·DR-68]` **tooltip 时间为人类可读**：监控图显示 `T+mm:ss` 相对时间 + 墙钟 `YYYY-MM-DD HH:MM:SS`；任何图不得输出 epoch 浮点数时间戳。
+- **R-CHART-4** `[已固化·DR-68]` **缩放控件**：x 轴底部原生 `slider` + `inside`（滚轮缩放/拖拽平移）；y 轴右侧原生竖向 `slider` + `inside`（上下平移）；一律使用 ECharts 原生组件，不新增自绘缩放轨。
 
 ### K. run 总览（OV）
 
@@ -320,6 +326,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-62 | 2026-11-28 | **慢点捕捉「节点与实例」控件 UI 与报告其他位置统一（用户需求）**：外层改为 `.objtree-strip`（JS 内建 `.objtree-body`），内部复用标准对象树组件——`.tree-group`（角色/总计）、`.node-group-head`（标题 + 已选 N 项 + `button.mini` 全选节点/全选实例/全部清空）、`.tree-list` 的 `.tree-row`（`.tree-caret` 展开实例、`.tree-check`/`.tree-box` 勾选、节点行带该节点实例的全选/清空与「N 实例」note）；删除无 CSS 定义的自定义 `slow-chip-btn` 与 `.slow-ctl` 专属容器样式；独立选择/叠加语义/摘要条/图表逻辑不变 | 用户需求 |
 | DR-66 | 2026-11-28 | **trace 阶段树重构为 per-op JSON 单一事实源（用户需求；修复读/写路径解析的系统性错误）**：六根因——读树无传输段（classic `memread_*`/TENT 四相位缺失）、`batch_put` 误按 put 族并集解析（残差 = total）、树按 group 共享字段错并集、树定义 Python/JS 双份漂移（TREAD/TWRITE）、字段归一引入第三套名（`query_us`/`alloc_us`）、`read_us` 双分解未表达；重构为每 op 一份 `configs/_trace_trees/<op>.json`（13 棵，schema `mp-trace-tree/1`，`scripts/trace_trees.py` 唯一入口，目录缺失/校验失败硬失败）；字段名 = 日志原生名（legacy 方向翻转：旧 `get_breakdown` 行的 `query_us`/`alloc_us` 单向别名到 `query_total_us`/`buf_alloc_us`）；新增 views（`read_us` 的 classic/tent/A-B 并列分解，L2 子行带徽标）与 switch（put 族传输段按行内 engine 切 L1 形状，case 名作 view）；report 页面嵌 `TRACE_TREES`、删 TREAD/TWRITE，渲染 JS 零 op 知识；`batch_put`/`batch_put_into`/`batch_upsert_from` 薄行 = prep/write 两段；`get` 非独立树（legacy_ops 归一到 get_buffer）；未知 op 归「其它」组并计 `meta.unknown_ops` | 用户需求 |
 | DR-67 | 2026-11-28 | **map/reduce 侧树下发补齐（E2E 事故 20261128-1331/1355）**：tracestats 在 pod 内、kvtest_partial_reduce 在 controller 上 `import trace_trees`（report.py → trace_trees），但两处远端脚本清单都未包含树 → pod 内 map 全挂（`no trace product`）→ 修后收集阶段又挂（partial reduce `ModuleNotFoundError`）→ 场景 FAIL。修复：benchmark 新增 `_trace_tree_payload`（`trace_trees.py` + `configs/_trace_trees/*.json` 随脚本**平铺**下发——configmap 键不允许子目录），三处下发点统一接入（k8s pod configmap / ssh `deploy_scripts` / controller partial reduce `_controller_reduce_stage`）；`trace_trees._resolve_tree_dir` 支持平铺布局（`scripts/` 本身，以 `_schema.json` 作标记，源仓库布局优先，两个候选都缺 → load 硬失败不静默）。单测无法覆盖此路径（源仓库本地 `configs/` 天然存在），E2E 逐处抓出 | E2E 事故 |
+| DR-68 | 2026-11-28 | **监控三图统一图表框架 + RSS/URMA 交互修正（用户需求）**：① 抽出 `lfChartFrame` 统一图表模板（后续任何图必须走它）：图与上方控件间距统一、图例左右边界=grid（不越过 y 轴）、`grid.top` 保证图例不被截断、tooltip 时间一律人类可读（`T+mm:ss` + 墙钟）、x 底部 slider+inside、y 右侧竖向 slider+inside（全部 ECharts 原生）；② 进程 RSS：RSS 增长 TOP-10 移到图下方并加标题；进程节点行去掉专属节点色/加粗（仍无 checkbox，节点级聚合语义有歧义）；默认只勾选 `mem.proc_pattern` 前缀（comm 截断 15 字符，缺省 `mooncake_kvtest`，无命中回退全选）；删除「未勾选进程：…」空态文案；③ URMA：速率点按 `urma.interval_s`（默认 1s）量化到相对 t0 的时间桶并同桶平均，修复纳秒时间戳抖动导致“每条竖线只命中一个节点”；compact payload 透传 `config` 供前端取默认进程前缀 | 用户需求 |
 
 ---
 

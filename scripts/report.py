@@ -1886,8 +1886,38 @@ def _parse_mem_proc(path, node, leak_pct, leak_mb, t0=None, t1=None,
     return out
 
 
+def _bucket_time(at, base, interval):
+    """Quantize an absolute timestamp onto a sampler-aligned grid.
+
+    URMA samples carry nanosecond timestamps, so different nodes' samples
+    land on different x values (tens of ms apart) and a hover vertical line
+    only hits one series. Collapsing each sample onto its sampling bucket
+    (relative to the task start) makes every node share the same x values.
+    """
+    if not interval or interval <= 0:
+        return at
+    b = base if base is not None else 0.0
+    return round(b + math.floor((at - b) / interval) * interval, 3)
+
+
+def _collapse_buckets(t, rxr, txr):
+    """Average duplicate bucket timestamps produced after quantization."""
+    if len(set(t)) == len(t):
+        return t, rxr, txr
+    agg = {}
+    for i, at in enumerate(t):
+        a = agg.setdefault(at, [0.0, 0.0, 0])
+        a[0] += rxr[i]
+        a[1] += txr[i]
+        a[2] += 1
+    out_t = sorted(agg)
+    out_rx = [round(agg[k][0] / agg[k][2], 4) for k in out_t]
+    out_tx = [round(agg[k][1] / agg[k][2], 4) for k in out_t]
+    return out_t, out_rx, out_tx
+
+
 def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None,
-                avg_from=None):
+                avg_from=None, bucket=1.0):
     rows = _read_csv_rows(path)
     if len(rows) < 2:
         return []
@@ -1952,13 +1982,16 @@ def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None,
                     dsec = dt_ns / 1e9
                     if ((clip_t0 is None or at >= clip_t0)
                             and (clip_t1 is None or at <= clip_t1)):
-                        t.append(at)
+                        # 纳秒采样时刻量化到采样周期，使各节点共享同一组
+                        # x 值（否则 hover 竖线只能命中一条序列）。
+                        t.append(_bucket_time(at, clip_t0, bucket))
                         rxr.append(round(drx * flit_bytes / dsec / gib, 4))
                         txr.append(round(dtx * flit_bytes / dsec / gib, 4))
                 resync = (drx < 0 or dtx < 0)
             prev = (ts, rx, tx)
         if not t:
             continue
+        t, rxr, txr = _collapse_buckets(t, rxr, txr)
 
         def _avg(vals, since):
             sel = [v for i, v in enumerate(vals)
@@ -2032,8 +2065,10 @@ def reduce_monitors(local_log_dir, t0=None, t1=None, warmup_cutoff=None):
             mem_cfg = rcfg.get("mem") or cfg.get("mem") or {}
             leak_pct = float(mem_cfg.get("leak_growth_pct") or _MON_LEAK_PCT)
             leak_mb = float(mem_cfg.get("leak_min_mb") or _MON_LEAK_MB)
-            flit_bytes = int((rcfg.get("urma") or cfg.get("urma") or {})
-                             .get("bytes_per_flit") or _MON_FLIT_BYTES)
+            urma_cfg = rcfg.get("urma") or cfg.get("urma") or {}
+            flit_bytes = int(urma_cfg.get("bytes_per_flit") or
+                             _MON_FLIT_BYTES)
+            urma_bucket = float(urma_cfg.get("interval_s") or 1)
             if MEM_HOST in fset and disp not in seen_host:
                 seen_host.add(disp)
                 h = _parse_mem_host(os.path.join(root, MEM_HOST), disp,
@@ -2057,7 +2092,8 @@ def reduce_monitors(local_log_dir, t0=None, t1=None, warmup_cutoff=None):
                 got = _parse_urma(
                     os.path.join(root, URMA_FLITS), disp, flit_bytes,
                     t0=t0, t1=t1, flags=flags,
-                    avg_from=warmup_cutoff if warmup_cutoff is not None else t0)
+                    avg_from=warmup_cutoff if warmup_cutoff is not None else t0,
+                    bucket=urma_bucket)
                 urma_samples = int(flags.pop("urma_samples", 0) or 0)
                 if got:
                     urma.extend(got)
@@ -2170,6 +2206,7 @@ def compact_monitors(mons):
         return {}
     out = {"summary": mons.get("summary") or {},
            "notes": mons.get("notes") or [],
+           "config": mons.get("config") or {},
            "mem_host": [], "mem_proc": [], "urma": []}
     if mons.get("time_relative"):
         out["time_relative"] = True
@@ -2321,6 +2358,9 @@ font-size:13px;min-width:0}
 white-space:nowrap;font-family:'Cascadia Code',Consolas,monospace;
 font-variant-numeric:tabular-nums}
 .chart{width:100%;height:420px}.chart.sm{height:250px}
+/* 监控三图与上方树控件保持统一间距；图例顶部留白由 lfChartFrame 的
+   grid.top 保证，绝不被容器上沿截断（C22） */
+#memchart,#procchart,#urmachart{margin-top:8px}
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{border-bottom:1px solid var(--grid);padding:6px 10px;text-align:left;
 white-space:nowrap}
@@ -2443,8 +2483,8 @@ overflow:hidden;background:var(--track)}
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46%}
 .pstat-total{font-weight:700;font-variant-numeric:tabular-nums;
 white-space:nowrap}
-/* RSS 增幅正负条（G10 diverging） */
-.grow{display:flex;flex-direction:column;gap:4px;margin:14px 0 2px}
+/* RSS 增幅正负条（G10 diverging）—— 置于进程图下方，标题「RSS 增长 TOP-10」 */
+.grow{display:flex;flex-direction:column;gap:4px;margin:6px 0 2px}
 .grow-row{display:flex;align-items:center;gap:10px}
 .grow-name{flex:0 0 190px;font-size:12px;overflow:hidden;
 text-overflow:ellipsis;white-space:nowrap;color:var(--mut)}
@@ -2851,6 +2891,61 @@ function axisCommon(){
     grid:{left:46,right:20,top:30,bottom:50},
     xAxis:lfAxisTime(null,'main'),
     dataZoom:zoomModel('main')};
+}
+/* ---- 统一图表模板（C22）----
+   后续新增任何图都必须走 lfChartFrame，禁止再单独拼 legend/axis/zoom：
+     · 图例左右边界 = grid 左右边界，宽度不越过 y 轴标签区，顶部留白
+       由 grid.top 保证，任何图例都不会被容器上沿截断；
+     · x 轴：底部原生 slider + inside 滚轮缩放/拖拽平移；
+     · y 轴：右侧原生竖向 slider + inside 拖拽平移；
+     · tooltip 时间统一由调用方经 lfTooltipTime 输出人类可读文本。
+   监控三图（mem/proc/urma）是该模板的首批使用者。 */
+const LF_FRAME={left:72,right:64,top:56,bottom:64};
+function lfChartFrame(cfg){
+  cfg=cfg||{};
+  const grid=Object.assign({},LF_FRAME,cfg.grid||{});
+  const legend=Object.assign({show:true,type:'scroll',top:4,
+    left:grid.left,right:grid.right,icon:'roundRect',
+    itemWidth:14,itemHeight:3,itemGap:14,selectedMode:false,
+    textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}},
+    cfg.legend||{});
+  const zoomCfg={filterMode:'none'};
+  return {
+    animation:false,
+    textStyle:{fontFamily:LFFONT,color:C.fg,fontSize:12},
+    grid:grid,
+    legend:legend,
+    tooltip:cfg.tooltip||lfTooltip(),
+    dataZoom:[
+      {type:'inside',xAxisIndex:[0],zoomOnMouseWheel:true,
+       moveOnMouseWheel:false,moveOnMouseMove:true,
+       filterMode:zoomCfg.filterMode},
+      {type:'slider',xAxisIndex:[0],height:16,bottom:10,
+       borderColor:'transparent',fillerColor:C.quiet,
+       dataBackground:{lineStyle:{color:C.faint},
+                       areaStyle:{color:C.quiet}},
+       handleStyle:{color:C.fg},textStyle:{color:C.mut,fontSize:12},
+       filterMode:zoomCfg.filterMode},
+      {type:'inside',yAxisIndex:[0],zoomOnMouseWheel:false,
+       moveOnMouseWheel:false,moveOnMouseMove:true,
+       filterMode:zoomCfg.filterMode},
+      {type:'slider',yAxisIndex:[0],width:14,right:8,
+       borderColor:'transparent',fillerColor:C.quiet,
+       dataBackground:{lineStyle:{color:C.faint},
+                       areaStyle:{color:C.quiet}},
+       handleStyle:{color:C.fg},filterMode:zoomCfg.filterMode}
+    ]};
+}
+/* tooltip 时间行：相对时间（T+mm:ss）+ 墙钟；绝不输出 epoch 浮点数 */
+function lfTooltipTime(ms,rel,origin){
+  const t=Number(ms);
+  if(!isFinite(t)) return '';
+  let html='<div style="font-weight:600;margin-bottom:4px">'
+    +(rel?_monRel(t):fullts(t/1000))+'</div>';
+  if(rel&&origin!=null)
+    html+='<div style="opacity:.65;font-size:12px;margin-bottom:4px">'
+      +fullts(Number(origin)+t/1000)+'</div>';
+  return html;
 }
 /* ---- 缩放 / 平移模型 --------------------------------------------------
    滚轮 = 只缩时间轴（时延轴不动）；左右拖 = 平移时间轴；上下拖 = 平移时延轴
@@ -5176,36 +5271,23 @@ function _monChart(id, series, yname, domain){
   if(!series.length){ c.setOption({series:[]},true); return false; }
   bindHoverGuards(c);
   const M=D.monitors||{}; const rel=!!M.time_relative;
-  const o=axisCommon();
-  o.grid={left:104,right:104,top:34,bottom:42};
-  o.yAxis=[lfAxisValue({name:yname,scale:true,nameLocation:'end',nameGap:14})];
-  o.dataZoom=zoomModel('xonly');
-  if(rel){
-    /* 监控序列统一为「任务开始 = 0」的相对秒：刻度 T+mm:ss，
-       tooltip 同时给出相对时间与墙钟（origin + t_rel）。 */
-    o.tooltip=lfTooltip({formatter:function(ps){
+  /* 统一图表模板：图例不越过 y 轴、x/y 原生缩放滑块、时间 tooltip 人类可读 */
+  const o=lfChartFrame({
+    grid:{left:88,right:64,top:56,bottom:64},
+    tooltip:lfTooltip({formatter:function(ps){
       if(!ps||!ps.length) return '';
       const p0=ps[0];
       const ms=(p0.axisValue!=null)?Number(p0.axisValue)
         :(p0.data?Number(p0.data[0]):0);
-      let html='<div style="font-weight:600;margin-bottom:4px">'
-        +_monRel(ms)+'</div>';
-      if(M.time_origin!=null)
-        html+='<div style="opacity:.65;font-size:12px;margin-bottom:4px">'
-          +fullts(Number(M.time_origin)+ms/1000)+'</div>';
+      let html=lfTooltipTime(ms,rel,M.time_origin);
       ps.forEach(function(p){
         const v=(p.data&&p.data.length>1)?p.data[1]:p.value;
         html+='<div>'+p.marker+String(p.seriesName)+'  <b>'
           +(v==null?'—':v)+'</b> '+yname+'</div>';
       });
       return html;
-    }});
-  }
-  /* 图例只说明颜色（同主图 C5.V4：selectedMode:false 不可点）——
-     曲线显隐只由各树勾选控制 */
-  o.legend={show:true,top:0,type:'scroll',icon:'roundRect',itemWidth:14,
-    itemHeight:3,itemGap:14,selectedMode:false,
-    textStyle:{color:C.mut,fontSize:12,fontFamily:LFFONT}};
+    }})});
+  o.yAxis=[lfAxisValue({name:yname,scale:true,nameLocation:'end',nameGap:14})];
   // x 轴显式范围（value 轴默认从 0 开始会把数据挤到最右端）
   let t0=null,t1=null;
   series.forEach(function(sr){
@@ -5214,15 +5296,16 @@ function _monChart(id, series, yname, domain){
       if(t0===null||t<t0)t0=t;
       if(t1===null||t>t1)t1=t;});
   });
+  const frameRight=88;
   if(domain&&domain.max>0){
     /* 共用任务窗口：即使某张图的首个采样晚于任务开始，x 轴也从 0 起算，
        三张监控图起点/终点严格对齐。 */
     const hi=Math.max(domain.max,(t1!==null?t1:0));
-    const ext=xExtent(0,hi,plotWidthOf(c,{left:104,right:104}));
+    const ext=xExtent(0,hi,plotWidthOf(c,{left:88,right:frameRight}));
     o.xAxis=lfAxisTime(ext,id);
     if(rel) o.xAxis.axisLabel.formatter=function(v){return _monRel(v);};
   }else if(t0!==null){
-    const ext=xExtent(t0,t1,plotWidthOf(c,{left:104,right:104}));
+    const ext=xExtent(t0,t1,plotWidthOf(c,{left:88,right:frameRight}));
     o.xAxis=lfAxisTime(ext,id);
     if(rel) o.xAxis.axisLabel.formatter=function(v){return _monRel(v);};
   }
@@ -5244,6 +5327,14 @@ let monUrmaOpen={};              /* URMA 节点/DIE 展开状态 */
 function monResetSel(){
   monMemSel=null; monProcSel=null; monUrmaSel=null;
   monMemUsed=true; monMemShowAvail=false;
+}
+/* 进程图默认勾选前缀：优先 monitor.config 的 mem.proc_pattern（取前 15
+   字符，与内核 comm 截断一致），缺省回退 mooncake_kvtest。 */
+function _procDefaultPrefix(){
+  const cfg=(D.monitors&&D.monitors.config)||{};
+  const pat=cfg.mem&&cfg.mem.proc_pattern;
+  const p=(pat==null?'':String(pat)).replace(/^\s+|\s+$/g,'');
+  return (p||'mooncake_kvtest').slice(0,15);
 }
 function _monNodes(list){        /* 数据里出现的节点名（排序稳定） */
   const set={};
@@ -5389,7 +5480,13 @@ function renderMonitors(){
   }
   if(monProcSel===null&&hasProc){
     monProcSel={};
-    (M.mem_proc||[]).forEach(function(p){
+    /* 默认只勾选目标进程前缀（内核 comm 截断 15 字符）；配置缺失回退
+       mooncake_kvtest；一个都没命中则回退全选，避免空图。 */
+    const procs=M.mem_proc||[];
+    const prefix=_procDefaultPrefix();
+    const matched=procs.filter(function(p){
+      return String(p.comm||'').indexOf(prefix)===0;});
+    (matched.length?matched:procs).forEach(function(p){
       monProcSel[p.node+'/'+p.pid]=true;});
   }
   if(monUrmaSel===null&&hasUrma){
@@ -5484,7 +5581,7 @@ function renderProcTree(box){
     caret.onclick=function(){monMemOpen['p:'+n]=!monMemOpen['p:'+n];
       renderProcTree(box);};
     return {key:'pn:'+n,label:n,check:false,cls:'mon-node-head',
-      color:monNodeHue(n),weight:'600',caret:caret,
+      caret:caret,
       note:kids.length+' 进程',open:open,
       minis:kidKeys.length?[
         actBtn('全选','选中该节点的全部进程',
@@ -5610,6 +5707,8 @@ function renderUrmaStats(){
 /* ---- 三图组装（按勾选过滤；配色=节点色系/同系色阶） ---- */
 function _monEmpty(id,msg){
   const e=document.getElementById(id); if(!e) return;
+  /* 空文案为空 = 不打扰（如进程图未勾选时不再显示「未勾选进程：…」） */
+  if(!msg){ e.textContent=''; e.style.display='none'; return; }
   e.textContent=msg;
   e.style.display='';
 }
@@ -5682,7 +5781,7 @@ function monRenderCharts(){
     });
     safe('proc-chart',function(){
       if(!_monChart('procchart',ps,'RSS MB',mdomain))
-        _monEmpty('procEmpty','未勾选进程：在上方树中勾选后查看。');});
+        _monEmpty('procEmpty','');});
   }
   /* URMA：节点/DIE/端口三级勾选 → 每选中对象一条 RX 实线 + TX 虚线；
      节点 = 该节点全部端口求和，DIE = 该 DIE 端口求和，端口 = 单端口。 */
@@ -5739,9 +5838,15 @@ function monRenderCharts(){
 function round1(x){ return (x==null||isNaN(x))?null:Math.round(x*10)/10; }
 function renderGrowth(rows){
   const box=document.getElementById('growth'); if(!box) return;
+  const title=document.getElementById('growthTitle');
   box.innerHTML='';
-  if(!rows.length){box.style.display='none';return;}
+  if(!rows.length){
+    box.style.display='none';
+    if(title){title.style.display='none';}
+    return;
+  }
   box.style.display='';
+  if(title){title.style.display='';}
   const max=Math.max.apply(null, rows.map(function(r){
     return Math.abs(r.growth_mb||0);}).concat([1]));
   rows.slice(0,10).forEach(function(r){
@@ -7834,12 +7939,13 @@ _MONITOR_CARD = """
 <div id="memchart" class="chart" role="img" aria-label="节点宿主内存图"></div>
 <div id="memEmpty" class="empty-tip" style="display:none"></div>
 <h3 class="sec" id="procTitle">进程 RSS</h3>
-<div id="growth" class="grow" style="display:none"></div>
 <div class="objtree-strip mon-strip">
 <div class="objtree-body" id="procTree"></div>
 </div>
 <div id="procchart" class="chart" role="img" aria-label="进程 RSS 内存图"></div>
 <div id="procEmpty" class="empty-tip" style="display:none"></div>
+<h3 class="sec" id="growthTitle" style="display:none">RSS 增长 TOP-10</h3>
+<div id="growth" class="grow" style="display:none"></div>
 <h3 class="sec" id="urmaTitle">URMA 端口流量监控</h3>
 <div class="objtree-strip mon-strip">
 <div class="objtree-body" id="urmaTree"></div>

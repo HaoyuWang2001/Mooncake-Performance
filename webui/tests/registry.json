@@ -7355,6 +7355,30 @@
     "test_stage_tree_view_badges"
    ],
    "e2e": []
+  },
+  {
+   "id": "C18.V14",
+   "module": "report",
+   "desc": "**监控三图统一图表框架 + RSS/URMA 交互**：三图走 lfChartFrame（图例左右=grid、顶部留白不被截断、tooltip 时间为 T+mm:ss+墙钟、x 底部 slider+inside、y 右侧竖向 slider+inside）；RSS 增长 TOP-10 移至图下方并带标题；进程节点行仅分组无 checkbox 且不单独染节点色/加粗，默认只勾 mem.proc_pattern 前缀（comm 15 字符，缺省 mooncake_kvtest，无命中回退全选），未勾选不显示文案；URMA 采样时刻按 interval_s（默认 1s）量化到相对 t0 的桶并同桶平均，各节点共享 x 值",
+   "req": "R-CHART-1",
+   "unit": [
+    "test_c18v14_monitor_chart_frame_and_sliders",
+    "test_c18v14_proc_default_prefix_and_no_empty_hint",
+    "test_c18v14_growth_below_chart_with_title",
+    "test_reduce_monitors_urma_bucket_aligns_nodes",
+    "test_compact_monitors_keeps_config_for_proc_prefix"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C22.V1",
+   "module": "report",
+   "desc": "**统一图表框架 lfChartFrame**：新增/改造任何图必须走该入口（图例/坐标轴/缩放控件唯一来源）；图距统一、图例边界=grid 不越过 y 轴、tooltip 时间人类可读、x 底部 slider+inside、y 右侧 slider+inside，禁止自绘缩放轨",
+   "req": "R-CHART-2",
+   "unit": [
+    "test_c18v14_monitor_chart_frame_and_sliders"
+   ],
+   "e2e": []
   }
  ]
 }

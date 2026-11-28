@@ -400,14 +400,51 @@ def test_reduce_monitors_urma_relative_and_formal_avg(tmp_path):
     mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"),
                              t0=1000.5, t1=1004.0, warmup_cutoff=1002.5)
     u = mon["urma"][0]
-    # 窗口前一条样本 (1000) 参与差分 → 1001 的首点被保留
-    assert u["t"] == [0.5, 1.5, 2.5, 3.5], u["t"]
+    # 窗口前一条样本 (1000) 参与差分 → 1001 的首点被保留；采样时刻量化到
+    # 1s 桶（相对 t0），各节点共享同一组 x 值。
+    assert u["t"] == [0.0, 1.0, 2.0, 3.0], u["t"]
     assert u["rx"] == [1.0, 2.0, 3.0, 4.0], u["rx"]
     assert u["rx_avg"] == 2.5
     # formal 窗口从 warmup 结束 (1002.5) 起 → 只剩 rate 3、4
     assert u["rx_avg_formal"] == 3.5, u["rx_avg_formal"]
     assert u["tx_avg_formal"] == 1.75, u["tx_avg_formal"]
     assert mon["time_span"] == 3.5, mon["time_span"]
+
+
+def test_reduce_monitors_urma_bucket_aligns_nodes(tmp_path):
+    """URMA 纳秒采样抖动量化到采样周期：两个节点的 x 值完全一致，
+    hover 竖线可同时命中所有序列。"""
+    logs = tmp_path / "logs" / "cfg"
+    F = 53687091
+    for node, jitter_ms in (("n1", 30), ("n2", 780)):
+        root = logs / "profiling" / node
+        root.mkdir(parents=True)
+        (root / "monitor.config.json").write_text(
+            json.dumps({"urma": {"bytes_per_flit": 20, "interval_s": 1}}),
+            encoding="utf-8")
+        rows = ["ts_ns,ubpu,port,rx_flits,tx_flits"]
+        acc = 0
+        for i in range(0, 4):
+            ts = (1000000000 + i) * 1000000000 + jitter_ms * 1000000
+            acc += F
+            rows.append("{},0,1,{},{}".format(ts, acc, acc))
+        (root / "urma.flits.csv").write_text("\n".join(rows) + "\n",
+                                             encoding="utf-8")
+    mon = rp.reduce_monitors(str(logs), t0=1000000000.0, t1=1000000004.0)
+    ts = {u["node"]: u["t"] for u in mon["urma"]}
+    assert ts["n1"] == ts["n2"] == [1.0, 2.0, 3.0], ts
+
+
+def test_compact_monitors_keeps_config_for_proc_prefix(tmp_path):
+    """compact payload 透传 config，前端才能按 mem.proc_pattern 选默认进程。"""
+    mon = {"config": {"mem": {"proc_pattern": "mooncake_kvtest"}},
+           "mem_proc": [{"node": "n1", "pid": 1, "comm": "mooncake_kvtest",
+                         "t": [1000, 1001], "rss_mb": [1.0, 2.0],
+                         "pss_mb": [1.0, 2.0], "rss_growth_mb": 1.0,
+                         "rss_growth_pct": 100.0, "leak_suspect": False}],
+           "summary": {}}
+    comp = rp.compact_monitors(mon)
+    assert comp["config"]["mem"]["proc_pattern"] == "mooncake_kvtest"
 
 
 def test_reduce_monitor_sites_reads_config_and_sizes(tmp_path):
