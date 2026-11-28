@@ -2416,8 +2416,8 @@ white-space:nowrap;font-size:13px}
 color:var(--faint);cursor:pointer;font-size:12px;padding:0}
 .tree-empty{color:var(--mut);font-size:12.5px;padding:6px 8px}
 button.mini{font-size:12px;padding:1px 8px;border-radius:99px;line-height:1.6}
-/* ---- 节点监控：树条收紧（只列节点/NUMA/进程，无需 300px） ---- */
-.mon-strip{max-height:160px}
+/* ---- 节点监控：树条高度（三棵控件同为 320px，便于展开 NUMA/进程） ---- */
+.mon-strip{max-height:320px}
 /* ---- 时延轴：左侧缩放滑块（倍率）+ 细刻度轨（窗口平移） ---- */
 .chart-frame{display:grid;grid-template-columns:16px 16px minmax(0,1fr);gap:8px;
 align-items:stretch}
