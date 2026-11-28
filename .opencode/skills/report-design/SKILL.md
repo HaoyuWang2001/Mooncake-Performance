@@ -428,8 +428,9 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C18.V4 无监控数据整卡隐藏（仅限完全没有 profiling 产物）
 - C18.V5 产物目录 = 节点 IP（k8s 宿主 IP / ssh 管理 IP；显示名冲突回退原名）
 - C18.V6 有产物无可用序列 → 占位卡列出原因（URMA 失败原文 / CSV 无数据行 / 时间窗无交叠），不静默消失
-- C18.V8 三树控件（复用 `.tree-row/.tree-check/button.mini` 既有组件）：**mem 树** = 节点行（勾选 = 该节点 used 求和实线）+ caret 展开分 NUMA 行（勾选 = 分列线）+「用量/可用量」指标开关（lat-sel-btns 同风格；用量默认开且不可关、可用量默认关 = 勾选节点时多一条同色虚线；available 仅节点级）；**proc 树** = 节点行纯分组头（无 checkbox，仅 caret 展开，默认展开、节点名着节点色）+ 进程行勾选（不再 slice(0,8) 截断）；**urma 树** = 仅节点行。三树均允许空选（不回填）→ 图区 empty-tip；toggle 按钮未全选显示「全选*」、全选变「清空*」；选择状态会话内保留，size 切换重置
+- C18.V8 三树控件（复用 `.tree-row/.tree-check/button.mini` 既有组件）：**mem 树** = 节点行（勾选 = 该节点 used 求和实线）+ caret 展开分 NUMA 行（勾选 = 分列线）+「用量/可用量」指标开关（lat-sel-btns 同风格；用量默认开且不可关、可用量默认关 = 勾选节点时多一条同色虚线；available 仅节点级）；**proc 树** = 节点行纯分组头（无 checkbox，仅 caret 展开，默认展开、节点名着节点色）+ 进程行勾选（不再 slice(0,8) 截断）；**urma 树** = 仅节点行。三树均允许空选（不回填）→ 图区 empty-tip；toggle 按钮未全选显示「全选*」、全选变「清空*」；选择状态会话内保留，size 切换重置。三树统一由 `renderMonTree` + `treeNodeGroup`/`treeRow` 渲染（与主图/慢点捕捉同一模板），禁止再写私有行/分组头
 - C18.V9 配色与图例：节点色 = `monNodeHue`（与主图 `nodeHue` 同一调色板按节点名排序固定分配，跨选择稳定）；NUMA/进程 = 同系色阶 `monShade`（同 instanceColor 算法）；图例 `type:'scroll'`、**`selectedMode:false` 固定不可点**（显隐只由树勾选控制，与主图「叠加只走对象树」同构）；URMA RX 实线 / TX 同系虚线；进程序列名 `comm pid @node`
+- C18.V11 监控摘要只保留「进程 RSS 增幅正负条」：已删除逐节点峰值内存 / `RSS 最大增幅` / `端口峰值带宽` 三处 KV 行；data.js summary 与 overview 摘要行不变（DR-63）
 - C18.D1 监控时间窗与主图对齐（reduce 按 t0/t1 切片）
 - C18.D2 URMA 计数器回绕/重置不产生尖峰
 - C18.D3 产物下采样有界（compact_monitors；notes 透传）
@@ -437,6 +438,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C18.D5 URMA slot 以 mdcli 报错的 available slot id 为准（配置仅提示），自动切换并记录 probe
 - C18.I1 图表 tooltip 同构（悬浮指针 / 点击开框）
 - C18.I2 树勾选即时重渲染对应图（monRenderCharts，不触发整页 renderAll）；主题切换重渲监控树（配色随 token 翻转，选择保留）
+- C18.I3 监控树渲染幂等：入口先清空容器；勾选/caret/主题/size 重渲染不追加重复树。旧 append-only 实现导致展开无法收起、勾选后 UI 重影（DR-63）
 - C18.B1 监控卡在页脚之后（曾被追加到 body 末尾）
 ### C19 overview.html（run 总览）
 

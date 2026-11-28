@@ -4377,10 +4377,7 @@ function renderSlowControls(){
   tb.onclick=function(){slowTotal=!slowTotal;renderSlowStrip();};
   g2t.appendChild(tb);
   box.appendChild(g2t);
-  function sbtn(label,title,fn){
-    const b=el('button','mini',label);
-    b.title=title; b.onclick=fn; return b;
-  }
+  const sbtn=actBtn;
   function slowKindAll(kind){
     const ks=slowAllKeys(kind);
     return ks.length>0&&ks.every(function(k){return slowSel.indexOf(k)>=0;});
@@ -4394,23 +4391,16 @@ function renderSlowControls(){
     renderSlowStrip();
   }
   function slowKindSet(kind,on){slowSetMany(slowAllKeys(kind),on);}
-  const g2=el('div','tree-group node-group');
-  const head=el('div','node-group-head');
-  head.appendChild(el('span','tree-group-title','节点与实例'));
-  head.appendChild(el('span','objtree-count','已选 '+slowSel.length+' 项'));
-  const acts=el('div','node-group-acts');
   const sndAll=slowKindAll('node'), sclAll=slowKindAll('client');
-  acts.appendChild(sbtn(sndAll?'清空节点':'全选节点',
-    sndAll?'取消全部节点慢点高亮':'高亮当前范围内全部节点的慢点',
-    function(){slowKindSet('node',!sndAll);}));
-  acts.appendChild(sbtn(sclAll?'清空实例':'全选实例',
-    sclAll?'取消全部实例慢点高亮':'高亮当前范围内全部实例的慢点',
-    function(){slowKindSet('client',!sclAll);}));
-  acts.appendChild(sbtn('全部清空','清空节点与实例高亮，并自动显示总计',
-    function(){slowSel=[];slowTotal=true;renderSlowStrip();}));
-  head.appendChild(acts);
-  g2.appendChild(head);
-  const list=el('div','tree-list');
+  const list=treeNodeGroup(box,'节点与实例',slowSel.length,[
+    sbtn(sndAll?'清空节点':'全选节点',
+      sndAll?'取消全部节点慢点高亮':'高亮当前范围内全部节点的慢点',
+      function(){slowKindSet('node',!sndAll);}),
+    sbtn(sclAll?'清空实例':'全选实例',
+      sclAll?'取消全部实例慢点高亮':'高亮当前范围内全部实例的慢点',
+      function(){slowKindSet('client',!sclAll);}),
+    sbtn('全部清空','清空节点与实例高亮，并自动显示总计',
+      function(){slowSel=[];slowTotal=true;renderSlowStrip();})]);
   const nodes={};
   (z.clients||[]).forEach(function(c){
     if(isPipeMode()&&c.role!==slowRole) return;
@@ -4448,8 +4438,6 @@ function renderSlowControls(){
   if(!Object.keys(nodes).length){
     list.appendChild(el('div','tree-empty','该角色没有可高亮的节点'));
   }
-  g2.appendChild(list);
-  box.appendChild(g2);
 }
 function renderSlowStrip(){
   const z=Z(); const card=document.getElementById('slowcard'); if(!card) return;
@@ -4804,6 +4792,12 @@ function miniBtn(label,keys,title,on){
   b.onclick=function(){setMany(keys,on);};
   return b;
 }
+/* 通用动作按钮（全选/清空等）：主图/慢点/监控共用 */
+function actBtn(label,title,fn){
+  const b=el('button','mini',label);
+  b.title=title; b.onclick=fn;
+  return b;
+}
 function treeGroupStrip(title,keys){
   const g=el('div','tree-group');
   g.appendChild(el('span','tree-group-title',title));
@@ -4813,22 +4807,51 @@ function treeGroupStrip(title,keys){
 }
 function treeRow(key,label,depth,opts){
   opts=opts||{};
-  /* opts.on / opts.onToggle：让对象树之外的选择器（如慢点捕捉）复用同一
-     行结构；缺省走主图全局 selObjs/toggleObj。 */
+  /* opts.on / opts.onToggle：让对象树之外的选择器（慢点捕捉/监控树）复用
+     同一行结构；缺省走主图全局 selObjs/toggleObj。opts.check=false 渲染
+     纯分组行（caret + 名称，无 checkbox，如进程树的节点头）。 */
   const on=(opts.on!=null)?!!opts.on:(selObjs.indexOf(key)>=0);
-  const row=el('div','tree-row'+(on?' on':''));
+  const row=el('div','tree-row'+(on?' on':'')+(opts.cls?' '+opts.cls:''));
   row.style.paddingLeft=(depth>1?36:0)+'px';
   if(opts.lead) row.appendChild(opts.lead);
-  const b=el('button','tree-check');
-  b.setAttribute('data-key',key);
-  b.appendChild(el('span','tree-box',on?'✓':''));
-  b.appendChild(el('span','tree-name',label));
-  b.title=opts.title||label;
-  b.onclick=function(){(opts.onToggle||toggleObj)(key);};
-  row.appendChild(b);
+  function nameEl(){
+    const nm=el('span','tree-name',label);
+    if(opts.nameColor) nm.style.color=opts.nameColor;
+    if(opts.nameWeight) nm.style.fontWeight=opts.nameWeight;
+    return nm;
+  }
+  if(opts.check!==false){
+    const b=el('button','tree-check');
+    b.setAttribute('data-key',key);
+    b.appendChild(el('span','tree-box',on?'✓':''));
+    b.appendChild(nameEl());
+    b.title=opts.title||label;
+    b.onclick=function(){(opts.onToggle||toggleObj)(key);};
+    row.appendChild(b);
+  }else{
+    row.appendChild(nameEl());
+  }
   (opts.minis||[]).forEach(function(m){row.appendChild(m);});
   if(opts.note) row.appendChild(el('span','tree-note',opts.note));
   return row;
+}
+/* 标准对象树节点组：标题 + 已选计数 + 动作按钮 + tree-list。
+   主图、慢点捕捉、节点监控三处共用，禁止再各写一套分组头。 */
+function treeNodeGroup(box,title,count,btns){
+  const grp=el('div','tree-group node-group');
+  const head=el('div','node-group-head');
+  head.appendChild(el('span','tree-group-title',title));
+  if(count!=null) head.appendChild(el('span','objtree-count','已选 '+count+' 项'));
+  if(btns&&btns.length){
+    const acts=el('div','node-group-acts');
+    btns.forEach(function(b){acts.appendChild(b);});
+    head.appendChild(acts);
+  }
+  grp.appendChild(head);
+  const list=el('div','tree-list');
+  grp.appendChild(list);
+  box.appendChild(grp);
+  return list;
 }
 function renderObjTree(){
   const box=document.getElementById('objTree'); if(!box) return;
@@ -4881,12 +4904,6 @@ function renderObjTree(){
   /* 单元报表（单 size×combo）里只有一个实例时，节点/实例与「总览」
      完全等价，隐藏该组避免三重冗余。多实例场景保持原样。 */
   if(m.clients.length<=1&&m.nodes.length<=1) return;
-  const g2=el('div','tree-group node-group');
-  const head=el('div','node-group-head');
-  head.appendChild(el('span','tree-group-title','节点与实例'));
-  head.appendChild(el('span','objtree-count','已选 '+selObjs.length+' 项'));
-  g2.appendChild(head);
-  const acts=el('div','node-group-acts');
   /* 全选/清空节点、全选/清空实例（按当前是否已全选动态切换）、全部清空 */
   function kindKeys(kind){
     const all=objAll(); const keys=[];
@@ -4918,22 +4935,15 @@ function renderObjTree(){
     }
     renderAll();
   }
-  function actBtn(label,title,fn){
-    const b=el('button','mini',label);
-    b.title=title; b.onclick=fn;
-    return b;
-  }
   const ndAll=kindAll('node'), clAll=kindAll('client');
-  acts.appendChild(actBtn(ndAll?'清空节点':'全选节点',
-    ndAll?'取消当前范围内全部节点的选择':'选中当前范围内全部节点',
-    function(){selKind('node',!ndAll);}));
-  acts.appendChild(actBtn(clAll?'清空实例':'全选实例',
-    clAll?'取消当前范围内全部实例的选择':'选中当前范围内全部实例',
-    function(){selKind('client',!clAll);}));
-  acts.appendChild(actBtn('全部清空','清空节点与实例，并自动开启总计',
-    clearAll));
-  g2.appendChild(acts);
-  const list=el('div','tree-list');
+  const list=treeNodeGroup(box,'节点与实例',selObjs.length,[
+    actBtn(ndAll?'清空节点':'全选节点',
+      ndAll?'取消当前范围内全部节点的选择':'选中当前范围内全部节点',
+      function(){selKind('node',!ndAll);}),
+    actBtn(clAll?'清空实例':'全选实例',
+      clAll?'取消当前范围内全部实例的选择':'选中当前范围内全部实例',
+      function(){selKind('client',!clAll);}),
+    actBtn('全部清空','清空节点与实例，并自动开启总计',clearAll)]);
   m.nodes.forEach(function(k){
     const nodeName=String((m.all[k]&&m.all[k].node)||k.replace(/^node:/,''));
     const kids=m.byNode[nodeName]||[];
@@ -4959,8 +4969,6 @@ function renderObjTree(){
   if(!m.nodes.length){
     list.appendChild(el('div','tree-empty','该数据大小没有节点聚合对象'));
   }
-  g2.appendChild(list);
-  box.appendChild(g2);
 }
 
 function renderControls(){
@@ -5092,41 +5100,30 @@ function monShade(hue,i){
   return mixHex(hue,LF_DARK?'#000000':'#FFFFFF',t);
 }
 let monNodeNamesCache=[];
-function _monRow(box,txt,depth,on,fn,lead,note){
-  const row=el('div','tree-row'+(on?' on':''));
-  row.style.paddingLeft=(depth>1?36:0)+'px';
-  if(lead) row.appendChild(lead);
-  const b=el('button','tree-check');
-  b.appendChild(el('span','tree-box',on?'✓':''));
-  b.appendChild(el('span','tree-name',txt));
-  b.title=txt;
-  b.onclick=fn;
-  row.appendChild(b);
-  if(note) row.appendChild(el('span','tree-note',note));
-  box.appendChild(row);
-  return b;
-}
-function _monGroupHead(box,title,count,btns){
-  const head=el('div','node-group-head');
-  head.appendChild(el('span','tree-group-title',title));
-  if(count!=null) head.appendChild(el('span','objtree-count','已选 '+count+' 项'));
-  if(btns){
-    const acts=el('div','node-group-acts');
-    btns.forEach(function(x){acts.appendChild(x);});
-    head.appendChild(acts);
-  }
-  const grp=el('div','tree-group node-group');
-  grp.appendChild(head);
-  box.appendChild(grp);
-  return grp;
-}
-function _monMini(label,title,fn){
-  const b=el('button','mini',label);
-  b.title=title; b.onclick=fn;
-  return b;
+/* ---- 监控树统一渲染（三张图共用一套模板） ----
+   cfg = { title, count, btns, extra, groups, empty }。
+   入口先清空容器：勾选/caret/主题/size 重渲染全部幂等，不再叠加重复树
+   （旧实现 append-only，曾致折叠失效、勾选后 UI 重影）。 */
+function renderMonTree(box,cfg){
+  if(!box) return;
+  box.innerHTML='';
+  if(cfg.extra) box.appendChild(cfg.extra);
+  const list=treeNodeGroup(box,cfg.title,cfg.count,cfg.btns);
+  (cfg.groups||[]).forEach(function(g){
+    list.appendChild(treeRow(g.key||('g:'+g.label),g.label,1,{
+      lead:g.caret, check:g.check!==false, on:g.on, onToggle:g.onToggle,
+      minis:g.minis||[], note:g.note, title:g.title, cls:g.cls,
+      nameColor:g.color, nameWeight:g.weight}));
+    if(g.open)(g.rows||[]).forEach(function(r){
+      list.appendChild(treeRow(r.key,r.label,2,{
+        on:r.on, onToggle:r.onToggle, title:r.title, note:r.note}));
+    });
+  });
+  if(!(cfg.groups||[]).length)
+    list.appendChild(el('div','tree-empty',cfg.empty||''));
 }
 /* 用量/可用量指标开关（lat-sel-btns 同风格；点钮不触发整页 renderAll） */
-function _renderMemPills(box){
+function _renderMemPills(){
   const wrap=el('div','lat-sel');
   const u=el('button','on','用量');
   u.title='每节点/NUMA 的已用内存求和线（默认显示）';
@@ -5139,11 +5136,10 @@ function _renderMemPills(box){
     _refreshMem();
   };
   wrap.appendChild(u); wrap.appendChild(a);
-  box.appendChild(wrap);
+  return wrap;
 }
 function _refreshMem(){
   const box=document.getElementById('memTree'); if(!box) return;
-  box.innerHTML='';
   renderMemTree(box);
 }
 function renderMonitors(){
@@ -5208,23 +5204,8 @@ function renderMonitors(){
     (M.urma||[]).forEach(function(u){monUrmaSel[u.node]=true;});
   }
   const sm=M.summary||{};
-  if(sm.peak_mem_mb) Object.keys(sm.peak_mem_mb).forEach(function(n){
-    g.appendChild(kv('峰值内存 · '+n, sm.peak_mem_mb[n], 'MB'));});
-  if(sm.worst_proc){
-    const w=sm.worst_proc;
-    const k=kv('RSS 最大增幅', w.label||'-', '');
-    if(w.leak_suspect){
-      const t=el('span','tag hero',' 疑似泄露');
-      k.querySelector('.v').appendChild(t);
-    }
-    k.appendChild(el('div','note',
-      (w.growth_mb==null?'-':w.growth_mb+' MB')+' / '+
-      (w.growth_pct==null?'-':w.growth_pct+'%')));
-    g.appendChild(k);
-  }
-  if(sm.peak_urma&&sm.peak_urma.value!=null)
-    g.appendChild(kv('端口峰值带宽', sm.peak_urma.label||'-',
-      sm.peak_urma.value.toFixed(3)+' GiB/s'));
+  /* 三处摘要 KV 行（逐节点峰值、进程增幅、端口峰值）已按需求删除；
+     进程 RSS 增幅正负条保留（G10）。 */
   renderGrowth(sm.proc_growth||[]);
   if(hasHost) renderMemTree(document.getElementById('memTree'));
   if(hasProc) renderProcTree(document.getElementById('procTree'));
@@ -5240,23 +5221,10 @@ function renderMemTree(box){
     numsByNode[h.node]=(h.columns||[]).filter(function(c){
       return c.indexOf('used_mb')>=0;});
   });
-  _renderMemPills(box);
-  const selKeys=Object.keys(monMemSel).filter(function(k){
-    return monMemSel[k];});
-  _monGroupHead(box,'节点与 NUMA',selKeys.length,[
-    _monMini(selKeys.length?'清空节点':'全选节点',
-      selKeys.length?'取消全部节点的选择（允许空，图区显示空态）':
-        '选中全部节点（求和线）',
-      function(){
-        const on=!(hosts.every(function(h){return monMemSel[h.node];}));
-        hosts.forEach(function(h){
-          monMemSel[h.node]=on;
-          numsByNode[h.node].forEach(function(c){
-            monMemSel[h.node+'/'+c.replace('_used_mb','')]=false;});
-        });
-        monRenderCharts(); renderMemTree(box);
-      })]);
-  hosts.forEach(function(h){
+  const selCount=Object.keys(monMemSel).filter(function(k){
+    return monMemSel[k];}).length;
+  const anyNode=hosts.some(function(h){return !!monMemSel[h.node];});
+  const groups=hosts.map(function(h){
     const nums=numsByNode[h.node]||[];
     const key=h.node;
     const open=!!monMemOpen[key];
@@ -5267,23 +5235,36 @@ function renderMemTree(box){
       caret.onclick=function(){monMemOpen[key]=!monMemOpen[key];
         renderMemTree(box);};
     }
-    _monRow(box,h.node,1,!!monMemSel[key],function(){
-      monMemSel[key]=!monMemSel[key];
-      monRenderCharts(); renderMemTree(box);
-    },caret,nums.length?(nums.length+' NUMA'):'');
-    if(open&&nums.length){
-      nums.forEach(function(c,i){
+    return {key:key,label:h.node,on:!!monMemSel[key],caret:caret,
+      note:nums.length?(nums.length+' NUMA'):'',
+      onToggle:function(){
+        monMemSel[key]=!monMemSel[key];
+        monRenderCharts(); renderMemTree(box);},
+      open:open,
+      rows:nums.map(function(c){
         const sub=c.replace('_used_mb','');
         const skey=key+'/'+sub;
-        _monRow(box,'NUMA '+sub,2,!!monMemSel[skey],function(){
-          monMemSel[skey]=!monMemSel[skey];
-          monRenderCharts(); renderMemTree(box);
-        },null,null);
-      });
-    }
+        return {key:skey,label:'NUMA '+sub,on:!!monMemSel[skey],
+          onToggle:function(){
+            monMemSel[skey]=!monMemSel[skey];
+            monRenderCharts(); renderMemTree(box);}};
+      })};
   });
-  if(!hosts.length)
-    box.appendChild(el('div','tree-empty','没有宿主内存采样'));
+  renderMonTree(box,{
+    title:'节点与 NUMA', count:selCount, extra:_renderMemPills(),
+    btns:[actBtn(anyNode?'清空节点':'全选节点',
+      anyNode?'取消全部节点的选择（允许空，图区显示空态）':
+        '选中全部节点（求和线）',
+      function(){
+        const on=!hosts.every(function(h){return monMemSel[h.node];});
+        hosts.forEach(function(h){
+          monMemSel[h.node]=on;
+          numsByNode[h.node].forEach(function(c){
+            monMemSel[h.node+'/'+c.replace('_used_mb','')]=false;});
+        });
+        monRenderCharts(); renderMemTree(box);
+      })],
+    groups:groups, empty:'没有宿主内存采样'});
 }
 /* ---- 进程树：节点仅分组（不可选），进程行勾选 ---- */
 function renderProcTree(box){
@@ -5295,17 +5276,9 @@ function renderProcTree(box){
   const nodeNames=Object.keys(byNode).sort();
   const allKeys=procs.map(function(p){return p.node+'/'+p.pid;});
   const selCount=allKeys.filter(function(k){return monProcSel[k];}).length;
-  _monGroupHead(box,'进程',selCount,[
-    _monMini(selCount?'清空进程':'全选进程',
-      selCount?'取消全部进程的选择（允许空，图区显示空态）':
-        '选中全部进程的 RSS 曲线',
-      function(){
-        const on=!(procs.every(function(p){
-          return monProcSel[p.node+'/'+p.pid];}));
-        allKeys.forEach(function(k){monProcSel[k]=on;});
-        monRenderCharts(); renderProcTree(box);
-      })]);
-  nodeNames.forEach(function(n){
+  const allOn=procs.length>0&&procs.every(function(p){
+    return monProcSel[p.node+'/'+p.pid];});
+  const groups=nodeNames.map(function(n){
     const kids=byNode[n]||[];
     /* 进程默认展开（undefined 时预设 true，再读） */
     if(monMemOpen['p:'+n]===undefined) monMemOpen['p:'+n]=true;
@@ -5314,55 +5287,52 @@ function renderProcTree(box){
     caret.title=open?'收起该节点的进程':'展开该节点的进程';
     caret.onclick=function(){monMemOpen['p:'+n]=!monMemOpen['p:'+n];
       renderProcTree(box);};
-    /* 节点行 = 纯分组头：无 checkbox（仅展开/收起），颜色按节点色系 */
-    const head=el('div','tree-row mon-node-head');
-    head.style.paddingLeft='0px';
-    head.appendChild(caret);
-    const nm=el('span','tree-name',n);
-    nm.style.color=monNodeHue(n);
-    nm.style.fontWeight='600';
-    head.appendChild(nm);
-    head.appendChild(el('span','tree-note',kids.length+' 进程'));
-    box.appendChild(head);
-    if(open){
-      kids.forEach(function(p){
+    return {key:'pn:'+n,label:n,check:false,cls:'mon-node-head',
+      color:monNodeHue(n),weight:'600',caret:caret,
+      note:kids.length+' 进程',open:open,
+      rows:kids.map(function(p){
         const k=n+'/'+p.pid;
-        _monRow(box,(p.comm?p.comm+' ':'')+p.pid,2,!!monProcSel[k],function(){
-          monProcSel[k]=!monProcSel[k];
-          monRenderCharts(); renderProcTree(box);
-        },null,null);
-      });
-    }
+        return {key:k,label:(p.comm?p.comm+' ':'')+p.pid,
+          on:!!monProcSel[k],onToggle:function(){
+            monProcSel[k]=!monProcSel[k];
+            monRenderCharts(); renderProcTree(box);}};
+      })};
   });
-  if(!procs.length)
-    box.appendChild(el('div','tree-empty','没有进程内存采样'));
+  renderMonTree(box,{
+    title:'进程', count:selCount,
+    btns:[actBtn(allOn?'清空进程':'全选进程',
+      allOn?'取消全部进程的选择（允许空，图区显示空态）':
+        '选中全部进程的 RSS 曲线',
+      function(){
+        allKeys.forEach(function(k){monProcSel[k]=!allOn;});
+        monRenderCharts(); renderProcTree(box);
+      })],
+    groups:groups, empty:'没有进程内存采样'});
 }
 /* ---- URMA 树：仅节点勾选 ---- */
 function renderUrmaTree(box){
   if(!box) return;
   const M=D.monitors||{}; const urma=M.urma||[];
   const nodes=_monNodes(urma);
-  _monGroupHead(box,'节点',
-    nodes.filter(function(n){return monUrmaSel[n];}).length,[
-      _monMini(nodes.every(function(n){return monUrmaSel[n];})?
-        '清空节点':'全选节点',
-        nodes.every(function(n){return monUrmaSel[n];})?
-          '取消全部节点的选择（允许空，图区显示空态）':
-          '选中全部节点的端口流量',
-        function(){
-          const on=!(nodes.every(function(n){return monUrmaSel[n];}));
-          nodes.forEach(function(n){monUrmaSel[n]=on;});
-          monRenderCharts(); renderUrmaTree(box);
-        })]);
-  nodes.forEach(function(n){
+  const allOn=nodes.length>0&&nodes.every(function(n){return monUrmaSel[n];});
+  const groups=nodes.map(function(n){
     const ports=urma.filter(function(u){return u.node===n;});
-    _monRow(box,n,1,!!monUrmaSel[n],function(){
-      monUrmaSel[n]=!monUrmaSel[n];
-      monRenderCharts(); renderUrmaTree(box);
-    },null,ports.length?((ports.length)+' 端口'):'');
+    return {key:n,label:n,on:!!monUrmaSel[n],
+      note:ports.length?(ports.length+' 端口'):'',
+      onToggle:function(){
+        monUrmaSel[n]=!monUrmaSel[n];
+        monRenderCharts(); renderUrmaTree(box);}};
   });
-  if(!nodes.length)
-    box.appendChild(el('div','tree-empty','没有 URMA 采样'));
+  renderMonTree(box,{
+    title:'节点', count:nodes.filter(function(n){return monUrmaSel[n];}).length,
+    btns:[actBtn(allOn?'清空节点':'全选节点',
+      allOn?'取消全部节点的选择（允许空，图区显示空态）':
+        '选中全部节点的端口流量',
+      function(){
+        nodes.forEach(function(n){monUrmaSel[n]=!allOn;});
+        monRenderCharts(); renderUrmaTree(box);
+      })],
+    groups:groups, empty:'没有 URMA 采样'});
 }
 /* ---- 三图组装（按勾选过滤；配色=节点色系/同系色阶） ---- */
 function _monEmpty(id,msg){
