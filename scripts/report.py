@@ -1771,6 +1771,47 @@ _MON_LEAK_MB = 200.0
 _MON_FLIT_BYTES = 20
 MON_EMBED_MAX_POINTS = 2000
 
+# `pgrep -f <pattern>` also matches shell/tool wrappers whose command line
+# merely contains the pattern (e.g. `bash -c "... mooncake_kvtest ..."`).
+# Their RSS growth is meaningless and used to flood the TOP-10 list.
+_PROC_WRAPPER_COMMS = frozenset({
+    "bash", "sh", "dash", "zsh", "ksh", "pgrep", "ps", "grep", "egrep",
+    "awk", "sed", "timeout", "xargs", "env", "nohup", "tee", "cat", "tr",
+    "wc", "head", "tail", "cut", "sort", "uniq", "flock",
+})
+
+
+def _proc_prefix(cfg):
+    """Configured monitor process prefix (kernel comm = first 15 chars)."""
+    mem_cfg = (cfg or {}).get("mem") or {}
+    pat = str(mem_cfg.get("proc_pattern") or "").strip()
+    return (pat or "mooncake_kvtest")[:15]
+
+
+def _proc_growth_targets(mem_proc, cfg):
+    """Processes eligible for RSS growth ranking / leak summary.
+
+    Only the sampled target processes count (kvtest binary comm prefix, or
+    the python interpreter that runs the benchmark client). Wrapper shells
+    matched by `pgrep -f` are excluded so TOP-10 reflects real clients.
+    Falls back to all non-wrapper rows when nothing matches, then to the raw
+    list, to avoid silently dropping the whole summary on old artifacts.
+    """
+    prefix = _proc_prefix(cfg)
+
+    def _is_target(p):
+        comm = str(p.get("comm") or "").strip()
+        if not comm or comm in _PROC_WRAPPER_COMMS:
+            return False
+        return comm.startswith(prefix) or comm.startswith("python")
+
+    targets = [p for p in mem_proc if _is_target(p)]
+    if targets:
+        return targets
+    nowrap = [p for p in mem_proc
+              if str(p.get("comm") or "").strip() not in _PROC_WRAPPER_COMMS]
+    return nowrap or mem_proc
+
 
 def _read_csv_rows(path):
     try:
@@ -2127,7 +2168,8 @@ def reduce_monitors(local_log_dir, t0=None, t1=None, warmup_cutoff=None):
             peak = max(peak, s)
         summary["peak_mem_mb"][h["node"]] = round(peak, 1)
     if mem_proc:
-        growth = sorted(mem_proc, key=lambda p: -(p.get("rss_growth_mb") or 0))
+        targets = _proc_growth_targets(mem_proc, cfg)
+        growth = sorted(targets, key=lambda p: -(p.get("rss_growth_mb") or 0))
         summary["proc_growth"] = [{
             "label": "{}/{} {}".format(p["node"], p["pid"],
                                        p.get("comm") or "").strip(),
@@ -2135,7 +2177,7 @@ def reduce_monitors(local_log_dir, t0=None, t1=None, warmup_cutoff=None):
             "growth_pct": p.get("rss_growth_pct"),
             "leak_suspect": p.get("leak_suspect")}
             for p in growth[:12]]
-        worst = max(mem_proc, key=lambda p: p.get("rss_growth_mb") or 0)
+        worst = max(targets, key=lambda p: p.get("rss_growth_mb") or 0)
         summary["worst_proc"] = {
             "label": "{}/{} {}".format(worst["node"], worst["pid"],
                                        worst.get("comm") or "").strip(),

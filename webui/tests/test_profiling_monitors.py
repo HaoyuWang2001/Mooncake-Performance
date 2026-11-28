@@ -435,6 +435,32 @@ def test_reduce_monitors_urma_bucket_aligns_nodes(tmp_path):
     assert ts["n1"] == ts["n2"] == [1.0, 2.0, 3.0], ts
 
 
+def test_proc_growth_excludes_wrapper_shells(tmp_path):
+    """RSS TOP-10 只统计目标进程：pgrep -f 命中的 bash/pgrep 包装器即使
+    增幅更大也不得进入 proc_growth / worst_proc。"""
+    root = tmp_path / "logs" / "cfg" / "profiling" / "n1"
+    root.mkdir(parents=True)
+    (root / "monitor.config.json").write_text(
+        json.dumps({"mem": {"proc_pattern": "mooncake_kvtest"}}),
+        encoding="utf-8")
+    (root / "mem.proc.csv").write_text(
+        "ts,pid,comm,rss_kb,pss_kb,private_dirty_kb,private_clean_kb,swap_kb\n"
+        # bash wrapper: huge fake growth (the reported symptom)
+        "1000,11,bash,10240,10000,1,1,0\n"
+        "1001,11,bash,1048576,1048000,1,1,0\n"
+        # pgrep helper
+        "1000,12,pgrep,1024,1000,1,1,0\n"
+        "1001,12,pgrep,2048,2000,1,1,0\n"
+        # real kvtest client
+        "1000,13,mooncake_kvtest,102400,100000,1,1,0\n"
+        "1001,13,mooncake_kvtest,153600,150000,1,1,0\n",
+        encoding="utf-8")
+    mon = rp.reduce_monitors(str(tmp_path / "logs" / "cfg"))
+    labels = [g["label"] for g in mon["summary"]["proc_growth"]]
+    assert labels == ["n1/13 mooncake_kvtest"], labels
+    assert mon["summary"]["worst_proc"]["label"] == "n1/13 mooncake_kvtest"
+
+
 def test_compact_monitors_keeps_config_for_proc_prefix(tmp_path):
     """compact payload 透传 config，前端才能按 mem.proc_pattern 选默认进程。"""
     mon = {"config": {"mem": {"proc_pattern": "mooncake_kvtest"}},

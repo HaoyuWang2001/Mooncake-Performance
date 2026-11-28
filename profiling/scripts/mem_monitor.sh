@@ -89,6 +89,13 @@ while true; do
   for pid in $pids; do
     [ -r "/proc/$pid/smaps_rollup" ] || continue
     comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+    # pgrep -f 会把命令行里含 pattern 的 shell/工具包装器一并匹配
+    # （bash -c "... mooncake_kvtest ..."、pgrep/ps 等），其 RSS 增长无意义，
+    # 会污染 TOP-10；按 comm 跳过这些包装器。
+    case "$comm" in
+      bash|sh|dash|zsh|ksh|pgrep|ps|grep|egrep|awk|sed|timeout|xargs|env|nohup|tee|cat|tr|wc|head|tail|cut|sort|uniq|flock)
+        continue ;;
+    esac
     rss=0; pss=0; pd=0; pc=0; sw=0
     while read -r key val _; do
       case "$key" in

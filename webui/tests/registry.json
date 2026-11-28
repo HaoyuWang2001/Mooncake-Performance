@@ -7401,7 +7401,8 @@
     "test_c18v14_proc_default_prefix_and_no_empty_hint",
     "test_c18v14_growth_below_chart_with_title",
     "test_reduce_monitors_urma_bucket_aligns_nodes",
-    "test_compact_monitors_keeps_config_for_proc_prefix"
+    "test_compact_monitors_keeps_config_for_proc_prefix",
+    "test_proc_growth_excludes_wrapper_shells"
    ],
    "e2e": []
   },

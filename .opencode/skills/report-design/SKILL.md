@@ -427,7 +427,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 
 - C18.V1 三图：宿主内存（mem.host）/ 进程 RSS（mem.proc）/ URMA 端口流量（urma.flits）；标题后缀；每图三元组 = h3 标题（`宿主内存`/`进程 RSS`/`URMA 端口流量监控`）+ `.objtree-strip mon-strip` 树条 + 图 + `empty-tip` 空态
 - C18.V2 部分缺失分支：三元组整组隐藏（标题/树/图/空态同组同显隐），不留空占位、标题与图注同步
-- C18.V3 进程 RSS 增幅正负条**置于进程图下方**并带标题「RSS 增长 TOP-10」（G10）；疑似泄露标记
+- C18.V3 进程 RSS 增幅正负条**置于进程图下方**并带标题「RSS 增长 TOP-10」（G10）；**只统计目标进程**（`mem.proc_pattern` 前缀 / python 解释器），排除 `pgrep -f` 命中的 bash/pgrep 包装器（采样端 `mem_monitor.sh` 同样跳过）；疑似泄露标记
 - C18.V4 无监控数据整卡隐藏（仅限完全没有 profiling 产物）
 - C18.V5 产物目录 = 节点 IP（k8s 宿主 IP / ssh 管理 IP；显示名冲突回退原名）
 - C18.V6 有产物无可用序列 → 占位卡列出原因（URMA 失败原文 / CSV 无数据行 / 时间窗无交叠），不静默消失
