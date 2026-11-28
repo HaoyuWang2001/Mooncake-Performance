@@ -589,6 +589,52 @@ def test_trace_stage_tree_covers_unified_breakdown_fields():
     assert "TRACE_TREES" in js and "TREAD" not in js and "TWRITE" not in js
 
 
+def test_trace_every_level_sums_to_100(tmp_path):
+    """每个渲染层（含残差）必须 = 父项 100%；views 并列分解各自成行、
+    各自带残差（互不加和）。"""
+    import tracestats as tstats
+    glog = tmp_path / "gb.glog"
+    line = (GLOG + "trace_id[1] breakdown[get_buffer] key[bench/o] "
+            "status[ok] size[1048576] type[memory_remote] replica_count[1] "
+            "remote_endpoint[-] local_endpoint[10.0.0.1:50051] "
+            "start_time[2026-11-25 10:23:41.882310] "
+            "query_total_us[57] query_route_us[5] query_rpc_us[50] "
+            "query_retry_us[0] query_retry_count[0] "
+            "select_us[18] local_endpoints_us[12] select_replica_us[6] "
+            "buf_alloc_us[5] engine[classic] memread_total_us[196] "
+            "read_submit_us[8] read_queue_us[14] read_urma_us[160] "
+            "read_teardown_us[14] slice_count[2] read_urma_min_us[148] "
+            "read_urma_avg_us[150] read_us[196] read_a_us[58] read_b_us[12] "
+            "read_transfer_window_us[126] read_ab_valid[1] "
+            "read_transfer_count[1] memcpy_us[0] total_us[269]")
+    glog.write_text(line + "\n" + line.replace("trace_id[1]", "trace_id[2]")
+                    + "\n", encoding="utf-8")
+    tr = tstats.compute_trace_stats(str(glog), node="n1", size="8MB")
+    st = _stats(tmp_path, "a.reader", "reader", node="n1")
+    data = rp.reduce_scenario(rp.load([st]), {"config": "cfg"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--levels-focus",
+                    "query_total_us,read_us")
+    if res is None:
+        return
+    assert res["errors"] == []
+    rows = [r for r in (res.get("levels_rows") or []) if r]
+    assert rows
+    # 每一行（含残差）百分比之和 = 100%
+    for r in rows:
+        pcts = [b["pct"] for b in r if b["pct"] is not None]
+        assert pcts, r
+        assert abs(sum(pcts) - 100.0) <= 0.05, (r, sum(pcts))
+    txt = res.get("levels_focus_text") or ""
+    # query 的 L2（route/rpc/retry + 残差）
+    assert "query_rpc_us" in txt
+    # read_us 的三套并列分解各自成行，各自残差 100%
+    assert "视图 classic" in txt and "视图 tent" in txt and "视图 A/B" in txt
+    # 单请求分解：views 分组，真实 engine 组（classic）有值，全零 tent 组不渲染
+    tb = res.get("tbreak_text") or ""
+    assert "视图 classic" in tb or "read_submit_us" in tb
+    assert "残差" in tb
+
+
 def test_trace_reduce_merges_engine_distribution(tmp_path):
     """reduce 合并 per-op engine 分布（classic/tent 计数不能丢）。"""
     import tracestats as tstats

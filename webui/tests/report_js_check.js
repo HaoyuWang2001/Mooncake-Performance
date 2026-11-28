@@ -1650,6 +1650,72 @@ if (!errs.length) {
       out.reset_cap = textOf(getEl("zsliderCap"));
     } catch (e) { errs.push("reset-view: " + String(e && e.stack || e)); }
   }
+  if (process.argv.includes("--tgroup")) {
+    try {
+      const want = arg("--tgroup", "read");
+      const label = want === "write" ? "写路径" : (want === "other" ? "其它" : "读路径");
+      const b = findBtn(getEl("tgroups"), label);
+      if (b && b.onclick) b.onclick();
+      const op = arg("--top-op", null);
+      if (op) {
+        const sel = getEl("topSel");
+        sel.value = op;
+        if (sel.onchange) sel.onchange();
+      }
+      out.tgroup = want;
+      out.top_op = op;
+    } catch (e) { errs.push("tgroup: " + String(e && e.stack || e)); }
+  }
+  if (process.argv.includes("--levels-focus")) {
+    try {
+      // 点击 levels 块图中指定标签的阶段（可多级：A/B 依次点击），
+      // 采集展开后的块图文本，用于校验「一层内（含残差）= 100%」。
+      const targets = String(arg("--levels-focus", "")).split(",")
+        .filter(function (s) { return !!s; });
+      const nameOf = function (blk) {
+        const nm = (blk.children || []).find(function (c) {
+          return String(c.className || "").indexOf("lvl-name") >= 0;});
+        return nm ? textOf(nm) : "";
+      };
+      targets.forEach(function (t) {
+        let hit = null;
+        (function walk(n) {
+          if (hit || !n) return;
+          (n.children || []).forEach(function (c) {
+            const cls = String(c.className || "");
+            if (!hit && cls.indexOf("lvl-blk") === 0 && c.onclick &&
+                nameOf(c).indexOf(t) === 0) { hit = c; return; }
+            walk(c);
+          });
+        })(getEl("levels"));
+        if (hit && hit.onclick) hit.onclick();
+      });
+      out.levels_focus_text = textOf(getEl("levels"));
+      out.levels_focus_targets = targets;
+      // 结构化行汇总：每行（含残差）各块百分比之和必须 = 100%
+      const rows = [];
+      (function walk(n) {
+        (n.children || []).forEach(function (c) {
+          const cls = String(c.className || "");
+          if (cls.indexOf("lvl-row") >= 0) {
+            const blks = (c.children || []).filter(function (x) {
+              return String(x.className || "").indexOf("lvl-blk") === 0;});
+            rows.push(blks.map(function (b) {
+              const nm = (b.children || []).find(function (x) {
+                return String(x.className || "").indexOf("lvl-name") >= 0;});
+              const vv = (b.children || []).find(function (x) {
+                return String(x.className || "").indexOf("lvl-val") >= 0;});
+              const m = /(-?[\d.]+)%/.exec(vv ? textOf(vv) : "");
+              return {label: nm ? textOf(nm) : "",
+                      pct: m ? Number(m[1]) : null};
+            }));
+          }
+          walk(c);
+        });
+      })(getEl("levels"));
+      out.levels_rows = rows;
+    } catch (e) { errs.push("levels-focus: " + String(e && e.stack || e)); }
+  }
   if (process.argv.includes("--trace-stage-all")) {
     try {
       const series = function () {
