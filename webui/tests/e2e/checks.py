@@ -92,20 +92,13 @@ def check_trace_read_residual(art):
 def check_trace_unknown_ops(art):
     """读/写组的每个 op 都在树注册表里（未知 op 只允许出现在 other 组）。
 
-    树 = configs/_trace_trees/<op>.json（单一事实源）；read/write 组出现
-    未登记 op 说明树落后于 SDK 打点，必须补树而不是静默归组。"""
+    树 = configs/_trace_trees/<op>.json（单一事实源，经 trace_trees.py
+    加载——与 map/渲染同一入口）；read/write 组出现未登记 op 说明树
+    落后于 SDK 打点，必须补树而不是静默归组。"""
+    import trace_trees as _tt
+    known = set(_tt.load_trace_trees())
     d = _data(art)
     tr = list(d["sizes"].values())[0].get("trace") or {}
-    import json as _json
-    import os as _os
-    _here = _os.path.dirname(_os.path.dirname(_os.path.dirname(
-        _os.path.abspath(__file__))))
-    _trees = _os.path.join(_here, "configs", "_trace_trees")
-    known = set()
-    for fn in _os.listdir(_trees):
-        if fn.endswith(".json") and not fn.startswith("_"):
-            with open(_os.path.join(_trees, fn), encoding="utf-8") as f:
-                known.add(_json.load(f)["op"])
     for g in ("read", "write"):
         for op in ((tr.get("groups") or {}).get(g) or {}).get("ops") or {}:
             assert op in known, ("op 不在树注册表： %s（补 configs/_trace_trees/"
