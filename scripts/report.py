@@ -2312,13 +2312,12 @@ font-variant-numeric:tabular-nums;line-height:1.25}
 #perfcards .kv.strong .v,#tcards .kv.strong .v,
 #rolecards .kv.strong .v{font-weight:800;font-size:24px}
 .gridbreak{grid-column:1/-1;height:0;margin:0;padding:0}
-/* overview 指标行：吞吐/avg/p99/p9999 为主，计数行为次要字重；
-   pipeline 每个角色一行（整行标签占满网格）。 */
+/* overview 指标行：计数行在上，pipeline 随后每角色一行（行首内联角色标签）。 */
 .card > .grid + .grid{margin-top:14px}
 .grid.metric .kv .k{text-transform:none}
 .grid.minor .kv .v{font-size:18px;font-weight:500}
-.ovrole{grid-column:1/-1;color:var(--mut);font-size:12px;font-weight:600;
-letter-spacing:.06em}
+.grid.metric > .ovrole{padding:2px 0;color:var(--mut);font-size:12px;
+font-weight:600;letter-spacing:.06em;display:flex;align-items:flex-end}
 #unitmeta{gap:10px 22px;margin-bottom:8px}
 #rolecards .rblock{margin-bottom:4px}
 #rolecards .rblock .sec{margin-top:16px}
@@ -8335,12 +8334,12 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
                 _metric_cell("p99", _fmt_lat_ms(row.get("p99_ms"))),
                 _metric_cell("p9999", _fmt_lat_ms(row.get("p9999_ms")))])
 
-        # pipeline：写路径/读路径各一行（各自 role_summaries 聚合）；
-        # basic 或旧产物无角色摘要时回落合并口径。
+        # pipeline：计数行在上，随后 写路径/读路径 各一行（行首角色标签）；
+        # basic 或旧产物无角色摘要时回落合并口径单行。
         metric_blocks = ""
         if _scenario_of(m) == "pipeline":
-            for role, label in (("writer", "写路径（writer）"),
-                                ("reader", "读路径（reader）")):
+            for role, label in (("writer", "写路径"),
+                                ("reader", "读路径")):
                 rbs = []
                 for u in units:
                     for z in (u.get("sizes") or {}).values():
@@ -8373,8 +8372,8 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
         cards.append("""
 <div class="card"><h2>{name}</h2>
 <div class="sub">{mode} · {proto} · {sizes} · 时长 {dur} {early}</div>
-{metrics}
 {counts}
+{metrics}
 {agg_note}
 {monline}
 {linkblock}

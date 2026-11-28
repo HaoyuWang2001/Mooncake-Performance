@@ -192,9 +192,13 @@ def test_render_overview(tmp_path):
     assert "运行总览" in src and "rank_smoke" in src
     assert "report/report.html" in src
     assert "节点日志量" in src
-    # pipeline：写路径一行（吞吐/avg/p99/p9999），无 reader 数据不凭空造行
-    assert '<div class="ovrole">写路径（writer）</div>' in src
-    assert '<div class="ovrole">读路径（reader）</div>' not in src
+    # pipeline：计数行在上，随后 写路径 一行（吞吐/avg/p99/p9999）；
+    # 无 reader 数据不凭空造行
+    assert '<div class="grid minor">' in src
+    assert '<div class="ovrole">写路径</div>' in src
+    assert '<div class="ovrole">读路径</div>' not in src
+    assert (src.index('<div class="grid minor">') <
+            src.index('<div class="ovrole">写路径</div>'))
     for k in ("吞吐", "avg", "p99", "p9999"):
         assert '<div class="k">' + k + "</div>" in src, k
     assert "MB/s" in src
@@ -968,7 +972,11 @@ def test_overview_sums_all_data_sizes(tmp_path):
     src = open(ov, encoding="utf-8").read()
     assert '<div class="k">成功</div><div class="v">20</div>' in src
     assert '<div class="k">失败</div><div class="v">0</div>' in src
-    # basic 合并口径：吞吐/avg/p99/p9999 同卡展示；单单元无跨单元注记
+    # basic 合并口径：计数行在上，随后吞吐/avg/p99/p9999 一行（无角色标签）；
+    # 单单元无跨单元注记
+    assert src.index('<div class="grid minor">') < src.index(
+        '<div class="grid metric">')
+    assert '<div class="ovrole">' not in src
     for k in ("吞吐", "avg", "p99", "p9999"):
         assert '<div class="k">' + k + "</div>" in src, k
     assert "个报表单元聚合" not in src
