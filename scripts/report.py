@@ -6125,6 +6125,18 @@ function tChildrenOf(key,cur){
       view:(x[3]||'')};});
   return kids;
 }
+/* 子节点按 view 分组：views 是同一父的多套并列分解，互不加和。
+   主视图（view=''）在前，其后按树序；每组的「残差 = 父 − 该组之和」，
+   保证每一行（含残差）都恰好等于父项的 100%。 */
+function tChildGroups(key,cur){
+  const kids=tChildrenOf(key,cur), order=[], by={};
+  kids.forEach(function(k){
+    const v=k.view||'';
+    if(!by[v]){by[v]=[];order.push(v);}
+    by[v].push(k);
+  });
+  return order.map(function(v){return {view:v,items:by[v]};});
+}
 function fmtUs(v){v=Number(v)||0;
   return v>=1000?(v/1000).toFixed(2)+' ms':v.toFixed(1)+' µs';}
 /* 色深 = 占父项百分比（连续插值）：占比越大，颜色越深 */
@@ -6246,7 +6258,7 @@ function lvlBlock(b,cur,lit,depth){
     ' '+tViewLabel(b.x.view)));
   blk.appendChild(nm);
   blk.appendChild(el('div','lvl-val',
-    fmtUs(b.x.v)+'  '+(b.share*100).toFixed(1)+'%'));
+    fmtUs(b.x.v)+'  '+(b.pctTxt||(b.share*100).toFixed(1)+'%')));
   blk.title=levelTip(b);
   const hasKids=!b.residual&&tChildrenOf(b.x.key,cur).length>0;
   if(hasKids){
@@ -6285,20 +6297,45 @@ function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
     return {key:it.key,label:it.label,st:it.st,v:(v==null?0:v),has:v!=null,
       view:(it.view||'')};
   });
-  const sum=vals.reduce(function(a,b){return a+b.v;},0);
   const parentV=parentVal||0;
+  /* 本行若自带树残差项（L1 行）：以「父 − 其余项之和」重算残差值，
+     保证一行（含残差）恰好 = 父项 100%。树残差按逐请求计算后再平均，
+     与「平均后相减」在 switch 混跑（字段样本数不同）时会差 ~1%；
+     显示层以父均值为准，tooltip 仍保留残差通道的分位数。 */
+  const hasResidual=vals.some(function(x){return x.key==='residual';});
+  if(hasResidual&&parentV>0){
+    const nonRes=vals.reduce(function(a,b){
+      return a+(b.key==='residual'?0:b.v);},0);
+    vals.forEach(function(x){
+      if(x.key==='residual'){x.v=parentV-nonRes;x.has=true;}
+    });
+  }
+  const sum=vals.reduce(function(a,b){return a+b.v;},0);
   let scale=1,over=false;
   if(parentV>0&&sum>parentV){scale=parentV/sum;over=true;}
   const used=vals.reduce(function(a,b){return a+b.v*scale;},0);
   const rest=parentV>0?Math.max(0,parentV-used):0;
-  const hasResidual=vals.some(function(x){return x.key==='residual';});
   const hasRest=!hasResidual&&(rest>0.0001||over);
+  /* 显示层取整校正：每个块的百分比四舍五入到 0.1%，把累计舍入差
+     归到最大的非残差项，保证「本行（含残差）显示之和 = 100.0%」。 */
+  const dispPct=vals.map(function(x){
+    return Math.round((parentV>0?x.v/parentV:0)*1000)/10;});
+  if(parentV>0&&vals.length){
+    let bi=-1;
+    vals.forEach(function(x,i){
+      if(x.key!=='residual'&&(bi<0||x.v>vals[bi].v)) bi=i;});
+    if(bi<0) bi=0;
+    const drift=Math.round((100-dispPct.reduce(function(a,b){
+      return a+b;},0))*10)/10;
+    dispPct[bi]=Math.round((dispPct[bi]+drift)*10)/10;
+  }
   const anyFocus=vals.some(function(x){return !!tFocus[x.key];});
   const cols=[],blocks=[];
-  vals.forEach(function(x){
+  vals.forEach(function(x,i){
     const share=parentV>0?(x.v/parentV):0;
     const w=share*100*scale;
-    const valTxt=fmtUs(x.v)+'  '+(share*100).toFixed(1)+'%';
+    const pctTxt=dispPct[i].toFixed(1)+'%';
+    const valTxt=fmtUs(x.v)+'  '+pctTxt;
     const minW=lvlBlockMinW(x.label+lvlViewLabelOf(x),valTxt);
     const zeroW=lvlZeroW(x.label+lvlViewLabelOf(x),valTxt); /* 0% 块：文字宽（含 view 徽标）+ 标准 padding */
     const focused=!!tFocus[x.key];
@@ -6309,30 +6346,45 @@ function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
     else col='minmax('+minW+'px,'+w.toFixed(3)+'fr)';
     cols.push(col);
     blocks.push({x:x,share:share,w:w,focused:focused,
-      compressed:anyFocus&&!focused});
+      pctTxt:pctTxt,compressed:anyFocus&&!focused});
   });
   if(hasRest){
     const share=parentV>0?(rest/parentV):0;
-    const resW=lvlBlockMinW('残差',
-      fmtUs(rest)+'  '+(share*100).toFixed(1)+'%');
+    const pct=Math.round((100-dispPct.reduce(function(a,b){
+      return a+b;},0))*10)/10;
+    const pctTxt=pct.toFixed(1)+'%';
+    const resW=lvlBlockMinW('残差',fmtUs(rest)+'  '+pctTxt);
     cols.push(anyFocus?'minmax(0px, 0.4fr)'
       :'minmax('+resW+'px,'+(share*100).toFixed(3)+'fr)');
-    blocks.push({x:{key:'__residual__',label:'残差',
-      st:tStat('residual',cur),v:rest},
-      share:share,w:share*100,residual:true,compressed:anyFocus});
+    /* 根行（L1）残差走全局残差通道（含分位数）；L2/视图行残差由
+       「父均值 − 本组子项均值」现算（map 侧只有 L1+全局残差通道）。 */
+    const rst=(depth<=1)?tStat('residual',cur)
+      :{avg:rest,n:(parentStat&&parentStat.n)||null};
+    blocks.push({x:{key:'__residual__',label:'残差',st:rst,v:rest},
+      share:share,w:share*100,residual:true,pctTxt:pctTxt,
+      compressed:anyFocus});
   }
   rowEl.style.gridTemplateColumns=cols.join(' ');
   blocks.forEach(function(b,i){
     rowEl.appendChild(lvlBlock(b,cur,lit,depth));
-    const kids=b.residual?[]:tChildrenOf(b.x.key,cur);
-    if(!kids.length) return;
+    if(b.residual) return;
+    const groups=tChildGroups(b.x.key,cur);
+    if(!groups.length) return;
     if(!(b.focused||tExpandAll)) return;
     const holder=el('div','lvl-children');
     holder.style.gridColumn=(i+1);
     holder.style.gridRow='2';
-    const sub=el('div','lvl-row');
-    appendLevelRow(sub,kids,b.x.st,b.x.v,cur,lit,depth+1);
-    holder.appendChild(sub);
+    groups.forEach(function(gp){
+      /* views 并列分解：每组一行，各自带本组残差（父 − 本组子项和）；
+         主视图不加标题，视图组用纯文字标题区分。 */
+      if(gp.view){
+        holder.appendChild(el('div','lvl-note',
+          '视图 '+tViewLabel(gp.view)));
+      }
+      const sub=el('div','lvl-row');
+      appendLevelRow(sub,gp.items,b.x.st,b.x.v,cur,lit,depth+1);
+      holder.appendChild(sub);
+    });
     rowEl.appendChild(holder);
   });
   const notes=[];
@@ -7237,9 +7289,22 @@ function stageBreakdownRow(r,opts){
   function blockRow(items,parentV,cur){
     const row=el('div','lvl-row');
     const cols=[];
-    items.forEach(function(it){
+    /* 显示取整校正：本行（含残差）显示之和恰为 100.0%（差归最大非残差项） */
+    const dispPct=items.map(function(it){
+      return Math.round((parentV>0?it.v/parentV:0)*1000)/10;});
+    if(parentV>0&&items.length){
+      let bi=-1;
+      items.forEach(function(it,i){
+        if(it.key!=='residual'&&(bi<0||it.v>items[bi].v)) bi=i;});
+      if(bi<0) bi=0;
+      const drift=Math.round((100-dispPct.reduce(function(a,b){
+        return a+b;},0))*10)/10;
+      dispPct[bi]=Math.round((dispPct[bi]+drift)*10)/10;
+    }
+    items.forEach(function(it,i){
       const share=parentV>0?(it.v/parentV):0;
-      const valTxt=fmtUs(it.v)+'  '+(share*100).toFixed(1)+'%';
+      const pctTxt=dispPct[i].toFixed(1)+'%';
+      const valTxt=fmtUs(it.v)+'  '+pctTxt;
       const vtag=lvlViewLabelOf(it);
       const zeroW=lvlZeroW(it.label+vtag,valTxt);
       const minW=lvlBlockMinW(it.label+vtag,valTxt);
@@ -7254,7 +7319,7 @@ function stageBreakdownRow(r,opts){
         ' '+tViewLabel(it.view)));
       b.appendChild(nm);
       b.appendChild(el('div','lvl-val',
-        fmtUs(it.v)+'  '+(share*100).toFixed(1)+'%'));
+        fmtUs(it.v)+'  '+pctTxt));
       const ga=stAvg(cur,it.key);
       let tip=it.label+'：'+fmtUs(it.v)+
         '（占端到端 '+(share*100).toFixed(1)+'%）';
@@ -7291,7 +7356,7 @@ function stageBreakdownRow(r,opts){
         return {key:x[0],label:x[0],v:Number(stages[x[0]])||0};
       });
     const ssum=items.reduce(function(a,b){return a+b.v;},0);
-    items.push({key:'residual',label:'残差',v:Math.max(0,total-ssum)});
+    items.push({key:'residual',label:'残差',v:total-ssum});
     if(!opts.noTotal) wrap.appendChild(blockRow(items,total,cur));
     /* 全部「有二级子区间且有值」的 L1：每个都展开二级（不止一个主要原因） */
     const causes=items.filter(function(it){
@@ -7304,13 +7369,27 @@ function stageBreakdownRow(r,opts){
         return x[1]===2&&x[2]===c.key;}).map(function(x){
           return {key:x[0],label:x[0],v:Number(stages[x[0]])||0,
             view:(x[3]||'')};});
-      const ks=kids.reduce(function(a,b){return a+b.v;},0);
-      if(fv-ks>0.0001)
-        kids.push({key:'__unattributed__',label:'未归因',v:fv-ks});
-      wrap.appendChild(el('div','lvl-note',
-        '二级：'+c.key+'（占端到端 '+
-        (total>0?(fv/total*100).toFixed(1):'0.0')+'%）'));
-      wrap.appendChild(blockRow(kids,fv>0?fv:1,cur));
+      /* views 多套并列分解：按 view 分组各占一行，每行独立补残差
+         （父 − 本组之和），单行内（含残差）= 父项的 100%。
+         单请求只有实际 engine 那一组有值，全零视图组不渲染。 */
+      const groups=[], by={};
+      kids.forEach(function(k){
+        const v=k.view||'';
+        if(!by[v]){by[v]=[];groups.push(v);}
+        by[v].push(k);
+      });
+      groups.forEach(function(vk){
+        const gkids=by[vk];
+        const ks=gkids.reduce(function(a,b){return a+b.v;},0);
+        if(vk&&!gkids.some(function(k){return k.v>0;})) return;
+        const rowKids=gkids.slice();
+        if(Math.abs(fv-ks)>0.0001)
+          rowKids.push({key:'residual',label:'残差',v:fv-ks,view:vk});
+        wrap.appendChild(el('div','lvl-note',
+          '二级：'+c.key+(vk?'（'+tViewLabel(vk)+' 视图）':'')+
+          '（占端到端 '+(total>0?(fv/total*100).toFixed(1):'0.0')+'%）'));
+        wrap.appendChild(blockRow(rowKids,fv>0?fv:1,cur));
+      });
     });
   }
   render();

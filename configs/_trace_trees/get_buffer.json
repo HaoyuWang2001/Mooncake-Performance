@@ -3,69 +3,135 @@
   "op": "get_buffer",
   "group": "read",
   "line": {
-    "markers": ["breakdown[get_buffer]"],
+    "markers": [
+      "breakdown[get_buffer]"
+    ],
     "legacy": {
       "marker": "get_breakdown",
-      "require": ["key"],
+      "require": [
+        "key"
+      ],
       "field_aliases": {
         "query_us": "query_total_us",
         "alloc_us": "buf_alloc_us"
       },
-      "legacy_ops": ["get", "get_batch", "batch_get_buffer", "batch_get_into_buffer"]
+      "legacy_ops": [
+        "get",
+        "get_batch",
+        "batch_get_buffer",
+        "batch_get_into_buffer"
+      ]
     }
   },
-  "ok_statuses": ["read_ok"],
+  "ok_statuses": [
+    "read_ok"
+  ],
   "total_field": "total_us",
   "meta_fields": [
-    "size", "type", "replica_count", "remote_endpoint", "local_endpoint",
-    "slice_count", "engine", "read_urma_min_us", "read_urma_avg_us",
-    "read_ab_valid", "read_transfer_count", "query_retry_count", "memcpy_us",
-    "memread_total_us", "read_submit_us_note"
+    "size",
+    "type",
+    "replica_count",
+    "remote_endpoint",
+    "local_endpoint",
+    "slice_count",
+    "engine",
+    "read_urma_min_us",
+    "read_urma_avg_us",
+    "read_ab_valid",
+    "read_transfer_count",
+    "query_retry_count",
+    "memcpy_us",
+    "memread_total_us"
   ],
   "stages": [
     {
-      "field": "query_total_us", "label": "query", "chart": true,
+      "field": "query_total_us",
+      "label": "query",
+      "chart": true,
       "children": [
-        {"field": "query_route_us", "label": "route"},
-        {"field": "query_rpc_us", "label": "rpc"},
-        {"field": "query_retry_us", "label": "retry"}
+        {
+          "field": "query_route_us",
+          "label": "route"
+        },
+        {
+          "field": "query_rpc_us",
+          "label": "rpc"
+        },
+        {
+          "field": "query_retry_us",
+          "label": "retry"
+        }
       ]
     },
     {
-      "field": "select_us", "label": "select", "chart": true,
+      "field": "select_us",
+      "label": "select",
+      "chart": true,
       "children": [
-        {"field": "local_endpoints_us"},
-        {"field": "select_replica_us"}
+        {
+          "field": "local_endpoints_us"
+        },
+        {
+          "field": "select_replica_us"
+        }
       ]
     },
-    {"field": "buf_alloc_us", "label": "buf_alloc", "chart": true},
     {
-      "field": "read_us", "label": "read", "chart": true,
+      "field": "buf_alloc_us",
+      "label": "buf_alloc",
+      "chart": true
+    },
+    {
+      "field": "read_us",
+      "label": "read",
+      "chart": true,
       "views": {
         "classic": {
           "label": "classic",
           "children": [
-            {"field": "read_submit_us"},
-            {"field": "read_queue_us"},
-            {"field": "read_urma_us"},
-            {"field": "read_teardown_us"}
+            {
+              "field": "read_submit_us"
+            },
+            {
+              "field": "read_queue_us"
+            },
+            {
+              "field": "read_urma_us"
+            },
+            {
+              "field": "read_teardown_us"
+            }
           ]
         },
         "tent": {
           "label": "tent",
           "children": [
-            {"field": "admit_us"},
-            {"field": "queue_prep_us"},
-            {"field": "wire_span_us"},
-            {"field": "propagate_us"}
+            {
+              "field": "admit_us"
+            },
+            {
+              "field": "queue_prep_us"
+            },
+            {
+              "field": "wire_span_us"
+            },
+            {
+              "field": "propagate_us"
+            }
           ]
         },
         "ab": {
           "label": "A/B",
           "children": [
-            {"field": "read_a_us"},
-            {"field": "read_transfer_window_us"},
-            {"field": "read_b_us"}
+            {
+              "field": "read_a_us"
+            },
+            {
+              "field": "read_transfer_window_us"
+            },
+            {
+              "field": "read_b_us"
+            }
           ]
         }
       }

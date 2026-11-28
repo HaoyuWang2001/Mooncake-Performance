@@ -21,9 +21,10 @@ SDK 把高频 trace 打到 glog（`<glog 前缀> trace_id[...] breakdown[op] k[v
   读 get_into: total ≈ query+select+read（read 拆 offload 三段+overhead）
   读 batch_get / batch_get_into: total = query+prep+read（恒等）
   写 put/put_from: prep+checksum+prepare+put_start+传输段+put_end+revoke
-  写 upsert/upsert_from: prep+checksum+prepare+query+传输段+finalize+cache_inval+revoke
+  写 upsert/upsert_from: prep+checksum+prepare+query+传输段+finalize+cache_inval
+       （失败路径的 revoke 嵌在 finalize span 内；revoke_us 恒 0 不作 L1）
        传输段 classic=memwrite_total(四子段) / tent=四相位；engine 标注不参与门控
-  写 batch_put / batch_put_into / batch_upsert_from: 薄行 prep+write（恒等）
+  写 batch_put / batch_put_into: 薄行 prep+write（恒等）
   remove / batchRemove：薄行 remove_rpc ≡ total，归「其它」组
   辅助（不参与加和）: slice_count, replicas, bytes, engine 分布, *_urma_min/avg_us
 

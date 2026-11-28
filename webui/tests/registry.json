@@ -1794,7 +1794,7 @@
   {
    "id": "C14.V11",
    "module": "report",
-   "desc": "阶段树按 op 分割：单一事实源 configs/_trace_trees/<op>.json，report.py build 时 import trace_trees 并向页面嵌 TRACE_TREES（行 = [field,level,parent,view]），渲染 JS 对具体 op 零知识、只遍历通用行（不再有 TREAD/TWRITE 常量）；get_buffer = query_total/select/buf_alloc/read，batch 读含 prep_us；put 不列 query/finalize、upsert 不列 put_start/put_end（恒 0 不列）；batch_put/batch_put_into/batch_upsert_from 薄行 = prep/write 两段；query 带 query_route/rpc/retry 三段下钻；读树含 classic 传输段四字段",
+   "desc": "阶段树按 op 分割：单一事实源 configs/_trace_trees/<op>.json，report.py build 时 import trace_trees 并向页面嵌 TRACE_TREES（行 = [field,level,parent,view]），渲染 JS 对具体 op 零知识、只遍历通用行（不再有 TREAD/TWRITE 常量）；get_buffer = query_total/select/buf_alloc/read，batch 读含 prep_us；put 不列 query/finalize、upsert 不列 put_start/put_end/revoke（恒 0 不列，失败 revoke 嵌于 finalize）；batch_put/batch_put_into 薄行 = prep/write 两段（batch_upsert_from 无发射点，树已删）；query 带 query_route/rpc/retry 三段下钻；读树含 classic 传输段四字段",
    "req": "R-TRACE-14",
    "unit": [
     "test_trace_stage_tree_covers_unified_breakdown_fields",
@@ -7351,7 +7351,7 @@
   {
    "id": "C11.V9",
    "module": "report",
-   "desc": "**树 = 单一事实源 configs/_trace_trees/<op>.json（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」不是独立树，breakdown[get] 经 get_buffer.legacy_ops 归一）；目录缺失或校验失败（schema 版本 / 重复字段 / 引用父缺失 / views 子带 chart）一律 TreeError 硬失败，不静默回退；extends 仅支持单层（put_from/upsert_from 继承）；stage_rows_of 扁平行 L1 父 = total_us，residual 由 loader 统一追加为渲染行、不进 chart L1 元组（map 侧残差走独立通道）；树随脚本平铺下发至 pod/节点（benchmark _trace_tree_payload：configmap 键无子目录，loader 以 _schema.json 标记识别平铺布局，源仓库布局优先）。",
+   "desc": "**树 = 单一事实源 configs/_trace_trees/<op>.json（schema mp-trace-tree/1）**：12 棵树（全部为源码真实发射点；batch_upsert_from 源码无 breakdown 发射点，已删除死树；「get」不是独立树，breakdown[get] 经 get_buffer.legacy_ops 归一）；目录缺失或校验失败（schema 版本 / 重复字段 / 引用父缺失 / views 子带 chart）一律 TreeError 硬失败，不静默回退；extends 仅支持单层（put_from/upsert_from 继承）；stage_rows_of 扁平行 L1 父 = total_us，residual 由 loader 统一追加为渲染行、不进 chart L1 元组（map 侧残差走独立通道）；树随脚本平铺下发至 pod/节点（benchmark _trace_tree_payload：configmap 键无子目录，loader 以 _schema.json 标记识别平铺布局，源仓库布局优先）；树字段与源码发射行逐项对账（upsert 的 revoke_us 恒 0 且嵌在 finalize span 内、不作 L1；读侧 batch/get_into 行无 engine/slice_count、不作 meta）",
    "req": "R-TRACE-14",
    "unit": [
     "test_all_trees_load_and_validate",
@@ -7362,7 +7362,8 @@
     "test_l1_set_matches_tree_per_op",
     "test_tree_dir_prefers_repo_layout",
     "test_tree_dir_flat_pod_layout",
-    "test_tree_dir_missing_keeps_hard_failure"
+    "test_tree_dir_missing_keeps_hard_failure",
+    "test_tree_schema_matches_source_emitters"
    ],
    "e2e": [
     "check_trace_unknown_ops"
@@ -7375,7 +7376,18 @@
    "req": "R-TRACE-14",
    "unit": [
     "test_levels_view_children_badges",
-    "test_stage_tree_view_badges"
+    "test_stage_tree_view_badges",
+    "test_trace_every_level_sums_to_100"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C14.V13",
+   "module": "report",
+   "desc": "**逐层加和恒等式（含残差）= 父项 100%**：块图/慢点展开的每一层都按「父 − 子项之和」补残差行；views 并列分解按 view 分组各自成行、各自补本组残差（互不加和，避免 classic+tent+A/B 混加超 100%）。L2/视图残差由「父均值 − 本组子项均值」现算（map 侧只有 L1+全局残差通道），根行仍用全局残差通道（含分位数）。单请求展开只渲染真实 engine 的非零视图组；子项和超出父项时按比例压缩并注记。",
+   "req": "R-TRACE-14",
+   "unit": [
+    "test_trace_every_level_sums_to_100"
    ],
    "e2e": []
   },
