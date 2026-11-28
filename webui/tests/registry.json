@@ -116,6 +116,14 @@
   [
    "scripts/test_scope.py",
    "utils"
+  ],
+  [
+   "scripts/trace_trees.py",
+   "report"
+  ],
+  [
+   "configs/_trace_trees/",
+   "report"
   ]
  ],
  "rules": [
@@ -1397,13 +1405,19 @@
   {
    "id": "C11.V7",
    "module": "report",
-   "desc": "**统一 `breakdown[op]` 行匹配与字段归一**（docs/yh/log-reference.md §14）：get_buffer 走通用分支（旧 `get_breakdown` 仅兼容）；`query_total_us→query_us`、`buf_alloc_us→alloc_us`；接口集合 读=get_buffer/get_into/batch_get/batch_get_into、写=put/put_from/upsert/upsert_from/batch_put/batch_put_into；remove/batchRemove 薄行归「其它」；TENT+TCP 四相位诚实零值按 engine 标注（不误判 classic）",
+   "desc": "**统一 breakdown[op] 行匹配（树驱动）**（docs/yh/log-reference.md §14；树 = configs/_trace_trees/<op>.json，scripts/trace_trees.py 唯一读取入口）：行匹配按 op 树注册表（marker → op），字段名 = 日志原生名（query_total_us/buf_alloc_us，不再归一改名）；旧 get_breakdown 行按 legacy 别名**单向**映射（query_us → query_total_us、alloc_us → buf_alloc_us；get/get_batch 等旧 op 名归一到 get_buffer）；未知 op 归「其它」组并计 meta.unknown_ops（字段探测仅兜底）；remove/batchRemove 薄行归「其它」；树 meta_fields（slice_count/*_min_us 等）不进时延字段统计；TENT+TCP 四相位诚实零值按 engine 标注（不误判 classic）",
    "req": "R-TRACE-14",
    "unit": [
     "test_unified_get_buffer_field_alias_and_tree",
     "test_batch_read_interfaces_prep_and_query_drill",
     "test_batch_put_write_group_and_remove_other",
-    "test_tent_tcp_honest_zero_phases"
+    "test_tent_tcp_honest_zero_phases",
+    "test_every_line_matches_its_tree",
+    "test_group_comes_from_tree_not_field_sniffing",
+    "test_unknown_op_counted_in_meta",
+    "test_legacy_get_breakdown_maps_to_native_names",
+    "test_legacy_bd_alias_maps_to_target_tree",
+    "test_fields_stats_skip_tree_meta_fields"
    ],
    "e2e": []
   },
@@ -1780,11 +1794,14 @@
   {
    "id": "C14.V11",
    "module": "report",
-   "desc": "阶段树 L1/L2 覆盖统一字段：读 L1 增 `prep_us`（batch 接口）、query 下钻 `query_route/rpc/retry`；写 query 同带三段下钻（阶段树与数据字段名一致）",
+   "desc": "阶段树按 op 分割：单一事实源 configs/_trace_trees/<op>.json，report.py build 时 import trace_trees 并向页面嵌 TRACE_TREES（行 = [field,level,parent,view]），渲染 JS 对具体 op 零知识、只遍历通用行（不再有 TREAD/TWRITE 常量）；get_buffer = query_total/select/buf_alloc/read，batch 读含 prep_us；put 不列 query/finalize、upsert 不列 put_start/put_end（恒 0 不列）；batch_put/batch_put_into/batch_upsert_from 薄行 = prep/write 两段；query 带 query_route/rpc/retry 三段下钻；读树含 classic 传输段四字段",
    "req": "R-TRACE-14",
    "unit": [
     "test_trace_stage_tree_covers_unified_breakdown_fields",
-    "test_batch_read_interfaces_prep_and_query_drill"
+    "test_batch_read_interfaces_prep_and_query_drill",
+    "test_residual_per_op_tree",
+    "test_classic_read_transfer_segment_visible",
+    "test_top_stages_follow_tree"
    ],
    "e2e": []
   },
@@ -2790,7 +2807,7 @@
   {
    "id": "E-12",
    "module": "report",
-   "desc": "验证 trace 行解析与 get_breakdown 归一化",
+   "desc": "验证 trace 行解析（树驱动 marker + legacy 别名单向归一）",
    "req": "",
    "unit": [
     "test_parse_pairs_with_spaces_and_glog_prefix"
@@ -7304,6 +7321,34 @@
    "e2e": [
     "check_embed_skeleton_complete"
    ]
+  },
+  {
+   "id": "C11.V9",
+   "module": "report",
+   "desc": "**树 = 单一事实源 configs/_trace_trees/<op>.json（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」不是独立树，breakdown[get] 经 get_buffer.legacy_ops 归一）；目录缺失或校验失败（schema 版本 / 重复字段 / 引用父缺失 / views 子带 chart）一律 TreeError 硬失败，不静默回退；extends 仅支持单层（put_from/upsert_from 继承）；stage_rows_of 扁平行 L1 父 = total_us，residual 由 loader 统一追加为渲染行、不进 chart L1 元组（map 侧残差走独立通道）",
+   "req": "R-TRACE-14",
+   "unit": [
+    "test_all_trees_load_and_validate",
+    "test_schema_version_enforced",
+    "test_missing_dir_is_hard_failure",
+    "test_bad_tree_raises",
+    "test_stage_rows_shape",
+    "test_l1_set_matches_tree_per_op"
+   ],
+   "e2e": [
+    "check_trace_unknown_ops"
+   ]
+  },
+  {
+   "id": "C14.V12",
+   "module": "report",
+   "desc": "**views 并列分解与 switch 引擎切换段**：同一父节点的多套分解互不加和（get_buffer.read_us 的 classic 四段 / tent 四相位 / A-B 分段；get_into.read_us 的 offload 三段），L2 子行带徽标（classic/tent/A-B/offload）；put 族传输段为 switch（按行内 engine 切换 L1 形状：classic memwrite_* ↔ tent 四相位，case 名作为 view 并列展开、缺字段的行自然为空，混跑时残差按出现的 L1 计算）——分级时延块图 / 阶段树 / 慢点展开三处同款标识",
+   "req": "R-TRACE-14",
+   "unit": [
+    "test_levels_view_children_badges",
+    "test_stage_tree_view_badges"
+   ],
+   "e2e": []
   }
  ]
 }
