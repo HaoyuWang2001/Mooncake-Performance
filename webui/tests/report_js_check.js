@@ -693,6 +693,25 @@ if (!errs.length) {
   out.mon_tree_lists = {mem: monCountClass("memTree", "tree-list"),
                         proc: monCountClass("procTree", "tree-list"),
                         urma: monCountClass("urmaTree", "tree-list")};
+  /* 每个节点行跟随的 mini 全选/清空按钮数（URMA 无子行 = 0） */
+  function monRowMinis(id) {
+    let n = 0;
+    (function walk(node) {
+      if (!node) return;
+      (node.children || []).forEach(function(c) {
+        if (String(c.className || "").split(" ").indexOf("tree-row") >= 0) {
+          (c.children || []).forEach(function(x) {
+            if (String(x.className || "").split(" ").indexOf("mini") >= 0) n++;
+          });
+        }
+        walk(c);
+      });
+    })(getEl(id));
+    return n;
+  }
+  out.mon_row_minis = {mem: monRowMinis("memTree"),
+                       proc: monRowMinis("procTree"),
+                       urma: monRowMinis("urmaTree")};
   out.mon_counts = {mem: monCounts("memTree"), proc: monCounts("procTree"),
                     urma: monCounts("urmaTree")};
   /* 幂等：模拟主题切换 / size 切换时 renderMonitors 再次进入 */
@@ -742,6 +761,82 @@ if (!errs.length) {
         proc: monCounts("procTree"), urma: monCounts("urmaTree")};
     } catch (e) {
       errs.push("mon caret: " + String(e && e.stack || e));
+    }
+  }
+  const monMini = arg("--mon-mini", null);
+  if (monMini) {
+    /* 点击某节点行跟随的 mini 全选/清空（树::节点::按钮） */
+    try {
+      const parts = monMini.split("::");
+      const treeId = parts[0];
+      const rowLabel = parts[1] || "";
+      const btnLabel = parts[2] || "";
+      const treeBox = getEl(treeId);
+      let clicked = false;
+      (function walk(node) {
+        if (clicked || !node) return;
+        (node.children || []).forEach(function(c) {
+          if (clicked) return;
+          if (String(c.className || "").split(" ").indexOf("tree-row") >= 0) {
+            let nm = null;
+            (c.children || []).forEach(function(x) {
+              const xc = String(x.className || "");
+              if (xc.indexOf("tree-check") >= 0) nm = (x.children || [])[1];
+              else if (xc.indexOf("tree-name") >= 0) nm = x;
+            });
+            if (nm && String(nm._text || "") === rowLabel) {
+              (c.children || []).forEach(function(x) {
+                if (!clicked
+                    && String(x.className || "").split(" ").indexOf("mini") >= 0
+                    && String(x._text || "") === btnLabel && x.onclick) {
+                  x.onclick(); clicked = true;
+                }
+              });
+            }
+          }
+          walk(c);
+        });
+      })(treeBox);
+      if (!clicked) errs.push("mon mini: not found " + monMini);
+      out.mon_mini_series = {mem: monSeries("memchart"),
+                             proc: monSeries("procchart"),
+                             urma: monSeries("urmachart")};
+      out.mon_counts_after_mini = {mem: monCounts("memTree"),
+        proc: monCounts("procTree"), urma: monCounts("urmaTree")};
+    } catch (e) {
+      errs.push("mon mini: " + String(e && e.stack || e));
+    }
+  }
+  const monMetric = arg("--mon-metric", null);
+  if (monMetric) {
+    /* 点击宿主内存「用量/可用量」指标开关（逗号分隔可连续点） */
+    try {
+      monMetric.split(",").forEach(function(label) {
+        const treeNow = getEl("memTree");
+        let done = false;
+        (function walk(node) {
+          if (done || !node) return;
+          (node.children || []).forEach(function(c) {
+            if (done) return;
+            if (String(c.className || "").split(" ").indexOf("lat-sel") >= 0) {
+              (c.children || []).forEach(function(b) {
+                if (!done && String(b._text || "") === label && b.onclick) {
+                  b.onclick(); done = true;
+                }
+              });
+            }
+            walk(c);
+          });
+        })(treeNow);
+        if (!done) errs.push("mon metric: button not found " + label);
+      });
+      out.mem_series_after_metric = monSeries("memchart");
+      out.mem_empty_after_metric = getEl("memEmpty")
+        ? String(getEl("memEmpty").style.display || "") : null;
+      out.mem_empty_text_after_metric = getEl("memEmpty")
+        ? String(getEl("memEmpty")._text || "") : null;
+    } catch (e) {
+      errs.push("mon metric: " + String(e && e.stack || e));
     }
   }
   const monClick = arg("--mon-click", null);

@@ -4265,10 +4265,11 @@ def test_b07_monitor_tree_controls_and_legends(tmp_path):
     if res is None:
         return
     assert res["errors"] == [], res["errors"]
-    # mem 树：节点行 + NUMA 展开（默认收起）+ toggle 按钮
+    # mem 树：节点行 + NUMA 展开（默认收起）+ 端到端同构三键
     mem_tree = res["mem_tree"]
     assert "row:n1" in mem_tree, mem_tree
-    assert "btn:清空节点" in mem_tree or "btn:全选节点" in mem_tree, mem_tree
+    for btn in ("btn:清空节点", "btn:全选实例", "btn:全部清空"):
+        assert btn in mem_tree, (btn, mem_tree)
     assert not any(t.startswith("row:NUMA") for t in mem_tree), mem_tree
     # mem 图默认 = 每节点一条 used 求和线（可用量默认关）
     names = [s["name"] for s in res["mem_series"]]
@@ -4280,13 +4281,19 @@ def test_b07_monitor_tree_controls_and_legends(tmp_path):
     proc_tree = res["proc_tree"]
     assert "head:n1" in proc_tree, proc_tree
     assert "row:cli 11" in proc_tree, proc_tree
-    assert "btn:清空进程" in proc_tree or "btn:全选进程" in proc_tree, proc_tree
+    for btn in ("btn:全选节点", "btn:清空实例", "btn:全部清空"):
+        assert btn in proc_tree, (btn, proc_tree)
     # proc 图默认 = 全部进程（不再截断前 8）
     pnames = sorted(s["name"] for s in res["proc_series"])
     assert pnames == ["cli 11 @n1", "cli 12 @n1", "cli 21 @n2"], pnames
-    # urma 树：仅节点行
+    # urma 树：仅节点行；无实例维度 → 全选实例置灰仍保留
     urma_tree = res["urma_tree"]
     assert "row:n1" in urma_tree and "row:n2" in urma_tree, urma_tree
+    for btn in ("btn:清空节点", "btn:全选实例", "btn:全部清空"):
+        assert btn in urma_tree, (btn, urma_tree)
+    # 每个节点行跟随该节点子行的 全选/清空 mini 按钮（mem/proc 各 2 节点）
+    assert res["mon_row_minis"] == {"mem": 4, "proc": 4, "urma": 0}, \
+        res["mon_row_minis"]
     # urma 图 = 每节点 RX 实线 + TX 虚线
     us = res["urma_series"]
     assert len(us) == 4, us
@@ -4387,6 +4394,45 @@ def test_c18_monitor_trees_share_one_template():
         assert dead not in src, "监控树私有控件回潮: " + dead
     assert src.count("renderMonTree(box,{") == 3, \
         "应有三棵监控树复用统一渲染器"
+
+
+def test_b11_mem_metric_optional_and_row_minis(tmp_path):
+    """C18.V12：用量与可用量同为可选指标；全部关掉 → 空态提示；
+    节点行跟随的 mini 全选/清空只作用于该节点的子行。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    # 只关用量：没有可用量 → 空图 + 指标空态提示
+    res = _js_check(tmp_path, data, "--mon-metric", "用量")
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    assert res["mem_series_after_metric"] == [], res["mem_series_after_metric"]
+    assert res["mem_empty_after_metric"] == ""
+    assert "未选择指标" in res["mem_empty_text_after_metric"]
+    # 关用量 + 开可用量 → 只剩节点 available 虚线
+    res2 = _js_check(tmp_path, data, "--mon-metric", "用量,可用量")
+    if res2 is None:
+        return
+    assert res2["errors"] == [], res2["errors"]
+    names = [s["name"] for s in res2["mem_series_after_metric"]]
+    assert names == ["n1 available", "n2 available"], names
+    # mem 节点行「全选」只加该节点 NUMA 分列，不影响其它节点
+    res3 = _js_check(tmp_path, data, "--mon-mini", "memTree::n1::全选")
+    if res3 is None:
+        return
+    assert res3["errors"] == [], res3["errors"]
+    mnames = [s["name"] for s in res3["mon_mini_series"]["mem"]]
+    assert "n1/n0" in mnames and "n1/n1" in mnames, mnames
+    assert not any(n.startswith("n2/") for n in mnames), mnames
+    assert res3["mon_counts_after_mini"]["mem"].get("row:n1") == 1
+    # proc 节点行「清空」只清该节点进程，n2 保留
+    res4 = _js_check(tmp_path, data, "--mon-mini", "procTree::n1::清空")
+    if res4 is None:
+        return
+    assert res4["errors"] == [], res4["errors"]
+    pnames = [s["name"] for s in res4["mon_mini_series"]["proc"]]
+    assert pnames == ["cli 21 @n2"], pnames
 
 
 def test_b09_monitor_partial_missing_groups(tmp_path):
