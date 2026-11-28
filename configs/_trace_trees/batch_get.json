@@ -3,7 +3,9 @@
   "op": "batch_get",
   "group": "read",
   "line": {
-    "markers": ["breakdown[batch_get]"],
+    "markers": [
+      "breakdown[batch_get]"
+    ],
     "legacy": {
       "marker": "batch_get_breakdown",
       "require": [],
@@ -12,20 +14,44 @@
   },
   "total_field": "total_us",
   "meta_fields": [
-    "num_keys", "batch_get_ops", "ssd_offload_ops", "success", "replicas",
-    "start_time", "trace_id", "engine", "slice_count"
+    "num_keys",
+    "batch_get_ops",
+    "ssd_offload_ops",
+    "success",
+    "replicas",
+    "start_time",
+    "trace_id"
   ],
   "stages": [
     {
-      "field": "query_us", "label": "query", "chart": true,
+      "field": "query_us",
+      "label": "query",
+      "chart": true,
       "children": [
-        {"field": "query_route_us", "label": "route"},
-        {"field": "query_rpc_us", "label": "rpc"},
-        {"field": "query_retry_us", "label": "retry"}
+        {
+          "field": "query_route_us",
+          "label": "route"
+        },
+        {
+          "field": "query_rpc_us",
+          "label": "rpc"
+        },
+        {
+          "field": "query_retry_us",
+          "label": "retry"
+        }
       ]
     },
-    {"field": "prep_us", "label": "prep", "chart": true},
-    {"field": "read_us", "label": "read", "chart": true}
+    {
+      "field": "prep_us",
+      "label": "prep",
+      "chart": true
+    },
+    {
+      "field": "read_us",
+      "label": "read",
+      "chart": true
+    }
   ],
   "invariants": [
     "total_us = query_us + prep_us + read_us（batch 口径：t0→t_query→t_prep→end，恒等）",

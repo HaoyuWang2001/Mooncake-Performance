@@ -7,7 +7,7 @@ TE/TENT 双引擎；阶段树来自 configs/_trace_trees/<op>.json，字段名 =
   get_into、batch_get、batch_get_into（query 三段下钻 / prep_us L1；旧 get_breakdown
   行按 legacy 别名单向映射 query_us→query_total_us、alloc_us→buf_alloc_us）
 - 写：put 家族 breakdown[op]：engine[classic] memwrite_* / engine[tent] 四相位；
-  batch_put / batch_put_into / batch_upsert_from 薄行（prep/write 两段）；TENT+TCP 诚实零值
+  batch_put / batch_put_into 薄行（prep/write 两段）；TENT+TCP 诚实零值
 - remove / batchRemove 薄行归「其它」组（remove_rpc_us 仍入字段统计）
 - slice / slice_stats 明细行仅计数；方向 read/write；阶段树加和/残差；
   -1 哨兵；失败早退字段为 0；engine 分布；未知 op 计数 meta.unknown_ops

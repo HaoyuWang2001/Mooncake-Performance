@@ -119,17 +119,43 @@ def _compute(tmp_path, lines):
 
 def test_all_trees_load_and_validate():
     trees = tt.load_trace_trees()
-    # 13 棵树 = 12 个真实接口 + batch_upsert_from（put 族薄行）；
+    # 12 棵树 = 12 个真实接口（batch_upsert_from 源码无发射点，已删除死树）；
     # 「get」不是独立树：breakdown[get] 经 get_buffer.legacy_ops 归一
     for op in ("get_buffer", "get_into", "batch_get", "batch_get_into",
                "put", "put_from", "upsert", "upsert_from",
-               "batch_put", "batch_put_into", "batch_upsert_from",
+               "batch_put", "batch_put_into",
                "remove", "batchRemove"):
         assert op in trees, op
+    assert len(trees) == 12, sorted(trees)
+    assert "batch_upsert_from" not in trees   # 源码无 breakdown 发射点
     assert "get" not in trees          # 旧别名归一，不再有独立树
     assert trees["batch_put"]["group"] == "write"
     assert trees["remove"]["group"] == "other"
     assert trees["get_buffer"]["group"] == "read"
+
+
+def test_tree_schema_matches_source_emitters():
+    """树字段与源码真实发射行逐项对齐（本次对账审计）。
+
+    - upsert 行虽统一 schema 打印 revoke_us，但该路径从不赋值（恒 0），
+      失败时的 PutRevoke 嵌在 finalize span 内 → 不作 L1 阶段；
+    - 读侧 batch/get_into 行没有 engine/slice_count（只有 get_buffer 的
+      传输段打印它们），meta 不得收录幻影字段。"""
+    trees = tt.load_trace_trees()
+    urows = [tuple(r) for r in tt.stage_rows_of(trees)["upsert"]]
+    assert not any(r[0] == "revoke_us" for r in urows), urows
+    # upsert_from 继承 upsert（同样不含 revoke）
+    ufrows = [tuple(r) for r in tt.stage_rows_of(trees)["upsert_from"]]
+    assert not any(r[0] == "revoke_us" for r in ufrows)
+    # put 仍保留 revoke（put 失败路径真实赋值）
+    prows = [tuple(r) for r in tt.stage_rows_of(trees)["put"]]
+    assert any(r[0] == "revoke_us" for r in prows)
+
+    assert "read_submit_us_note" not in trees["get_buffer"]["meta_fields"]
+    for op in ("get_into", "batch_get", "batch_get_into"):
+        meta = trees[op]["meta_fields"]
+        assert "engine" not in meta, (op, meta)
+        assert "slice_count" not in meta, (op, meta)
 
 
 def test_schema_version_enforced():
@@ -228,6 +254,8 @@ def test_l1_set_matches_tree_per_op():
     assert "query_us" not in cf["put"][0]
     assert "finalize_us" not in cf["put"][0]
     assert "put_start_us" not in cf["upsert"][0]
+    assert "revoke_us" not in cf["upsert"][0]     # 恒 0，且嵌于 finalize
+    assert "revoke_us" in cf["put"][0]            # put 失败路径真实赋值
     # switch 两侧都在 L1 并集（classic + tent 混跑兼容）
     assert "memwrite_total_us" in cf["put"][0]
     assert "admit_us" in cf["upsert"][0]
