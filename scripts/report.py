@@ -5048,8 +5048,10 @@ function renderAll(){
 }
 let monCharts={};
 function _monChart(id, series, yname){
-  const box=document.getElementById(id); if(!box||!series.length) return false;
+  const box=document.getElementById(id); if(!box) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
+  /* 无序列：清空图区，避免取消勾选/关指标后旧曲线残留在 empty-tip 之上 */
+  if(!series.length){ c.setOption({series:[]},true); return false; }
   bindHoverGuards(c);
   const o=axisCommon();
   o.grid={left:104,right:104,top:34,bottom:42};
@@ -5079,11 +5081,14 @@ function _monChart(id, series, yname){
    monMemSel: { '<node>':true, '<node>/n0':false, ... }   节点行=求和，NUMA 行=分列
    monProcSel: { '<node>/<pid>':true }                     节点行仅分组不可选
    monUrmaSel: { '<node>':true }
-   monMemShowAvail: 可用量开关（默认关）；清空保底用量防空图（与 C6.I1 同策） */
-let monMemSel=null, monProcSel=null, monUrmaSel=null, monMemShowAvail=false;
+   monMemUsed: 用量指标开关（默认开，可关闭）
+   monMemShowAvail: 可用量指标开关（默认关） */
+let monMemSel=null, monProcSel=null, monUrmaSel=null;
+let monMemUsed=true, monMemShowAvail=false;
 let monMemOpen={};               /* NUMA/进程分组展开状态 */
 function monResetSel(){
-  monMemSel=null; monProcSel=null; monUrmaSel=null; monMemShowAvail=false;
+  monMemSel=null; monProcSel=null; monUrmaSel=null;
+  monMemUsed=true; monMemShowAvail=false;
 }
 function _monNodes(list){        /* 数据里出现的节点名（排序稳定） */
   const set={};
@@ -5128,11 +5133,15 @@ function renderMonTree(box,cfg){
 /* 用量/可用量指标开关（lat-sel-btns 同风格；点钮不触发整页 renderAll） */
 function _renderMemPills(){
   const wrap=el('div','lat-sel');
-  const u=el('button','on','用量');
-  u.title='每节点/NUMA 的已用内存求和线（默认显示）';
+  const u=el('button',monMemUsed?'on':'off','用量');
+  u.title='每节点/NUMA 的已用内存求和线（默认显示，可关闭）';
   const a=el('button',monMemShowAvail?'on':'off','可用量');
-  a.title='整机 MemAvailable（仅节点级，虚线）';
-  u.disabled=true;
+  a.title='整机 MemAvailable（仅节点级，虚线；默认关闭）';
+  u.onclick=function(){
+    monMemUsed=!monMemUsed;
+    monRenderCharts();
+    _refreshMem();
+  };
   a.onclick=function(){
     monMemShowAvail=!monMemShowAvail;
     monRenderCharts();
@@ -5140,6 +5149,28 @@ function _renderMemPills(){
   };
   wrap.appendChild(u); wrap.appendChild(a);
   return wrap;
+}
+/* 监控树顶栏三键：与端到端曲线严格同构（全选节点 / 全选实例 / 全部清空）。
+   维度为空的树（进程树节点仅分组 / URMA 无实例）保留按钮但置灰，
+   三棵树控件形态不分叉。 */
+function _monTopBtns(nodeKeys,instKeys,sel,setMany,clearAll){
+  const ndAll=nodeKeys.length>0&&nodeKeys.every(function(k){return !!sel[k];});
+  const inAll=instKeys.length>0&&instKeys.every(function(k){return !!sel[k];});
+  function b(label,title,fn,off){
+    const x=actBtn(label,title,fn);
+    if(off) x.disabled=true;
+    return x;
+  }
+  return [
+    b(ndAll?'清空节点':'全选节点',
+      nodeKeys.length?'选中/清空全部节点':'该树节点行仅作分组，无节点级曲线',
+      function(){setMany(nodeKeys,!ndAll);}, !nodeKeys.length),
+    b(inAll?'清空实例':'全选实例',
+      instKeys.length?'选中/清空全部实例行':'该树没有可选的实例行',
+      function(){setMany(instKeys,!inAll);}, !instKeys.length),
+    b('全部清空','清空节点与实例选择（允许空，图区显示空态）',
+      clearAll, false)
+  ];
 }
 function _refreshMem(){
   const box=document.getElementById('memTree'); if(!box) return;
@@ -5220,16 +5251,25 @@ function renderMemTree(box){
   if(!box) return;
   const M=D.monitors||{}; const hosts=M.mem_host||[];
   const numsByNode={};
+  const nodeKeys=[], instKeys=[];
   hosts.forEach(function(h){
     numsByNode[h.node]=(h.columns||[]).filter(function(c){
       return c.indexOf('used_mb')>=0;});
+    nodeKeys.push(h.node);
+    numsByNode[h.node].forEach(function(c){
+      instKeys.push(h.node+'/'+c.replace('_used_mb',''));});
   });
+  function setMany(keys,on){
+    keys.forEach(function(k){monMemSel[k]=on;});
+    monRenderCharts(); renderMemTree(box);
+  }
   const selCount=Object.keys(monMemSel).filter(function(k){
     return monMemSel[k];}).length;
-  const anyNode=hosts.some(function(h){return !!monMemSel[h.node];});
   const groups=hosts.map(function(h){
     const nums=numsByNode[h.node]||[];
     const key=h.node;
+    const numaKeys=nums.map(function(c){
+      return key+'/'+c.replace('_used_mb','');});
     const open=!!monMemOpen[key];
     let caret=null;
     if(nums.length){
@@ -5240,33 +5280,24 @@ function renderMemTree(box){
     }
     return {key:key,label:h.node,on:!!monMemSel[key],caret:caret,
       note:nums.length?(nums.length+' NUMA'):'',
-      onToggle:function(){
-        monMemSel[key]=!monMemSel[key];
-        monRenderCharts(); renderMemTree(box);},
+      minis:nums.length?[
+        actBtn('全选','选中该节点的全部 NUMA 分列',
+          function(){setMany(numaKeys,true);}),
+        actBtn('清空','取消该节点的全部 NUMA 分列',
+          function(){setMany(numaKeys,false);})]:[],
+      onToggle:function(){setMany([key],!monMemSel[key]);},
       open:open,
       rows:nums.map(function(c){
         const sub=c.replace('_used_mb','');
         const skey=key+'/'+sub;
         return {key:skey,label:'NUMA '+sub,on:!!monMemSel[skey],
-          onToggle:function(){
-            monMemSel[skey]=!monMemSel[skey];
-            monRenderCharts(); renderMemTree(box);}};
+          onToggle:function(){setMany([skey],!monMemSel[skey]);}};
       })};
   });
   renderMonTree(box,{
     title:'节点与 NUMA', count:selCount, extra:_renderMemPills(),
-    btns:[actBtn(anyNode?'清空节点':'全选节点',
-      anyNode?'取消全部节点的选择（允许空，图区显示空态）':
-        '选中全部节点（求和线）',
-      function(){
-        const on=!hosts.every(function(h){return monMemSel[h.node];});
-        hosts.forEach(function(h){
-          monMemSel[h.node]=on;
-          numsByNode[h.node].forEach(function(c){
-            monMemSel[h.node+'/'+c.replace('_used_mb','')]=false;});
-        });
-        monRenderCharts(); renderMemTree(box);
-      })],
+    btns:_monTopBtns(nodeKeys,instKeys,monMemSel,setMany,
+      function(){setMany(nodeKeys.concat(instKeys),false);}),
     groups:groups, empty:'没有宿主内存采样'});
 }
 /* ---- 进程树：节点仅分组（不可选），进程行勾选 ---- */
@@ -5278,11 +5309,14 @@ function renderProcTree(box){
     (byNode[p.node]=byNode[p.node]||[]).push(p);});
   const nodeNames=Object.keys(byNode).sort();
   const allKeys=procs.map(function(p){return p.node+'/'+p.pid;});
+  function setMany(keys,on){
+    keys.forEach(function(k){monProcSel[k]=on;});
+    monRenderCharts(); renderProcTree(box);
+  }
   const selCount=allKeys.filter(function(k){return monProcSel[k];}).length;
-  const allOn=procs.length>0&&procs.every(function(p){
-    return monProcSel[p.node+'/'+p.pid];});
   const groups=nodeNames.map(function(n){
     const kids=byNode[n]||[];
+    const kidKeys=kids.map(function(p){return n+'/'+p.pid;});
     /* 进程默认展开（undefined 时预设 true，再读） */
     if(monMemOpen['p:'+n]===undefined) monMemOpen['p:'+n]=true;
     const open=!!monMemOpen['p:'+n];
@@ -5293,23 +5327,23 @@ function renderProcTree(box){
     return {key:'pn:'+n,label:n,check:false,cls:'mon-node-head',
       color:monNodeHue(n),weight:'600',caret:caret,
       note:kids.length+' 进程',open:open,
+      minis:kidKeys.length?[
+        actBtn('全选','选中该节点的全部进程',
+          function(){setMany(kidKeys,true);}),
+        actBtn('清空','取消该节点的全部进程',
+          function(){setMany(kidKeys,false);})]:[],
       rows:kids.map(function(p){
         const k=n+'/'+p.pid;
         return {key:k,label:(p.comm?p.comm+' ':'')+p.pid,
           on:!!monProcSel[k],onToggle:function(){
-            monProcSel[k]=!monProcSel[k];
-            monRenderCharts(); renderProcTree(box);}};
+            setMany([k],!monProcSel[k]);}};
       })};
   });
   renderMonTree(box,{
     title:'进程', count:selCount,
-    btns:[actBtn(allOn?'清空进程':'全选进程',
-      allOn?'取消全部进程的选择（允许空，图区显示空态）':
-        '选中全部进程的 RSS 曲线',
-      function(){
-        allKeys.forEach(function(k){monProcSel[k]=!allOn;});
-        monRenderCharts(); renderProcTree(box);
-      })],
+    /* 节点行仅作分组：全选节点维度为空（置灰），实例=进程 */
+    btns:_monTopBtns([],allKeys,monProcSel,setMany,
+      function(){setMany(allKeys,false);}),
     groups:groups, empty:'没有进程内存采样'});
 }
 /* ---- URMA 树：仅节点勾选 ---- */
@@ -5317,24 +5351,21 @@ function renderUrmaTree(box){
   if(!box) return;
   const M=D.monitors||{}; const urma=M.urma||[];
   const nodes=_monNodes(urma);
-  const allOn=nodes.length>0&&nodes.every(function(n){return monUrmaSel[n];});
+  function setMany(keys,on){
+    keys.forEach(function(n){monUrmaSel[n]=on;});
+    monRenderCharts(); renderUrmaTree(box);
+  }
   const groups=nodes.map(function(n){
     const ports=urma.filter(function(u){return u.node===n;});
     return {key:n,label:n,on:!!monUrmaSel[n],
       note:ports.length?(ports.length+' 端口'):'',
-      onToggle:function(){
-        monUrmaSel[n]=!monUrmaSel[n];
-        monRenderCharts(); renderUrmaTree(box);}};
+      onToggle:function(){setMany([n],!monUrmaSel[n]);}};
   });
   renderMonTree(box,{
     title:'节点', count:nodes.filter(function(n){return monUrmaSel[n];}).length,
-    btns:[actBtn(allOn?'清空节点':'全选节点',
-      allOn?'取消全部节点的选择（允许空，图区显示空态）':
-        '选中全部节点的端口流量',
-      function(){
-        nodes.forEach(function(n){monUrmaSel[n]=!allOn;});
-        monRenderCharts(); renderUrmaTree(box);
-      })],
+    /* 无实例维度：全选实例置灰 */
+    btns:_monTopBtns(nodes,[],monUrmaSel,setMany,
+      function(){setMany(nodes,false);}),
     groups:groups, empty:'没有 URMA 采样'});
 }
 /* ---- 三图组装（按勾选过滤；配色=节点色系/同系色阶） ---- */
@@ -5353,13 +5384,15 @@ function monRenderCharts(){
       const usedCols=(h.columns||[]).filter(function(c){
         return c.indexOf('used_mb')>=0;});
       if(monMemSel[h.node]){
-        const sum=h.t.map(function(t,j){
-          return usedCols.reduce(function(a,c){return a+(h.series[c][j]||0);},0);
-        });
-        hs.push({name:h.node+' used',type:'line',showSymbol:false,
-          lineStyle:{width:1.6,color:monNodeHue(h.node)},
-          itemStyle:{color:monNodeHue(h.node)},
-          data:h.t.map(function(t,j){return [t*1000,round1(sum[j])];})});
+        if(monMemUsed){
+          const sum=h.t.map(function(t,j){
+            return usedCols.reduce(function(a,c){return a+(h.series[c][j]||0);},0);
+          });
+          hs.push({name:h.node+' used',type:'line',showSymbol:false,
+            lineStyle:{width:1.6,color:monNodeHue(h.node)},
+            itemStyle:{color:monNodeHue(h.node)},
+            data:h.t.map(function(t,j){return [t*1000,round1(sum[j])];})});
+        }
         if(monMemShowAvail&&h.columns.indexOf('mem_available_mb')>=0){
           const av=h.series['mem_available_mb'];
           hs.push({name:h.node+' available',type:'line',showSymbol:false,
@@ -5368,7 +5401,7 @@ function monRenderCharts(){
             data:h.t.map(function(t,j){return [t*1000,round1(av[j])];})});
         }
       }
-      usedCols.forEach(function(c){
+      if(monMemUsed) usedCols.forEach(function(c){
         const sub=c.replace('_used_mb','');
         if(monMemSel[h.node+'/'+sub]){
           const col=h.series[c];
@@ -5382,7 +5415,9 @@ function monRenderCharts(){
     });
     safe('mem-chart',function(){
       if(!_monChart('memchart',hs,'MB'))
-        _monEmpty('memEmpty','未勾选节点或 NUMA：在上方树中勾选后查看。');});
+        _monEmpty('memEmpty',(!monMemUsed&&!monMemShowAvail)?
+          '未选择指标：在上方勾选「用量」或「可用量」。':
+          '未勾选节点或 NUMA：在上方树中勾选后查看。');});
   }
   /* 进程 RSS：按进程勾选；色=所属节点色系色阶（同节点内按 pid 排序定阶） */
   const hasProc=!!(M.mem_proc&&M.mem_proc.length);
