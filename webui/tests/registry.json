@@ -2330,7 +2330,7 @@
    "id": "C19.V2",
    "module": "report",
    "desc": "跨单元聚合口径：计数求和、分位数取最差单元、注明单元数",
-   "req": "R-OV-2",
+   "req": "R-OV-4",
    "unit": [
     "test_overview_sums_all_data_sizes"
    ],
@@ -2384,6 +2384,29 @@
    "req": "R-OV-3",
    "unit": [
     "test_adapter_resolves_parent_relative_links"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C19.V5",
+   "module": "report",
+   "desc": "overview 卡片指标行：吞吐/avg/p99/p9999；pipeline 按角色写/读路径两行",
+   "req": "R-OV-1",
+   "unit": [
+    "test_render_overview",
+    "test_overview_sums_all_data_sizes",
+    "test_overview_groups_units_per_config"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C19.V6",
+   "module": "report",
+   "desc": "overview 跨单元聚合口径（吞吐=字节/时长、avg 加权、分位数取最差）与注记",
+   "req": "R-OV-4",
+   "unit": [
+    "test_overview_groups_units_per_config",
+    "test_overview_sums_all_data_sizes"
    ],
    "e2e": []
   },

@@ -2312,6 +2312,13 @@ font-variant-numeric:tabular-nums;line-height:1.25}
 #perfcards .kv.strong .v,#tcards .kv.strong .v,
 #rolecards .kv.strong .v{font-weight:800;font-size:24px}
 .gridbreak{grid-column:1/-1;height:0;margin:0;padding:0}
+/* overview 指标行：吞吐/avg/p99/p9999 为主，计数行为次要字重；
+   pipeline 每个角色一行（整行标签占满网格）。 */
+.card > .grid + .grid{margin-top:14px}
+.grid.metric .kv .k{text-transform:none}
+.grid.minor .kv .v{font-size:18px;font-weight:500}
+.ovrole{grid-column:1/-1;color:var(--mut);font-size:12px;font-weight:600;
+letter-spacing:.06em}
 #unitmeta{gap:10px 22px;margin-bottom:8px}
 #rolecards .rblock{margin-bottom:4px}
 #rolecards .rblock .sec{margin-top:16px}
@@ -8135,6 +8142,40 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     return html_path, full_js
 
 
+def _ov_agg(blocks):
+    """overview 指标行的跨块聚合：计数/字节/时长求和，avg 按成功数加权，
+    p99/p9999 取最差块（C19.V2），吞吐 = 字节合计 ÷ 时长合计。
+    无有效块时返回 None。"""
+    blocks = [b for b in (blocks or []) if b]
+    if not blocks:
+        return None
+    out = {"total": 0, "ok": 0, "fail": 0, "bytes": 0.0, "wall_s": 0.0,
+           "avg_ms": None, "p99_ms": None, "p9999_ms": None,
+           "throughput_mb_s": None}
+    lat_sum = 0.0
+    lat_n = 0
+    for b in blocks:
+        out["total"] += int(b.get("total") or 0)
+        out["ok"] += int(b.get("ok") or 0)
+        out["fail"] += int(b.get("fail") or 0)
+        out["bytes"] += float(b.get("bytes") or 0)
+        out["wall_s"] += float(b.get("wall_s") or 0)
+        n = int(b.get("ok") or 0)
+        if b.get("avg_ms") is not None and n > 0:
+            lat_sum += float(b["avg_ms"]) * n
+            lat_n += n
+        for key in ("p99_ms", "p9999_ms"):
+            v = b.get(key)
+            if v is not None:
+                out[key] = (float(v) if out[key] is None
+                            else max(out[key], float(v)))
+    out["avg_ms"] = round(lat_sum / lat_n, 2) if lat_n else None
+    out["fail_rate"] = (out["fail"] / out["total"]) if out["total"] else 0.0
+    if out["wall_s"] > 0:
+        out["throughput_mb_s"] = out["bytes"] / out["wall_s"] / 1048576.0
+    return out
+
+
 def render_overview(run_meta, scenarios, out_dir, rel_base=None):
     """run 级总览：**每配置一卡**（跨单元聚合口径）+ 卡内单元报表链接列表
     + 节点日志量。scenarios 的每一项是「单元」（一个 size×combo），
@@ -8152,23 +8193,13 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
     for cfg_name in order:
         units = groups[cfg_name]
         m = units[0].get("meta") or {}
-        # 跨单元聚合：ok/fail/bytes/total 求和，时长求和（单元顺序执行），
-        # 分位数取最差单元（并注明单元数）。
+        # 跨单元聚合：计数求和、avg 按成功数加权、p99/p9999 取最差单元，
+        # 吞吐 = 字节合计 ÷ 时长合计（见 _ov_agg）。
         blocks = [z.get("summary")
                   for u in units
                   for z in (u.get("sizes") or {}).values()
                   if z and z.get("summary")]
-        if blocks:
-            s = {
-                "ok": sum(int(b.get("ok") or 0) for b in blocks),
-                "fail": sum(int(b.get("fail") or 0) for b in blocks),
-                "total": sum(int(b.get("total") or 0) for b in blocks),
-                "bytes": sum(int(b.get("bytes") or 0) for b in blocks),
-                "wall_s": sum(float(b.get("wall_s") or 0) for b in blocks),
-            }
-            s["fail_rate"] = (s["fail"] / s["total"]) if s["total"] else 0.0
-        else:
-            s = {}
+        s = _ov_agg(blocks) or {}
         # 监控摘要跨单元聚合（每个单元只带自己时间窗的数据）；
         # 峰值内存逐 pod 名单过长，不写入 overview（见 DR-43）
         worst_proc, peak_urma = None, None
@@ -8209,14 +8240,63 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
                         for k in (u.get("sizes") or {}) if k != "all"})
         name = html.escape(str(cfg_name))
         mode = html.escape(str(m.get("mode") or ""))
+
+        def _metric_cell(k, v, unit=""):
+            u = ('<span class="u"> ' + unit + "</span>") if unit else ""
+            return ('<div class="kv"><div class="k">{}</div>'
+                    '<div class="v">{}{}</div></div>').format(k, v, u)
+
+        def _metrics(row):
+            tp = row.get("throughput_mb_s")
+            return "".join([
+                _metric_cell("吞吐", "-" if tp is None
+                             else "{:.1f}".format(float(tp)),
+                             "" if tp is None else "MB/s"),
+                _metric_cell("avg", _fmt_lat_ms(row.get("avg_ms"))),
+                _metric_cell("p99", _fmt_lat_ms(row.get("p99_ms"))),
+                _metric_cell("p9999", _fmt_lat_ms(row.get("p9999_ms")))])
+
+        # pipeline：写路径/读路径各一行（各自 role_summaries 聚合）；
+        # basic 或旧产物无角色摘要时回落合并口径。
+        metric_blocks = ""
+        if _scenario_of(m) == "pipeline":
+            for role, label in (("writer", "写路径（writer）"),
+                                ("reader", "读路径（reader）")):
+                rbs = []
+                for u in units:
+                    for z in (u.get("sizes") or {}).values():
+                        rs = ((z or {}).get("role_summaries") or {}).get(role)
+                        if rs:
+                            rbs.append(rs)
+                agg = _ov_agg(rbs)
+                if agg:
+                    metric_blocks += ('<div class="grid metric">'
+                                      '<div class="ovrole">{}</div>{}</div>'
+                                      .format(label, _metrics(agg)))
+        if not metric_blocks:
+            metric_blocks = ('<div class="grid metric">' + _metrics(s) +
+                             "</div>")
+        counts = ('<div class="grid minor">'
+                  '<div class="kv"><div class="k">成功</div>'
+                  '<div class="v">{ok}</div></div>'
+                  '<div class="kv"><div class="k">失败</div>'
+                  '<div class="v">{fail}</div></div>'
+                  '<div class="kv"><div class="k">失败率</div>'
+                  '<div class="v">{fr}<span class="u"> %</span></div></div>'
+                  "</div>").format(ok=s.get("ok", "-"),
+                                   fail=s.get("fail", "-"),
+                                   fr=round((s.get("fail_rate") or 0) * 100, 2))
+        agg_note = ""
+        if len(units) > 1:
+            agg_note = ('<div class="note">跨 {} 个报表单元聚合：计数与字节求和，'
+                        "吞吐 = 字节合计 ÷ 时长合计，"
+                        "p99/p9999 取最差单元。</div>".format(len(units)))
         cards.append("""
 <div class="card"><h2>{name}</h2>
 <div class="sub">{mode} · {proto} · {sizes} · 时长 {dur} {early}</div>
-<div class="grid">
-<div class="kv"><div class="k">成功</div><div class="v">{ok}</div></div>
-<div class="kv"><div class="k">失败</div><div class="v">{fail}</div></div>
-<div class="kv"><div class="k">失败率</div><div class="v">{fr}<span class="u"> %</span></div></div>
-</div>
+{metrics}
+{counts}
+{agg_note}
 {monline}
 {linkblock}
 </div>""".format(
@@ -8226,8 +8306,7 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
             dur=_fmt_dur(s.get("wall_s") or 0),
             early='<span class="tag warn">提前停止/异常</span>'
             if m.get("early_stop") else "",
-            ok=s.get("ok", "-"), fail=s.get("fail", "-"),
-            fr=round((s.get("fail_rate") or 0) * 100, 2),
+            metrics=metric_blocks, counts=counts, agg_note=agg_note,
             linkblock=link_block, monline=monline))
     nodes = run_meta.get("nodes") or []
     node_rows = "".join(
@@ -8274,6 +8353,19 @@ def render_overview(run_meta, scenarios, out_dir, rel_base=None):
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)
     return path
+
+
+def _fmt_lat_ms(v):
+    """overview 时延单元格：ms/s 自适应（与 report.html 的 fmtMs 同阶梯）。
+    None（无统计/无 digest）显示 "-"。"""
+    if v is None:
+        return "-"
+    v = float(v)
+    if v >= 1000:
+        return "{:.2f}s".format(v / 1000.0)
+    if v >= 10:
+        return "{:.1f}ms".format(v)
+    return "{:.2f}ms".format(v)
 
 
 def _fmt_dur(s):
