@@ -7377,6 +7377,19 @@ def _kvtest_pod_map(cluster, entry, remote_scripts, globals_cfg,
     return [out_stats, out_csv]
 
 
+def _controller_reduce_stage():
+    """controller partial reduce 的远端脚本清单。
+
+    kvtest_partial_reduce.py 在 controller 上 import logstats + report，
+    report 又 import trace_trees —— 树必须随脚本平铺下发（同 pod map
+    口径，loader 以 _schema.json 标记识别平铺布局）。"""
+    stage = [os.path.join(SCRIPTS_DIR, n) for n in
+             ("logstats.py", "report.py", "kvtest_partial_reduce.py")]
+    for _fname, _src in _trace_tree_payload()[1]:
+        stage.append(os.path.join(_src, _fname))
+    return stage
+
+
 def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
                                 cfg_name, ds, instance_pids, groups,
                                 local_log_dir, qps_target=0, nodes=0,
@@ -7396,9 +7409,7 @@ def _kvtest_controller_collect(cluster, globals_cfg, cfg, args, ts,
     os.makedirs(red_dir, exist_ok=True)
     _controller_cp_groups(cluster, groups, cdir)
     scripts_dst = posixpath.join(cdir, "scripts")
-    stage = [os.path.join(SCRIPTS_DIR, n) for n in
-             ("logstats.py", "report.py", "kvtest_partial_reduce.py")]
-    controller_put(c, stage, scripts_dst)
+    controller_put(c, _controller_reduce_stage(), scripts_dst)
     names = set()
     for _n, files, _l in groups:
         for f in files:

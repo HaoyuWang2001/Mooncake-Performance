@@ -155,6 +155,21 @@ def test_map_pod_payload_carries_trace_trees():
     assert tree_dir.endswith(os.path.join("configs", "_trace_trees"))
 
 
+def test_controller_reduce_stage_carries_trace_trees():
+    """controller partial reduce 的脚本清单同样带树：kvtest_partial_
+    reduce 在 controller 上 import report → trace_trees（事故
+    20261128-1355：ModuleNotFoundError → partial reduce rc=1 → 收集
+    阶段 FAIL，此时 pod 内 map 已成功、产物白白拉回）。"""
+    stage = bm._controller_reduce_stage()
+    base = [os.path.basename(p) for p in stage]
+    for name in ("logstats.py", "report.py", "kvtest_partial_reduce.py",
+                 "trace_trees.py", "_schema.json", "get_buffer.json",
+                 "put.json"):
+        assert name in base, name
+    for p in stage:
+        assert os.path.isfile(p), p
+
+
 def test_map_timeout_env_and_passthrough(monkeypatch):
     """map 超时可配（MC_MAP_TIMEOUT），并真正传给 ssh/exec。"""
     monkeypatch.delenv("MC_MAP_TIMEOUT", raising=False)

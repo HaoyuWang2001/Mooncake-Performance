@@ -4121,11 +4121,12 @@
   {
    "id": "E-138",
    "module": "benchmark",
-   "desc": "验证 trace map 用进程基目录且 glog 严格；trace_trees.py + configs/_trace_trees/*.json 随脚本平铺下发（漏发 = pod 内 import 失败 → 全部 map 挂）",
+   "desc": "验证 trace map 用进程基目录且 glog 严格；trace_trees.py + configs/_trace_trees/*.json 随脚本平铺下发到 pod（map）与 controller（partial reduce），漏发 = 远端 import 失败 → 全部 map/收集挂",
    "req": "",
    "unit": [
     "test_remote_trace_map_uses_process_base_and_strict_glog",
-    "test_map_pod_payload_carries_trace_trees"
+    "test_map_pod_payload_carries_trace_trees",
+    "test_controller_reduce_stage_carries_trace_trees"
    ],
    "e2e": []
   },
