@@ -1268,6 +1268,31 @@ if (!errs.length) {
       out.stage_tree_note = textOf(getEl("stageTree"));
     } catch (e) { errs.push("stage-tree: " + String(e && e.stack || e)); }
   }
+  if (process.argv.includes("--stage-tree-view")) {
+    try {
+      // 展开指定 L1（按 data-key 找 caret）后采集阶段树文本
+      // （views 子行徽标：classic/tent/A-B 并列分解标识）
+      const target = arg("--stage-tree-view", "read_us");
+      let caret = null;
+      (function walk(n) {
+        if (caret || !n) return;
+        (n.children || []).forEach(function (c) {
+          const k = c.getAttribute && c.getAttribute("data-key");
+          if (!caret && k === target) {
+            const row = c.parentNode;
+            const car = (row.children || []).find(function (x) {
+              return String(x.className || "").indexOf("tree-caret") >= 0;});
+            if (car && car.onclick) caret = car;
+          }
+          walk(c);
+        });
+      })(getEl("stageTree"));
+      if (caret && caret.onclick) caret.onclick();
+      out.stage_tree_view_text = textOf(getEl("stageTree"));
+    } catch (e) {
+      errs.push("stage-tree-view: " + String(e && e.stack || e));
+    }
+  }
   if (process.argv.includes("--trace-tree")) {
     try {
       const tsel = function () {
