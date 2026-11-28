@@ -192,6 +192,14 @@ def test_render_overview(tmp_path):
     assert "运行总览" in src and "rank_smoke" in src
     assert "report/report.html" in src
     assert "节点日志量" in src
+    # pipeline：写路径一行（吞吐/avg/p99/p9999），无 reader 数据不凭空造行
+    assert '<div class="ovrole">写路径（writer）</div>' in src
+    assert '<div class="ovrole">读路径（reader）</div>' not in src
+    for k in ("吞吐", "avg", "p99", "p9999"):
+        assert '<div class="k">' + k + "</div>" in src, k
+    assert "MB/s" in src
+    # 单单元：不出现跨单元聚合注记
+    assert "个报表单元聚合" not in src
 
 
 def test_rebuild_reports_local(tmp_path, monkeypatch):
@@ -914,6 +922,10 @@ def test_overview_sums_all_data_sizes(tmp_path):
     src = open(ov, encoding="utf-8").read()
     assert '<div class="k">成功</div><div class="v">20</div>' in src
     assert '<div class="k">失败</div><div class="v">0</div>' in src
+    # basic 合并口径：吞吐/avg/p99/p9999 同卡展示；单单元无跨单元注记
+    for k in ("吞吐", "avg", "p99", "p9999"):
+        assert '<div class="k">' + k + "</div>" in src, k
+    assert "个报表单元聚合" not in src
 
 
 def test_qw_average_divides_by_ok_rows(tmp_path):
@@ -1889,15 +1901,16 @@ def test_overview_groups_units_per_config(tmp_path):
     html = open(ov, encoding="utf-8").read()
     assert html.count('<div class="card">') == 1
     assert "1MB, 8MB" in html
-    # 指标行只保留 成功/失败/失败率（QPS/分位数不再上 overview）
-    for k in ("成功", "失败", "失败率"):
+    # 指标行：吞吐/avg/p99/p9999 + 成功/失败/失败率；p50/p999/QPS 仍不上 overview
+    for k in ("吞吐", "avg", "p99", "p9999", "成功", "失败", "失败率"):
         assert '<div class="k">' + k + "</div>" in html, k
-    for k in ("QPS", "p50", "p99", "p999"):
+    for k in ("QPS", "p50", "p999"):
         assert '<div class="k">' + k + "</div>" not in html, k
-    # 小字：场景/协议/数据量/时长（无「个单元/客户端/目标 QPS」）
-    assert "个单元" not in html and "目标 QPS" not in html
-    # 底部合并口径说明行已删除
-    assert "分位数取最差单元" not in html
+    # 多单元：注明聚合口径（计数求和、分位数取最差单元）
+    assert "跨 2 个报表单元聚合" in html
+    assert "p99/p9999 取最差单元" in html
+    # 小字：场景/协议/数据量/时长（无「目标 QPS」）
+    assert "目标 QPS" not in html
     assert 'href="logs/cfg/report/c1_t1_8MB/report.html"' in html
     assert 'href="logs/cfg/report/c1_t1_1MB/report.html"' in html
 

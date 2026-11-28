@@ -190,9 +190,10 @@ report.py（本组件：reduce + render，纯标准库）
 
 ### K. run 总览（OV）
 
-- **R-OV-1** `[已固化·DR-9·DR-12]` overview.html 为 run 级索引：**每配置一张卡**（跨单元聚合口径 + 分位数取最差单元），卡内列出该配置的**逐单元链接**（一个 size×参数组 一份报表）；点击链接在新标签页打开对应单元报表。
+- **R-OV-1** `[已固化·DR-9·DR-12·DR-69]` overview.html 为 run 级索引：**每配置一张卡**（跨单元聚合口径 + 分位数取最差单元），**卡内指标行显示 吞吐/avg/p99/p9999**：pipeline 形态按角色拆两行（`写路径（writer）` / `读路径（reader）`，各取该角色 `role_summaries` 跨单元聚合；basic 形态单行合并口径）；卡内列出该配置的**逐单元链接**（一个 size×参数组 一份报表）；点击链接在新标签页打开对应单元报表。
 - **R-OV-2** `[已固化]` 节点日志量表：每节点的客户端数与日志量。
 - **R-OV-3** `[已固化]` overview 内链接对产物所在目录层级自适应（磁盘双击打开与 WebUI raw 模式均可达）。
+- **R-OV-4** `[已固化·DR-69]` 跨单元聚合口径与注记：计数/字节求和，avg 按成功数加权，**吞吐 = 字节合计 ÷ 时长合计**，p99/p9999 取最差单元；单元数 > 1 时卡内注明该口径。
 
 ---
 
@@ -327,6 +328,7 @@ report.py（本组件：reduce + render，纯标准库）
 | DR-66 | 2026-11-28 | **trace 阶段树重构为 per-op JSON 单一事实源（用户需求；修复读/写路径解析的系统性错误）**：六根因——读树无传输段（classic `memread_*`/TENT 四相位缺失）、`batch_put` 误按 put 族并集解析（残差 = total）、树按 group 共享字段错并集、树定义 Python/JS 双份漂移（TREAD/TWRITE）、字段归一引入第三套名（`query_us`/`alloc_us`）、`read_us` 双分解未表达；重构为每 op 一份 `configs/_trace_trees/<op>.json`（13 棵，schema `mp-trace-tree/1`，`scripts/trace_trees.py` 唯一入口，目录缺失/校验失败硬失败）；字段名 = 日志原生名（legacy 方向翻转：旧 `get_breakdown` 行的 `query_us`/`alloc_us` 单向别名到 `query_total_us`/`buf_alloc_us`）；新增 views（`read_us` 的 classic/tent/A-B 并列分解，L2 子行带徽标）与 switch（put 族传输段按行内 engine 切 L1 形状，case 名作 view）；report 页面嵌 `TRACE_TREES`、删 TREAD/TWRITE，渲染 JS 零 op 知识；`batch_put`/`batch_put_into`/`batch_upsert_from` 薄行 = prep/write 两段；`get` 非独立树（legacy_ops 归一到 get_buffer）；未知 op 归「其它」组并计 `meta.unknown_ops` | 用户需求 |
 | DR-67 | 2026-11-28 | **map/reduce 侧树下发补齐（E2E 事故 20261128-1331/1355）**：tracestats 在 pod 内、kvtest_partial_reduce 在 controller 上 `import trace_trees`（report.py → trace_trees），但两处远端脚本清单都未包含树 → pod 内 map 全挂（`no trace product`）→ 修后收集阶段又挂（partial reduce `ModuleNotFoundError`）→ 场景 FAIL。修复：benchmark 新增 `_trace_tree_payload`（`trace_trees.py` + `configs/_trace_trees/*.json` 随脚本**平铺**下发——configmap 键不允许子目录），三处下发点统一接入（k8s pod configmap / ssh `deploy_scripts` / controller partial reduce `_controller_reduce_stage`）；`trace_trees._resolve_tree_dir` 支持平铺布局（`scripts/` 本身，以 `_schema.json` 作标记，源仓库布局优先，两个候选都缺 → load 硬失败不静默）。单测无法覆盖此路径（源仓库本地 `configs/` 天然存在），E2E 逐处抓出 | E2E 事故 |
 | DR-68 | 2026-11-28 | **监控三图统一图表框架 + RSS/URMA 交互修正（用户需求）**：① 抽出 `lfChartFrame` 统一图表模板（后续任何图必须走它）：图与上方控件间距统一、图例左右边界=grid（不越过 y 轴）、`grid.top` 保证图例不被截断、tooltip 时间一律人类可读（`T+mm:ss` + 墙钟）、x 底部 slider+inside、y 右侧竖向 slider+inside（全部 ECharts 原生）；② 进程 RSS：RSS 增长 TOP-10 移到图下方并加标题；进程节点行去掉专属节点色/加粗（仍无 checkbox，节点级聚合语义有歧义）；默认只勾选 `mem.proc_pattern` 前缀（comm 截断 15 字符，缺省 `mooncake_kvtest`，无命中回退全选）；删除「未勾选进程：…」空态文案；③ URMA：速率点按 `urma.interval_s`（默认 1s）量化到相对 t0 的时间桶并同桶平均，修复纳秒时间戳抖动导致“每条竖线只命中一个节点”；compact payload 透传 `config` 供前端取默认进程前缀 | 用户需求 |
+| DR-69 | 2026-11-28 | **overview 卡片指标行加强（用户需求）**：每配置卡在 成功/失败/失败率 之上新增指标行 **吞吐 / avg / p99 / p9999**；pipeline 形态按角色拆两行（`写路径（writer）` / `读路径（reader）`，各自取该角色 `role_summaries` 跨单元聚合；无角色摘要的旧产物回落合并口径），basic 单行合并口径；聚合口径 = 计数/字节求和、avg 按成功数加权、吞吐 = 字节合计 ÷ 时长合计、p99/p9999 取最差单元，单元数 >1 时卡内注明；计数行降为次要字重（18px/500），指标行保持强调字重 | 用户需求 |
 
 ---
 
