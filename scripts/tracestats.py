@@ -6,32 +6,26 @@ SDK 把高频 trace 打到 glog（`<glog 前缀> trace_id[...] breakdown[op] k[v
 <glog>.trace.json：按方向（read/write/other）与 op 聚合每请求端到端时延与
 各阶段时延（树状），供 report.py 跨客户端合并渲染。
 
+**阶段树单一事实源：configs/_trace_trees/<op>.json（schema mp-trace-tree/1）**。
+每 op 一份树、字段名 = 日志原生名；行匹配（marker/legacy 别名/字段归一）、
+分组（read/write/other）、L1 阶段集合（fminutes 曲线字段/残差分母/TopN 阶段）
+全部由树注册表驱动（scripts/trace_trees.py 加载并静态校验，缺失即硬失败）。
+树是静态 schema 知识，不进 trace 产物 JSON；report.py 渲染端读同一目录。
+
 字段格式：`name[value]` 全局括号感知匹配（value 可含空格 : . @ / -，不含 ]）；
 数值字段按 int/float 解析，`-1` 为"该阶段拿不到时间戳"的哨兵（不参与时延统计，
 仅计 neg）；start_time 为本地日期时间（含空格），转 epoch 用于时间桶。
 
-阶段树（数据自检用，report 按此展示；对齐 Mooncake 源码统一 breakdown[op] 体系，
-见 Mooncake 仓库 docs/yh/log-reference.md §14；TE/TENT 双引擎）：
-  读 get_buffer（breakdown[get_buffer]；旧 get_breakdown 行仍兼容）:
-    total ≈ query_total + select(local_endpoints+select_replica) + buf_alloc + read
-            (query_total ≈ query_route + query_rpc + query_retry + glue)
-            (read ≈ read_a + read_transfer_window + read_b；classic: read == memread_total)
-  读 get_into（breakdown[get_into]）:
-    total ≈ query + select(local_endpoints+select_replica) + read
-            (read = offload_rpc + transfer_data + release_buffer + read_overhead)
-  读 batch_get / batch_get_into（breakdown[batch_get|batch_get_into]）:
-    total ≈ query + prep(逐 key 选择/分配汇总) + read
-            (query 同样带 query_route/query_rpc/query_retry 下钻)
-  写 put/put_from/upsert/upsert_from（breakdown[op]，engine[tent|classic]）:
-    total ≈ prep_total(buf_alloc+memcpy+split) + checksum + prepare
-            + query(upsert，带 query_route/rpc/retry 下钻) | put_start(put)
-            + <传输段> + put_end(put) | finalize(upsert) + cache_invalidate + revoke
-    <传输段> classic: memwrite_total(submit+queue+urma+teardown)
-             tent:    admit + queue_prep + wire_span + propagate
-  写 batch_put / batch_put_into（breakdown[op]）：put 族字段集（缺省字段跳过）
-  remove / batchRemove：薄行（remove_rpc_us/total_us/status），归「其它」组
-  辅助（不参与加和）: slice_count, replicas, bytes, engine 分布
-  字段名归一：query_total_us→query_us、buf_alloc_us→alloc_us（报表树沿用规范名）
+树口径（对齐 Mooncake 仓库 docs/yh/log-reference.md §14 与源码发射点）：
+  读 get_buffer（含旧 get_breakdown 兼容）: total ≈ query_total+select+buf_alloc+read
+  读 get_into: total ≈ query+select+read（read 拆 offload 三段+overhead）
+  读 batch_get / batch_get_into: total = query+prep+read（恒等）
+  写 put/put_from: prep+checksum+prepare+put_start+传输段+put_end+revoke
+  写 upsert/upsert_from: prep+checksum+prepare+query+传输段+finalize+cache_inval+revoke
+       传输段 classic=memwrite_total(四子段) / tent=四相位；engine 标注不参与门控
+  写 batch_put / batch_put_into / batch_upsert_from: 薄行 prep+write（恒等）
+  remove / batchRemove：薄行 remove_rpc ≡ total，归「其它」组
+  辅助（不参与加和）: slice_count, replicas, bytes, engine 分布, *_urma_min/avg_us
 
 采样门控（报表需标注）：主行仅在采样命中或失败时出现；样本数 ≠ 请求总数。
 
@@ -51,56 +45,53 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import logstats as ls   # noqa: E402  (bin ladder + histogram percentile shared)
+import trace_trees as tt  # noqa: E402  (per-op stage trees, single source)
 
 PAIR_RE = re.compile(r"(\w+)\[([^\]]*)\]")
-# 成功状态归一：C++ 读路径历史上把成功写成 status[read_ok]（写路径为
-# status[ok]），严格 status=="ok" 会把全部读请求误判为失败。识别集合里的
-# 成功变体统一按 ok 归档（旧镜像/旧产物的兼容；生产端应写 ok）。
-SUCCESS_STATUSES = frozenset({"ok", "read_ok"})
+# 阶段树唯一来源：configs/_trace_trees/<op>.json（schema mp-trace-tree/1）。
+# 树缺失/非法时硬失败——静默回退到错误树正是读/写路径解析全错的根因。
+TREES = tt.load_trace_trees()
+_LEGACY_TO_OP = tt.legacy_index(TREES)          # 旧 marker -> 兼容规则
+_OK_STATUSES = tt.ok_statuses_of(TREES)         # op -> frozenset(ok)
+_CHART_FIELDS = tt.chart_fields_of(TREES)       # op -> (L1 元组, L2 元组)
+_META_FIELDS = tt.meta_fields_of(TREES)         # op -> set(非时延字段)
+_KNOWN_OPS = frozenset(TREES)
+# 旧 get_breakdown 行的 bd 归一表：{bd 值: 目标 op}
+_LEGACY_OP_ALIASES = {}
+for _leg in _LEGACY_TO_OP.values():
+    for _bdv in _leg["legacy_ops"]:
+        _LEGACY_OP_ALIASES[_bdv] = _leg["op"]
+# 未知 op 的兜底成功状态（已知 op 一律用自身树口径）
+GLOBAL_FALLBACK_OK = frozenset({"ok"})
 
+# 兼容期全局集合（仅测试与外部调用方使用；主流程一律走按 op 的树注册表）
+SUCCESS_STATUSES = frozenset({"ok", "read_ok"})
 STRING_FIELDS = {"trace_id", "breakdown", "key", "status", "type",
                  "remote_endpoint", "local_endpoint", "src", "dst",
                  "engine"}
 META_FIELDS = {"start_time", "slice_idx", "offset", "bytes"}
-
-READ_OPS = {"get", "get_batch", "get_into", "get_buffer", "batch_get",
-            "batch_get_into", "batch_get_buffer", "batch_get_into_buffer"}
-WRITE_OPS = {"put", "put_batch", "put_from", "upsert", "upsert_from",
-             "batch_put", "batch_put_into", "batch_upsert_from",
-             "batch_put_from"}
-
-# 统一 breakdown[get_buffer] 的字段改名（log-reference §14.5/§14.9）：
-# 报表阶段树沿用既有规范名 query_us/alloc_us，这里做一次等价归一。
-FIELD_ALIASES = {"query_total_us": "query_us", "buf_alloc_us": "alloc_us"}
-
-# 读侧（get_breakdown / breakdown[get_into]）：query+select+alloc+read 四个 L1；
-# select 拆 local_endpoints/select_replica，read 拆 A/B 分段（get_buffer）或
-# offload 三段+overhead（get_into）。
-READ_TOP = ("query_us", "select_us", "alloc_us", "prep_us", "read_us")
-# L2 子阶段：慢请求展开明细要回答「慢的一块里哪个子区间慢」——top 条目
-# 除 L1 外一并保留这些字段（与 report.py 的 TREAD/TWRITE 树一致）。
-READ_SUB = ("local_endpoints_us", "select_replica_us",
-            "read_a_us", "read_transfer_window_us", "read_b_us",
-            "offload_rpc_us", "transfer_data_us", "release_buffer_us",
-            "read_overhead_us",
-            "query_route_us", "query_rpc_us", "query_retry_us")
-# 写侧公共段 + 双引擎传输段：classic 的 memwrite_*（字段名不变）与 TENT 四相位
-# admit/queue_prep/wire_span/propagate 并列；逐行缺省字段跳过，残差各自成立。
-WRITE_TOP = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
-             "put_start_us",
-             "memwrite_total_us",
-             "admit_us", "queue_prep_us", "wire_span_us", "propagate_us",
-             "put_end_us", "finalize_us",
-             "cache_invalidate_us", "revoke_us")
-WRITE_SUB = ("prep_buf_alloc_us", "prep_memcpy_us", "prep_split_us",
-             "memwrite_submit_us", "memwrite_queue_us",
-             "memwrite_urma_us", "memwrite_teardown_us",
-             "query_route_us", "query_rpc_us", "query_retry_us")
-
-# 段3：阶段曲线（图2）采样字段 = L1 顶层 + total + residual。
+# 未知 op 兜底树（保守并集；已知 op 一律用 configs/_trace_trees/<op>.json）
+READ_TOP_LEGACY = ("query_us", "query_total_us", "select_us", "alloc_us",
+                   "buf_alloc_us", "prep_us", "read_us")
+READ_SUB_LEGACY = ("local_endpoints_us", "select_replica_us",
+                   "read_a_us", "read_transfer_window_us", "read_b_us",
+                   "offload_rpc_us", "transfer_data_us", "release_buffer_us",
+                   "read_overhead_us",
+                   "query_route_us", "query_rpc_us", "query_retry_us")
+WRITE_TOP_LEGACY = ("prep_total_us", "checksum_us", "prepare_us", "query_us",
+                    "put_start_us",
+                    "memwrite_total_us",
+                    "admit_us", "queue_prep_us", "wire_span_us", "propagate_us",
+                    "put_end_us", "finalize_us",
+                    "cache_invalidate_us", "revoke_us")
+WRITE_SUB_LEGACY = ("prep_buf_alloc_us", "prep_memcpy_us", "prep_split_us",
+                    "memwrite_submit_us", "memwrite_queue_us",
+                    "memwrite_urma_us", "memwrite_teardown_us",
+                    "query_route_us", "query_rpc_us", "query_retry_us")
+# 段3：阶段曲线（图2）采样字段 = 按 op 树的 L1（chart:true）+ residual。
 # L2 子阶段（query_route/read_urma/...）不再逐时间采样（体积随字段数线性膨胀，
 # 512 客户端不可控）；L2 细粒度分析在阶段树/指标套件里提供全局统计。
-CHART_FIELDS = set(READ_TOP) | set(WRITE_TOP) | {"residual"}
+CHART_FIELDS = {f for top, _sub in _CHART_FIELDS.values() for f in top} | {"residual"}
 FIELD_BASE_SECONDS = 1        # 采集粒度：按 1 秒累加
 # 时间尺度收集规则（与 logstats.py / report.py 一致）：
 #   尺度 s 回传 ⇔ 桶数 span/s ∈ [MIN_TIER_BUCKETS, MAX_TIER_BUCKETS]
@@ -166,50 +157,64 @@ def _truncated(line):
     return seg.count("[") != seg.count("]") or not seg.endswith("]")
 
 
-def _group_of(pairs):
+def _group_of(pairs, trees=TREES):
     """read / write / other for one parsed line.
 
-    Field presence is authoritative (it implies which stage tree applies);
-    an early-exit request may be missing the telling field, so the op name
-    is the fallback — otherwise a failed put silently lands in 'other' and
-    loses its residual."""
+    先按 op 树注册表（bd 值 → group，权威口径）；字段探测只作未知 op 的
+    兜底——已知 op 早期退出行保留 op 归组（失败 put 不丢残差），未知 op
+    按字段猜组并进 other。"""
     bd = pairs.get("breakdown", "")
+    tree = trees.get(bd)
+    if tree is not None:
+        return tree["group"]
     if ("read_a_us" in pairs or "read_transfer_window_us" in pairs
             or "offload_rpc_us" in pairs):
         return "read"
     if ("admit_us" in pairs or "wire_span_us" in pairs
             or "memwrite_total_us" in pairs):
         return "write"
-    if bd in READ_OPS:
-        return "read"
-    if bd in WRITE_OPS:
-        return "write"
     return "other"
 
 
-def parse_line(line):
+def parse_line(line, trees=TREES, legacy_to_op=None):
     """One glog line -> pairs or None when not a trace line.
 
-    Two families (both bracket-pair `name[value]` payloads):
-      - `breakdown[<op>] ...` (put family, get_into, batch ops, .slice/.slice_stats)
-      - `get_breakdown key[...] ...` (get_buffer; normalized to
-        breakdown="get_buffer" so the rest of the pipeline is unchanged)"""
-    is_get = " get_breakdown " in line
-    if not is_get and "breakdown[" not in line:
+    行匹配由树注册表驱动：主行 `breakdown[<op>]`（marker → op）；各树的
+    legacy marker（如 `get_breakdown`）按兼容规则归一——bd 归一到目标 op、
+    旧字段名按单向别名映射到日志原生名（如 query_us → query_total_us）。"""
+    if legacy_to_op is None:
+        legacy_to_op = _LEGACY_TO_OP
+    # legacy 行优先：`get_breakdown` 行没有 breakdown[...] 字段
+    leg = None
+    leg_i = -1
+    for m in legacy_to_op:
+        leg_i = line.find(" " + m + " ")
+        if leg_i >= 0:
+            leg = legacy_to_op[m]
+            break
+    if leg is None and "breakdown[" not in line:
         return None
     i = line.find("trace_id[")
     if i < 0:
-        i = line.find("get_breakdown") if is_get else line.find("breakdown[")
-    pairs = dict(PAIR_RE.findall(line[i:]))
-    if is_get:
-        if "key" not in pairs:
+        i = line.find("breakdown[") if leg is None else (leg_i + 1)
+        if i < 0:
             return None
-        pairs["breakdown"] = "get_buffer"
-    elif "breakdown" not in pairs:
+    pairs = dict(PAIR_RE.findall(line[i:]))
+    if leg is not None:
+        for req in leg["require"]:
+            if req not in pairs:
+                return None
+        pairs["breakdown"] = leg["op"]
+        for old, new in (leg.get("field_aliases") or {}).items():
+            if old in pairs and new not in pairs:
+                pairs[new] = pairs.pop(old)
+        return pairs
+    bd = pairs.get("breakdown")
+    if bd is None:
         return None
-    for _old, _new in FIELD_ALIASES.items():
-        if _old in pairs and _new not in pairs:
-            pairs[_new] = pairs.pop(_old)
+    # bd 归一：旧别名 op（get/get_batch/...）→ 目标树 op
+    bd = _LEGACY_OP_ALIASES.get(bd, bd)
+    pairs["breakdown"] = bd
     return pairs
 
 
@@ -448,6 +453,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     ops = {}                       # (group, op) -> aggregate dict
     lines_total = lines_trace = lines_slice = parse_errors = 0
     ts_from = ts_to = None
+    unknown_ops = {}               # op -> count（不在树注册表中的 op）
 
     def op_state(group, op):
         key = (group, op)
@@ -507,7 +513,9 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             lines_trace += 1
             eng = pairs.get("engine", "")
             status = pairs.get("status", "")
-            ok = status in SUCCESS_STATUSES
+            if bd not in TREES and bd not in _LEGACY_OP_ALIASES:
+                unknown_ops[bd] = unknown_ops.get(bd, 0) + 1
+            ok = status in _OK_STATUSES.get(bd, GLOBAL_FALLBACK_OK)
             if ok:
                 status = "ok"          # canonical label (read_ok -> ok)
             group = _group_of(pairs)
@@ -550,9 +558,13 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             if ep_pre is not None:
                 ep_pre += ep_shift
             # numeric field statistics (histogram + sum/min/max; -1 counts as neg)
+            # 跳过项按当前 op 的树口径（meta_fields）+ 全局字符串/时间字段
+            _meta_of_op = _META_FIELDS.get(bd, set())
             parsed = {}
             for k, v in pairs.items():
                 if k in STRING_FIELDS or k in META_FIELDS or k == "trace_id":
+                    continue
+                if k in _meta_of_op:
                     continue
                 if not k.endswith("_us"):
                     continue
@@ -576,11 +588,15 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 fd["hist"][hb] = fd["hist"].get(hb, 0) + 1
 
             total = parsed.get("total_us")
-            # 阶段分钟桶（图2）：L1 顶层 + residual（端到端减去 L1 之和）
+            # 阶段分钟桶（图2）：L1 顶层 + residual（端到端减去 L1 之和）。
+            # L1 集合按当前行 op 的树取（switch 两侧并集；classic/tent 混跑时
+            # 缺失侧自然跳过，残差按「出现的 L1」计算）。
             if ep_pre is not None:
                 mkey = int(ep_pre) // FIELD_BASE_SECONDS * FIELD_BASE_SECONDS
-                tops = READ_TOP if group == "read" else (
-                    WRITE_TOP if group == "write" else ())
+                tops = _CHART_FIELDS.get(bd, ((), ()))[0] if bd in TREES \
+                    else (READ_TOP_LEGACY if group == "read"
+                          else (WRITE_TOP_LEGACY if group == "write"
+                                else ()))
                 stage_sum = 0.0
                 for cf in tops:
                     cv = parsed.get(cf)
@@ -617,8 +633,14 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
             # stages 同时保留 L1 与 L2（展开行要下钻到子区间）。
             if total is not None and total >= 0:
                 st["_top_seq"] += 1
-                stage_tree = ((READ_TOP + READ_SUB) if group == "read"
-                              else (WRITE_TOP + WRITE_SUB))
+                _top, _sub = _CHART_FIELDS.get(bd, ((), ()))
+                if bd not in TREES:
+                    # 未知 op 兜底：按字段是否出现组树（保守集合）
+                    if group == "read":
+                        _top, _sub = READ_TOP_LEGACY, READ_SUB_LEGACY
+                    elif group == "write":
+                        _top, _sub = WRITE_TOP_LEGACY, WRITE_SUB_LEGACY
+                stage_tree = _top + _sub
                 stages = {f: parsed[f] for f in stage_tree if f in parsed
                           and parsed[f] > 0}
                 cand = (total, st["_top_seq"])
@@ -636,8 +658,10 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
     # finalize: residual histogram + top list + fields cleanup
     groups = {}
     for (group, op), st in ops.items():
-        top_fields = READ_TOP if group == "read" else (
-            WRITE_TOP if group == "write" else ())
+        top_fields = (_CHART_FIELDS[op][0] if op in TREES
+                      else (READ_TOP_LEGACY if group == "read"
+                            else (WRITE_TOP_LEGACY if group == "write"
+                                  else ())))
         fields = {}
         for k, fd in st["fields"].items():
             fields[k] = {"n": fd["n"], "neg": fd["neg"],
@@ -691,12 +715,14 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
                 if bd.endswith(".slice") or bd.endswith(".slice_stats"):
                     continue
                 group = _group_of(pairs)
-                if group == "read":
-                    tops = READ_TOP
-                elif group == "write":
-                    tops = WRITE_TOP
-                else:
+                if group == "other":
                     continue
+                if bd in TREES:
+                    tops = _CHART_FIELDS[bd][0]
+                elif group == "read":
+                    tops = READ_TOP_LEGACY
+                else:
+                    tops = WRITE_TOP_LEGACY
                 total = _num(pairs.get("total_us", ""))
                 if total is None or total < 0:
                     continue
@@ -746,6 +772,7 @@ def compute_trace_stats(path, node=None, pod=None, role=None, size=None,
         "trace_lines": lines_trace,
         "slice_lines": lines_slice,
         "parse_errors": parse_errors,
+        "unknown_ops": unknown_ops,
         "ts_from": ts_from, "ts_to": ts_to,
         "dated": ts_from is not None,
         "bucket_unit": "s",

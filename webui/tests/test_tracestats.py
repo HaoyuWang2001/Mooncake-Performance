@@ -2,14 +2,15 @@
 """tracestats（C++ SDK trace 主行）单测——fixtures 严格取自 SDK 日志格式样例。
 
 覆盖当前打点体系（对齐 Mooncake 源码 docs/yh/log-reference.md §14，统一 breakdown[op]，
-TE/TENT 双引擎）：
-- 读：breakdown[get_buffer]（新字段 query_total_us/buf_alloc_us 归一为 query_us/alloc_us）、
-  get_into、batch_get、batch_get_into（query 三段下钻 / prep_us L1；旧 get_breakdown 仍兼容）
+TE/TENT 双引擎；阶段树来自 configs/_trace_trees/<op>.json，字段名 = 日志原生名）：
+- 读：breakdown[get_buffer]（原生字段 query_total_us/buf_alloc_us，不再归一改名）、
+  get_into、batch_get、batch_get_into（query 三段下钻 / prep_us L1；旧 get_breakdown
+  行按 legacy 别名单向映射 query_us→query_total_us、alloc_us→buf_alloc_us）
 - 写：put 家族 breakdown[op]：engine[classic] memwrite_* / engine[tent] 四相位；
-  batch_put / batch_put_into；TENT+TCP 诚实零值
+  batch_put / batch_put_into / batch_upsert_from 薄行（prep/write 两段）；TENT+TCP 诚实零值
 - remove / batchRemove 薄行归「其它」组（remove_rpc_us 仍入字段统计）
 - slice / slice_stats 明细行仅计数；方向 read/write；阶段树加和/残差；
-  -1 哨兵；失败早退字段为 0；engine 分布
+  -1 哨兵；失败早退字段为 0；engine 分布；未知 op 计数 meta.unknown_ops
 """
 import json
 import os
@@ -137,8 +138,10 @@ def _field_percentile(fd, q):
 
 def test_parse_pairs_with_spaces_and_glog_prefix():
     p = ts.parse_line(READ_OK)
-    # get_breakdown 行归一化为 breakdown="get_buffer"（下游零改动）
+    # get_breakdown 行归一化为 breakdown="get_buffer"，旧字段名按 legacy
+    # 别名映射到日志原生名（query_us → query_total_us）
     assert p["breakdown"] == "get_buffer"
+    assert p["query_total_us"] == "50" and p["buf_alloc_us"] == "5"
     assert p["start_time"] == "2026-11-25 10:23:41.882310"
     assert p["total_us"] == "269" and p["type"] == "memory_remote"
     assert ts.parse_line("plain log line without trace") is None
@@ -165,10 +168,10 @@ def test_read_tree_and_direction(tmp_path):
     # total_us statistics exclude nothing here (miss total 37 is a valid value)
     assert op["fields"]["total_us"]["n"] == 2
     assert op["fields"]["total_us"]["max"] == 269
-    # tree sums for the OK sample（get_breakdown 新树）
+    # tree sums for the OK sample（字段名 = 日志原生名）
     f = op["fields"]
-    assert (f["query_us"]["max"] + f["select_us"]["max"] +
-            f["alloc_us"]["max"] + f["read_us"]["max"]) == \
+    assert (f["query_total_us"]["max"] + f["select_us"]["max"] +
+            f["buf_alloc_us"]["max"] + f["read_us"]["max"]) == \
         f["total_us"]["max"]
     assert (f["local_endpoints_us"]["max"] +
             f["select_replica_us"]["max"]) == f["select_us"]["max"]
@@ -193,10 +196,8 @@ def test_write_ops_and_failure_early_exit(tmp_path):
     assert put["count"] == 3 and put["ok"] == 2 and put["fail"] == 1
     assert put["status"]["TRANSFER_FAIL"] == 1
     # -1 sentinel: counted as neg, excluded from min/max/sum
-    mm = put["fields"]["memwrite_urma_min_us"]
-    # TRANSFER_FAIL and ALREADY_EXISTS both report -1 (TIMESTAMP unavailable)
-    assert mm["neg"] == 2
-    assert mm["min"] == 148 and mm["max"] == 148
+    # （memwrite_urma_min_us 属树 meta_fields：不进 fields 统计，仅计 neg 兜底见下）
+    assert "memwrite_urma_min_us" not in put["fields"]
     # failure early-exit fields are 0, not negative
     assert put["fields"]["put_end_us"]["neg"] == 0
     # upsert: query_us is the UpsertStart RPC, put_start always 0
@@ -246,7 +247,7 @@ def test_time_buckets_and_topn(tmp_path):
     assert "stages" in op["top"][0]
     # 展开明细需要 L1+L2：top 条目必须保留二级子阶段
     st0 = op["top"][0]["stages"]
-    for k in ("query_us", "select_us", "alloc_us", "read_us"):
+    for k in ("query_total_us", "select_us", "buf_alloc_us", "read_us"):
         assert k in st0
     for k in ("local_endpoints_us", "select_replica_us", "read_a_us",
               "read_transfer_window_us", "read_b_us"):
@@ -311,20 +312,21 @@ TENT_TCP_ZERO = (
 
 
 def test_unified_get_buffer_field_alias_and_tree(tmp_path):
-    """breakdown[get_buffer] 新字段：query_total_us/buf_alloc_us 归一为
-    query_us/alloc_us，query 三段下钻与 A/B 分段保留，残差为 0。"""
+    """breakdown[get_buffer] 原生字段名直达（query_total_us/buf_alloc_us，
+    不再归一改名）；query 三段下钻与 A/B 分段保留，残差为 0。"""
     st = ts.compute_trace_stats(_write(tmp_path, "u.glog", [READ_UNIFIED]))
     op = st["groups"]["read"]["ops"]["get_buffer"]
     f = op["fields"]
     assert op["count"] == 1 and op["ok"] == 1
-    assert f["query_us"]["max"] == 57          # query_total_us → query_us
-    assert f["alloc_us"]["max"] == 5           # buf_alloc_us → alloc_us
+    assert f["query_total_us"]["max"] == 57
+    assert f["buf_alloc_us"]["max"] == 5
     assert f["select_us"]["max"] == 18 and f["read_us"]["max"] == 189
     assert f["query_route_us"]["max"] == 5
     assert f["query_rpc_us"]["max"] == 50
     assert f["query_retry_us"]["max"] == 0
     assert f["read_a_us"]["max"] == 58 and f["read_transfer_window_us"]["max"] == 126
-    assert "memread_total_us" in f             # classic 传输段仍入字段统计
+    assert "read_urma_min_us" not in f         # 分布辅助字段按树 meta_fields 排除
+    assert "memread_total_us" not in f         # 同值两报字段不重复统计
     assert op["residual"]["n"] == 1 and op["residual"]["max"] == 0
     assert op["engine"] == {"classic": 1}
 
@@ -545,10 +547,10 @@ def test_field_minutes_l1_and_residual(tmp_path):
     read = st["groups"]["read"]["ops"]["get_buffer"]
     fm = read["fminutes"]
     # L1 顶层 + residual；L2 不逐时间采样（体积控制）
-    assert set(fm) == {"query_us", "select_us", "alloc_us", "read_us",
-                       "residual"}
+    assert set(fm) == {"query_total_us", "select_us", "buf_alloc_us",
+                       "read_us", "residual"}
     assert "read_a_us" not in fm
-    rows = fm["query_us"]
+    rows = fm["query_total_us"]
     assert len(rows) == 1
     t, n, avg, mx = rows[0]
     assert n == 1 and avg == 50 and mx == 50
@@ -635,6 +637,7 @@ def test_get_into_offload_tree(tmp_path):
     op = st["groups"]["read"]["ops"]["get_into"]
     assert op["count"] == 1
     f = op["fields"]
+    # get_into 的 L1 本身就叫 query_us（与 get_buffer 的 query_total_us 不同）
     assert (f["query_us"]["max"] + f["select_us"]["max"] +
             f["read_us"]["max"]) == f["total_us"]["max"]
     assert (f["offload_rpc_us"]["max"] + f["transfer_data_us"]["max"] +
