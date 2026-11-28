@@ -434,7 +434,7 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C18.V9 配色与图例：节点色 = `monNodeHue`（与主图 `nodeHue` 同一调色板按节点名排序固定分配，跨选择稳定）；NUMA/进程 = 同系色阶 `monShade`（同 instanceColor 算法）；图例 `type:'scroll'`、**`selectedMode:false` 固定不可点**（显隐只由树勾选控制，与主图「叠加只走对象树」同构）；URMA RX 实线 / TX 同系虚线；进程序列名 `comm pid @node`
 - C18.V11 监控摘要只保留「进程 RSS 增幅正负条」：已删除逐节点峰值内存 / `RSS 最大增幅` / `端口峰值带宽` 三处 KV 行；data.js summary 与 overview 摘要行不变（DR-63）
 - C18.V13 URMA 三级列表：节点 → DIE（= `ubpu`，UI 显示 DIE）→ 端口 三级均可勾选，标准控件逻辑（父子不联动）——节点/DIE 曲线 = 其端口 RX/TX 求和，端口 = 单端口；节点行 mini 只操作直接子项 DIE、DIE 行 mini 只操作其端口；顶栏 全选节点 / 全选实例（端口叶子）/ 全部清空（允许空图 + empty-tip）。URMA 图下固定平均流量表（节点 / DIE / 端口 / RX 平均 / TX 平均），不随树勾选过滤；平均=warmup 结束→任务结束逐采样点算术平均（`rx_avg_formal`/`tx_avg_formal`，无 warmup 回退 t0）
-- C18.D1 监控时间基准统一：`reduce_monitors` 返回 `t = 采样时刻 - 任务开始 t0`（并带 `time_relative/time_origin`），三图 x 轴刻度 `T+mm:ss`、tooltip 显示相对时间 + 墙钟；`_parse_urma` 先差分再按窗口裁剪并保留窗口前一条样本，首点不晚一拍
+- C18.D1 监控时间基准统一：`reduce_monitors` 返回 `t = 采样时刻 - 任务开始 t0`（并带 `time_relative/time_origin/time_span`），三图 x 轴共用 `[0, time_span]` 任务窗口（首个采样偏晚也从 T+0 起算），刻度 `T+mm:ss`、tooltip 显示相对时间 + 墙钟；`_parse_urma` 先差分再按窗口裁剪并保留窗口前一条样本，首点不晚一拍
 - C18.D2 URMA 计数器回绕/重置不产生尖峰
 - C18.D3 产物下采样有界（compact_monitors；notes 透传）
 - C18.D4 kvtest 采样注入编排器时钟基准 EPOCH_BASE（时间戳=基准+节点流逝）；窗口裁空回退全量+注记；python 保持节点绝对时间

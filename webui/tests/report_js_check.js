@@ -635,6 +635,14 @@ if (!errs.length) {
   out.urma_series = monSeries("urmachart");
   out.mem_legend = monLegend("memchart");
   out.urma_legend = monLegend("urmachart");
+  /* 三图 x 轴范围：验证共用 [0, time_span] 任务窗口 */
+  out.mon_xaxis = {};
+  ["memchart", "procchart", "urmachart"].forEach(function(id) {
+    const a = charts[id] || [];
+    const o = a.length ? a[a.length - 1] : null;
+    const x = (o && o.xAxis) || {};
+    out.mon_xaxis[id] = {min: x.min, max: x.max};
+  });
   out.mem_empty = getEl("memEmpty") ? String(getEl("memEmpty").style.display || "") : null;
   out.proc_empty = getEl("procEmpty") ? String(getEl("procEmpty").style.display || "") : null;
   out.urma_empty = getEl("urmaEmpty") ? String(getEl("urmaEmpty").style.display || "") : null;

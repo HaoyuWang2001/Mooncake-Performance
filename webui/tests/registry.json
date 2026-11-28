@@ -2214,6 +2214,7 @@
    "req": "R-MON-1",
    "unit": [
     "test_c18v13_urma_three_level_controls",
+    "test_c18v13_monitor_charts_shared_time_origin",
     "test_b07_monitor_tree_controls_and_legends",
     "test_reduce_monitors_urma_relative_and_formal_avg",
     "test_reduce_monitors_window_slice"

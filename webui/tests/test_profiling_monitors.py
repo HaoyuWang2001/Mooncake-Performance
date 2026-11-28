@@ -407,6 +407,7 @@ def test_reduce_monitors_urma_relative_and_formal_avg(tmp_path):
     # formal 窗口从 warmup 结束 (1002.5) 起 → 只剩 rate 3、4
     assert u["rx_avg_formal"] == 3.5, u["rx_avg_formal"]
     assert u["tx_avg_formal"] == 1.75, u["tx_avg_formal"]
+    assert mon["time_span"] == 3.5, mon["time_span"]
 
 
 def test_reduce_monitor_sites_reads_config_and_sizes(tmp_path):

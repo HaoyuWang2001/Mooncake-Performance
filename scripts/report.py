@@ -2127,8 +2127,19 @@ def reduce_monitors(local_log_dir, t0=None, t1=None, warmup_cutoff=None):
             p["t"] = _rel(p["t"])
         for u in urma:
             u["t"] = _rel(u["t"])
+        # 统一 x 轴窗口：0（任务开始）→ 任务结束。三张监控图共用同一
+        # 时间域，避免各图按自身首/末采样各自缩放导致起点不齐。
+        last = 0.0
+        for seq in ([h["t"] for h in mem_host]
+                    + [p["t"] for p in mem_proc]
+                    + [u["t"] for u in urma]):
+            if seq:
+                last = max(last, float(seq[-1]))
+        if t1 is not None:
+            last = max(last, float(t1) - origin)
         out["time_origin"] = origin
         out["time_relative"] = True
+        out["time_span"] = round(max(0.0, last), 3)
     if notes:
         out["notes"] = notes
     return out
@@ -2163,6 +2174,7 @@ def compact_monitors(mons):
     if mons.get("time_relative"):
         out["time_relative"] = True
         out["time_origin"] = mons.get("time_origin")
+        out["time_span"] = mons.get("time_span")
     for h in mons.get("mem_host") or []:
         cols = h.get("columns") or []
         t, arrs = _downsample(h["t"], [h["series"][c] for c in cols])
@@ -5140,7 +5152,24 @@ function _monRel(ms){
   const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), r=s%60;
   return 'T+'+(h?h+':'+p2(m):String(m))+':'+p2(r);
 }
-function _monChart(id, series, yname){
+function _monSpan(M){
+  /* 三张监控图共用 [0, time_span] 时间域（同一任务窗口）；time_span
+     缺失的旧产物回退到所有序列的最大相对时刻。 */
+  const v=Number(M&&M.time_span);
+  if(M&&M.time_span!=null&&isFinite(v)&&v>0) return v;
+  let mx=0;
+  function scan(seq,getter){
+    (seq||[]).forEach(function(x){
+      const arr=getter(x)||[];
+      arr.forEach(function(t){ if(isFinite(t)&&t>mx) mx=t; });
+    });
+  }
+  scan(M&&M.mem_host,function(h){return h.t;});
+  scan(M&&M.mem_proc,function(p){return p.t;});
+  scan(M&&M.urma,function(u){return u.t;});
+  return mx;
+}
+function _monChart(id, series, yname, domain){
   const box=document.getElementById(id); if(!box) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
   /* 无序列：清空图区，避免取消勾选/关指标后旧曲线残留在 empty-tip 之上 */
@@ -5185,7 +5214,14 @@ function _monChart(id, series, yname){
       if(t0===null||t<t0)t0=t;
       if(t1===null||t>t1)t1=t;});
   });
-  if(t0!==null){
+  if(domain&&domain.max>0){
+    /* 共用任务窗口：即使某张图的首个采样晚于任务开始，x 轴也从 0 起算，
+       三张监控图起点/终点严格对齐。 */
+    const hi=Math.max(domain.max,(t1!==null?t1:0));
+    const ext=xExtent(0,hi,plotWidthOf(c,{left:104,right:104}));
+    o.xAxis=lfAxisTime(ext,id);
+    if(rel) o.xAxis.axisLabel.formatter=function(v){return _monRel(v);};
+  }else if(t0!==null){
     const ext=xExtent(t0,t1,plotWidthOf(c,{left:104,right:104}));
     o.xAxis=lfAxisTime(ext,id);
     if(rel) o.xAxis.axisLabel.formatter=function(v){return _monRel(v);};
@@ -5579,6 +5615,9 @@ function _monEmpty(id,msg){
 }
 function monRenderCharts(){
   const M=D.monitors||{};
+  /* 三图共用任务窗口 [0, time_span]：起点对齐，不随各自首末采样缩放 */
+  const _mspan=_monSpan(M);
+  const mdomain=(M.time_relative&&_mspan>0)?{min:0,max:_mspan}:null;
   /* 宿主内存：节点=used 求和实线（+可选 available 虚线）；NUMA=分列线 */
   const hasHost=!!(M.mem_host&&M.mem_host.length);
   if(hasHost){
@@ -5617,7 +5656,7 @@ function monRenderCharts(){
       });
     });
     safe('mem-chart',function(){
-      if(!_monChart('memchart',hs,'MB'))
+      if(!_monChart('memchart',hs,'MB',mdomain))
         _monEmpty('memEmpty',(!monMemUsed&&!monMemShowAvail)?
           '未选择指标：在上方勾选「用量」或「可用量」。':
           '未勾选节点或 NUMA：在上方树中勾选后查看。');});
@@ -5642,7 +5681,7 @@ function monRenderCharts(){
       });
     });
     safe('proc-chart',function(){
-      if(!_monChart('procchart',ps,'RSS MB'))
+      if(!_monChart('procchart',ps,'RSS MB',mdomain))
         _monEmpty('procEmpty','未勾选进程：在上方树中勾选后查看。');});
   }
   /* URMA：节点/DIE/端口三级勾选 → 每选中对象一条 RX 实线 + TX 虚线；
@@ -5692,7 +5731,7 @@ function monRenderCharts(){
       });
     });
     safe('urma-chart',function(){
-      if(!_monChart('urmachart',us,'GiB/s'))
+      if(!_monChart('urmachart',us,'GiB/s',mdomain))
         _monEmpty('urmaEmpty','未勾选节点/DIE/端口：在上方树中勾选后查看。');});
     safe('urma-stats',function(){renderUrmaStats();});
   }

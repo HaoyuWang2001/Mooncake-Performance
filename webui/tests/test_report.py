@@ -4621,6 +4621,38 @@ def test_c18v13_urma_three_level_controls(tmp_path):
     assert r3["urma_stats_after_top"] == 3
 
 
+def test_c18v13_monitor_charts_shared_time_origin(tmp_path):
+    """C18.V13 [新增]：三张监控图共用 [0, time_span] 任务窗口——即使某图
+    首个采样晚于任务开始（如进程延迟拉起），x 轴仍从 T+0 起算并与其它图
+    终点对齐；不再各自按首末采样缩放。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    mons = {
+        "time_relative": True, "time_origin": 1000.0, "time_span": 120.0,
+        "mem_host": [{"node": "n1", "t": [5.0, 10.0],
+                      "columns": ["n0_used_mb"],
+                      "series": {"n0_used_mb": [10.0, 20.0]}}],
+        "mem_proc": [{"node": "n1", "pid": 11, "comm": "cli",
+                      "t": [30.0, 40.0], "rss_mb": [5.0, 6.0],
+                      "pss_mb": [4.0, 5.0], "rss_growth_mb": 1.0,
+                      "rss_growth_pct": 20.0, "leak_suspect": False}],
+        "urma": [{"node": "n1", "ubpu": 0, "port": 1, "t": [7.0, 15.0],
+                  "rx": [1.0, 2.0], "tx": [0.5, 1.0],
+                  "rx_avg": 1.5, "rx_max": 2.0,
+                  "tx_avg": 0.75, "tx_max": 1.0,
+                  "rx_avg_formal": 1.5, "tx_avg_formal": 0.75}],
+        "summary": {},
+    }
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"}, monitors=mons)
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    for cid in ("memchart", "procchart", "urmachart"):
+        ax = res["mon_xaxis"][cid]
+        assert ax["min"] == 0, (cid, ax)
+        assert ax["max"] >= 120000, (cid, ax)
+
+
 def test_b09_monitor_partial_missing_groups(tmp_path):
     """C18.V9 [新增]：部分缺失三元组（标题+树+图+空态）整组隐藏。"""
     a = _stats(tmp_path, "a.writer", "writer")
