@@ -1878,7 +1878,8 @@ def _parse_mem_proc(path, node, leak_pct, leak_mb, t0=None, t1=None,
     return out
 
 
-def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None):
+def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None,
+                avg_from=None):
     rows = _read_csv_rows(path)
     if len(rows) < 2:
         return []
@@ -1887,8 +1888,12 @@ def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None):
                                   "tx_flits")):
         return []
 
-    def _collect(lo, hi):
+    def _collect(hi):
+        """Collect samples up to hi; t0 filtering happens AFTER the counter
+        diff so the first rate point can be anchored at the window start
+        instead of the second in-window sample."""
         groups = {}
+        seen_in_window = 0
         for r in rows[1:]:
             def cell(name):
                 i = idx[name]
@@ -1899,20 +1904,31 @@ def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None):
             if None in (ts, ubpu, port, rx, tx):
                 continue
             sec = ts / 1e9
-            if (lo is not None and sec < lo) or (hi is not None and sec > hi):
+            if hi is not None and sec > hi:
                 continue
+            if (t0 is None or sec >= t0) and (hi is None or sec <= hi):
+                seen_in_window += 1
             groups.setdefault((ubpu, port), []).append((ts, rx, tx))
-        return groups
+        return groups, seen_in_window
 
-    groups = _collect(t0, t1)
-    if not groups and (t0 is not None or t1 is not None):
-        groups = _collect(None, None)
-        if groups and flags is not None:
-            flags["window_misaligned"] = True
+    groups, samples_in_window = _collect(t1)
+    misaligned = False
+    if (samples_in_window == 0
+            and (t0 is not None or t1 is not None)):
+        groups, samples_in_window = _collect(None)
+        if groups:
+            misaligned = True
+            if flags is not None:
+                flags["window_misaligned"] = True
     if flags is not None:
         # 窗口内样本数：>0 但 <2 属「样本不足」（不打扰），0 才是采集失败
-        flags["urma_samples"] = sum(len(v) for v in groups.values())
+        flags["urma_samples"] = samples_in_window
     gib = float(1024 ** 3)
+    # 时间窗无交叠时回退全量采样：此时 t0/t1（以及来自编排器域时间的
+    # warmup_cutoff）都不可信，差分/均值不再按窗口裁剪。
+    clip_t0, clip_t1 = (None, None) if misaligned else (t0, t1)
+    formal_from = (None if misaligned
+                   else (avg_from if avg_from is not None else t0))
     out = []
     for (ubpu, port), samples in groups.items():
         samples.sort(key=lambda s: s[0])
@@ -1924,30 +1940,46 @@ def _parse_urma(path, node, flit_bytes, t0=None, t1=None, flags=None):
                 dt_ns = ts - prev[0]
                 drx, dtx = rx - prev[1], tx - prev[2]
                 if dt_ns > 0 and drx >= 0 and dtx >= 0 and not resync:
-                    sec = dt_ns / 1e9
-                    t.append(round(ts / 1e9, 3))
-                    rxr.append(round(drx * flit_bytes / sec / gib, 4))
-                    txr.append(round(dtx * flit_bytes / sec / gib, 4))
+                    at = round(ts / 1e9, 3)
+                    dsec = dt_ns / 1e9
+                    if ((clip_t0 is None or at >= clip_t0)
+                            and (clip_t1 is None or at <= clip_t1)):
+                        t.append(at)
+                        rxr.append(round(drx * flit_bytes / dsec / gib, 4))
+                        txr.append(round(dtx * flit_bytes / dsec / gib, 4))
                 resync = (drx < 0 or dtx < 0)
             prev = (ts, rx, tx)
         if not t:
             continue
+
+        def _avg(vals, since):
+            sel = [v for i, v in enumerate(vals)
+                   if since is None or t[i] >= since]
+            return round(sum(sel) / len(sel), 3) if sel else None
+
         out.append({"node": node, "ubpu": ubpu, "port": port, "t": t,
                     "rx": rxr, "tx": txr,
                     "rx_avg": round(sum(rxr) / len(rxr), 3),
+                    "rx_avg_formal": _avg(rxr, formal_from),
                     "rx_max": max(rxr),
                     "tx_avg": round(sum(txr) / len(txr), 3),
+                    "tx_avg_formal": _avg(txr, formal_from),
                     "tx_max": max(txr)})
     out.sort(key=lambda x: (x["node"], x["ubpu"], x["port"]))
     return out
 
 
-def reduce_monitors(local_log_dir, t0=None, t1=None):
+def reduce_monitors(local_log_dir, t0=None, t1=None, warmup_cutoff=None):
     """Scan <local_log_dir>/**/profiling/<node>/ for monitor CSVs.
 
     t0/t1（epoch 秒，可选）把采样行裁到该时间窗内——单元报表（一个
     size×combo）只带自己的时间窗，避免同一场景的监控曲线在每份报表里
     重复且混入其它单元的数据。summary 在裁剪后的数据上重算。
+
+    t0 同时是监控序列的统一时间原点：返回的 mem/urma `t` 一律改为
+    `采样时刻 - t0` 的相对秒（`t0` 缺省时保持绝对时间，兼容旧调用）。
+    warmup_cutoff（epoch 秒）用于 URMA 表格统计窗（warmup 结束→任务结束）；
+    缺省时回退 t0。
 
     Returns {config, mem_host, mem_proc, urma, summary, notes}；当存在监控
     产物却没有任何可用序列时返回 {notes: [...]}（报表渲染占位卡列出原因，
@@ -2016,7 +2048,8 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
                 flags.pop("urma_samples", None)
                 got = _parse_urma(
                     os.path.join(root, URMA_FLITS), disp, flit_bytes,
-                    t0=t0, t1=t1, flags=flags)
+                    t0=t0, t1=t1, flags=flags,
+                    avg_from=warmup_cutoff if warmup_cutoff is not None else t0)
                 urma_samples = int(flags.pop("urma_samples", 0) or 0)
                 if got:
                     urma.extend(got)
@@ -2073,6 +2106,21 @@ def reduce_monitors(local_log_dir, t0=None, t1=None):
             "value": round(max(best.get("rx_max") or 0, best.get("tx_max") or 0), 3)}
     out = {"config": cfg, "mem_host": mem_host, "mem_proc": mem_proc,
            "urma": urma, "summary": summary}
+    if t0 is not None:
+        # 统一时间设计：监控序列相对任务开始（t0）的秒数。主图/监控图
+        # 由此都从 0 起算，不再混用节点绝对时间戳或 profiling 启动时刻。
+        origin = float(t0)
+
+        def _rel(seq):
+            return [round(float(v) - origin, 3) for v in seq]
+        for h in mem_host:
+            h["t"] = _rel(h["t"])
+        for p in mem_proc:
+            p["t"] = _rel(p["t"])
+        for u in urma:
+            u["t"] = _rel(u["t"])
+        out["time_origin"] = origin
+        out["time_relative"] = True
     if notes:
         out["notes"] = notes
     return out
@@ -2104,6 +2152,9 @@ def compact_monitors(mons):
     out = {"summary": mons.get("summary") or {},
            "notes": mons.get("notes") or [],
            "mem_host": [], "mem_proc": [], "urma": []}
+    if mons.get("time_relative"):
+        out["time_relative"] = True
+        out["time_origin"] = mons.get("time_origin")
     for h in mons.get("mem_host") or []:
         cols = h.get("columns") or []
         t, arrs = _downsample(h["t"], [h["series"][c] for c in cols])
@@ -4828,7 +4879,9 @@ function treeRow(key,label,depth,opts){
      纯分组行（caret + 名称，无 checkbox，如进程树的节点头）。 */
   const on=(opts.on!=null)?!!opts.on:(selObjs.indexOf(key)>=0);
   const row=el('div','tree-row'+(on?' on':'')+(opts.cls?' '+opts.cls:''));
-  row.style.paddingLeft=(depth>1?36:0)+'px';
+  /* 递归层级：每深一层缩进一格（节点=0，DIE=22，端口=44），
+     三级树与两级树共用同一行模板。 */
+  row.style.paddingLeft=(Math.max(1,depth||1)-1)*22+'px';
   if(opts.lead) row.appendChild(opts.lead);
   function nameEl(){
     const nm=el('span','tree-name',label);
@@ -5060,16 +5113,44 @@ function renderAll(){
   safe('theme-toggle',renderThemeToggle);
 }
 let monCharts={};
+function _monRel(ms){
+  const s=Math.max(0,Math.round(ms/1000));
+  const p2=function(n){return String(n).padStart(2,'0');};
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), r=s%60;
+  return 'T+'+(h?h+':'+p2(m):String(m))+':'+p2(r);
+}
 function _monChart(id, series, yname){
   const box=document.getElementById(id); if(!box) return false;
   let c=monCharts[id]; if(!c) c=monCharts[id]=echarts.init(box);
   /* 无序列：清空图区，避免取消勾选/关指标后旧曲线残留在 empty-tip 之上 */
   if(!series.length){ c.setOption({series:[]},true); return false; }
   bindHoverGuards(c);
+  const M=D.monitors||{}; const rel=!!M.time_relative;
   const o=axisCommon();
   o.grid={left:104,right:104,top:34,bottom:42};
   o.yAxis=[lfAxisValue({name:yname,scale:true,nameLocation:'end',nameGap:14})];
   o.dataZoom=zoomModel('xonly');
+  if(rel){
+    /* 监控序列统一为「任务开始 = 0」的相对秒：刻度 T+mm:ss，
+       tooltip 同时给出相对时间与墙钟（origin + t_rel）。 */
+    o.tooltip=lfTooltip({formatter:function(ps){
+      if(!ps||!ps.length) return '';
+      const p0=ps[0];
+      const ms=(p0.axisValue!=null)?Number(p0.axisValue)
+        :(p0.data?Number(p0.data[0]):0);
+      let html='<div style="font-weight:600;margin-bottom:4px">'
+        +_monRel(ms)+'</div>';
+      if(M.time_origin!=null)
+        html+='<div style="opacity:.65;font-size:12px;margin-bottom:4px">'
+          +fullts(Number(M.time_origin)+ms/1000)+'</div>';
+      ps.forEach(function(p){
+        const v=(p.data&&p.data.length>1)?p.data[1]:p.value;
+        html+='<div>'+p.marker+String(p.seriesName)+'  <b>'
+          +(v==null?'—':v)+'</b> '+yname+'</div>';
+      });
+      return html;
+    }});
+  }
   /* 图例只说明颜色（同主图 C5.V4：selectedMode:false 不可点）——
      曲线显隐只由各树勾选控制 */
   o.legend={show:true,top:0,type:'scroll',icon:'roundRect',itemWidth:14,
@@ -5083,8 +5164,11 @@ function _monChart(id, series, yname){
       if(t0===null||t<t0)t0=t;
       if(t1===null||t>t1)t1=t;});
   });
-  if(t0!==null) o.xAxis=lfAxisTime(xExtent(t0,t1,
-    plotWidthOf(c,{left:104,right:104})),id);
+  if(t0!==null){
+    const ext=xExtent(t0,t1,plotWidthOf(c,{left:104,right:104}));
+    o.xAxis=lfAxisTime(ext,id);
+    if(rel) o.xAxis.axisLabel.formatter=function(v){return _monRel(v);};
+  }
   o.series=series;
   c.setOption(o, true);
   return true;
@@ -5099,6 +5183,7 @@ function _monChart(id, series, yname){
 let monMemSel=null, monProcSel=null, monUrmaSel=null;
 let monMemUsed=true, monMemShowAvail=false;
 let monMemOpen={};               /* NUMA/进程分组展开状态 */
+let monUrmaOpen={};              /* URMA 节点/DIE 展开状态 */
 function monResetSel(){
   monMemSel=null; monProcSel=null; monUrmaSel=null;
   monMemUsed=true; monMemShowAvail=false;
@@ -5130,16 +5215,19 @@ function renderMonTree(box,cfg){
   box.innerHTML='';
   if(cfg.extra) box.appendChild(cfg.extra);
   const list=treeNodeGroup(box,cfg.title,cfg.count,cfg.btns);
-  (cfg.groups||[]).forEach(function(g){
-    list.appendChild(treeRow(g.key||('g:'+g.label),g.label,1,{
-      lead:g.caret, check:g.check!==false, on:g.on, onToggle:g.onToggle,
-      minis:g.minis||[], note:g.note, title:g.title, cls:g.cls,
-      nameColor:g.color, nameWeight:g.weight}));
-    if(g.open)(g.rows||[]).forEach(function(r){
-      list.appendChild(treeRow(r.key,r.label,2,{
-        on:r.on, onToggle:r.onToggle, title:r.title, note:r.note}));
+  /* 递归渲染：groups[].rows 可再带 rows（节点→DIE→端口三级），
+     open 时展开直接子行；深度由递归层数决定缩进。 */
+  function _rows(rows,depth){
+    (rows||[]).forEach(function(r){
+      list.appendChild(treeRow(r.key,r.label,depth,{
+        lead:r.caret, check:r.check!==false, on:r.on,
+        onToggle:r.onToggle, minis:r.minis||[], note:r.note,
+        title:r.title, cls:r.cls, nameColor:r.color,
+        nameWeight:r.weight}));
+      if(r.open) _rows(r.rows,depth+1);
     });
-  });
+  }
+  _rows(cfg.groups,1);
   if(!(cfg.groups||[]).length)
     list.appendChild(el('div','tree-empty',cfg.empty||''));
 }
@@ -5208,7 +5296,8 @@ function renderMonitors(){
   const groups={
     mem:['memHostTitle','memTree','memchart','memEmpty'],
     proc:['procTitle','growth','procTree','procchart','procEmpty'],
-    urma:['urmaTitle','urmaTree','urmachart','urmaEmpty']};
+    urma:['urmaTitle','urmaTree','urmachart','urmaEmpty',
+          'urmaStatsWrap','urmaStatsNote']};
   const hasHost=!!(M.mem_host&&M.mem_host.length);
   const hasProc=!!(M.mem_proc&&M.mem_proc.length);
   const hasUrma=!!(M.urma&&M.urma.length);
@@ -5359,27 +5448,107 @@ function renderProcTree(box){
       function(){setMany(allKeys,false);}),
     groups:groups, empty:'没有进程内存采样'});
 }
-/* ---- URMA 树：仅节点勾选 ---- */
+/* ---- URMA 树：节点 → DIE(ubpu) → 端口 三级可勾选 ----
+   选择键：node / node/ubpu / node/ubpu/port。父子不联动（标准控件逻辑）：
+   勾节点=该节点全部端口的求和曲线，勾 DIE=该 DIE 端口求和，勾端口=单端口。 */
+function _urmaSelKeys(){
+  const M=D.monitors||{}; const urma=M.urma||[];
+  const nodes={}, dies={}, ports={};
+  urma.forEach(function(u){
+    nodes[u.node]=1;
+    dies[u.node+'/'+u.ubpu]=1;
+    ports[u.node+'/'+u.ubpu+'/'+u.port]=1;
+  });
+  return {nodes:Object.keys(nodes).sort(), dies:Object.keys(dies).sort(),
+    ports:Object.keys(ports).sort()};
+}
 function renderUrmaTree(box){
   if(!box) return;
   const M=D.monitors||{}; const urma=M.urma||[];
-  const nodes=_monNodes(urma);
-  function setMany(keys,on){
-    keys.forEach(function(n){monUrmaSel[n]=on;});
+  const keys=_urmaSelKeys();
+  function setMany(list,on){
+    list.forEach(function(k){monUrmaSel[k]=on;});
     monRenderCharts(); renderUrmaTree(box);
   }
-  const groups=nodes.map(function(n){
-    const ports=urma.filter(function(u){return u.node===n;});
-    return {key:n,label:n,on:!!monUrmaSel[n],
-      note:ports.length?(ports.length+' 端口'):'',
-      onToggle:function(){setMany([n],!monUrmaSel[n]);}};
+  const groups=keys.nodes.map(function(n){
+    const kids=urma.filter(function(u){return u.node===n;});
+    const dieMap={};
+    kids.forEach(function(u){(dieMap[u.ubpu]=dieMap[u.ubpu]||[]).push(u);});
+    const dieKeys=Object.keys(dieMap).sort(function(a,b){return a-b;});
+    const dieKeyList=dieKeys.map(function(b){return n+'/'+b;});
+    const nodeOpen=monUrmaOpen['n:'+n]!==false;
+    const nodeCaret=el('button','tree-caret',nodeOpen?'▾':'▸');
+    nodeCaret.title=nodeOpen?'收起该节点的 DIE':'展开该节点的 DIE';
+    nodeCaret.onclick=function(){monUrmaOpen['n:'+n]=!nodeOpen;
+      renderUrmaTree(box);};
+    const dieRows=dieKeys.map(function(b){
+      const dk=n+'/'+b;
+      const ports=dieMap[b].slice().sort(function(a,c){
+        return a.port-c.port;});
+      const portKeyList=ports.map(function(u){
+        return u.node+'/'+u.ubpu+'/'+u.port;});
+      const dieOpen=monUrmaOpen['d:'+dk]!==false;
+      const dieCaret=el('button','tree-caret',dieOpen?'▾':'▸');
+      dieCaret.title=dieOpen?'收起该 DIE 的端口':'展开该 DIE 的端口';
+      dieCaret.onclick=function(){monUrmaOpen['d:'+dk]=!dieOpen;
+        renderUrmaTree(box);};
+      return {key:dk,label:'DIE '+b,on:!!monUrmaSel[dk],caret:dieCaret,
+        note:ports.length+' 端口',open:dieOpen,
+        onToggle:function(){setMany([dk],!monUrmaSel[dk]);},
+        minis:[
+          actBtn('全选','选中该 DIE 的全部端口',
+            function(){setMany(portKeyList,true);}),
+          actBtn('清空','取消该 DIE 的全部端口',
+            function(){setMany(portKeyList,false);})],
+        rows:ports.map(function(u){
+          const pk=u.node+'/'+u.ubpu+'/'+u.port;
+          return {key:pk,label:'端口 '+u.port,on:!!monUrmaSel[pk],
+            onToggle:function(){setMany([pk],!monUrmaSel[pk]);}};
+        })};
+    });
+    return {key:n,label:n,on:!!monUrmaSel[n],caret:nodeCaret,
+      note:kids.length+' 端口',open:nodeOpen,
+      onToggle:function(){setMany([n],!monUrmaSel[n]);},
+      minis:[
+        actBtn('全选','选中该节点的全部 DIE',
+          function(){setMany(dieKeyList,true);}),
+        actBtn('清空','取消该节点的全部 DIE',
+          function(){setMany(dieKeyList,false);})],
+      rows:dieRows};
   });
+  const selCount=Object.keys(monUrmaSel).filter(function(k){
+    return monUrmaSel[k];}).length;
   renderMonTree(box,{
-    title:'节点', count:nodes.filter(function(n){return monUrmaSel[n];}).length,
-    /* 无实例维度：全选实例置灰 */
-    btns:_monTopBtns(nodes,[],monUrmaSel,setMany,
-      function(){setMany(nodes,false);}),
+    title:'节点 / DIE / 端口', count:selCount,
+    btns:_monTopBtns(keys.nodes,keys.ports,monUrmaSel,setMany,
+      function(){
+        setMany(keys.nodes.concat(keys.dies,keys.ports),false);}),
     groups:groups, empty:'没有 URMA 采样'});
+}
+/* ---- URMA 固定统计表：全部端口（不随树勾选过滤）----
+   平均流量 = warmup 结束→任务结束窗口内逐采样点算术平均（与曲线点同口径）。 */
+function _fmtAvg(v){
+  return (v==null||isNaN(v))?'—':(Math.round(Number(v)*1000)/1000).toFixed(3);
+}
+function renderUrmaStats(){
+  const M=D.monitors||{}; const urma=M.urma||[];
+  const tb=document.getElementById('urmaStatsBody'); if(!tb) return;
+  tb.innerHTML='';
+  urma.slice().sort(function(a,b){
+    return a.node===b.node
+      ? (a.ubpu===b.ubpu ? a.port-b.port : a.ubpu-b.ubpu)
+      : (a.node<b.node?-1:1);
+  }).forEach(function(u){
+    const tr=el('tr');
+    tr.appendChild(el('td','mono',u.node));
+    tr.appendChild(el('td','mono','DIE '+u.ubpu));
+    tr.appendChild(el('td','mono','端口 '+u.port));
+    tr.appendChild(el('td','n mono',
+      _fmtAvg(u.rx_avg_formal!=null?u.rx_avg_formal:u.rx_avg)));
+    tr.appendChild(el('td','n mono',
+      _fmtAvg(u.tx_avg_formal!=null?u.tx_avg_formal:u.tx_avg)));
+    tb.appendChild(tr);
+  });
 }
 /* ---- 三图组装（按勾选过滤；配色=节点色系/同系色阶） ---- */
 function _monEmpty(id,msg){
@@ -5455,26 +5624,56 @@ function monRenderCharts(){
       if(!_monChart('procchart',ps,'RSS MB'))
         _monEmpty('procEmpty','未勾选进程：在上方树中勾选后查看。');});
   }
-  /* URMA：节点勾选 → 该节点各 (ubpu, port) RX 实线 / TX 虚线 */
+  /* URMA：节点/DIE/端口三级勾选 → 每选中对象一条 RX 实线 + TX 虚线；
+     节点 = 该节点全部端口求和，DIE = 该 DIE 端口求和，端口 = 单端口。 */
   const hasUrma=!!(M.urma&&M.urma.length);
   if(hasUrma){
     const us=[];
+    const byNode={}, byDie={};
     (M.urma||[]).forEach(function(u){
-      if(!monUrmaSel[u.node]) return;
-      const hue=monNodeHue(u.node);
-      const tag=u.node+' ubpu='+u.ubpu+' port='+u.port;
-      us.push({name:tag+' RX',type:'line',showSymbol:false,
-        lineStyle:{width:1.5,color:hue},
-        itemStyle:{color:hue},
-        data:u.t.map(function(t,i){return [t*1000,u.rx[i]];})});
-      us.push({name:tag+' TX',type:'line',showSymbol:false,
-        lineStyle:{width:1.1,color:monShade(hue,0),type:'dashed'},
-        itemStyle:{color:monShade(hue,0)},
-        data:u.t.map(function(t,i){return [t*1000,u.tx[i]];})});
+      (byNode[u.node]=byNode[u.node]||[]).push(u);
+      const dk=u.node+'/'+u.ubpu;
+      (byDie[dk]=byDie[dk]||[]).push(u);
+    });
+    function sumSeries(items,field){
+      const acc={};
+      items.forEach(function(it){
+        (it.t||[]).forEach(function(t,i){
+          acc[t]=(acc[t]||0)+(it[field][i]||0);
+        });
+      });
+      return Object.keys(acc).map(Number).sort(function(a,b){return a-b;})
+        .map(function(t){return [t*1000,acc[t]];});
+    }
+    function pushRV(name,items,color,width){
+      us.push({name:name+' RX',type:'line',showSymbol:false,
+        lineStyle:{width:width,color:color},itemStyle:{color:color},
+        data:sumSeries(items,'rx')});
+      us.push({name:name+' TX',type:'line',showSymbol:false,
+        lineStyle:{width:Math.max(1,width-0.4),color:color,type:'dashed'},
+        itemStyle:{color:color},data:sumSeries(items,'tx')});
+    }
+    Object.keys(byNode).sort().forEach(function(n){
+      const hue=monNodeHue(n);
+      if(monUrmaSel[n]) pushRV(n,byNode[n],hue,1.8);
+      Object.keys(byDie).filter(function(dk){
+        return dk.indexOf(n+'/')===0;}).sort().forEach(function(dk,di){
+        const dHue=monShade(hue,di+1);
+        if(monUrmaSel[dk]) pushRV(dk.replace(n+'/','DIE '),
+          byDie[dk],dHue,1.4);
+        byDie[dk].slice().sort(function(a,b){return a.port-b.port;})
+          .forEach(function(u,pi){
+            const pk=u.node+'/'+u.ubpu+'/'+u.port;
+            if(!monUrmaSel[pk]) return;
+            pushRV(pk,[u],
+              monShade(hue,di+3+pi),1.0);
+          });
+      });
     });
     safe('urma-chart',function(){
       if(!_monChart('urmachart',us,'GiB/s'))
-        _monEmpty('urmaEmpty','未勾选节点：在上方树中勾选后查看。');});
+        _monEmpty('urmaEmpty','未勾选节点/DIE/端口：在上方树中勾选后查看。');});
+    safe('urma-stats',function(){renderUrmaStats();});
   }
 }
 function round1(x){ return (x==null||isNaN(x))?null:Math.round(x*10)/10; }
@@ -7581,9 +7780,16 @@ _MONITOR_CARD = """
 </div>
 <div id="urmachart" class="chart" role="img" aria-label="URMA 端口流量图"></div>
 <div id="urmaEmpty" class="empty-tip" style="display:none"></div>
+<div id="urmaStatsWrap" class="wrapx"><table id="urmaStats"><thead><tr>
+<th>节点</th><th>DIE</th><th>端口</th>
+<th class="n">RX 平均 (GiB/s)</th><th class="n">TX 平均 (GiB/s)</th>
+</tr></thead><tbody id="urmaStatsBody"></tbody></table></div>
+<div class="note" id="urmaStatsNote">平均流量窗口：warmup 结束 → 任务结束；
+按采样点算术平均（与上方曲线同口径），不随树勾选过滤。</div>
 <div class="note" id="monNote">整机内存来自 numastat（NUMA 分列，节点行=求和），进程内存来自
-/proc/&lt;pid&gt;/smaps_rollup；<span id="monUrmaNote">URMA 端口为 mdcli flit 计数器差分（GiB/s，1024 进制）。</span>
-时间轴与上方延迟图同源，可对照异常窗口；进程 RSS 持续增长会被标记「疑似泄露」。
+/proc/&lt;pid&gt;/smaps_rollup；<span id="monUrmaNote">URMA 端口为 mdcli flit 计数器差分（GiB/s，1024 进制），DIE = 节点内 ubpu。</span>
+监控时间轴统一从任务开始起算（T+0，相对秒），可据此对照上方延迟曲线的异常窗口；
+进程 RSS 持续增长会被标记「疑似泄露」。
 节点色与主图对象树同源；树勾选控制曲线显隐，图例仅说明颜色。</div></div>
 """
 

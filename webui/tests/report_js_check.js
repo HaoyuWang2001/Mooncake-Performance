@@ -623,7 +623,7 @@ if (!errs.length) {
     return o ? (o.series || []).map(function(s) {
       return {name: s.name, color: (s.lineStyle || {}).color,
               dash: (s.lineStyle || {}).type === "dashed",
-              n: (s.data || []).length}; }) : null;
+              n: (s.data || []).length, data: s.data}; }) : null;
   }
   function monLegend(id) {
     const a = charts[id] || [];
@@ -671,6 +671,16 @@ if (!errs.length) {
   out.mem_tree = monTreeTexts("memTree");
   out.proc_tree = monTreeTexts("procTree");
   out.urma_tree = monTreeTexts("urmaTree");
+  /* URMA 固定统计表（全部端口，不随树勾选过滤） */
+  out.urma_stats = (function() {
+    const body = getEl("urmaStatsBody");
+    if (!body) return null;
+    return (body.children || []).map(function(tr) {
+      return (tr.children || []).map(function(td) {
+        return String(td._text || "");
+      });
+    });
+  })();
   /* 行/节点头出现次数：用于锁死重复追加（旧实现 append-only 会重影） */
   function monCounts(id) {
     const acc = {};
@@ -837,6 +847,44 @@ if (!errs.length) {
         ? String(getEl("memEmpty")._text || "") : null;
     } catch (e) {
       errs.push("mon metric: " + String(e && e.stack || e));
+    }
+  }
+  const monTop = arg("--mon-top", null);
+  if (monTop) {
+    /* 点击某树顶栏动作按钮（树::按钮文字），用于验证顶栏三键语义 */
+    try {
+      const parts = monTop.split("::");
+      const treeId = parts[0];
+      const btnText = parts[1] || "";
+      const treeBox = getEl(treeId);
+      let clicked = false;
+      (function walk(node) {
+        if (clicked || !node) return;
+        (node.children || []).forEach(function(c) {
+          if (clicked) return;
+          if (String(c.className || "").indexOf("node-group-acts") >= 0) {
+            (c.children || []).forEach(function(b) {
+              if (!clicked && String(b._text || "") === btnText && b.onclick) {
+                b.onclick(); clicked = true;
+              }
+            });
+          }
+          walk(c);
+        });
+      })(treeBox);
+      if (!clicked) errs.push("mon top: button not found " + monTop);
+      out.urma_stats_after_top = (function() {
+        const body = getEl("urmaStatsBody");
+        return body ? (body.children || []).length : null;
+      })();
+      out.urma_series_after_top = monSeries("urmachart");
+      out.urma_empty_after_top = getEl("urmaEmpty")
+        ? {display: String(getEl("urmaEmpty").style.display || ""),
+           text: String(getEl("urmaEmpty")._text || "")} : null;
+      out.mon_counts_after_top = {mem: monCounts("memTree"),
+        proc: monCounts("procTree"), urma: monCounts("urmaTree")};
+    } catch (e) {
+      errs.push("mon top: " + String(e && e.stack || e));
     }
   }
   const monClick = arg("--mon-click", null);

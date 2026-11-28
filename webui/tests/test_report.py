@@ -4260,10 +4260,16 @@ def _mon_full():
         "urma": [
             {"node": "n1", "ubpu": 0, "port": 1, "t": [1000, 1001],
              "rx": [1.0, 2.0], "tx": [0.5, 1.0],
-             "rx_avg": 1.5, "rx_max": 2.0, "tx_avg": 0.75, "tx_max": 1.0},
+             "rx_avg": 1.5, "rx_max": 2.0, "tx_avg": 0.75, "tx_max": 1.0,
+             "rx_avg_formal": 1.5, "tx_avg_formal": 0.75},
+            {"node": "n1", "ubpu": 1, "port": 2, "t": [1000, 1001],
+             "rx": [2.0, 4.0], "tx": [1.0, 2.0],
+             "rx_avg": 3.0, "rx_max": 4.0, "tx_avg": 1.5, "tx_max": 2.0,
+             "rx_avg_formal": 3.0, "tx_avg_formal": 1.5},
             {"node": "n2", "ubpu": 0, "port": 1, "t": [1000, 1001],
              "rx": [3.0, 4.0], "tx": [1.5, 2.0],
-             "rx_avg": 3.5, "rx_max": 4.0, "tx_avg": 1.75, "tx_max": 2.0},
+             "rx_avg": 3.5, "rx_max": 4.0, "tx_avg": 1.75, "tx_max": 2.0,
+             "rx_avg_formal": 3.5, "tx_avg_formal": 1.75},
         ],
         "summary": {
             "peak_mem_mb": {"n1": 28, "n2": 40},
@@ -4308,18 +4314,29 @@ def test_b07_monitor_tree_controls_and_legends(tmp_path):
     # proc 图默认 = 全部进程（不再截断前 8）
     pnames = sorted(s["name"] for s in res["proc_series"])
     assert pnames == ["cli 11 @n1", "cli 12 @n1", "cli 21 @n2"], pnames
-    # urma 树：仅节点行；无实例维度 → 全选实例置灰仍保留
+    # urma 树：节点 → DIE → 端口三级可勾选，默认全展开
     urma_tree = res["urma_tree"]
-    assert "row:n1" in urma_tree and "row:n2" in urma_tree, urma_tree
+    for row in ("row:n1", "row:n2", "row:DIE 0", "row:DIE 1",
+                "row:端口 1", "row:端口 2"):
+        assert row in urma_tree, (row, urma_tree)
     for btn in ("btn:清空节点", "btn:全选实例", "btn:全部清空"):
         assert btn in urma_tree, (btn, urma_tree)
-    # 每个节点行跟随该节点子行的 全选/清空 mini 按钮（mem/proc 各 2 节点）
-    assert res["mon_row_minis"] == {"mem": 4, "proc": 4, "urma": 0}, \
-        res["mon_row_minis"]
-    # urma 图 = 每节点 RX 实线 + TX 虚线
+    # 节点/DIE 行各带一对 mini 全选/清空：n1(2) + DIE0(2) + DIE1(2)
+    # + n2(2) + DIE0(2) = 10
+    assert res["mon_row_minis"]["urma"] == 10, res["mon_row_minis"]
+    # urma 图默认 = 每个节点一条 RX 求和实线 + TX 虚线（父子不联动）
     us = res["urma_series"]
-    assert len(us) == 4, us
+    assert [s["name"] for s in us] == ["n1 RX", "n1 TX", "n2 RX", "n2 TX"], us
     assert sum(1 for s in us if s["dash"]) == 2, us
+    # n1 节点 RX = DIE0 端口 + DIE1 端口 求和：1+2=3, 2+4=6
+    n1rx = [s for s in us if s["name"] == "n1 RX"][0]
+    assert n1rx["data"] == [[1000000, 3.0], [1001000, 6.0]], n1rx
+    # 固定表格：全部端口（3 行），带 formal 平均（不随树勾选过滤）
+    assert res["urma_stats"] == [
+        ["n1", "DIE 0", "端口 1", "1.500", "0.750"],
+        ["n1", "DIE 1", "端口 2", "3.000", "1.500"],
+        ["n2", "DIE 0", "端口 1", "3.500", "1.750"],
+    ], res["urma_stats"]
     # 图例固定不可点（同主图 C5.V4）
     assert res["mem_legend"]["selectedMode"] is False, res["mem_legend"]
     assert res["urma_legend"]["selectedMode"] is False, res["urma_legend"]
@@ -4364,7 +4381,7 @@ def test_b08_monitor_tree_click_filters(tmp_path):
         return
     assert res2["errors"] == [], res2["errors"]
     unames = [s["name"] for s in res2["urma_series_after"]]
-    assert unames == ["n2 ubpu=0 port=1 RX", "n2 ubpu=0 port=1 TX"], unames
+    assert unames == ["n2 RX", "n2 TX"], unames
     # proc 树点进程行 → 该进程消失
     res3 = _js_check(tmp_path, data, "--mon-click", "procTree::cli 11")
     if res3 is None:
@@ -4404,6 +4421,16 @@ def test_b10_monitor_tree_caret_expand_collapse(tmp_path):
     # n2 未动，仍展开
     assert "row:cli 21" in proc_after, proc_after
     assert res2["mon_counts_after_caret"]["proc"].get("head:n1") == 1
+    # URMA 节点默认展开，点 caret 收起该节点的 DIE/端口行
+    res3 = _js_check(tmp_path, data, "--mon-caret", "urmaTree::n1")
+    if res3 is None:
+        return
+    assert res3["errors"] == [], res3["errors"]
+    urma_after = res3["mon_tree_after_caret"]["urma"]
+    assert "row:n1" in urma_after, urma_after
+    # n1 的 DIE1（独有）消失；n2 的 DIE0 仍在（n1 收起不影响 n2）
+    assert "row:DIE 1" not in urma_after, urma_after
+    assert "row:DIE 0" in urma_after, urma_after
 
 
 def test_c18_monitor_trees_share_one_template():
@@ -4455,6 +4482,45 @@ def test_b11_mem_metric_optional_and_row_minis(tmp_path):
     assert res4["errors"] == [], res4["errors"]
     pnames = [s["name"] for s in res4["mon_mini_series"]["proc"]]
     assert pnames == ["cli 21 @n2"], pnames
+
+
+def test_c18v13_urma_three_level_controls(tmp_path):
+    """C18.V13 [新增]：URMA 树节点→DIE→端口三级可勾选；父子不联动，
+    节点/DIE 的 mini 只操作直接子项；顶栏「全选实例」= 端口叶子，
+    「全部清空」允许空图（不回填）；固定平均表不随勾选过滤。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    # 节点 mini「全选」→ 只勾该节点的 DIE（n1 两个 DIE），不加端口曲线
+    r1 = _js_check(tmp_path, data, "--mon-mini", "urmaTree::n1::全选")
+    if r1 is None:
+        return
+    assert r1["errors"] == [], r1["errors"]
+    names = [s["name"] for s in r1["mon_mini_series"]["urma"]]
+    assert "DIE 0 RX" in names and "DIE 1 RX" in names, names
+    assert not any("端口" in n for n in names), names
+    # 节点曲线仍在（父子不联动）
+    assert "n1 RX" in names and "n2 RX" in names, names
+    # 顶栏「全选实例」= 端口叶子全选（不含 DIE 聚合）
+    r2 = _js_check(tmp_path, data, "--mon-top", "urmaTree::全选实例")
+    if r2 is None:
+        return
+    assert r2["errors"] == [], r2["errors"]
+    names2 = [s["name"] for s in r2["urma_series_after_top"]]
+    port_names = [n for n in names2 if n.count("/") == 2]
+    assert len(port_names) == 6, names2      # 3 个端口 × RX/TX
+    assert not any(n.startswith("DIE ") for n in names2), names2
+    # 固定表始终全量（不随端口叶子选择变化）
+    assert r2["urma_stats_after_top"] == 3
+    # 顶栏「全部清空」→ 空图 + empty-tip；表格仍全量
+    r3 = _js_check(tmp_path, data, "--mon-top", "urmaTree::全部清空")
+    if r3 is None:
+        return
+    assert r3["errors"] == [], r3["errors"]
+    assert r3["urma_series_after_top"] == [], r3["urma_series_after_top"]
+    assert r3["urma_empty_after_top"]["display"] == ""
+    assert "未勾选" in r3["urma_empty_after_top"]["text"]
+    assert r3["urma_stats_after_top"] == 3
 
 
 def test_b09_monitor_partial_missing_groups(tmp_path):
