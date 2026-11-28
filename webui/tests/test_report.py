@@ -3665,6 +3665,26 @@ def test_slow_capture_independent_controls(tmp_path):
         r2.get("slow_btn_after_instances")
 
 
+def test_slow_controls_use_standard_tree_style(tmp_path):
+    """慢点捕捉「节点与实例」复用标准对象树结构（objtree-strip /
+    tree-row / tree-check + button.mini），不再用无样式的自定义 chip。"""
+    a = _stats(tmp_path, "a.writer", "writer", node="n1")
+    b = _stats(tmp_path, "b.reader", "reader", node="n2")
+    data = rp.reduce_scenario(rp.load([a, b]),
+                              {"config": "cfg", "mode": "pipeline"})
+    res = _js_check(tmp_path, data)
+    if res is None:
+        return
+    assert res["errors"] == []
+    assert (res.get("slow_tree_checks") or 0) >= 1, res.get("slow_tree_checks")
+    rows = res.get("slow_tree_rows") or []
+    assert any("n2" in r for r in rows), rows
+    # 控件不再保留自定义 chip / 专属容器样式（UI 与全站对象树统一）
+    assert "slow-chip-btn" not in rp._APP_JS
+    assert ".slow-ctl" not in rp._PAGE_CSS
+    assert 'id="slowctl" class="objtree-strip"' in rp._SEC_SLOW
+
+
 def test_slow_capture_basic_has_no_role_radio(tmp_path):
     a = _stats(tmp_path, "a.merged", "client")
     data = rp.reduce_scenario(rp.load([a]), {"config": "c", "mode": "basic"})

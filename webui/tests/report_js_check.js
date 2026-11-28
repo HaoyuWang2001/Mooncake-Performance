@@ -317,6 +317,16 @@ if (!errs.length) {
   });
   out.slow_x = (so && so.xAxis) ? [so.xAxis.min, so.xAxis.max] : null;
   out.slow_ctl_text = textOf(getEl("slowctl"));
+  out.slow_tree_rows = [];
+  out.slow_tree_checks = 0;
+  (function walkSlow(n) {
+    ((n && n.children) || []).forEach(function (c) {
+      const cls = String(c.className || "");
+      if (cls.indexOf("tree-row") >= 0) out.slow_tree_rows.push(textOf(c));
+      if (cls.indexOf("tree-check") >= 0) out.slow_tree_checks += 1;
+      walkSlow(c);
+    });
+  })(getEl("slowctl"));
   // R-SLOW-2：慢点 tooltip 时刻必须来自 ts_epoch（不得出现 undefined）
   const _slowOpt = sseq.length ? sseq[sseq.length - 1] : null;
   const _fmt = (_slowOpt && _slowOpt.tooltip && _slowOpt.tooltip.formatter)
