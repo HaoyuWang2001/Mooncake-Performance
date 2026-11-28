@@ -4951,7 +4951,6 @@ function renderObjTree(){
     const nodeName=String((m.all[k]&&m.all[k].node)||k.replace(/^node:/,''));
     const kids=m.byNode[nodeName]||[];
     const open=!!treeOpen[k];
-    const ndTrim=!!(m.all[k]&&m.all[k].trimmed);
     let caret=null;
     if(kids.length){
       caret=el('button','tree-caret',open?'▾':'▸');
@@ -4963,13 +4962,10 @@ function renderObjTree(){
       minis:kids.length?[
         miniBtn('全选',kids,'选中该节点下的全部实例',true),
         miniBtn('清空',kids,'取消该节点下的全部实例',false)]:[],
-      note:kids.length?(kids.length+' 实例'+(ndTrim?' · 曲线见 data.js':''))
-        :(ndTrim?'曲线见 data.js':'')}));
+      note:kids.length?(kids.length+' 实例'):''}));
     if(open&&kids.length){
       kids.forEach(function(ck){
-        const cTrim=!!(m.all[ck]&&m.all[ck].trimmed);
-        list.appendChild(treeRow(ck,objLabel(ck),2,
-          {note:cTrim?'曲线见 data.js':''}));
+        list.appendChild(treeRow(ck,objLabel(ck),2));
       });
     }
   });
@@ -7627,7 +7623,7 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
         # 按 Top-K/预算裁剪。否则 data.js 未加载时，树会退化成「节点有
         # 统计值、下面却只剩 Top-K 实例」的残缺形态，写/读实例还会漏。
         # 骨架只带 label/kind/node/role/p99_ms(+trimmed)，曲线仍由
-        # data.js 提供，前端对 trimmed 行标注「曲线见 data.js」。
+        # data.js 提供；缺失时由页面顶部注释条统一说明。
         for key, o in objs.items():
             if key in emb_objs:
                 continue
