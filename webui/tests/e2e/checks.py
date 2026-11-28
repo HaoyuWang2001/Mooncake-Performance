@@ -201,7 +201,8 @@ def check_embed_skeleton_complete(art):
     emb = _embedded(art)
     d = _data(art)
     for size, blk in (d.get("sizes") or {}).items():
-        eo = ((emb.get("sizes") or {}).get(size) or {}).get("objects") or {}
+        eb = (emb.get("sizes") or {}).get(size) or {}
+        eo = eb.get("objects") or {}
         fo = blk.get("objects") or {}
         want = {k for k, v in fo.items()
                 if (v or {}).get("kind") in ("node", "client", "role")}
@@ -224,6 +225,16 @@ def check_embed_skeleton_complete(art):
                 assert v.get("node") in node_names, (size, k)
             if not ev.get("tiers"):
                 assert ev.get("trimmed"), (size, k)   # 无曲线须显式标裁剪
+        # 实例统计行（错误与异常节点合计、慢点树）同样必须全量内嵌
+        by = {(c or {}).get("name"): (c or {})
+              for c in (eb.get("clients") or [])}
+        fc = blk.get("clients") or []
+        missing = {(c or {}).get("name") for c in fc} - set(by)
+        assert not missing, (size, "clients", sorted(missing)[:5])
+        for c in fc:
+            got = by.get((c or {}).get("name")) or {}
+            assert got.get("node") == c.get("node"), (size, c.get("name"))
+            assert got.get("role") == c.get("role"), (size, c.get("name"))
     # 分级时延曲线（trace）同款：内嵌 trace.objects 覆盖全部结构行；
     # 超预算对象必须是带 trimmed 的骨架（无 groups），曲线留 data.js。
     for size, blk in (d.get("sizes") or {}).items():

@@ -113,11 +113,13 @@ def test_render_self_contained_and_data_js(tmp_path):
     assert len(html_src) > 500 * 1024
     assert "window.__MC_REPORT__" in html_src
     assert '"sizes"' in html_src
-    # lightweight copy embeds only top-1 client per size
+    # 实例结构行全量内嵌；只有 top-1 保留完整条目（含 slowest）
     embedded = re.search(r"window\.__MC_REPORT__ = (.*?);</script>",
                          html_src, re.S).group(1)
     emb = json.loads(embedded)
-    assert len(emb["sizes"]["8MB"]["clients"]) == 1
+    ecl = emb["sizes"]["8MB"]["clients"]
+    assert len(ecl) == 2
+    assert sum(1 for c in ecl if not c.get("trimmed")) == 1
     # data.js carries the full per-client data and is valid JS assignment
     dj_src = open(dj, encoding="utf-8").read()
     assert dj_src.startswith("window.__MC_FULL__ = ")
@@ -1113,6 +1115,16 @@ def test_embed_skeleton_keeps_all_clients_without_datajs(tmp_path):
     assert len(with_tiers) == 5
     assert all(eo[k].get("trimmed") for k in clients if k not in with_tiers)
     assert all("tiers" not in eo[k] for k in clients if k not in with_tiers)
+    # 实例统计行也必须全量内嵌：否则「错误与异常」节点合计只算 Top-K、
+    # 慢点树的节点/实例列表缺实例（曲线数据仍留 data.js）
+    ecl = emb["clients"]
+    assert len(ecl) == 30
+    assert {c.get("name") for c in ecl} == {c.get("name") for c in z["clients"]}
+    ctrim = [c for c in ecl if c.get("trimmed")]
+    assert len(ctrim) == 25
+    assert all("slowest" not in c for c in ctrim)
+    assert all(c.get("total") is not None and c.get("errors") is not None
+               for c in ctrim)
 
 
 def test_overlay_two_objects_js(tmp_path):

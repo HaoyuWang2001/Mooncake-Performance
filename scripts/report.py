@@ -4414,10 +4414,12 @@ function renderSlowControls(){
     sbtn('全部清空','清空节点与实例高亮，并自动显示总计',
       function(){slowSel=[];slowTotal=true;renderSlowStrip();})]);
   const nodes={};
-  (z.clients||[]).forEach(function(c){
-    if(isPipeMode()&&c.role!==slowRole) return;
-    const n=c.node||'未归属节点';
-    (nodes[n]=nodes[n]||[]).push(c.name);
+  const all=objAll();
+  Object.keys(all).forEach(function(k){
+    const o=all[k]; if(!o||o.kind!=='client') return;
+    if(isPipeMode()&&o.role!==slowRole) return;
+    const n=o.node||'未归属节点';
+    (nodes[n]=nodes[n]||[]).push(o.label||k.replace(/^client:/,''));
   });
   Object.keys(nodes).sort().forEach(function(n){
     const open=!!slowOpen[n];
@@ -4489,10 +4491,12 @@ function renderSlowStrip(){
       (byNode[n]=byNode[n]||[]).push(r);
     });
     const p99={};
-    (z.clients||[]).forEach(function(c){
-      if(isPipeMode()&&c.role!==slowRole) return;
-      const n=c.node||'未归属节点';
-      p99[n]=Math.max(p99[n]||0,Number(c.p99_ms)||0);
+    const allc=objAll();
+    Object.keys(allc).forEach(function(k){
+      const o=allc[k]; if(!o||o.kind!=='client') return;
+      if(isPipeMode()&&o.role!==slowRole) return;
+      const n=o.node||'未归属节点';
+      p99[n]=Math.max(p99[n]||0,Number(o.p99_ms)||0);
     });
     Object.keys(byNode).sort().forEach(function(n){
       const chip=el('span','slow-chip');
@@ -7615,7 +7619,8 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
     meta = data.get("meta") or {}
     _volume_dir_mode_compat(data)
     size_keys = list((data.get("sizes") or {}).keys())
-    # compact copy for the HTML: only top-K clients carry minute series
+    # compact copy for the HTML: only top-K clients carry minute series;
+    # 结构行全量内嵌（骨架），详细曲线/慢点留 data.js
     embedded = {"meta": meta, "sizes": {}, "nodes": data.get("nodes") or [],
                 "sources": data.get("sources") or [],
                 "logsite": data.get("logsite") or [],
@@ -7628,7 +7633,19 @@ def render_scenario(data, out_dir, echarts_path, topk=TOPK_DEFAULT,
         if z.get("trace"):
             # SDK 区的按对象阶段数据：总计全嵌，节点/实例抽稀+预算
             slim["trace"] = _trim_trace_embed(z["trace"])
-        slim["clients"] = keep
+        # 实例统计行全量内嵌：Top-K 保留完整条目（含 slowest），其余保留
+        # 结构+汇总（total/fail/errors/p99_ms，去掉体积大的 slowest）。
+        # 否则 data.js 缺失时「错误与异常」节点合计只算 Top-K，慢点树缺实例。
+        keep_names = {c.get("name") for c in keep}
+        slim_clients = []
+        for c in clients:
+            if c.get("name") in keep_names:
+                slim_clients.append(c)
+            else:
+                sk = {k: v for k, v in c.items() if k != "slowest"}
+                sk["trimmed"] = True
+                slim_clients.append(sk)
+        slim["clients"] = slim_clients
         # 段2：对象预算裁剪（角色全嵌 -> 节点按日志量 -> Top 客户端），
         # 单点行预算 EMBED_ROW_BUDGET；其余对象留在 data.js
         emb = set(z.get("embed_tiers") or [])
