@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mp-trace-tree/1",
+  "description": "每 op 一份的 breakdown[op] 阶段树。字段名 = 日志原生名（零翻译）；树是静态 schema 知识，map（tracestats）与渲染（report）共用。",
+  "type": "object",
+  "required": ["schema", "op", "group", "stages", "total_field"],
+  "properties": {
+    "schema": { "const": "mp-trace-tree/1" },
+    "op": { "type": "string", "description": "breakdown[op] 的 op 名（不含 .slice/.slice_stats 后缀）" },
+    "extends": { "type": "string", "description": "单层继承：复制 <op>.json 后覆盖 op/差异字段" },
+    "group": { "enum": ["read", "write", "other"] },
+    "line": {
+      "type": "object",
+      "description": "行匹配规则",
+      "properties": {
+        "markers": {
+          "type": "array", "minItems": 1, "items": { "type": "string" },
+          "description": "该 op 主行的字面 marker（如 breakdown[get_buffer]）"
+        },
+        "legacy": {
+          "type": "object",
+          "properties": {
+            "marker": { "type": "string", "description": "旧格式字面 marker（如 ' get_breakdown '）" },
+            "require": { "type": "array", "items": { "type": "string" }, "description": "额外必备字段（排除他行误命中）" },
+            "field_aliases": {
+              "type": "object",
+              "description": "旧字段名 → 新字段名，仅作用于 legacy 行",
+              "additionalProperties": { "type": "string" }
+            },
+            "legacy_ops": {
+              "type": "array", "items": { "type": "string" },
+              "description": "breakdown[op] 值映射到本 op 的旧别名（行内 bd 值归一为本树 op）"
+            }
+          }
+        }
+      }
+    },
+    "ok_statuses": { "type": "array", "items": { "type": "string" }, "description": "成功状态集合（额外于全局 'ok'）" },
+    "total_field": { "enum": ["total_us"], "description": "端到端总时延字段（残差计算的分母）" },
+    "meta_fields": {
+      "type": "array", "items": { "type": "string" },
+      "description": "不参与阶段树/时延统计的行内字段（尺寸/分布/标记类）"
+    },
+    "stages": { "type": "array", "items": { "$ref": "#/definitions/node" } },
+    "invariants": {
+      "type": "array", "items": { "type": "string" },
+      "description": "加和恒等式（首版作文档；后续可升级为数据自检）"
+    }
+  },
+  "definitions": {
+    "fielddef": { "type": "string", "pattern": "^[a-z][a-z0-9_]*_us$" },
+    "node": {
+      "type": "object",
+      "required": ["field"],
+      "properties": {
+        "field": { "$ref": "#/definitions/fielddef" },
+        "label": { "type": "string", "description": "展示名（缺省 = field 去掉 _us 后缀）" },
+        "chart": { "type": "boolean", "default": false, "description": "L1：参与阶段时间桶（fminutes）与曲线多选" },
+        "children": { "type": "array", "items": { "$ref": "#/definitions/node" } },
+        "views": {
+          "type": "object",
+          "description": "同一父节点的多种并列分解（classic/tent/ab/...），互不加和",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "label": { "type": "string" },
+              "children": { "type": "array", "items": { "$ref": "#/definitions/node" } }
+            }
+          }
+        }
+      }
+    },
+    "switchNode": {
+      "type": "object",
+      "required": ["switch", "cases"],
+      "description": "按行内字段值（engine）切换的形状节点：每个 case 是一组替代 L1 节点",
+      "properties": {
+        "switch": { "enum": ["engine"] },
+        "label": { "type": "string" },
+        "cases": {
+          "type": "object",
+          "additionalProperties": { "type": "array", "items": { "$ref": "#/definitions/node" } }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "get_into",
+  "group": "read",
+  "line": {
+    "markers": ["breakdown[get_into]"],
+    "legacy": {
+      "marker": "get_into_breakdown",
+      "require": ["key"],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "key", "start_time", "type", "mode", "replica_count", "selected_type",
+    "local_endpoint", "remote_endpoint", "status", "trace_id", "engine",
+    "slice_count"
+  ],
+  "stages": [
+    {
+      "field": "query_us", "label": "query", "chart": true,
+      "children": [
+        {"field": "query_route_us", "label": "route"},
+        {"field": "query_rpc_us", "label": "rpc"},
+        {"field": "query_retry_us", "label": "retry"}
+      ]
+    },
+    {
+      "field": "select_us", "label": "select", "chart": true,
+      "children": [
+        {"field": "local_endpoints_us"},
+        {"field": "select_replica_us"}
+      ]
+    },
+    {
+      "field": "read_us", "label": "read", "chart": true,
+      "views": {
+        "offload": {
+          "label": "offload",
+          "children": [
+            {"field": "offload_rpc_us"},
+            {"field": "transfer_data_us"},
+            {"field": "release_buffer_us"},
+            {"field": "read_overhead_us"}
+          ]
+        }
+      }
+    }
+  ],
+  "invariants": [
+    "total_us ≈ query_us + select_us + read_us",
+    "query_us ≈ query_route_us + query_rpc_us + query_retry_us + glue",
+    "read_us ≈ offload_rpc_us + transfer_data_us + release_buffer_us + read_overhead_us",
+    "get_into 无 buf_alloc 阶段（用户 buffer，免分配）"
+  ]
+}

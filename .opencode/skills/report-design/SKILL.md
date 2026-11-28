@@ -343,7 +343,8 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C11.I2 切换读写组时重置 op 选择与阶段/对象选择（对象按组作用域过滤）
 - C11.B1 写/读分组曾只作用于部分子图（慢点追踪未跟随）
 - C11.V8 SDK 元信息行展示 **engine 分布**（`engine classic×N / tent×M`；reduce 必须合并 per-op `engine` 计数，否则合并阶段丢失）
-- C11.V7 **统一 `breakdown[op]` 行匹配与字段归一**（docs/yh/log-reference.md §14）：get_buffer 走通用分支（旧 `get_breakdown` 仅兼容）；`query_total_us→query_us`、`buf_alloc_us→alloc_us`；接口集合 读=get_buffer/get_into/batch_get/batch_get_into、写=put/put_from/upsert/upsert_from/batch_put/batch_put_into；remove/batchRemove 薄行归「其它」；TENT+TCP 四相位诚实零值按 engine 标注（不误判 classic）
+- C11.V7 **统一 `breakdown[op]` 行匹配（树驱动）**（docs/yh/log-reference.md §14；树 = configs/_trace_trees/<op>.json）：行匹配按 op 树注册表（marker → op）；字段名 = 日志原生名（`query_total_us`/`buf_alloc_us`，不再归一改名）；旧 `get_breakdown` 行按 legacy 别名**单向**映射（`query_us → query_total_us`、`alloc_us → buf_alloc_us`；旧 op 名 get/get_batch 归一到 get_buffer）；未知 op 归「其它」组并计 `meta.unknown_ops`（字段探测仅兜底）；remove/batchRemove 薄行归「其它」；树 meta_fields（slice_count/*_min_us 等）不进时延字段统计；TENT+TCP 四相位诚实零值按 engine 标注（不误判 classic）
+- C11.V9 **树 = 单一事实源 `configs/_trace_trees/<op>.json`（schema mp-trace-tree/1）**：13 棵树（12 个真实接口 + batch_upsert_from 薄行；「get」非独立树，`breakdown[get]` 经 legacy_ops 归一）；`scripts/trace_trees.py` 唯一读取入口，目录缺失或校验失败一律 TreeError 硬失败（不静默回退）；extends 仅单层（put_from/upsert_from 继承）；`stage_rows_of` 扁平行 `[field,level,parent,view]`（L1 父 = total_us；residual 由 loader 统一追加为渲染行、不进 chart L1 元组）
 ### C12 SDK 全链路 · 对象树
 
 - C12.V1 树 = 总计（当前读写组全实例聚合）+ 节点与实例；**无角色行**（角色在顶部）；位于分级时延曲线控台**左栏**
@@ -386,7 +387,8 @@ p999/p9999），位置在生成图表时即确定，不随所选 pod/node/实例
 - C14.B1 tooltip 落回原始毫秒时间戳（无 formatter）
 - C14.B2 三重维度无收敛 → 曲线灾难（阶段×对象×指标全开）
 - C14.B3 阶段曲线对象树在角色行/节点禁用状态间的历史漂移
-- C14.V11 阶段树 L1/L2 覆盖统一字段：读 L1 增 `prep_us`（batch 接口）、query 下钻 `query_route/rpc/retry`；写 query 同带三段下钻（阶段树与数据字段名一致）
+- C14.V11 阶段树按 op 分割：单一事实源 `configs/_trace_trees/<op>.json`，report.py build 时 import trace_trees 并向页面嵌 `TRACE_TREES`（行 = `[field,level,parent,view]`），渲染 JS 对具体 op 零知识、只遍历通用行（不再有 TREAD/TWRITE 常量）；get_buffer = query_total/select/buf_alloc/read，batch 读含 `prep_us`；put 不列 query/finalize、upsert 不列 put_start/put_end（恒 0 不列）；batch_put/batch_put_into/batch_upsert_from 薄行 = prep/write 两段；query 带 `query_route/rpc/retry` 三段下钻；读树含 classic 传输段四字段
+- C14.V12 **views 并列分解与 switch 引擎切换段**：同一父节点的多套分解互不加和（get_buffer.read_us 的 classic 四段 / tent 四相位 / A-B 分段；get_into.read_us 的 offload 三段），L2 子行带徽标（classic/tent/A-B/offload）；put 族传输段为 switch（按行内 engine 切换 L1 形状：classic `memwrite_*` ↔ tent 四相位，case 名作为 view 并列展开、缺字段的行自然为空，混跑残差按出现的 L1 计算）——分级时延块图 / 阶段树 / 慢点展开三处同款标识
 ### C15 SDK 全链路 · 慢点追踪（trace）
 
 - C15.V1 标题「慢点追踪（trace）」；柱按端到端时延**降序**排列，轴标签=时延值（可读出聚集簇）

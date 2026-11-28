@@ -1,0 +1,23 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "batchRemove",
+  "group": "other",
+  "line": {
+    "markers": ["breakdown[batchRemove]"],
+    "legacy": {
+      "marker": "batchRemove_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "num_keys", "failed", "force", "start_time", "status", "trace_id"
+  ],
+  "stages": [
+    {"field": "remove_rpc_us", "label": "remove_rpc", "chart": true}
+  ],
+  "invariants": [
+    "batchRemove 为薄行：remove_rpc_us ≡ total_us"
+  ]
+}

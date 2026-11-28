@@ -1,0 +1,13 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "upsert_from",
+  "extends": "upsert",
+  "line": {
+    "markers": ["breakdown[upsert_from]"],
+    "legacy": {
+      "marker": "upsert_from_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  }
+}

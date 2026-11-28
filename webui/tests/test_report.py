@@ -537,14 +537,48 @@ def test_trace_meta_shows_engine_distribution(tmp_path):
 
 
 def test_trace_stage_tree_covers_unified_breakdown_fields():
-    """统一 breakdown[op]：读树补 prep_us（batch 接口 L1），读写 query 均带
-    query_route/rpc/retry 下钻（log-reference §14.9）。"""
-    js = rp._APP_JS
-    assert '["prep_us",1,"total_us"]' in js
+    """统一 breakdown[op]：树按 op 分割（单一事实源 configs/_trace_trees/*.json），
+    嵌入 JS 的 TRACE_TREES 与 Python 侧 tracestats 用同一注册表。"""
+    trees = rp._TRACE_TREES_EMBED
+    # 读树（get_buffer）：query/select/buf_alloc/read + query 三段下钻 + 三视图
+    rows = [tuple(r) for r in trees["get_buffer"]]
+    assert ("query_total_us", 1, "total_us", "") in rows
+    assert ("select_us", 1, "total_us", "") in rows
+    assert ("buf_alloc_us", 1, "total_us", "") in rows
+    assert ("read_us", 1, "total_us", "") in rows
     for key in ("query_route_us", "query_rpc_us", "query_retry_us"):
-        assert '["{}",2,"query_us"]'.format(key) in js, key
-    # 两个引擎的写树都在（classic memwrite_* / tent 四相位）
-    assert "memwrite_total_us" in js and '"admit_us"' in js
+        assert (key, 2, "query_total_us", "") in rows, key
+    # read_us 的三个并列分解视图（classic/tent/ab）
+    assert ("read_submit_us", 2, "read_us", "classic") in rows
+    assert ("admit_us", 2, "read_us", "tent") in rows
+    assert ("read_a_us", 2, "read_us", "ab") in rows
+    # batch 读（prep_us L1）与 get_into（offload 视图）
+    assert ("prep_us", 1, "total_us", "") in [tuple(r) for r in trees["batch_get"]]
+    assert ("offload_rpc_us", 2, "read_us", "offload") in \
+        [tuple(r) for r in trees["get_into"]]
+    # 写树：put（put_start/put_end，无 query）与 upsert（query/finalize）分开；
+    # 传输段是 switch：classic 的 memwrite_* 与 tent 四相位并列、各带引擎徽标
+    prows = [tuple(r) for r in trees["put"]]
+    assert ("put_start_us", 1, "total_us", "") in prows
+    assert ("memwrite_total_us", 1, "total_us", "classic") in prows
+    assert ("memwrite_queue_us", 2, "memwrite_total_us", "classic") in prows
+    assert ("admit_us", 1, "total_us", "tent") in prows    # tent switch case
+    assert ("wire_span_us", 1, "total_us", "tent") in prows
+    assert not any(r[0] == "query_us" for r in prows)  # put 不发射 query
+    urows = [tuple(r) for r in trees["upsert"]]
+    assert ("query_us", 1, "total_us", "") in urows
+    assert ("finalize_us", 1, "total_us", "") in urows
+    assert not any(r[0] == "put_start_us" for r in urows)
+    # batch_put 薄行：prep/write 两段（不再按 put 族并集解析）
+    brows = [tuple(r) for r in trees["batch_put"]]
+    assert ("prep_us", 1, "total_us", "") in brows
+    assert ("write_us", 1, "total_us", "") in brows
+    assert len(brows) == 4  # total + prep + write + residual
+    # remove 薄行归 other 组
+    assert ("remove_rpc_us", 1, "total_us", "") in [tuple(r) for r in trees["remove"]]
+    # 渲染 JS 引用嵌入树（不再有 TREAD/TWRITE 常量）
+    js = rp._APP_JS
+    assert "TRACE_TREES" in js and "TREAD" not in js and "TWRITE" not in js
 
 
 def test_trace_reduce_merges_engine_distribution(tmp_path):
@@ -656,7 +690,10 @@ def _js_check(tmp_path, data, *args, env=None):
         print("  [skip] node not found")
         return None
     app = tmp_path / "app.js"
-    app.write_text(rp._APP_JS, encoding="utf-8")
+    app.write_text(rp._APP_JS.replace(
+        "__TRACE_TREES_JSON__",
+        json.dumps(rp._TRACE_TREES_EMBED, ensure_ascii=True,
+                   separators=(",", ":"))), encoding="utf-8")
     dj = tmp_path / "data.json"
     dj.write_text(json.dumps(data), encoding="utf-8")
     run_env = None
@@ -811,16 +848,24 @@ def test_trace_percentiles_not_clamped_by_ms_ladder(tmp_path):
 
 
 def test_trace_avg_excludes_neg_sentinel(tmp_path):
-    """-1 哨兵不参与时延统计：平均值的分母应为 n-neg（原为 n，被稀释）。"""
+    """-1 哨兵不参与时延统计：平均值的分母应为 n-neg（原为 n，被稀释）。
+
+    memwrite_urma_min_us 属 put 树 meta_fields（分布辅助，不入 fields），
+    改用 memwrite_queue_us 验证同一语义（失败行给 -1、成功行给有效值）。"""
     from tracestats import compute_trace_stats
     p = tmp_path / "neg.glog"
-    p.write_text(WRITE_FAIL_TRACE + "\n" + WRITE_OK_TRACE + "\n",
-                 encoding="utf-8")
+    fail = WRITE_FAIL_TRACE.replace("memwrite_total_us[40012]",
+                                     "memwrite_total_us[40012] "
+                                     "memwrite_queue_us[-1]")
+    ok = WRITE_OK_TRACE.replace("memwrite_total_us[188]",
+                                "memwrite_total_us[188] "
+                                "memwrite_queue_us[14]")
+    p.write_text(fail + "\n" + ok + "\n", encoding="utf-8")
     tr = compute_trace_stats(str(p))
     blk = rp.reduce_trace_size([tr])
-    fd = blk["groups"]["write"]["ops"]["put"]["fields"]["memwrite_urma_min_us"]
+    fd = blk["groups"]["write"]["ops"]["put"]["fields"]["memwrite_queue_us"]
     assert fd["n"] == 2 and fd["neg"] == 1
-    assert fd["avg"] == 148.0       # 只有 148 一个有效样本（不是 74）
+    assert fd["avg"] == 14.0        # 只有 14 一个有效样本（不被 -1 稀释）
     assert fd["avg_n"] == 1
 
 
@@ -1157,8 +1202,8 @@ def test_trace_field_sigma_and_reduce_merge(tmp_path):
     tot = read["fields"]["total_us"]
     assert tot["sigma"] is not None and tot["sigma"] >= 0
     assert read["fminutes"].get("total_us") is None or True  # total 不在 fminutes
-    assert "query_us" in read["fminutes"]
-    merged = read["fminutes"]["query_us"]
+    assert "query_total_us" in read["fminutes"]
+    merged = read["fminutes"]["query_total_us"]
     assert len(merged) >= 1
     # 合并后样本数翻倍（两个相同 glog）
     assert sum(r[1] for r in merged) == 2
@@ -1454,6 +1499,59 @@ def test_levels_focus_expand_and_residual(tmp_path):
     assert "select_replica_us" in lv, lv[:400]
 
 
+def _trace_stats_views(tmp_path, name):
+    """get_buffer classic 行：read_us 同时有 classic 传输段与 A/B 分段
+    （views 并列分解素材）。"""
+    from tracestats import compute_trace_stats
+    glog = ("I20261125 10:23:41.882310 1 te.cc:1] "
+            "trace_id[1] breakdown[get_buffer] key[bench/o] status[ok] "
+            "start_time[2026-11-25 10:23:41.882310] "
+            "query_total_us[57] select_us[18] buf_alloc_us[5] read_us[196] "
+            "engine[classic] memread_total_us[196] read_submit_us[8] "
+            "read_queue_us[14] read_urma_us[160] read_teardown_us[14] "
+            "read_a_us[58] read_b_us[12] read_transfer_window_us[126] "
+            "slice_count[2] total_us[269]")
+    p = tmp_path / name
+    p.write_text(glog + "\n", encoding="utf-8")
+    return compute_trace_stats(str(p), node="n1", size="8MB",
+                               sample_rate=1.0)
+
+
+def test_levels_view_children_badges(tmp_path):
+    """分级时延块图：views 并列分解的 L2 子块带徽标（classic/A-B），
+    同一父的多套分解互不加和。"""
+    tr = _trace_stats_views(tmp_path, "v.glog")
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--focus", "read_us")
+    if res is None:
+        return
+    assert res["errors"] == []
+    lv = (res.get("focus_text") or "").replace("  ", " ")
+    # classic 传输段 + A/B 分段同屏，各带自己的视图徽标
+    assert "read_submit_us classic" in lv, lv[:400]
+    assert "read_a_us A/B" in lv, lv[:400]
+    # tent 子行也在（无数据 → 0 值块）但不出现在有效统计里
+    assert "admit_us tent" in lv, lv[:400]
+
+
+def test_stage_tree_view_badges(tmp_path):
+    """阶段树（分级时延曲线控台）：read_us 展开后 views 子行带徽标
+    （classic / tent / A-B 并列分解，与块图同一标识）。"""
+    tr = _trace_stats_views(tmp_path, "v.glog")
+    a = _stats(tmp_path, "a.reader", "reader")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "cfg"}, traces=[tr])
+    res = _js_check(tmp_path, data, "--stage-tree-view", "read_us")
+    if res is None:
+        return
+    assert res["errors"] == []
+    note = res.get("stage_tree_view_text") or ""
+    assert "read_submit_us" in note and "classic" in note, note[:400]
+    assert "admit_us" in note and "tent" in note, note[:400]
+    assert "read_a_us" in note and "A/B" in note, note[:400]
+    assert note.count("无时间桶") >= 11   # 11 个 L2 子行均为禁用态
+
+
 def test_trace_field_has_p9999(tmp_path):
     """trace 字段统计补齐 p9999（供分级时延指标切换器使用）。"""
     tr = _trace_stats(tmp_path, "a.glog")
@@ -1461,7 +1559,7 @@ def test_trace_field_has_p9999(tmp_path):
     read = z["groups"]["read"]["ops"]["get_buffer"]
     tot = read["fields"]["total_us"]
     assert "p9999" in tot and tot["p9999"] is not None
-    for key in ("query_us", "select_us"):
+    for key in ("query_total_us", "select_us"):
         assert "p9999" in read["fields"][key]
 
 
@@ -1541,7 +1639,7 @@ def test_stage_buckets_use_seconds_and_multitier(tmp_path):
           "groups": {"read": {"ops": {"get_buffer": {
               "count": 600, "ok": 600, "fail": 0, "status": {"ok": 600},
               "fields": {}, "ftier": 1,
-              "fminutes": {"query_us": [
+              "fminutes": {"query_total_us": [
                   [1000000 + i * 10, 4, 100.0 + i, 400.0 + i]
                   for i in range(60)]},
           }}}}}
@@ -1550,7 +1648,7 @@ def test_stage_buckets_use_seconds_and_multitier(tmp_path):
     assert "128KB" in data["sizes"] and "trace" in data["sizes"]["128KB"]
     op = data["sizes"]["128KB"]["trace"]["groups"]["read"]["ops"]["get_buffer"]
     assert op["ftier"] == 1
-    assert len(op["fminutes"]["query_us"]) == 60
+    assert len(op["fminutes"]["query_total_us"]) == 60
 
 
 # ---------------------------------------------------------------------------
@@ -4009,7 +4107,7 @@ def test_a15_report_stdlib_only():
     import ast as _ast
     src = open(os.path.join(ROOT, "scripts", "report.py"),
                encoding="utf-8").read()
-    std = set(sys.stdlib_module_names) | {"logstats"}
+    std = set(sys.stdlib_module_names) | {"logstats", "trace_trees"}
     for node in _ast.walk(_ast.parse(src)):
         if isinstance(node, _ast.Import):
             for al in node.names:

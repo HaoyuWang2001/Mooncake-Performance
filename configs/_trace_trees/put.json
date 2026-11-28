@@ -1,0 +1,68 @@
+{
+  "schema": "mp-trace-tree/1",
+  "op": "put",
+  "group": "write",
+  "line": {
+    "markers": ["breakdown[put]"],
+    "legacy": {
+      "marker": "put_breakdown",
+      "require": [],
+      "field_aliases": {}
+    }
+  },
+  "total_field": "total_us",
+  "meta_fields": [
+    "key", "size", "replicas", "start_time", "status", "trace_id",
+    "engine", "slice_count", "memwrite_urma_min_us", "memwrite_urma_avg_us",
+    "bytes"
+  ],
+  "stages": [
+    {
+      "field": "prep_total_us", "label": "prep", "chart": true,
+      "children": [
+        {"field": "prep_buf_alloc_us"},
+        {"field": "prep_memcpy_us"},
+        {"field": "prep_split_us"}
+      ]
+    },
+    {"field": "checksum_us", "label": "checksum", "chart": true},
+    {"field": "prepare_us", "label": "prepare", "chart": true},
+    {
+      "field": "put_start_us", "label": "put_start", "chart": true
+    },
+    {
+      "switch": "engine",
+      "label": "传输段",
+      "cases": {
+        "classic": [
+          {
+            "field": "memwrite_total_us", "label": "memwrite", "chart": true,
+            "children": [
+              {"field": "memwrite_submit_us"},
+              {"field": "memwrite_queue_us"},
+              {"field": "memwrite_urma_us"},
+              {"field": "memwrite_teardown_us"}
+            ]
+          }
+        ],
+        "tent": [
+          {"field": "admit_us", "label": "admit", "chart": true},
+          {"field": "queue_prep_us", "label": "queue_prep", "chart": true},
+          {"field": "wire_span_us", "label": "wire_span", "chart": true},
+          {"field": "propagate_us", "label": "propagate", "chart": true}
+        ]
+      }
+    },
+    {"field": "put_end_us", "label": "put_end", "chart": true},
+    {"field": "revoke_us", "label": "revoke", "chart": true}
+  ],
+  "invariants": [
+    "total_us ≈ prep_total_us + checksum_us + prepare_us + put_start_us + <传输段> + put_end_us + revoke_us",
+    "prep_total_us = prep_buf_alloc_us + prep_memcpy_us + prep_split_us",
+    "<传输段> classic: memwrite_total_us = memwrite_submit + memwrite_queue + memwrite_urma + memwrite_teardown",
+    "<传输段> tent: admit_us + queue_prep_us + wire_span_us + propagate_us ≈ transfer 总跨度",
+    "put 不发射 query/finalize/cache_invalidate（upsert 专属，恒 0 故不列）",
+    "memwrite_urma_min/avg_us 为分布辅助字段，不参与加和",
+    "TENT+TCP 时四相位为诚实零值，残差吸收传输"
+  ]
+}

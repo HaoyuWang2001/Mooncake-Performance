@@ -30,6 +30,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import logstats as ls   # noqa: E402  (histogram ladder + percentile shared)
+import trace_trees as tt  # noqa: E402  (per-op stage trees, single source)
+
+# 嵌入 JS 的树（单一事实源 configs/_trace_trees/*.json；渲染与 map 同源）：
+# {op: rows[[field,level,parent,view], ...]}；level 0=total 1=L1(chart) 2=L2，
+# view 空=主视图，否则为 views key（classic/tent/ab/...，并列分解互不加和）。
+_TRACE_TREES_EMBED = {}
+for _op, _rows in tt.stage_rows_of(tt.load_trace_trees()).items():
+    _TRACE_TREES_EMBED[_op] = _rows
 
 EMBED_SECONDS_MAX = 86400        # ≤1 天：1s 桶内嵌；否则内嵌 1min
 SCATTER_MAX_POINTS = 200000      # per-client raw scatter cap (small runs)
@@ -2341,6 +2349,8 @@ font-size:12px;font-weight:600;min-width:0;overflow:hidden;line-height:1.3}
 .lvl-blk.compressed .lvl-name,.lvl-blk.compressed .lvl-val{visibility:hidden}
 .lvl-name{font-weight:700;white-space:nowrap;overflow:hidden;
 text-overflow:ellipsis;min-width:0}
+/* views 徽标（classic/tent/A/B）：并列分解标识，纯文字不加容器 */
+.lvl-view{font-weight:500;opacity:.82;white-space:nowrap}
 .lvl-val{font-variant-numeric:tabular-nums;opacity:.85;white-space:nowrap;
 overflow:hidden;text-overflow:ellipsis;min-width:0}
 .lvl-children{align-self:start;overflow-x:auto;padding-top:5px}
@@ -2553,6 +2563,17 @@ padding-top:14px}
 _APP_JS = r"""
 const D = window.__MC_REPORT__ || {};
 const FULL = window.__MC_FULL__ || null;   // loaded from data.js when present
+/* 每 op 阶段树（来自 configs/_trace_trees/<op>.json，与 tracestats 同源）：
+   行 = [field, level, parent, view]；level 0=total 1=L1(chart) 2=L2；
+   view 空 = 主视图，否则为并列分解（classic/tent/ab/...，互不加和）。 */
+const TRACE_TREES = __TRACE_TREES_JSON__;
+function tTreeOf(g,op){
+  const rows=(TRACE_TREES[op]||null);
+  if(rows) return rows;
+  /* 未知 op（旧产物/未登记）：按组回退到任一同组树，保渲染不崩 */
+  const fallback={read:'get_buffer',write:'put',other:'remove'}[g];
+  return TRACE_TREES[fallback]||[['total_us',0,'','']];
+}
 function fmtDur(s){s=Math.max(0,Math.round(s));const h=Math.floor(s/3600),
 m=Math.floor(s%3600/60);return (h?h+'h':'')+(m?m+'m':'')+(s%60)+'s';}
 function fmtBytes(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)
@@ -5781,34 +5802,8 @@ function mount(){
   });
 }
 /* ---------------- SDK 全链路（C++ trace）：分级时延 / 阶段曲线 / 阶段树 ---------------- */
-const TREAD=[["total_us",0,""],["query_us",1,"total_us"],
- ["query_route_us",2,"query_us"],["query_rpc_us",2,"query_us"],
- ["query_retry_us",2,"query_us"],
- ["select_us",1,"total_us"],["local_endpoints_us",2,"select_us"],
- ["select_replica_us",2,"select_us"],["alloc_us",1,"total_us"],
- ["prep_us",1,"total_us"],
- ["read_us",1,"total_us"],["read_a_us",2,"read_us"],
- ["read_transfer_window_us",2,"read_us"],["read_b_us",2,"read_us"],
- ["offload_rpc_us",2,"read_us"],["transfer_data_us",2,"read_us"],
- ["release_buffer_us",2,"read_us"],["read_overhead_us",2,"read_us"],
- ["residual",1,"total_us"]];
-const TWRITE=[["total_us",0,""],["prep_total_us",1,"total_us"],
- ["prep_buf_alloc_us",2,"prep_total_us"],["prep_memcpy_us",2,"prep_total_us"],
- ["prep_split_us",2,"prep_total_us"],["checksum_us",1,"total_us"],
- ["prepare_us",1,"total_us"],["query_us",1,"total_us"],
- ["query_route_us",2,"query_us"],["query_rpc_us",2,"query_us"],
- ["query_retry_us",2,"query_us"],
- ["put_start_us",1,"total_us"],["memwrite_total_us",1,"total_us"],
- ["memwrite_submit_us",2,"memwrite_total_us"],
- ["memwrite_queue_us",2,"memwrite_total_us"],
- ["memwrite_urma_us",2,"memwrite_total_us"],
- ["memwrite_teardown_us",2,"memwrite_total_us"],
- ["admit_us",1,"total_us"],["queue_prep_us",1,"total_us"],
- ["wire_span_us",1,"total_us"],["propagate_us",1,"total_us"],
- ["put_end_us",1,"total_us"],["finalize_us",1,"total_us"],
- ["cache_invalidate_us",1,"total_us"],["revoke_us",1,"total_us"],
- ["residual",1,"total_us"]];
-function tTree(g){return g==='write'?TWRITE:TREAD;}
+/* 树已上移到 TRACE_TREES（页面顶部，来自 configs/_trace_trees/<op>.json）：
+   渲染代码对具体 op 零知识，只遍历通用行 [field,level,parent,view]。 */
 function traceSizes(){return Object.keys(S).filter(function(k){
   return S[k]&&S[k].trace;});}
 let tGroup='',tOp='',tChart=null;
@@ -5925,10 +5920,14 @@ function tObjPick(key){
 function tStageName(k){
   return k==='total_us'?'total':(k==='residual'?'残差':k);
 }
+/* views 徽标文案：树 view key → 展示名（classic/tent/A/B/offload） */
+function tViewLabel(v){
+  return v==='ab'?'A/B':(v||'');
+}
 function tStageKeys(){
   const cur=tPick(); if(!cur) return ['total_us'];
   const keys=['total_us'];
-  tTree(cur.g).forEach(function(x){
+  tTreeOf(cur.g,cur.op).forEach(function(x){
     if(x[1]===1&&keys.indexOf(x[0])<0)keys.push(x[0]);});
   if(cur.data&&cur.data.residual) keys.push('residual');
   return keys;
@@ -5964,13 +5963,16 @@ function tStat(key,cur){
   return (cur.data.fields||{})[key]||{};
 }
 function tParentKey(key,cur){
-  const it=tTree(cur.g).find(function(x){return x[0]===key;});
+  const it=tTreeOf(cur.g,cur.op).find(function(x){return x[0]===key;});
   return (it&&it[2])||'total_us';
 }
 function tChildrenOf(key,cur){
-  return tTree(cur.g).filter(function(x){return x[1]>0&&x[2]===key;})
+  const kids=tTreeOf(cur.g,cur.op)
+    .filter(function(x){return x[1]>0&&x[2]===key;})
     .map(function(x){return {key:x[0],
-      label:(x[0]==='residual'?'残差':x[0]), st:tStat(x[0],cur)};});
+      label:(x[0]==='residual'?'残差':x[0]), st:tStat(x[0],cur),
+      view:(x[3]||'')};});
+  return kids;
 }
 function fmtUs(v){v=Number(v)||0;
   return v>=1000?(v/1000).toFixed(2)+' ms':v.toFixed(1)+' µs';}
@@ -6077,13 +6079,21 @@ function levelTip(b){
   else tip.push('点击聚焦：下一级在下一行展开，其余块横向压缩');
   return tip.join('\n');
 }
-/* 块：两行文字（名称 / 值 + 占父%），无任何边框；聚焦靠块的形态（更大）。 */
+/* 块：两行文字（名称 / 值 + 占父%），无任何边框；聚焦靠块的形态（更大）。
+   views 子块的名称行带徽标（classic/tent/A/B）：并列分解互不加和。 */
+function lvlViewLabelOf(x){
+  return (x&&x.view)?(' '+tViewLabel(x.view)):'';
+}
 function lvlBlock(b,cur,lit,depth){
   const blk=el('div','lvl-blk'+(b.focused?' focus':'')+
     (b.compressed?' compressed':''));
   const st=lvlStyle(b.share,b.residual);
   blk.style.background=st.background; blk.style.color=st.color;
-  blk.appendChild(el('div','lvl-name',b.x.label));
+  const nm=el('div','lvl-name');
+  nm.appendChild(el('span',null,b.x.label));
+  if(b.x&&b.x.view) nm.appendChild(el('span','lvl-view',
+    ' '+tViewLabel(b.x.view)));
+  blk.appendChild(nm);
   blk.appendChild(el('div','lvl-val',
     fmtUs(b.x.v)+'  '+(b.share*100).toFixed(1)+'%'));
   blk.title=levelTip(b);
@@ -6121,7 +6131,8 @@ function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
   const metric=tLevelMetric;
   const vals=items.map(function(it){
     const v=tMetricOf(it.st,metric);
-    return {key:it.key,label:it.label,st:it.st,v:(v==null?0:v),has:v!=null};
+    return {key:it.key,label:it.label,st:it.st,v:(v==null?0:v),has:v!=null,
+      view:(it.view||'')};
   });
   const sum=vals.reduce(function(a,b){return a+b.v;},0);
   const parentV=parentVal||0;
@@ -6137,8 +6148,8 @@ function appendLevelRow(rowEl,items,parentStat,parentVal,cur,lit,depth){
     const share=parentV>0?(x.v/parentV):0;
     const w=share*100*scale;
     const valTxt=fmtUs(x.v)+'  '+(share*100).toFixed(1)+'%';
-    const minW=lvlBlockMinW(x.label,valTxt);
-    const zeroW=lvlZeroW(x.label,valTxt); /* 0% 块：文字宽 + 标准 padding，尽可能窄 */
+    const minW=lvlBlockMinW(x.label+lvlViewLabelOf(x),valTxt);
+    const zeroW=lvlZeroW(x.label+lvlViewLabelOf(x),valTxt); /* 0% 块：文字宽（含 view 徽标）+ 标准 padding */
     const focused=!!tFocus[x.key];
     let col;
     if(focused) col='minmax('+minW+'px, 9fr)';
@@ -6863,8 +6874,9 @@ function toggleStageKey(k,cur){
 }
 function stageSelectableKeys(cur){
   const g=(cur&&cur.g)||tGroup;
+  const op=(cur&&cur.op)||tOp;
   const ks=['total_us'];
-  tTree(g).forEach(function(x){
+  tTreeOf(g,op).forEach(function(x){
     if(x[1]===1&&ks.indexOf(x[0])<0)ks.push(x[0]);});
   return ks;
 }
@@ -6872,7 +6884,7 @@ function renderStageTree(cur){
   const box=document.getElementById('stageTree'); if(!box) return;
   box.innerHTML='';
   const g=(cur&&cur.g)||tGroup;
-  const tree=tTree(g);
+  const tree=tTreeOf(g,(cur&&cur.op)||tOp);
   const order=stageSelectableKeys(cur);
   const head=el('div','node-group-head');
   head.appendChild(el('span','tree-group-title','阶段'));
@@ -6894,7 +6906,7 @@ function renderStageTree(cur){
   acts.appendChild(allb); acts.appendChild(clrb);
   box.appendChild(acts);
   const list=el('div','tree-list');
-  function stageRow(key,level){
+  function stageRow(key,level,view){
     const on=tStageSel.indexOf(key)>=0;
     const r=el('div','tree-row'+(on?' on':''));
     r.style.paddingLeft=(level*18)+'px';
@@ -6927,16 +6939,18 @@ function renderStageTree(cur){
     b.appendChild(el('span','tree-name',
       level===0?'total':tStageName(key)));
     r.appendChild(b);
+    /* views 子行带徽标（classic/tent/A/B）：同一父的并列分解互不加和 */
+    if(view) r.appendChild(el('span','tree-note',tViewLabel(view)));
     if(level===2) r.appendChild(el('span','tree-note','无时间桶'));
     return r;
   }
   tree.forEach(function(x){
     const level=x[1];
     if(level===2) return;             /* L2 随父行展开渲染 */
-    list.appendChild(stageRow(x[0],level));
+    list.appendChild(stageRow(x[0],level,x[3]));
     if(level===1&&tStageOpen[x[0]]){
       tree.filter(function(y){return y[1]===2&&y[2]===x[0];})
-        .forEach(function(y){list.appendChild(stageRow(y[0],2));});
+        .forEach(function(y){list.appendChild(stageRow(y[0],2,y[3]));});
     }
   });
   box.appendChild(list);
@@ -6955,8 +6969,8 @@ function renderCurveMetric(){
 function renderTree(cur){
   const box=document.getElementById('ttree'); if(!box) return;
   box.innerHTML='';
-  const tree=tTree(cur.g);
-  function addRow(key,level,st,label){
+  const tree=tTreeOf(cur.g,cur.op);
+  function addRow(key,level,st,label,view){
     const row=el('div','tnode'+(tSel===key?' sel':''));
     row.style.paddingLeft=(level*22)+'px';
     const hasKids=level===1&&tree.some(function(x){
@@ -6969,6 +6983,7 @@ function renderTree(cur){
     nm.title='点击在右侧查看该阶段的指标套件';
     nm.onclick=function(){tSel=key;renderTree(cur);renderTreeDetail(cur);};
     row.appendChild(nm);
+    if(view) row.appendChild(el('span','tree-note',tViewLabel(view)));
     const pk=(level===0)?'total_us':tParentKey(key,cur);
     const pm=tStat(pk,cur);
     const share=(pm&&pm.avg>0&&st&&st.avg!=null)?st.avg/pm.avg:0;
@@ -6986,10 +7001,10 @@ function renderTree(cur){
   addRow('total_us',0,tStat('total_us',cur),'total');
   tree.filter(function(x){return x[1]===1;}).forEach(function(it){
     addRow(it[0],1,tStat(it[0],cur),
-      it[0]==='residual'?'残差（total − 阶段和）':it[0]);
+      it[0]==='residual'?'残差（total − 阶段和）':it[0],it[3]);
     if(tExpand[it[0]]){
       tree.filter(function(x){return x[1]===2&&x[2]===it[0];})
-        .forEach(function(ch){addRow(ch[0],2,tStat(ch[0],cur),ch[0]);});
+        .forEach(function(ch){addRow(ch[0],2,tStat(ch[0],cur),ch[0],ch[3]);});
     }
   });
 }
@@ -7074,14 +7089,19 @@ function stageBreakdownRow(r,opts){
     items.forEach(function(it){
       const share=parentV>0?(it.v/parentV):0;
       const valTxt=fmtUs(it.v)+'  '+(share*100).toFixed(1)+'%';
-      const zeroW=lvlZeroW(it.label,valTxt);
-      const minW=lvlBlockMinW(it.label,valTxt);
+      const vtag=lvlViewLabelOf(it);
+      const zeroW=lvlZeroW(it.label+vtag,valTxt);
+      const minW=lvlBlockMinW(it.label+vtag,valTxt);
       cols.push(it.v<=0?zeroW+'px'
         :'minmax('+minW+'px,'+Math.max(share*100,0.001).toFixed(3)+'fr)');
       const st=lvlStyle(share,it.key==='residual');
       const b=el('div','lvl-blk');
       b.style.background=st.background; b.style.color=st.color;
-      b.appendChild(el('div','lvl-name',it.label));
+      const nm=el('div','lvl-name');
+      nm.appendChild(el('span',null,it.label));
+      if(it.view) nm.appendChild(el('span','lvl-view',
+        ' '+tViewLabel(it.view)));
+      b.appendChild(nm);
       b.appendChild(el('div','lvl-val',
         fmtUs(it.v)+'  '+(share*100).toFixed(1)+'%'));
       const ga=stAvg(cur,it.key);
@@ -7114,7 +7134,7 @@ function stageBreakdownRow(r,opts){
     const t=traceOf();
     const data=((((t||{}).groups||{})[g]||{}).ops||{})[r.op]||{};
     const cur={g:g,op:r.op,data:data};
-    const tree=tTree(g);
+    const tree=tTreeOf(g,r.op);
     const items=tree.filter(function(x){
       return x[1]===1&&x[0]!=='residual';}).map(function(x){
         return {key:x[0],label:x[0],v:Number(stages[x[0]])||0};
@@ -7131,7 +7151,8 @@ function stageBreakdownRow(r,opts){
       const fv=c.v;
       const kids=tree.filter(function(x){
         return x[1]===2&&x[2]===c.key;}).map(function(x){
-          return {key:x[0],label:x[0],v:Number(stages[x[0]])||0};});
+          return {key:x[0],label:x[0],v:Number(stages[x[0]])||0,
+            view:(x[3]||'')};});
       const ks=kids.reduce(function(a,b){return a+b.v;},0);
       if(fv-ks>0.0001)
         kids.push({key:'__unattributed__',label:'未归因',v:fv-ks});
@@ -7159,6 +7180,9 @@ function renderTraceStack(){
   const box=document.getElementById('tstackchart'); if(!box) return;
   const t=traceOf(); if(!t){box.style.display='none';return;}
   const g=tGroup;
+  /* 堆叠图阶段集合 = 该组当前 op 的树 L1（含 residual） */
+  const ops=Object.keys(((t.groups||{})[g]||{}).ops||{});
+  const _op=(ops.indexOf(tOp)>=0)?tOp:ops[0];
   const rows=tTop(g).filter(function(r){
     return Number(r.total_us)>0;
   }).sort(function(a,b){return Number(b.total_us)-Number(a.total_us);});
@@ -7166,7 +7190,7 @@ function renderTraceStack(){
   box.style.display='';
   if(!tStackChart) tStackChart=echarts.init(box);
   bindHoverGuards(tStackChart);
-  const tree=tTree(g).filter(function(x){return x[1]===1;});
+  const tree=tTreeOf(g,_op).filter(function(x){return x[1]===1;});
   const keys=tree.map(function(x){return x[0];});
   function l1sum(r){
     const st=r.stages||{};
@@ -7574,7 +7598,10 @@ def _page_html(title, subtitle, body_html, data_json, echarts_js, data_js_path,
            subtitle=html.escape(str(subtitle), quote=True), body=body_html,
            css=_PAGE_CSS, echarts=echarts_js, data=data_literal,
            theme=theme_js, rel_vars=rel_vars, loader=loader, adapter=adapter,
-           app=_APP_JS)
+           app=_APP_JS.replace("__TRACE_TREES_JSON__",
+                                json.dumps(_TRACE_TREES_EMBED,
+                                           ensure_ascii=True,
+                                           separators=(",", ":"))))
 
 
 # ---------------------------------------------------------------------------
