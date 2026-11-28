@@ -7269,6 +7269,18 @@
     "test_health_gate_error_carries_failing_entries"
    ],
    "e2e": []
+  },
+  {
+   "id": "E-441",
+   "module": "report",
+   "desc": "报表残缺（kvtest 树节点行有统计、下面只剩 Top-K 实例）：内嵌裁剪不对称——node 对象全嵌、client 对象只嵌 Top-K，data.js 缺失时树退化为「节点全在、实例残缺」。修复：node/client/role 结构行全量内嵌骨架（label/kind/node/role/p99_ms，tiers 仍按 Top-K/预算裁剪并标 trimmed），data.js 缺失时顶部注释条提示且实例行标「曲线见 data.js」；统计值始终按节点+角色配对，不落到裸节点",
+   "req": "",
+   "unit": [
+    "test_embed_skeleton_keeps_all_clients_without_datajs"
+   ],
+   "e2e": [
+    "check_embed_skeleton_complete"
+   ]
   }
  ]
 }

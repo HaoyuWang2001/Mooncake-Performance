@@ -190,3 +190,31 @@ def check_client_objects(art):
                    ("pipeline", "kvtest")) or meta.get("engine") == "kvtest"
     if is_pipeline:
         assert readers >= 1, "无 reader 角色实例对象（默认 reader 视图看不到实例）"
+
+
+def check_embed_skeleton_complete(art):
+    """内嵌骨架完整性（20261128 报表残缺回归）：report.html 的内嵌副本
+    必须覆盖 data.js 的全部 node/client/role 结构行，且每个 client 的
+    node+role 与同名节点对象一致。曲线 tiers 可裁剪，结构行不可丢——
+    否则 data.js 未加载时树会退化成「节点有统计、实例只剩 Top-K」。"""
+    emb = _embedded(art)
+    d = _data(art)
+    for size, blk in (d.get("sizes") or {}).items():
+        eo = ((emb.get("sizes") or {}).get(size) or {}).get("objects") or {}
+        fo = blk.get("objects") or {}
+        want = {k for k, v in fo.items()
+                if (v or {}).get("kind") in ("node", "client", "role")}
+        assert want, size
+        missing = want - set(eo)
+        assert not missing, (size, sorted(missing)[:5])
+        nodes = {((v or {}).get("node"), (v or {}).get("role"))
+                 for v in fo.values() if (v or {}).get("kind") == "node"}
+        for k, v in fo.items():
+            if (v or {}).get("kind") != "client":
+                continue
+            ev = eo.get(k) or {}
+            assert ev.get("node") == v.get("node"), (size, k)
+            assert ev.get("role") == v.get("role"), (size, k)
+            assert (v.get("node"), v.get("role")) in nodes, (size, k)
+            if not ev.get("tiers"):
+                assert ev.get("trimmed"), (size, k)   # 无曲线须显式标裁剪
