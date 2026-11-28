@@ -7200,6 +7200,16 @@
    "e2e": [
     "check_client_objects"
    ]
+  },
+  {
+   "id": "E-439",
+   "module": "benchmark",
+   "desc": "事故 20261128-1023 kvtest_rank_smoke：16 副本挂载刚创建的 ConfigMap 时 kubelet 报瞬时 FailedMount（sync cache 超时，自动重试即恢复），快判把它当致命事件导致误报失败（报错 1 秒后 16/16 全部 Running）。FailedMount 不列入致命事件集合；部署未满员 + 事件流含 FailedMount 时继续轮询，满员后正常返回，真实卡死由超时路径兜底并转储证据",
+   "req": "",
+   "unit": [
+    "test_wait_k8s_deployment_ready_ignores_transient_failedmount"
+   ],
+   "e2e": []
   }
  ]
 }
