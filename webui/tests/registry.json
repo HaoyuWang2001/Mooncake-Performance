@@ -2171,12 +2171,35 @@
    "e2e": []
   },
   {
+   "id": "C18.V11",
+   "module": "report",
+   "desc": "监控卡删除三处摘要 KV 行：逐节点峰值内存 / RSS 最大增幅 / 端口峰值带宽；进程 RSS 增幅正负条与 data.js summary 保留（overview 摘要行不变）",
+   "req": "R-MON-1",
+   "unit": [
+    "test_render_scenario_monitor_summary_rows_removed"
+   ],
+   "e2e": []
+  },
+  {
    "id": "C18.I2",
    "module": "report",
    "desc": "树勾选即时重渲染对应图（不触发整页 renderAll）；主题切换重渲监控树（配色随 token 翻换、选择保留）；size 切换重置监控选择",
    "req": "R-MON-1",
    "unit": [
     "test_b08_monitor_tree_click_filters"
+   ],
+   "e2e": []
+  },
+  {
+   "id": "C18.I3",
+   "module": "report",
+   "desc": "三棵监控树统一走 renderMonTree + treeNodeGroup/treeRow 模板，渲染前清空容器：勾选/caret/主题/size 重渲染幂等不叠树，展开收起生效",
+   "req": "R-MON-1",
+   "unit": [
+    "test_b07_monitor_tree_controls_and_legends",
+    "test_b08_monitor_tree_click_filters",
+    "test_b10_monitor_tree_caret_expand_collapse",
+    "test_c18_monitor_trees_share_one_template"
    ],
    "e2e": []
   },

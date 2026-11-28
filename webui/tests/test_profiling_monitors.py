@@ -149,6 +149,24 @@ def test_render_scenario_has_monitor_card(tmp_path):
     assert '"monitors"' in dj_src and '"urma"' in dj_src
 
 
+def test_render_scenario_monitor_summary_rows_removed(tmp_path):
+    """C18.V11：监控卡不再用 KV 行展示峰值内存 / RSS 最大增幅 / 端口峰值；
+    进程 RSS 增幅正负条（#growth / renderGrowth）保留。"""
+    log_dir = _write_monitors(tmp_path)
+    mon = rp.reduce_monitors(str(log_dir))
+    data = rp.reduce_scenario([_min_stats()],
+                              {"config": "cfg", "mode": "pipeline"},
+                              monitors=mon)
+    html, _dj = rp.render_scenario(data, str(tmp_path / "report"), ECHARTS)
+    src = open(html, encoding="utf-8").read()
+    for gone in ("峰值内存 · ", "RSS 最大增幅", "端口峰值带宽"):
+        assert gone not in src, "监控摘要行回潮: " + gone
+    # 正负条与数据侧 summary 保持不变
+    assert 'id="growth"' in src
+    assert "renderGrowth" in src
+    assert "proc_growth" in src
+
+
 def test_render_scenario_without_monitors_hides_card(tmp_path):
     data = rp.reduce_scenario([_min_stats()],
                               {"config": "cfg", "mode": "pipeline"})

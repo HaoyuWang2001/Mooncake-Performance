@@ -671,6 +671,79 @@ if (!errs.length) {
   out.mem_tree = monTreeTexts("memTree");
   out.proc_tree = monTreeTexts("procTree");
   out.urma_tree = monTreeTexts("urmaTree");
+  /* 行/节点头出现次数：用于锁死重复追加（旧实现 append-only 会重影） */
+  function monCounts(id) {
+    const acc = {};
+    monTreeTexts(id).forEach(function(t) {
+      if (/^(row|head):/.test(t)) acc[t] = (acc[t] || 0) + 1;
+    });
+    return acc;
+  }
+  function monCountClass(id, name) {
+    let n = 0;
+    (function walk(node) {
+      if (!node) return;
+      (node.children || []).forEach(function(c) {
+        if (String(c.className || "").split(" ").indexOf(name) >= 0) n++;
+        walk(c);
+      });
+    })(getEl(id));
+    return n;
+  }
+  out.mon_tree_lists = {mem: monCountClass("memTree", "tree-list"),
+                        proc: monCountClass("procTree", "tree-list"),
+                        urma: monCountClass("urmaTree", "tree-list")};
+  out.mon_counts = {mem: monCounts("memTree"), proc: monCounts("procTree"),
+                    urma: monCounts("urmaTree")};
+  /* 幂等：模拟主题切换 / size 切换时 renderMonitors 再次进入 */
+  try {
+    sandbox.renderMonitors();
+    sandbox.renderMonitors();
+    out.mon_counts_rerender = {mem: monCounts("memTree"),
+                               proc: monCounts("procTree"),
+                               urma: monCounts("urmaTree")};
+  } catch (e) { errs.push("mon rerender: " + String(e && e.stack || e)); }
+  out.mon_tree_rerender_stable =
+    JSON.stringify(out.mon_counts) === JSON.stringify(out.mon_counts_rerender);
+  const monCaret = arg("--mon-caret", null);
+  if (monCaret) {
+    try {
+      const parts = monCaret.split("::");
+      const treeId = parts[0];
+      const rowText = parts[1] || "";
+      const treeBox = getEl(treeId);
+      let clicked = false;
+      (function walk(node) {
+        if (clicked || !node) return;
+        const kids = node.children || [];
+        for (const c of kids) {
+          const cls = String(c.className || "");
+          if (cls.indexOf("tree-row") >= 0) {
+            let nm = null;
+            (c.children || []).forEach(function(x) {
+              const xc = String(x.className || "");
+              if (xc.indexOf("tree-check") >= 0) nm = (x.children || [])[1];
+              else if (xc.indexOf("tree-name") >= 0) nm = x;
+            });
+            if (nm && String(nm._text || "") === rowText) {
+              const car = (c.children || []).find(function(x) {
+                return String(x.className || "").indexOf("tree-caret") >= 0;
+              });
+              if (car && car.onclick) { car.onclick(); clicked = true; return; }
+            }
+          }
+          walk(c);
+        }
+      })(treeBox);
+      if (!clicked) errs.push("mon caret: row not found " + monCaret);
+      out.mon_tree_after_caret = {mem: monTreeTexts("memTree"),
+        proc: monTreeTexts("procTree"), urma: monTreeTexts("urmaTree")};
+      out.mon_counts_after_caret = {mem: monCounts("memTree"),
+        proc: monCounts("procTree"), urma: monCounts("urmaTree")};
+    } catch (e) {
+      errs.push("mon caret: " + String(e && e.stack || e));
+    }
+  }
   const monClick = arg("--mon-click", null);
   if (monClick) {
     try {
@@ -698,6 +771,8 @@ if (!errs.length) {
       out.mem_series_after = monSeries("memchart");
       out.proc_series_after = monSeries("procchart");
       out.urma_series_after = monSeries("urmachart");
+      out.mon_counts_after_click = {mem: monCounts("memTree"),
+        proc: monCounts("procTree"), urma: monCounts("urmaTree")};
     } catch (e) {
       errs.push("mon click: " + String(e && e.stack || e));
     }

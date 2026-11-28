@@ -4257,6 +4257,15 @@ def test_b07_monitor_tree_controls_and_legends(tmp_path):
     assert res["mem_empty"] == "none"
     assert res["proc_empty"] == "none"
     assert res["urma_empty"] == "none"
+    # C18.I3：三树统一模板（每树唯一 tree-list），重渲染幂等、行不重复
+    assert res["mon_tree_lists"] == {"mem": 1, "proc": 1, "urma": 1}, \
+        res["mon_tree_lists"]
+    assert res["mon_tree_rerender_stable"] is True, \
+        (res.get("mon_counts"), res.get("mon_counts_rerender"))
+    counts = res["mon_counts"]
+    for tree, key in (("mem", "row:n1"), ("proc", "head:n1"),
+                      ("proc", "row:cli 11"), ("urma", "row:n1")):
+        assert counts[tree].get(key) == 1, (tree, key, counts[tree])
 
 
 def test_b08_monitor_tree_click_filters(tmp_path):
@@ -4293,6 +4302,50 @@ def test_b08_monitor_tree_click_filters(tmp_path):
     assert res3["errors"] == [], res3["errors"]
     pnames = sorted(s["name"] for s in res3["proc_series_after"])
     assert pnames == ["cli 12 @n1", "cli 21 @n2"], pnames
+    # C18.I3：勾选后的局部重渲染不得把旧树再追加一份
+    assert res["mon_counts_after_click"]["mem"].get("row:n1") == 1
+    assert res2["mon_counts_after_click"]["urma"].get("row:n1") == 1
+    assert res3["mon_counts_after_click"]["proc"].get("row:cli 11") == 1
+
+
+def test_b10_monitor_tree_caret_expand_collapse(tmp_path):
+    """C18.I3 [新增]：caret 展开/收起真正生效且重渲染不叠加旧行。
+    mem 节点默认收起 → 点开出现 NUMA 子行；proc 节点默认展开 → 点收起后
+    进程行消失；两次重渲染后每行仍只有一份。"""
+    a = _stats(tmp_path, "a.writer", "writer")
+    data = rp.reduce_scenario(rp.load([a]), {"config": "c"},
+                              monitors=_mon_full())
+    res = _js_check(tmp_path, data, "--mon-caret", "memTree::n1")
+    if res is None:
+        return
+    assert res["errors"] == [], res["errors"]
+    mem_after = res["mon_tree_after_caret"]["mem"]
+    assert "row:NUMA n0" in mem_after and "row:NUMA n1" in mem_after, mem_after
+    assert res["mon_counts_after_caret"]["mem"].get("row:n1") == 1
+    assert res["mon_counts_after_caret"]["mem"].get("row:NUMA n0") == 1
+    # proc 节点默认展开，点 caret 收起该节点的进程行
+    res2 = _js_check(tmp_path, data, "--mon-caret", "procTree::n1")
+    if res2 is None:
+        return
+    assert res2["errors"] == [], res2["errors"]
+    proc_after = res2["mon_tree_after_caret"]["proc"]
+    assert "head:n1" in proc_after, proc_after
+    assert "row:cli 11" not in proc_after, proc_after
+    # n2 未动，仍展开
+    assert "row:cli 21" in proc_after, proc_after
+    assert res2["mon_counts_after_caret"]["proc"].get("head:n1") == 1
+
+
+def test_c18_monitor_trees_share_one_template():
+    """C18.I3：三棵监控树统一走 renderMonTree + treeNodeGroup/treeRow，
+    不再保留各写一套的私有行/分组头实现。"""
+    src = rp._APP_JS
+    assert "function renderMonTree(box,cfg)" in src
+    assert "function treeNodeGroup(" in src
+    for dead in ("_monRow(", "_monGroupHead(", "_monMini("):
+        assert dead not in src, "监控树私有控件回潮: " + dead
+    assert src.count("renderMonTree(box,{") == 3, \
+        "应有三棵监控树复用统一渲染器"
 
 
 def test_b09_monitor_partial_missing_groups(tmp_path):
