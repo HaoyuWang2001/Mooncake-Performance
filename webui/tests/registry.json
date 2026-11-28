@@ -2151,6 +2151,16 @@
    "e2e": []
   },
   {
+   "id": "C18.V10",
+   "module": "profiling",
+   "desc": "started 行 console 压缩为一条 `N nodes × [tools]`（同一次启动所有节点工具集一致），benchmark.log 仍保留完整 node -> tools 映射",
+   "req": "R-MON-1",
+   "unit": [
+    "test_started_line_console_compact_log_full"
+   ],
+   "e2e": []
+  },
+  {
    "id": "C18.I2",
    "module": "report",
    "desc": "树勾选即时重渲染对应图（不触发整页 renderAll）；主题切换重渲监控树（配色随 token 翻换、选择保留）；size 切换重置监控选择",

@@ -30,8 +30,8 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils import (flush_agg, get_node, log, log_agg, scp_pull,  # noqa: E402
-                   scp_push, ssh_check_output)
+from utils import (flush_agg, get_node, log, log_agg, log_detail,  # noqa: E402
+                   scp_pull, scp_push, ssh_check_output)
 
 try:
     import spdiag_tree as spdiag_tree_mod
@@ -350,8 +350,16 @@ def start_profiling(cluster, matrix, involved_nodes, cfg_name, remote_out_dir,
     flush_agg("profile.avail")
     if not session["tools"]:
         return None
-    log("[profile] started: {}".format(
-        {k: list(v.keys()) for k, v in session["tools"].items()}))
+    # console: one compact line ("N nodes × [tools]"); benchmark.log keeps
+    # the full node -> tools mapping (log_detail is console-silent unless
+    # --verbose). Every profiling target runs the same enabled tool set, so
+    # one node's list describes all of them.
+    tools_by_node = {k: list(v.keys()) for k, v in session["tools"].items()}
+    log_detail("[profile] started: {}".format(tools_by_node))
+    started_tools = next(iter(tools_by_node.values()))
+    log("[profile] started: {} node{} × {}".format(
+        len(tools_by_node), "" if len(tools_by_node) == 1 else "s",
+        started_tools))
     return session
 
 

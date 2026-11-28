@@ -253,3 +253,41 @@ def test_start_profiling_injects_epoch_base(monkeypatch, tmp_path):
     launched = [c for c in cmds
                 if "nohup" in c and "mem_monitor.sh" in c]
     assert launched and "EPOCH_BASE" not in launched[0], launched
+
+
+def test_started_line_console_compact_log_full(tmp_path, capsys, monkeypatch):
+    """started 行压缩：console 只有一条紧凑汇总（N nodes × [tools]），
+    benchmark.log 保留完整 node -> tools 映射。所有节点工具集一致。"""
+    import utils
+
+    def fake_run(ip, node, cmd, quiet=True):
+        return "OK" if ("command -v" in cmd or "test -x" in cmd) else "123"
+
+    monkeypatch.setattr(prof_core, "_run", fake_run)
+    monkeypatch.setattr(prof_core, "scp_push", lambda *a, **k: None)
+    monkeypatch.setattr(bm, "state_append", lambda *a, **k: None)
+    nodes = {"n1": {"ip": "10.0.0.1"}, "n2": {"ip": "10.0.0.2"}}
+    monkeypatch.setattr(prof_core, "get_node", lambda c, n: nodes[n])
+    matrix = {"nodes": "auto", "trigger": "whole_run",
+              "tools": {"mem": {"enabled": True, "interval_s": 1,
+                                "bin": "bash", "sudo": False,
+                                "proc_pattern": "p"},
+                        "urma": {"enabled": True, "interval_s": 1,
+                                 "bin": "mdcli", "sudo": False,
+                                 "host_tool": False}}}
+    logf = tmp_path / "benchmark.log"
+    utils.set_detail_log(str(logf))
+    try:
+        sess = prof_core.start_profiling({"nodes": nodes}, matrix,
+                                         ["n1", "n2"], "cfg", "/remote/out")
+        assert sess and len(sess["tools"]) == 2
+        out = capsys.readouterr().out
+        started = [l for l in out.splitlines() if "[profile] started" in l]
+        assert len(started) == 1, out
+        assert started[0].endswith("2 nodes × ['mem', 'urma']"), started[0]
+        assert "n1" not in started[0] and "n2" not in started[0]
+        text = logf.read_text(encoding="utf-8")
+        assert "'n1': ['mem', 'urma']" in text
+        assert "'n2': ['mem', 'urma']" in text
+    finally:
+        utils.close_detail_log()
