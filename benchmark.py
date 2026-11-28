@@ -409,6 +409,15 @@ def _kvtest_pod_dir(remote_log_dir, node):
     return remote_log_dir
 
 
+def _kvtest_instance_suffix(role, iid, port):
+    """Per-process directory suffix: <role>_i<iid>_p<port>.
+
+    One format shared by the on-node artifact layout and the failure
+    report's raw-log line, so the pinpoint path can never drift from
+    what _prepare_instance actually created on the node."""
+    return "{}_i{}_p{}".format(role or "client", iid, port)
+
+
 def _kvtest_instance_dir(remote_log_dir, node, role, iid, port):
     """Per-process artifact directory: <pod_dir>/<role>_i<iid>_p<port>/.
 
@@ -417,8 +426,8 @@ def _kvtest_instance_dir(remote_log_dir, node, role, iid, port):
     products) in this directory so role footprints never mix (du/meta.bytes
     and the map inputs are per process)."""
     pod_dir = _kvtest_pod_dir(remote_log_dir, node).rstrip("/")
-    return "{}/{}_{}".format(pod_dir, role or "client",
-                             "i{}_p{}".format(iid, port))
+    return "{}/{}".format(pod_dir,
+                          _kvtest_instance_suffix(role, iid, port))
 
 
 def _kvtest_push_cmd(inst_dir, payload, cfg_file):
@@ -7093,11 +7102,27 @@ def _kvtest_launch_split_roles(plan, split, prepare, fire, gate):
         gate(plan["readers"] + plan["writers"], "instances")
 
 
+class InstanceGateError(RuntimeError):
+    """Health-gate timeout that keeps the still-unhealthy instance entries.
+
+    ``failing`` holds the gate's pending plan entries (dicts carrying
+    node/iid/port plus the _prepare_instance fields such as _role), so the
+    failure report can pinpoint each instance instead of dumping every pod
+    in the namespace. The message text stays identical to the legacy
+    RuntimeError, so log-grepping habits do not break."""
+
+    def __init__(self, message, failing):
+        RuntimeError.__init__(self, message)
+        self.failing = list(failing)
+
+
 def _kvtest_health_gate(cluster, entries, timeout_s, what):
     """Poll GET /health on every kvtest instance until all respond. The
     binary starts its HTTP server only AFTER the store client setup, so
-    'healthy' means store connected + notify endpoint bound. Raises with the
-    missing list on timeout."""
+    'healthy' means store connected + notify endpoint bound. Raises
+    InstanceGateError (a RuntimeError subclass) with the missing list on
+    timeout; its .failing keeps the pending entries for the pinpoint
+    failure report."""
     if not entries:
         return
     from concurrent.futures import ThreadPoolExecutor
@@ -7123,12 +7148,12 @@ def _kvtest_health_gate(cluster, entries, timeout_s, what):
         if not pending:
             break
         if time.time() - t0 > timeout_s:
-            raise RuntimeError(
+            raise InstanceGateError(
                 "kvtest health gate timed out after {}s: {}/{} {} not "
                 "healthy: {}".format(
                     timeout_s, len(pending), len(entries), what,
                     ", ".join("i{} on {}".format(e["iid"], e["node"])
-                              for e in pending[:8])))
+                              for e in pending[:8])), pending)
         time.sleep(2)
     log("[kvtest] health gate: {}/{} {} healthy ({:.1f}s)".format(
         len(entries), len(entries), what, time.time() - t0))
@@ -8911,6 +8936,138 @@ def _raw_log_dirs(cluster, involved_nodes, remote_log_dir, ts):
         log("[FAIL] raw logs: ssh {} -> {}".format(ssh_to, where))
 
 
+def _k8s_pod_state_rows(cluster, wanted):
+    """STATUS/RESTARTS per wanted pod from ONE `kubectl get pods -o wide`
+    call. Returns {pod: (status, restarts)} on success, None when the
+    query itself failed. Pods absent from a successful listing (deleted /
+    never created) stay absent — the caller treats that as pod-down."""
+    c = cluster.get("_controller")
+    if c is None:
+        return None
+    try:
+        ns = k8s_settings(cluster)["namespace"]
+        out, rc = controller_run(
+            c, ["-n", ns, "get", "pods", "-o", "wide"], check=False)
+    except Exception:
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    rows = {}
+    for line in out.splitlines():
+        parts = line.split()
+        # NAME READY STATUS RESTARTS AGE IP NODE ... (header row's first
+        # field is never a wanted pod name, so it drops out naturally)
+        if len(parts) < 4 or parts[0] not in wanted:
+            continue
+        try:
+            restarts = int(parts[3])
+        except ValueError:
+            continue
+        rows[parts[0]] = (parts[2], restarts)
+    return rows
+
+
+def _describe_pod_full(cluster, pod):
+    """Full `kubectl describe pod` output for ONE failing pod (restarts,
+    OOMKilled, Last State and Events live only there). Best effort."""
+    c = cluster.get("_controller")
+    if c is None:
+        return
+    try:
+        ns = k8s_settings(cluster)["namespace"]
+        out, rc = controller_run(c, ["-n", ns, "describe", "pod", pod],
+                                 check=False)
+    except Exception as exc:
+        log("[WARN] describe pod {} failed: {}".format(pod, exc))
+        return
+    if rc == 0 and out.strip():
+        log("[k8s] describe pod {}:\n{}".format(pod, out.strip()))
+    else:
+        log("[WARN] describe pod {} failed (rc={}): {}".format(
+            pod, rc, out.strip()[:300]))
+
+
+def _instance_raw_log_line(cluster, entry, remote_log_dir, ts, is_k8s):
+    """One [FAIL] raw-logs line for a NAMED failing instance, pointing at
+    its per-process directory (the very suffix _kvtest_instance_dir laid
+    out on the node): k8s -> hostPath view + ssh via host IP; ssh mode ->
+    the flat remote dir."""
+    role = entry.get("_role") or "client"
+    suffix = _kvtest_instance_suffix(role, entry.get("iid", "?"),
+                                     entry.get("port", 0))
+    try:
+        n = get_node(cluster, entry["node"])
+    except Exception:
+        n = None
+    if is_k8s and n is not None and is_k8s_node(n):
+        host_root = (k8s_settings(cluster).get("host_log_root") or "")
+        where = "{}/{}/{}/{}".format(host_root.rstrip("/"), ts,
+                                     n.get("_pod") or entry["node"], suffix)
+        ssh_to = n.get("host_ip") or n.get("ip") or entry["node"]
+    else:
+        where = "{}/{}".format(remote_log_dir.rstrip("/"), suffix)
+        ssh_to = (n or {}).get("ip") or entry["node"]
+    return "[FAIL] raw logs: ssh {} -> {}/".format(ssh_to, where)
+
+
+def _report_failing_instances(cluster, failing, remote_log_dir, ts, is_k8s):
+    """Pinpoint a NAMED set of failing instances (health gate etc.).
+
+    Answers the two questions a failure actually needs answered, per
+    instance: POD DOWN (not Running / restarted / gone from the listing)
+    -> full describe for that pod ONLY; POD UP + process not ready ->
+    exactly ONE raw-logs line with the process's per-instance directory,
+    nothing else. One `kubectl get pods -o wide` feeds the classification;
+    no namespace-wide pod dump, no other pod is mentioned. Returns True
+    when at least one entry was reported."""
+    entries = [e for e in failing
+               if isinstance(e, dict) and e.get("node")]
+    if not entries:
+        return False
+    if not is_k8s:
+        # ssh: no pods to classify — one dir line per unhealthy instance
+        for e in entries:
+            log("[FAIL] i{} ({}) on {}: 进程未就绪".format(
+                e.get("iid", "?"), e.get("_role") or "client", e["node"]))
+            log(_instance_raw_log_line(cluster, e, remote_log_dir, ts,
+                                       is_k8s))
+        return True
+    wanted = []
+    for e in entries:
+        if e["node"] not in wanted:
+            wanted.append(e["node"])
+    states = _k8s_pod_state_rows(cluster, set(wanted))
+    if states is None:
+        log("[WARN] pod 状态查询失败：按『pod 已起、进程未就绪』给出日志目录")
+        states = {}
+        query_ok = False
+    else:
+        query_ok = True
+    described = set()
+    for e in entries:
+        role = e.get("_role") or "client"
+        tag = "i{} ({}) on {}".format(e.get("iid", "?"), role, e["node"])
+        row = states.get(e["node"])
+        if query_ok and (row is None or row[0].lower() != "running"
+                         or row[1] > 0):
+            why = ("不在 pod 列表中" if row is None else
+                   "STATUS={}，RESTARTS={}".format(row[0], row[1]))
+            log("[FAIL] {}: pod 未就绪（{}），describe 输出如下".format(tag, why))
+            if e["node"] not in described:
+                described.add(e["node"])
+                _describe_pod_full(cluster, e["node"])
+        else:
+            if row is not None:
+                log("[FAIL] {}: pod Running（RESTARTS={}），进程未就绪，"
+                    "原始日志目录如下".format(tag, row[1]))
+            else:
+                log("[FAIL] {}: pod 状态未知（查询失败），进程未就绪，"
+                    "原始日志目录如下".format(tag))
+            log(_instance_raw_log_line(cluster, e, remote_log_dir, ts,
+                                       is_k8s))
+    return True
+
+
 def _scenario_failure_report(cluster, cfg_name, stage, exc, involved_nodes,
                              remote_log_dir, ts, is_k8s, class1=False):
     """Unified failure output for every scenario type (kvtest/basic/pipeline).
@@ -8919,9 +9076,19 @@ def _scenario_failure_report(cluster, cfg_name, stage, exc, involved_nodes,
     and the detected reason, print the full pod list and the inspect commands
     only — no describe/events content. Case 2 (a stage failed after the pods
     were up): name scenario + stage + exception, print the full pod list and
-    the per-pod raw-log directories. Nothing is pulled or truncated."""
+    the per-pod raw-log directories. Nothing is pulled or truncated.
+
+    Pinpoint (exc carries a .failing list, e.g. the kvtest health gate's
+    InstanceGateError): the failure already NAMES its instances, so the full
+    dumps are skipped — each failing instance is classified instead (pod
+    down -> describe that pod only; pod up + process not ready -> its own
+    raw-log directory line). See _report_failing_instances."""
     log("[FAIL] scenario {} failed at stage '{}': {}".format(
         cfg_name, stage, exc))
+    failing = getattr(exc, "failing", None)
+    if failing and not class1 and _report_failing_instances(
+            cluster, failing, remote_log_dir, ts, is_k8s):
+        return
     if is_k8s:
         _k8s_pods_wide(cluster)
         if class1:

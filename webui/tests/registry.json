@@ -7220,6 +7220,22 @@
     "test_wait_k8s_deployment_ready_ignores_transient_failedmount"
    ],
    "e2e": []
+  },
+  {
+   "id": "E-440",
+   "module": "benchmark",
+   "desc": "事故 20261128-1033 kvtest_recall_smoke：健康门禁超时已点名失败实例（i11 on ...clf7hq5），失败报告却仍全量 dump namespace pod 表 + 全部节点 raw-logs 行，报错目录被 96 行噪音淹没。门禁超时改抛 InstanceGateError（消息文本不变）携带未健康 entries；失败报告走 pinpoint 分流：pod 未起（非 Running/重启过/不在列表）→ 仅对该 pod 打完整 describe；pod 已起进程未就绪 → 仅打该实例 per-process 日志目录行（与 _kvtest_instance_dir 同一后缀真源）；kubectl 查询失败 → WARN 后按进程未就绪降级；不再输出全量 pod 表与其余 pod 目录",
+   "req": "",
+   "unit": [
+    "test_report_gate_pinpoint_running_pod_process_dir",
+    "test_report_gate_pinpoint_pod_down_describes_only_that_pod",
+    "test_report_gate_pinpoint_pod_missing_from_listing",
+    "test_report_gate_pinpoint_shared_pod_describe_once",
+    "test_report_gate_pinpoint_ssh_flat_dir",
+    "test_report_gate_pinpoint_pod_query_failure_falls_back",
+    "test_health_gate_error_carries_failing_entries"
+   ],
+   "e2e": []
   }
  ]
 }
