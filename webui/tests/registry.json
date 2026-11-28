@@ -1238,6 +1238,16 @@
    "e2e": []
   },
   {
+   "id": "C10.V8",
+   "module": "report",
+   "desc": "慢点捕捉「节点与实例」控件复用标准对象树结构（objtree-strip / node-group-head / tree-row / tree-check / button.mini），节点行带实例展开与全选/清空、组头显示已选 N 项；不再使用无样式的自定义 chip",
+   "req": "R-SLOW-1",
+   "unit": [
+    "test_slow_controls_use_standard_tree_style"
+   ],
+   "e2e": []
+  },
+  {
    "id": "C10.I1",
    "module": "report",
    "desc": "全选节点/全选实例 toggle（全选后变清空*）；全部清空**自动显示总计**",

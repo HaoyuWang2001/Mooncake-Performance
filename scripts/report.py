@@ -2390,8 +2390,6 @@ padding:2px 0}
 .tree-group-title{font-size:12px;font-weight:700;letter-spacing:.06em;
 color:var(--lab);text-transform:uppercase}
 .chart-hint{color:var(--mut);font-size:12.5px;margin-top:6px;letter-spacing:.01em}
-.slow-ctl{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
-.slow-ctl .row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .slow-sum{display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:6px}
 .slow-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;
 color:var(--mut);font-variant-numeric:tabular-nums}
@@ -4350,12 +4348,17 @@ function slowColorOf(key){
   return instanceColor(o.node,key);
 }
 function renderSlowControls(){
-  const box=document.getElementById('slowctl'); if(!box) return;
-  box.innerHTML='';
+  /* 与主图/全链路对象树同一套结构: objtree-strip > tree-group /
+     node-group-head / tree-list > tree-row(tree-check)。不再用自定义
+     chip 按钮（无对应样式,视觉与全站对象树不一致）。 */
+  const strip=document.getElementById('slowctl'); if(!strip) return;
+  strip.innerHTML='';
+  const box=el('div','objtree-body');
+  strip.appendChild(box);
   const z=Z(); if(!z) return;
-  const row1=el('div','row');
   if(isPipeMode()){
-    row1.appendChild(el('span','tl-label','角色'));
+    const g1=el('div','tree-group role-group');
+    g1.appendChild(el('span','tree-group-title','角色'));
     ['reader','writer'].forEach(function(r){
       const b=el('button','role-btn'+(slowRole===r?' on':''),r);
       b.title='慢点捕捉按角色过滤（独立于主图）';
@@ -4363,16 +4366,17 @@ function renderSlowControls(){
         if(slowRole===r) return;
         slowRole=r; slowSel=[]; renderSlowStrip();
       };
-      row1.appendChild(b);
+      g1.appendChild(b);
     });
+    box.appendChild(g1);
   }
+  const g2t=el('div','tree-group total-group');
+  g2t.appendChild(el('span','tree-group-title','总计'));
   const tb=el('button','total-btn'+(slowTotal?' on':''),'总计');
   tb.title='总计 = 当前角色全部慢点（灰色背景点）';
   tb.onclick=function(){slowTotal=!slowTotal;renderSlowStrip();};
-  row1.appendChild(tb);
-  box.appendChild(row1);
-  const row2=el('div','row');
-  row2.appendChild(el('span','tl-label','节点与实例'));
+  g2t.appendChild(tb);
+  box.appendChild(g2t);
   function sbtn(label,title,fn){
     const b=el('button','mini',label);
     b.title=title; b.onclick=fn; return b;
@@ -4381,25 +4385,32 @@ function renderSlowControls(){
     const ks=slowAllKeys(kind);
     return ks.length>0&&ks.every(function(k){return slowSel.indexOf(k)>=0;});
   }
-  function slowKindSet(kind,on){
-    const ks=slowAllKeys(kind);
+  function slowSetMany(keys,on){
     if(on){
-      ks.forEach(function(k){if(slowSel.indexOf(k)<0)slowSel.push(k);});
+      keys.forEach(function(k){if(slowSel.indexOf(k)<0)slowSel.push(k);});
     }else{
-      slowSel=slowSel.filter(function(k){return ks.indexOf(k)<0;});
+      slowSel=slowSel.filter(function(k){return keys.indexOf(k)<0;});
     }
     renderSlowStrip();
   }
+  function slowKindSet(kind,on){slowSetMany(slowAllKeys(kind),on);}
+  const g2=el('div','tree-group node-group');
+  const head=el('div','node-group-head');
+  head.appendChild(el('span','tree-group-title','节点与实例'));
+  head.appendChild(el('span','objtree-count','已选 '+slowSel.length+' 项'));
+  const acts=el('div','node-group-acts');
   const sndAll=slowKindAll('node'), sclAll=slowKindAll('client');
-  row2.appendChild(sbtn(sndAll?'清空节点':'全选节点',
+  acts.appendChild(sbtn(sndAll?'清空节点':'全选节点',
     sndAll?'取消全部节点慢点高亮':'高亮当前范围内全部节点的慢点',
     function(){slowKindSet('node',!sndAll);}));
-  row2.appendChild(sbtn(sclAll?'清空实例':'全选实例',
+  acts.appendChild(sbtn(sclAll?'清空实例':'全选实例',
     sclAll?'取消全部实例慢点高亮':'高亮当前范围内全部实例的慢点',
     function(){slowKindSet('client',!sclAll);}));
-  row2.appendChild(sbtn('全部清空','清空节点与实例高亮，并自动显示总计',
+  acts.appendChild(sbtn('全部清空','清空节点与实例高亮，并自动显示总计',
     function(){slowSel=[];slowTotal=true;renderSlowStrip();}));
-  box.appendChild(row2);
+  head.appendChild(acts);
+  g2.appendChild(head);
+  const list=el('div','tree-list');
   const nodes={};
   (z.clients||[]).forEach(function(c){
     if(isPipeMode()&&c.role!==slowRole) return;
@@ -4407,29 +4418,38 @@ function renderSlowControls(){
     (nodes[n]=nodes[n]||[]).push(c.name);
   });
   Object.keys(nodes).sort().forEach(function(n){
-    const row=el('div','row');
     const open=!!slowOpen[n];
-    const caret=el('button','tree-caret',open?'▾':'▸');
-    caret.title=open?'收起该节点实例':'展开该节点实例';
-    caret.onclick=function(){slowOpen[n]=!slowOpen[n];renderSlowStrip();};
     const nodeKey=isPipeMode()?('node:'+n+':'+slowRole):('node:'+n);
-    const nb=el('button','slow-chip-btn'+(slowSel.indexOf(nodeKey)>=0?' on':''),n);
-    nb.title='高亮该节点的全部慢点';
-    nb.onclick=function(){slowToggle(nodeKey);};
-    row.appendChild(caret);
-    row.appendChild(nb);
-    if(open){
-      nodes[n].sort().forEach(function(name){
+    const kids=nodes[n].slice().sort().map(function(name){
+      return 'client:'+name;});
+    let caret=null;
+    if(kids.length){
+      caret=el('button','tree-caret',open?'▾':'▸');
+      caret.title=open?'收起该节点实例':'展开该节点实例';
+      caret.onclick=function(){slowOpen[n]=!slowOpen[n];renderSlowStrip();};
+    }
+    list.appendChild(treeRow(nodeKey,n,1,{
+      lead:caret, on:slowSel.indexOf(nodeKey)>=0, onToggle:slowToggle,
+      minis:kids.length?[
+        sbtn('全选','高亮该节点的全部慢点',
+          function(){slowSetMany(kids,true);}),
+        sbtn('清空','取消该节点的全部慢点高亮',
+          function(){slowSetMany(kids,false);})]:[],
+      note:kids.length?(kids.length+' 实例'):''}));
+    if(open&&kids.length){
+      nodes[n].slice().sort().forEach(function(name){
         const ck='client:'+name;
-        const cb=el('button','slow-chip-btn'+
-          (slowSel.indexOf(ck)>=0?' on':''),name.replace(/^.*\.benchmark_/,''));
-        cb.title=name;
-        cb.onclick=function(){slowToggle(ck);};
-        row.appendChild(cb);
+        list.appendChild(treeRow(ck,
+          name.replace(/^.*\.benchmark_/,''),2,{
+          title:name, on:slowSel.indexOf(ck)>=0, onToggle:slowToggle}));
       });
     }
-    box.appendChild(row);
   });
+  if(!Object.keys(nodes).length){
+    list.appendChild(el('div','tree-empty','该角色没有可高亮的节点'));
+  }
+  g2.appendChild(list);
+  box.appendChild(g2);
 }
 function renderSlowStrip(){
   const z=Z(); const card=document.getElementById('slowcard'); if(!card) return;
@@ -4793,7 +4813,9 @@ function treeGroupStrip(title,keys){
 }
 function treeRow(key,label,depth,opts){
   opts=opts||{};
-  const on=selObjs.indexOf(key)>=0;
+  /* opts.on / opts.onToggle：让对象树之外的选择器（如慢点捕捉）复用同一
+     行结构；缺省走主图全局 selObjs/toggleObj。 */
+  const on=(opts.on!=null)?!!opts.on:(selObjs.indexOf(key)>=0);
   const row=el('div','tree-row'+(on?' on':''));
   row.style.paddingLeft=(depth>1?36:0)+'px';
   if(opts.lead) row.appendChild(opts.lead);
@@ -4801,8 +4823,8 @@ function treeRow(key,label,depth,opts){
   b.setAttribute('data-key',key);
   b.appendChild(el('span','tree-box',on?'✓':''));
   b.appendChild(el('span','tree-name',label));
-  b.title=label;
-  b.onclick=function(){toggleObj(key);};
+  b.title=opts.title||label;
+  b.onclick=function(){(opts.onToggle||toggleObj)(key);};
   row.appendChild(b);
   (opts.minis||[]).forEach(function(m){row.appendChild(m);});
   if(opts.note) row.appendChild(el('span','tree-note',opts.note));
@@ -7387,7 +7409,7 @@ _SEC_HIST = """<div class="card" id="histcard" style="display:none"><h2>时延�
 _SEC_SLOW = """<div class="card" id="slowcard" style="display:none"><h2>慢点捕捉</h2>
 <div class="sub">每条 = 一次慢操作（Top-100）；总计 = 该角色全部慢点（灰），
 勾选节点/实例后高亮叠加</div>
-<div id="slowctl" class="slow-ctl"></div>
+<div id="slowctl" class="objtree-strip"></div>
 <div id="slowsum" class="slow-sum"></div>
 <div id="slowchart" class="chart sm" role="img" aria-label="慢点捕捉条带图"></div>
 <div class="note">时间轴与端到端时延曲线同窗口（缩放独立）；摘要条 = 各节点慢点次数
